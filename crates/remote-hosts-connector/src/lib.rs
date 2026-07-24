@@ -1,0 +1,10038 @@
+//! Connector-side execution guards and transport backends.
+
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    num::{NonZeroU32, NonZeroUsize},
+    path::{Path, PathBuf},
+    pin::Pin,
+    process::Stdio as ProcessStdio,
+    sync::{Arc, Mutex as StdMutex},
+};
+
+use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use governor::{
+    Quota, RateLimiter,
+    clock::{Clock, DefaultClock},
+    state::{InMemoryState, direct::NotKeyed},
+};
+use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder, Stdio as OpenSshStdio};
+use openssh_sftp_client::{
+    Error as OpenSshSftpError, Sftp as OpenSshSftp, SftpOptions,
+    error::SftpErrorKind as OpenSshSftpErrorKind,
+    file::TokioCompatFile as OpenSshSftpFile,
+    fs::Fs as OpenSshSftpFs,
+    metadata::{MetaData as OpenSshSftpMetadata, Permissions as OpenSshSftpPermissions},
+};
+use remote_hosts_core::{
+    CheckRequest, CheckResult, CommandProfile, CommandValidationError, ConnectorStateTracker,
+    ExecRequest, ExecResult, FileTransferSpec, ForwardHandle, ForwardRequest,
+    PtySessionOpenCommand, PtySessionSupervisor, PtySessionSupervisorError, RemoteTransport,
+    SecretRedactor, ServerProtectionPolicy, SftpDirection, SftpOverwritePolicy, SftpRequest,
+    SftpResult, transport::TransportError,
+};
+use remote_hosts_db::{
+    AuthorizedKeyBootstrapRepository, ClaimedOperationFinish, DbError, Repositories,
+};
+use remote_hosts_domain::{
+    AccessPath, AccessPathHealth, AccessPathId, AgentSessionId, AgentWorkspace,
+    AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason, AuthorizedKeyBootstrapState,
+    ConnectionSession, ConnectorId, EntityState, HostId, HostKind, HostWriteLease, OperationId,
+    OperationOutputArtifact, OperationOutputArtifactId, OperationOutputChunk,
+    OperationOutputChunkId, OperationRun, OperationState, OutputStream, PtyBackendCapabilities,
+    PtyBackendState, PtyInputEventId, PtyInputEventState, PtyOutputChunk, PtyOutputChunkId,
+    PtySession, PtySessionId, RouteType, SessionId, SshChannelKind, SshChannelTransportEvidence,
+    SshFileTransferMode, SshTransportBackend, SshTransportCapabilities, SshTransportRuntime,
+    SshTransportRuntimeId, SshTransportRuntimeState, SshTransportTelemetry, StateReasonCode,
+    WorkspaceId, WorkspaceState, now_utc,
+};
+use remote_hosts_vault::{CredentialSecret, CredentialVault, EncryptedCredentialBlob};
+use russh::{
+    ChannelMsg, client,
+    keys::{
+        PrivateKeyWithHashAlg,
+        agent::{AgentIdentity, client::AgentClient},
+        check_known_hosts, check_known_hosts_path, decode_secret_key,
+        known_hosts::{learn_known_hosts, learn_known_hosts_path},
+        ssh_key::{HashAlg, PrivateKey, PublicKey},
+    },
+};
+use russh_sftp::{
+    client::{SftpSession as RusshSftp, error::Error as RusshSftpError},
+    protocol::{
+        FileAttributes as RusshSftpMetadata, OpenFlags as RusshSftpOpenFlags,
+        StatusCode as RusshSftpStatusCode,
+    },
+};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    process::{Child as LocalChild, Command as LocalCommand},
+    sync::{Mutex, Semaphore, mpsc, oneshot, watch},
+    time::{Duration, Instant},
+};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+const DEFAULT_ARTIFACT_THRESHOLD_BYTES: usize = 64 * 1024;
+const DEFAULT_ARTIFACT_PREVIEW_BYTES: usize = 4 * 1024;
+const DEFAULT_ARTIFACT_ROOT: &str = "remote-hosts-artifacts";
+const MAX_SSH_AGENT_IDENTITIES_PER_HANDSHAKE: usize = 2;
+const AUTHORIZED_KEY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTHORIZED_KEY_BOOTSTRAP_MAX_FAILURES: u32 = 3;
+const EXEC_UPLOAD_CHUNK_BYTES: usize = 24 * 1024;
+const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
+const PTY_WRITE_LEASE_SECONDS: i64 = 300;
+
+type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+struct HandshakeLimiter {
+    path: DirectRateLimiter,
+    global: Arc<DirectRateLimiter>,
+}
+
+struct TransportTelemetryTracker {
+    runtime_id: SshTransportRuntimeId,
+    backend: SshTransportBackend,
+    capabilities: SshTransportCapabilities,
+    state: StdMutex<TransportTelemetryState>,
+}
+
+struct TransportTelemetryState {
+    state: SshTransportRuntimeState,
+    generation: u64,
+    connection_attempt_count: u64,
+    successful_handshake_count: u64,
+    reuse_count: u64,
+    last_handshake_at: Option<time::OffsetDateTime>,
+    last_validated_at: Option<time::OffsetDateTime>,
+}
+
+impl TransportTelemetryTracker {
+    fn new(backend: SshTransportBackend, capabilities: SshTransportCapabilities) -> Self {
+        Self {
+            runtime_id: SshTransportRuntimeId::new(),
+            backend,
+            capabilities,
+            state: StdMutex::new(TransportTelemetryState {
+                state: SshTransportRuntimeState::Cold,
+                generation: 0,
+                connection_attempt_count: 0,
+                successful_handshake_count: 0,
+                reuse_count: 0,
+                last_handshake_at: None,
+                last_validated_at: None,
+            }),
+        }
+    }
+
+    fn connection_attempted(&self) {
+        let mut state = self.lock_state();
+        state.state = SshTransportRuntimeState::Connecting;
+        state.connection_attempt_count = state.connection_attempt_count.saturating_add(1);
+    }
+
+    fn handshake_succeeded(&self, observed_at: time::OffsetDateTime) {
+        let mut state = self.lock_state();
+        state.state = SshTransportRuntimeState::Ready;
+        state.generation = state.generation.saturating_add(1);
+        state.successful_handshake_count = state.successful_handshake_count.saturating_add(1);
+        state.last_handshake_at = Some(observed_at);
+        state.last_validated_at = Some(observed_at);
+    }
+
+    fn session_reused(&self, observed_at: time::OffsetDateTime) {
+        let mut state = self.lock_state();
+        state.state = SshTransportRuntimeState::Ready;
+        state.reuse_count = state.reuse_count.saturating_add(1);
+        state.last_validated_at = Some(observed_at);
+    }
+
+    fn disconnected(&self) {
+        self.lock_state().state = SshTransportRuntimeState::Disconnected;
+    }
+
+    fn snapshot(&self) -> SshTransportTelemetry {
+        let state = self.lock_state();
+        SshTransportTelemetry {
+            runtime_id: self.runtime_id,
+            backend: self.backend.clone(),
+            state: state.state.clone(),
+            generation: state.generation,
+            connection_attempt_count: state.connection_attempt_count,
+            successful_handshake_count: state.successful_handshake_count,
+            reuse_count: state.reuse_count,
+            last_handshake_at: state.last_handshake_at,
+            last_validated_at: state.last_validated_at,
+            capabilities: self.capabilities.clone(),
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, TransportTelemetryState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl HandshakeLimiter {
+    #[cfg(test)]
+    fn new(max_per_minute: u16, max_per_ten_minutes: u32) -> Self {
+        Self::with_shared_global(max_per_minute, Self::shared_global(max_per_ten_minutes))
+    }
+
+    fn with_shared_global(max_per_minute: u16, global: Arc<DirectRateLimiter>) -> Self {
+        Self {
+            path: rate_limiter_for_window(u32::from(max_per_minute), Duration::from_secs(60)),
+            global,
+        }
+    }
+
+    fn shared_global(max_per_ten_minutes: u32) -> Arc<DirectRateLimiter> {
+        Arc::new(rate_limiter_for_window(
+            max_per_ten_minutes,
+            Duration::from_secs(600),
+        ))
+    }
+
+    fn try_acquire(&self) -> Result<(), TransportError> {
+        check_handshake_rate_limiter(&self.path)?;
+        check_handshake_rate_limiter(self.global.as_ref())
+    }
+}
+
+fn rate_limiter_for_window(max_events: u32, window: Duration) -> DirectRateLimiter {
+    let max_events = max_events.max(1);
+    let period = window.div_f64(f64::from(max_events));
+    let burst = NonZeroU32::new(max_events).unwrap_or(NonZeroU32::MIN);
+    let quota = Quota::with_period(period)
+        .unwrap_or_else(|| Quota::per_minute(NonZeroU32::MIN))
+        .allow_burst(burst);
+    RateLimiter::direct(quota)
+}
+
+fn check_handshake_rate_limiter(limiter: &DirectRateLimiter) -> Result<(), TransportError> {
+    limiter.check().map_err(|not_until| {
+        let retry_after_seconds = not_until
+            .wait_time_from(DefaultClock::default().now())
+            .as_secs()
+            .max(1);
+        TransportError::LocalHandshakeBudgetExhausted {
+            retry_after_seconds,
+        }
+    })
+}
+
+/// Host key policy for OpenSSH sessions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKeyPolicy {
+    /// Require known host match.
+    Strict,
+    /// Add new hosts, reject changed keys.
+    Add,
+    /// Accept all host keys.
+    Accept,
+}
+
+impl From<HostKeyPolicy> for KnownHosts {
+    fn from(value: HostKeyPolicy) -> Self {
+        match value {
+            HostKeyPolicy::Strict => Self::Strict,
+            HostKeyPolicy::Add => Self::Add,
+            HostKeyPolicy::Accept => Self::Accept,
+        }
+    }
+}
+
+/// OpenSSH `ControlMaster` transport configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OpenSshTransportConfig {
+    /// Destination accepted by OpenSSH, for example `ssh://user@example.com:22`.
+    pub destination: String,
+    /// Host key policy.
+    pub host_key_policy: HostKeyPolicy,
+    /// Connect timeout in seconds.
+    pub connect_timeout_seconds: u64,
+    /// Idle lifetime for the OpenSSH control master.
+    pub idle_ttl_seconds: u64,
+    /// OpenSSH server-alive interval.
+    pub keepalive_seconds: u64,
+    /// Access-path handshake budget per minute.
+    pub max_new_connections_per_minute: u16,
+    /// Global handshake budget per ten minutes.
+    pub max_new_ssh_handshakes_per_10_min: u32,
+}
+
+/// OpenSSH `ControlMaster` transport backed by the `openssh` crate's native mux.
+pub struct OpenSshTransport {
+    config: OpenSshTransportConfig,
+    session: Mutex<Option<Arc<Session>>>,
+    handshake_limiter: HandshakeLimiter,
+    telemetry: TransportTelemetryTracker,
+}
+
+impl OpenSshTransport {
+    /// Creates a transport.
+    pub fn new(config: OpenSshTransportConfig) -> Self {
+        let global = HandshakeLimiter::shared_global(config.max_new_ssh_handshakes_per_10_min);
+        Self::with_shared_handshake_budget(config, global)
+    }
+
+    fn with_shared_handshake_budget(
+        config: OpenSshTransportConfig,
+        global: Arc<DirectRateLimiter>,
+    ) -> Self {
+        let handshake_limiter =
+            HandshakeLimiter::with_shared_global(config.max_new_connections_per_minute, global);
+        Self {
+            config,
+            session: Mutex::new(None),
+            handshake_limiter,
+            telemetry: TransportTelemetryTracker::new(
+                SshTransportBackend::OpenSshControlMaster,
+                SshTransportCapabilities::pooled(SshFileTransferMode::Sftp),
+            ),
+        }
+    }
+
+    /// Builds an OpenSSH destination URI.
+    pub fn destination(username: &str, address: &str, port: u16) -> String {
+        format!("ssh://{username}@{address}:{port}")
+    }
+
+    async fn session(&self) -> Result<Arc<Session>, TransportError> {
+        let mut guard = self.session.lock().await;
+        if let Some(session) = guard.as_ref() {
+            if session.check().await.is_ok() {
+                self.telemetry.session_reused(now_utc());
+                return Ok(Arc::clone(session));
+            }
+            *guard = None;
+            self.telemetry.disconnected();
+        }
+
+        self.handshake_limiter.try_acquire()?;
+        self.telemetry.connection_attempted();
+        let mut builder = SessionBuilder::default();
+        builder
+            .known_hosts_check(KnownHosts::from(self.config.host_key_policy))
+            .connect_timeout(Duration::from_secs(self.config.connect_timeout_seconds));
+        if self.config.keepalive_seconds > 0 {
+            builder.server_alive_interval(Duration::from_secs(self.config.keepalive_seconds));
+        }
+        let idle_ttl = usize::try_from(self.config.idle_ttl_seconds)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        builder.control_persist(ControlPersist::IdleFor(
+            NonZeroUsize::new(idle_ttl).unwrap_or(NonZeroUsize::MIN),
+        ));
+        let connect = builder.connect_mux(&self.config.destination);
+        let session = tokio::time::timeout(
+            Duration::from_secs(self.config.connect_timeout_seconds),
+            connect,
+        )
+        .await;
+        let session = match session {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => {
+                self.telemetry.disconnected();
+                return Err(TransportError::Backend(error.to_string()));
+            }
+            Err(_) => {
+                self.telemetry.disconnected();
+                return Err(TransportError::Timeout);
+            }
+        };
+        let session = Arc::new(session);
+        *guard = Some(Arc::clone(&session));
+        self.telemetry.handshake_succeeded(now_utc());
+        Ok(session)
+    }
+}
+
+#[async_trait]
+impl RemoteTransport for OpenSshTransport {
+    fn transport_telemetry(&self) -> Option<SshTransportTelemetry> {
+        Some(self.telemetry.snapshot())
+    }
+
+    async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
+        let session = self.session().await?;
+        session
+            .check()
+            .await
+            .map_err(|error| TransportError::Backend(error.to_string()))?;
+        Ok(CheckResult {
+            ok: true,
+            latency_ms: None,
+            message: "openssh control master is healthy".to_owned(),
+        })
+    }
+
+    async fn exec(&self, request: ExecRequest) -> Result<ExecResult, TransportError> {
+        let session = self.session().await?;
+        let mut command = session.command(&request.profile.program);
+        command.args(&request.profile.args);
+        let output = tokio::time::timeout(
+            Duration::from_secs(request.profile.timeout_seconds),
+            command.output(),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)?
+        .map_err(|error| TransportError::Backend(error.to_string()))?;
+
+        Ok(ExecResult {
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            truncated: false,
+        })
+    }
+
+    async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+        request
+            .spec
+            .validate()
+            .map_err(|error| TransportError::FileTransfer(error.to_string()))?;
+        let timeout = Duration::from_secs(request.spec.timeout_seconds);
+        let session = self.session().await?;
+        tokio::time::timeout(timeout, execute_openssh_sftp(session, request))
+            .await
+            .map_err(|_| TransportError::Timeout)?
+    }
+
+    async fn open_forward(
+        &self,
+        _request: ForwardRequest,
+    ) -> Result<ForwardHandle, TransportError> {
+        Err(TransportError::Backend(
+            "OpenSSH port forwarding is not implemented yet".to_owned(),
+        ))
+    }
+}
+
+async fn execute_openssh_sftp(
+    session: Arc<Session>,
+    request: SftpRequest,
+) -> Result<SftpResult, TransportError> {
+    let sftp = OpenSshSftp::from_clonable_session(session, SftpOptions::default())
+        .await
+        .map_err(|error| {
+            TransportError::FileTransfer(format!("SFTP subsystem unavailable: {error}"))
+        })?;
+    let result = match request.spec.direction {
+        SftpDirection::Upload => openssh_upload(&sftp, &request).await,
+        SftpDirection::Download => openssh_download(&sftp, &request).await,
+    };
+    let close_result = sftp
+        .close()
+        .await
+        .map_err(|error| TransportError::FileTransfer(format!("close SFTP subsystem: {error}")));
+    match (result, close_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn openssh_upload(
+    sftp: &OpenSshSftp,
+    request: &SftpRequest,
+) -> Result<SftpResult, TransportError> {
+    let spec = &request.spec;
+    let (local_size, local_sha256) =
+        hash_local_source(Path::new(&spec.local_path), spec.max_size_bytes).await?;
+    ensure_expected_sha256(spec, &local_sha256)?;
+
+    let mut fs = sftp.fs();
+    ensure_openssh_remote_parent(&mut fs, &spec.remote_path).await?;
+    ensure_openssh_remote_destination(&mut fs, &spec.remote_path, spec.overwrite).await?;
+    let temporary_path = remote_temporary_path(&spec.remote_path, request.operation_id)?;
+    cleanup_openssh_temporary_file(&mut fs, &temporary_path).await?;
+
+    let transfer = async {
+        let mut local = tokio::fs::File::open(&spec.local_path)
+            .await
+            .map_err(file_transfer_io)?;
+        let mut options = sftp.options();
+        options.write(true).create_new(true);
+        let remote = options
+            .open(&temporary_path)
+            .await
+            .map_err(openssh_file_transfer_error)?;
+        let mut remote = Box::pin(OpenSshSftpFile::from(remote));
+        let (bytes_transferred, transfer_sha256) =
+            copy_bounded_and_hash(Pin::new(&mut local), remote.as_mut(), spec.max_size_bytes)
+                .await?;
+        remote.as_mut().shutdown().await.map_err(file_transfer_io)?;
+        drop(remote);
+        if bytes_transferred != local_size || transfer_sha256 != local_sha256 {
+            return Err(TransportError::FileTransfer(
+                "local file changed while it was being uploaded".to_owned(),
+            ));
+        }
+        if let Some(mode) = spec.mode {
+            let mode = u16::try_from(mode).map_err(|error| {
+                TransportError::FileTransfer(format!("invalid remote permission mode: {error}"))
+            })?;
+            fs.set_permissions(&temporary_path, OpenSshSftpPermissions::from(mode))
+                .await
+                .map_err(openssh_file_transfer_error)?;
+        }
+        let (remote_size, remote_sha256) =
+            hash_openssh_remote_file(sftp, &temporary_path, spec.max_size_bytes).await?;
+        if remote_size != local_size || remote_sha256 != local_sha256 {
+            return Err(TransportError::FileTransfer(format!(
+                "remote SHA-256 verification failed: local={local_sha256}, remote={remote_sha256}"
+            )));
+        }
+        fs.rename(&temporary_path, &spec.remote_path)
+            .await
+            .map_err(|error| {
+                TransportError::FileTransfer(format!(
+                    "atomic remote placement failed; destination may not support the requested overwrite policy: {error}"
+                ))
+            })?;
+        Ok(SftpResult {
+            direction: spec.direction,
+            bytes_transferred,
+            sha256: local_sha256,
+            local_path: spec.local_path.clone(),
+            remote_path: spec.remote_path.clone(),
+            overwrite: spec.overwrite,
+        })
+    }
+    .await;
+
+    if transfer.is_err() {
+        let _ = fs.remove_file(&temporary_path).await;
+    }
+    transfer
+}
+
+async fn openssh_download(
+    sftp: &OpenSshSftp,
+    request: &SftpRequest,
+) -> Result<SftpResult, TransportError> {
+    let spec = &request.spec;
+    let source = openssh_lstat(&mut sftp.fs(), &spec.remote_path)
+        .await?
+        .ok_or_else(|| TransportError::FileTransfer("remote source does not exist".to_owned()))?;
+    ensure_openssh_regular_file(&source, "remote source")?;
+    let source_size = source
+        .len()
+        .ok_or_else(|| TransportError::FileTransfer("remote source size is unknown".to_owned()))?;
+    ensure_size_within_limit(source_size, spec.max_size_bytes)?;
+
+    let destination = Path::new(&spec.local_path);
+    ensure_local_destination(destination, spec.overwrite).await?;
+    let temporary_path = local_temporary_path(destination, request.operation_id)?;
+    cleanup_local_temporary_file(&temporary_path).await?;
+
+    let transfer = async {
+        let remote = sftp
+            .open(&spec.remote_path)
+            .await
+            .map_err(openssh_file_transfer_error)?;
+        let mut remote = Box::pin(OpenSshSftpFile::from(remote));
+        let mut local = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .await
+            .map_err(file_transfer_io)?;
+        let (bytes_transferred, remote_sha256) =
+            copy_bounded_and_hash(remote.as_mut(), Pin::new(&mut local), spec.max_size_bytes)
+                .await?;
+        local.shutdown().await.map_err(file_transfer_io)?;
+        drop(remote);
+        if bytes_transferred != source_size {
+            return Err(TransportError::FileTransfer(format!(
+                "remote source changed while it was being downloaded: expected_bytes={source_size}, transferred_bytes={bytes_transferred}"
+            )));
+        }
+        ensure_expected_sha256(spec, &remote_sha256)?;
+        let (local_size, local_sha256) =
+            hash_local_source(&temporary_path, spec.max_size_bytes).await?;
+        if local_size != source_size || local_sha256 != remote_sha256 {
+            return Err(TransportError::FileTransfer(format!(
+                "local SHA-256 verification failed: remote={remote_sha256}, local={local_sha256}"
+            )));
+        }
+        if let Some(mode) = spec.mode {
+            set_local_mode(&temporary_path, mode).await?;
+        }
+        place_local_file(&temporary_path, destination, spec.overwrite).await?;
+        Ok(SftpResult {
+            direction: spec.direction,
+            bytes_transferred,
+            sha256: remote_sha256,
+            local_path: spec.local_path.clone(),
+            remote_path: spec.remote_path.clone(),
+            overwrite: spec.overwrite,
+        })
+    }
+    .await;
+
+    if transfer.is_err() {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+    }
+    transfer
+}
+
+async fn openssh_lstat(
+    fs: &mut OpenSshSftpFs,
+    path: &str,
+) -> Result<Option<OpenSshSftpMetadata>, TransportError> {
+    match fs.symlink_metadata(path).await {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(OpenSshSftpError::SftpError(OpenSshSftpErrorKind::NoSuchFile, _)) => Ok(None),
+        Err(error) => Err(openssh_file_transfer_error(error)),
+    }
+}
+
+async fn ensure_openssh_remote_parent(
+    fs: &mut OpenSshSftpFs,
+    path: &str,
+) -> Result<(), TransportError> {
+    let parent = remote_parent(path)?;
+    let metadata = openssh_lstat(fs, parent).await?.ok_or_else(|| {
+        TransportError::FileTransfer("remote parent directory is missing".to_owned())
+    })?;
+    if metadata
+        .file_type()
+        .is_none_or(|file_type| !file_type.is_dir())
+    {
+        return Err(TransportError::FileTransfer(
+            "remote parent path is not a directory".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_openssh_remote_destination(
+    fs: &mut OpenSshSftpFs,
+    path: &str,
+    overwrite: SftpOverwritePolicy,
+) -> Result<(), TransportError> {
+    let Some(metadata) = openssh_lstat(fs, path).await? else {
+        return Ok(());
+    };
+    ensure_openssh_regular_file(&metadata, "remote destination")?;
+    if overwrite == SftpOverwritePolicy::Deny {
+        return Err(TransportError::FileTransfer(
+            "remote destination already exists and overwrite=deny".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_openssh_regular_file(
+    metadata: &OpenSshSftpMetadata,
+    label: &str,
+) -> Result<(), TransportError> {
+    if metadata
+        .file_type()
+        .is_none_or(|file_type| !file_type.is_file())
+    {
+        return Err(TransportError::FileTransfer(format!(
+            "{label} is not a regular file"
+        )));
+    }
+    Ok(())
+}
+
+async fn cleanup_openssh_temporary_file(
+    fs: &mut OpenSshSftpFs,
+    path: &str,
+) -> Result<(), TransportError> {
+    let Some(metadata) = openssh_lstat(fs, path).await? else {
+        return Ok(());
+    };
+    ensure_openssh_regular_file(&metadata, "stale remote temporary path")?;
+    fs.remove_file(path)
+        .await
+        .map_err(openssh_file_transfer_error)
+}
+
+async fn hash_openssh_remote_file(
+    sftp: &OpenSshSftp,
+    path: &str,
+    max_size_bytes: u64,
+) -> Result<(u64, String), TransportError> {
+    let remote = sftp.open(path).await.map_err(openssh_file_transfer_error)?;
+    let mut remote = Box::pin(OpenSshSftpFile::from(remote));
+    hash_reader(remote.as_mut(), max_size_bytes).await
+}
+
+fn openssh_file_transfer_error(error: OpenSshSftpError) -> TransportError {
+    let message = error.to_string();
+    drop(error);
+    TransportError::FileTransfer(message)
+}
+
+async fn hash_local_source(
+    path: &Path,
+    max_size_bytes: u64,
+) -> Result<(u64, String), TransportError> {
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(file_transfer_io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(TransportError::FileTransfer(
+            "local source must be a regular file and cannot be a symlink".to_owned(),
+        ));
+    }
+    ensure_size_within_limit(metadata.len(), max_size_bytes)?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(file_transfer_io)?;
+    let result = hash_reader(Pin::new(&mut file), max_size_bytes).await?;
+    if result.0 != metadata.len() {
+        return Err(TransportError::FileTransfer(
+            "local source changed while it was being hashed".to_owned(),
+        ));
+    }
+    Ok(result)
+}
+
+async fn hash_reader<R>(
+    mut reader: Pin<&mut R>,
+    max_size_bytes: u64,
+) -> Result<(u64, String), TransportError>
+where
+    R: AsyncRead + ?Sized,
+{
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .as_mut()
+            .read(&mut buffer)
+            .await
+            .map_err(file_transfer_io)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).map_err(file_transfer_conversion)?)
+            .ok_or_else(|| TransportError::FileTransfer("file size overflow".to_owned()))?;
+        ensure_size_within_limit(total, max_size_bytes)?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((total, format!("{:x}", hasher.finalize())))
+}
+
+async fn copy_bounded_and_hash<R, W>(
+    mut reader: Pin<&mut R>,
+    mut writer: Pin<&mut W>,
+    max_size_bytes: u64,
+) -> Result<(u64, String), TransportError>
+where
+    R: AsyncRead + ?Sized,
+    W: AsyncWrite + ?Sized,
+{
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .as_mut()
+            .read(&mut buffer)
+            .await
+            .map_err(file_transfer_io)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).map_err(file_transfer_conversion)?)
+            .ok_or_else(|| TransportError::FileTransfer("file size overflow".to_owned()))?;
+        ensure_size_within_limit(total, max_size_bytes)?;
+        writer
+            .as_mut()
+            .write_all(&buffer[..read])
+            .await
+            .map_err(file_transfer_io)?;
+        hasher.update(&buffer[..read]);
+    }
+    writer.as_mut().flush().await.map_err(file_transfer_io)?;
+    Ok((total, format!("{:x}", hasher.finalize())))
+}
+
+fn ensure_size_within_limit(size: u64, max_size_bytes: u64) -> Result<(), TransportError> {
+    if size > max_size_bytes {
+        return Err(TransportError::FileTransfer(format!(
+            "file exceeds max_size_bytes: size={size}, max_size_bytes={max_size_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_expected_sha256(
+    spec: &FileTransferSpec,
+    actual_sha256: &str,
+) -> Result<(), TransportError> {
+    if spec
+        .expected_sha256
+        .as_deref()
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(actual_sha256))
+    {
+        return Err(TransportError::FileTransfer(format!(
+            "SHA-256 mismatch: expected={}, actual={actual_sha256}",
+            spec.expected_sha256.as_deref().unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_local_destination(
+    path: &Path,
+    overwrite: SftpOverwritePolicy,
+) -> Result<(), TransportError> {
+    let parent = path.parent().ok_or_else(|| {
+        TransportError::FileTransfer("local destination parent is missing".to_owned())
+    })?;
+    let parent_metadata = tokio::fs::metadata(parent)
+        .await
+        .map_err(file_transfer_io)?;
+    if !parent_metadata.is_dir() {
+        return Err(TransportError::FileTransfer(
+            "local destination parent is not a directory".to_owned(),
+        ));
+    }
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(TransportError::FileTransfer(
+                    "local destination exists but is not a regular file".to_owned(),
+                ));
+            }
+            if overwrite == SftpOverwritePolicy::Deny {
+                return Err(TransportError::FileTransfer(
+                    "local destination already exists and overwrite=deny".to_owned(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(file_transfer_io(error)),
+    }
+    Ok(())
+}
+
+async fn cleanup_local_temporary_file(path: &Path) -> Result<(), TransportError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(TransportError::FileTransfer(
+                    "stale local temporary path is not a regular file".to_owned(),
+                ));
+            }
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(file_transfer_io)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(file_transfer_io(error)),
+    }
+    Ok(())
+}
+
+async fn place_local_file(
+    temporary_path: &Path,
+    destination: &Path,
+    overwrite: SftpOverwritePolicy,
+) -> Result<(), TransportError> {
+    match overwrite {
+        SftpOverwritePolicy::Deny => {
+            tokio::fs::hard_link(temporary_path, destination)
+                .await
+                .map_err(|error| {
+                    TransportError::FileTransfer(format!(
+                        "atomic no-overwrite placement failed: {error}"
+                    ))
+                })?;
+            tokio::fs::remove_file(temporary_path)
+                .await
+                .map_err(file_transfer_io)
+        }
+        SftpOverwritePolicy::Replace => tokio::fs::rename(temporary_path, destination)
+            .await
+            .map_err(|error| {
+                TransportError::FileTransfer(format!("atomic local replacement failed: {error}"))
+            }),
+    }
+}
+
+#[cfg(unix)]
+async fn set_local_mode(path: &Path, mode: u32) -> Result<(), TransportError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .await
+        .map_err(file_transfer_io)
+}
+
+#[cfg(not(unix))]
+async fn set_local_mode(_path: &Path, _mode: u32) -> Result<(), TransportError> {
+    Err(TransportError::FileTransfer(
+        "local permission modes are unsupported on this connector platform".to_owned(),
+    ))
+}
+
+fn local_temporary_path(
+    destination: &Path,
+    operation_id: OperationId,
+) -> Result<PathBuf, TransportError> {
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| TransportError::FileTransfer("invalid local file name".to_owned()))?;
+    Ok(destination.with_file_name(format!(".{file_name}.remote-hosts-{operation_id}.part")))
+}
+
+fn remote_temporary_path(
+    destination: &str,
+    operation_id: OperationId,
+) -> Result<String, TransportError> {
+    let separator = destination.rfind('/').ok_or_else(|| {
+        TransportError::FileTransfer("remote destination has no parent".to_owned())
+    })?;
+    let file_name = &destination[separator + 1..];
+    Ok(format!(
+        "{}.{file_name}.remote-hosts-{operation_id}.part",
+        &destination[..=separator]
+    ))
+}
+
+fn remote_parent(path: &str) -> Result<&str, TransportError> {
+    let separator = path.rfind('/').ok_or_else(|| {
+        TransportError::FileTransfer("remote path has no parent directory".to_owned())
+    })?;
+    Ok(&path[..=separator])
+}
+
+fn file_transfer_io(error: std::io::Error) -> TransportError {
+    let message = error.to_string();
+    drop(error);
+    TransportError::FileTransfer(message)
+}
+
+fn file_transfer_io_context(context: &str, error: std::io::Error) -> TransportError {
+    let message = error.to_string();
+    drop(error);
+    TransportError::FileTransfer(format!("{context}: {message}"))
+}
+
+fn file_transfer_context(context: &str, error: TransportError) -> TransportError {
+    match error {
+        TransportError::FileTransfer(message) => {
+            TransportError::FileTransfer(format!("{context}: {message}"))
+        }
+        other => other,
+    }
+}
+
+fn file_transfer_conversion(error: std::num::TryFromIntError) -> TransportError {
+    TransportError::FileTransfer(error.to_string())
+}
+
+/// Request to spawn a managed persistent shell for a PTY session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PtyBackendSpawnRequest {
+    /// PTY session id.
+    pub pty_session_id: PtySessionId,
+    /// Workspace id.
+    pub workspace_id: WorkspaceId,
+    /// Existing connection session id.
+    pub session_id: SessionId,
+    /// Initial working directory.
+    pub cwd: Option<String>,
+}
+
+/// Output emitted by a managed PTY backend.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PtyBackendOutput {
+    /// Output stream.
+    pub stream: OutputStream,
+    /// Visible output text.
+    pub text: String,
+    /// Whether the backend already truncated the output.
+    pub truncated: bool,
+}
+
+/// Running managed PTY process handles.
+pub struct ManagedPtyProcess {
+    input_tx: mpsc::Sender<String>,
+    output_rx: mpsc::Receiver<PtyBackendOutput>,
+    close_tx: oneshot::Sender<()>,
+    transport_telemetry: Option<SshTransportTelemetry>,
+    transport_evidence: Option<SshChannelTransportEvidence>,
+}
+
+impl ManagedPtyProcess {
+    /// Creates process handles from channels.
+    pub fn new(
+        input_tx: mpsc::Sender<String>,
+        output_rx: mpsc::Receiver<PtyBackendOutput>,
+        close_tx: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            input_tx,
+            output_rx,
+            close_tx,
+            transport_telemetry: None,
+            transport_evidence: None,
+        }
+    }
+
+    /// Attaches SSH transport telemetry and evidence observed while opening the PTY channel.
+    #[must_use]
+    pub fn with_transport_observation(
+        mut self,
+        before: Option<&SshTransportTelemetry>,
+        after: Option<SshTransportTelemetry>,
+    ) -> Self {
+        if let Some(after) = after {
+            self.transport_evidence = Some(SshChannelTransportEvidence::between(
+                SshChannelKind::Pty,
+                before,
+                &after,
+                now_utc(),
+            ));
+            self.transport_telemetry = Some(after);
+        }
+        self
+    }
+}
+
+/// Backend capable of spawning a persistent shell for a PTY session.
+#[async_trait]
+pub trait ManagedPtyBackend: Send + Sync {
+    /// Returns the backend capabilities that should be visible to agents.
+    fn capabilities(&self) -> PtyBackendCapabilities;
+
+    /// Spawns a managed PTY-like persistent process.
+    async fn spawn(
+        &self,
+        request: PtyBackendSpawnRequest,
+    ) -> Result<ManagedPtyProcess, ConnectorPtyError>;
+}
+
+/// OpenSSH-backed persistent shell backend.
+pub struct OpenSshShellBackend {
+    transport: Arc<OpenSshTransport>,
+}
+
+impl OpenSshShellBackend {
+    /// Creates a backend from an OpenSSH transport.
+    pub fn new(transport: Arc<OpenSshTransport>) -> Self {
+        Self { transport }
+    }
+}
+
+#[async_trait]
+impl ManagedPtyBackend for OpenSshShellBackend {
+    fn capabilities(&self) -> PtyBackendCapabilities {
+        PtyBackendCapabilities::openssh_pipe_shell()
+    }
+
+    async fn spawn(
+        &self,
+        request: PtyBackendSpawnRequest,
+    ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
+        let before = self.transport.transport_telemetry();
+        let session = self.transport.session().await?;
+        let mut command = session.arc_command("sh");
+        command
+            .arg("-lc")
+            .arg(shell_start_script(request.cwd.as_deref()))
+            .stdin(OpenSshStdio::piped())
+            .stdout(OpenSshStdio::piped())
+            .stderr(OpenSshStdio::piped());
+        let mut child = command
+            .spawn()
+            .await
+            .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
+        let stdin = child.stdin().take();
+        let stdout = child.stdout().take();
+        let stderr = child.stderr().take();
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(64);
+        let (output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(128);
+        let (close_tx, close_rx) = oneshot::channel::<()>();
+        let writer_input_tx = input_tx.clone();
+
+        if let Some(mut stdin) = stdin {
+            tokio::spawn(async move {
+                while let Some(input) = input_rx.recv().await {
+                    if stdin.write_all(input.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        if let Some(stdout) = stdout {
+            spawn_reader_task(stdout, OutputStream::Stdout, output_tx.clone());
+        }
+        if let Some(stderr) = stderr {
+            spawn_reader_task(stderr, OutputStream::Stderr, output_tx.clone());
+        }
+        tokio::spawn(async move {
+            let wait = child.wait();
+            tokio::pin!(wait);
+            tokio::select! {
+                _ = close_rx => {
+                    drop(writer_input_tx);
+                    let _ = wait.await;
+                }
+                result = &mut wait => {
+                    let text = match result {
+                        Ok(status) => format!("remote shell exited: status={status}"),
+                        Err(error) => format!("remote shell wait failed: {error}"),
+                    };
+                    let _ = output_tx
+                        .send(PtyBackendOutput {
+                            stream: OutputStream::System,
+                            text,
+                            truncated: false,
+                        })
+                        .await;
+                }
+            }
+        });
+
+        Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx)
+            .with_transport_observation(before.as_ref(), self.transport.transport_telemetry()))
+    }
+}
+
+/// OpenSSH `ControlMaster` backend mode for persistent shell sessions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenSshManagedPtyBackendMode {
+    /// Compatibility mode through the `openssh` native mux API and plain pipes.
+    #[default]
+    PipeShell,
+    /// True terminal mode through a local `ssh -tt` child reusing the `ControlMaster` socket.
+    ControlMasterTty,
+}
+
+/// OpenSSH-backed true terminal backend using an existing `ControlMaster` socket.
+pub struct OpenSshControlMasterTtyBackend {
+    transport: Arc<OpenSshTransport>,
+    ssh_binary: PathBuf,
+    term: String,
+    columns: u32,
+    rows: u32,
+}
+
+impl OpenSshControlMasterTtyBackend {
+    /// Creates a backend that invokes the local `ssh` binary.
+    pub fn new(transport: Arc<OpenSshTransport>) -> Self {
+        Self {
+            transport,
+            ssh_binary: PathBuf::from("ssh"),
+            term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned()),
+            columns: 120,
+            rows: 40,
+        }
+    }
+
+    /// Overrides local `ssh` process settings.
+    #[must_use]
+    pub fn with_options(
+        mut self,
+        ssh_binary: impl Into<PathBuf>,
+        term: impl Into<String>,
+        columns: u32,
+        rows: u32,
+    ) -> Self {
+        self.ssh_binary = ssh_binary.into();
+        self.term = term.into();
+        self.columns = columns.max(1);
+        self.rows = rows.max(1);
+        self
+    }
+}
+
+#[async_trait]
+impl ManagedPtyBackend for OpenSshControlMasterTtyBackend {
+    fn capabilities(&self) -> PtyBackendCapabilities {
+        PtyBackendCapabilities::openssh_control_master_tty()
+    }
+
+    async fn spawn(
+        &self,
+        request: PtyBackendSpawnRequest,
+    ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
+        let before = self.transport.transport_telemetry();
+        let session = self.transport.session().await?;
+        let control_socket = session.control_socket().to_path_buf();
+        let mut command = LocalCommand::new(&self.ssh_binary);
+        command
+            .arg("-S")
+            .arg(control_socket)
+            .arg("-tt")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg(&self.transport.config.destination)
+            .env("TERM", &self.term)
+            .env("COLUMNS", self.columns.to_string())
+            .env("LINES", self.rows.to_string())
+            .stdin(ProcessStdio::piped())
+            .stdout(ProcessStdio::piped())
+            .stderr(ProcessStdio::piped());
+
+        let mut child = command
+            .spawn()
+            .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let (input_tx, mut input_rx) = mpsc::channel::<String>(64);
+        let (output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(128);
+        let (close_tx, close_rx) = oneshot::channel::<()>();
+        let writer_input_tx = input_tx.clone();
+
+        if let Some(mut stdin) = stdin {
+            let initial_input = shell_change_dir_input(request.cwd.as_deref());
+            tokio::spawn(async move {
+                if let Some(initial_input) = initial_input
+                    && stdin.write_all(initial_input.as_bytes()).await.is_err()
+                {
+                    return;
+                }
+                while let Some(input) = input_rx.recv().await {
+                    if stdin.write_all(input.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        if let Some(stdout) = stdout {
+            spawn_reader_task(stdout, OutputStream::Stdout, output_tx.clone());
+        }
+        if let Some(stderr) = stderr {
+            spawn_reader_task(stderr, OutputStream::Stderr, output_tx.clone());
+        }
+        spawn_local_child_wait_task(child, close_rx, writer_input_tx, output_tx);
+
+        Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx)
+            .with_transport_observation(before.as_ref(), self.transport.transport_telemetry()))
+    }
+}
+
+/// OpenSSH-backed PTY backend factory keyed by access path.
+pub struct OpenSshPtyBackendFactory {
+    repositories: Repositories,
+    pool: Arc<OpenSshTransportPool>,
+    mode: OpenSshManagedPtyBackendMode,
+}
+
+impl OpenSshPtyBackendFactory {
+    /// Creates an OpenSSH PTY backend factory.
+    pub fn new(
+        repositories: Repositories,
+        host_key_policy: HostKeyPolicy,
+        connect_timeout_seconds: u64,
+    ) -> Self {
+        let pool = Arc::new(OpenSshTransportPool::new(
+            repositories.clone(),
+            host_key_policy,
+            connect_timeout_seconds,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        ));
+        Self::with_pool(repositories, pool)
+    }
+
+    /// Creates an OpenSSH PTY backend factory from a shared raw transport pool.
+    pub fn with_pool(repositories: Repositories, pool: Arc<OpenSshTransportPool>) -> Self {
+        Self {
+            repositories,
+            pool,
+            mode: OpenSshManagedPtyBackendMode::default(),
+        }
+    }
+
+    /// Sets the OpenSSH persistent shell backend mode.
+    #[must_use]
+    pub fn with_mode(mut self, mode: OpenSshManagedPtyBackendMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    async fn transport_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Arc<OpenSshTransport>, ConnectorPtyError> {
+        let connection = self
+            .repositories
+            .connection_sessions
+            .get(session_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!("connection session not found: {session_id}"))
+            })?;
+        self.pool
+            .transport_for_access_path(connection.access_path_id)
+            .await
+            .map_err(ConnectorPtyError::Backend)
+    }
+}
+
+#[async_trait]
+impl ManagedPtyBackend for OpenSshPtyBackendFactory {
+    fn capabilities(&self) -> PtyBackendCapabilities {
+        match self.mode {
+            OpenSshManagedPtyBackendMode::PipeShell => PtyBackendCapabilities::openssh_pipe_shell(),
+            OpenSshManagedPtyBackendMode::ControlMasterTty => {
+                PtyBackendCapabilities::openssh_control_master_tty()
+            }
+        }
+    }
+
+    async fn spawn(
+        &self,
+        request: PtyBackendSpawnRequest,
+    ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
+        let transport = self.transport_for_session(request.session_id).await?;
+        match self.mode {
+            OpenSshManagedPtyBackendMode::PipeShell => {
+                OpenSshShellBackend::new(transport).spawn(request).await
+            }
+            OpenSshManagedPtyBackendMode::ControlMasterTty => {
+                OpenSshControlMasterTtyBackend::new(transport)
+                    .spawn(request)
+                    .await
+            }
+        }
+    }
+}
+
+fn spawn_reader_task<R>(
+    mut reader: R,
+    stream: OutputStream,
+    output_tx: mpsc::Sender<PtyBackendOutput>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buffer = vec![0_u8; 8192];
+        loop {
+            let read = match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = output_tx
+                        .send(PtyBackendOutput {
+                            stream: OutputStream::System,
+                            text: format!("pty stream read failed: {error}"),
+                            truncated: false,
+                        })
+                        .await;
+                    break;
+                }
+            };
+            let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+            if output_tx
+                .send(PtyBackendOutput {
+                    stream: stream.clone(),
+                    text,
+                    truncated: false,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_local_child_wait_task(
+    mut child: LocalChild,
+    close_rx: oneshot::Receiver<()>,
+    writer_input_tx: mpsc::Sender<String>,
+    output_tx: mpsc::Sender<PtyBackendOutput>,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = close_rx => {
+                drop(writer_input_tx);
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            result = child.wait() => {
+                let text = match result {
+                    Ok(status) => format!("remote tty shell exited: status={status}"),
+                    Err(error) => format!("remote tty shell wait failed: {error}"),
+                };
+                let _ = output_tx
+                    .send(PtyBackendOutput {
+                        stream: OutputStream::System,
+                        text,
+                        truncated: false,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+/// Transport wrapper that applies command validation, concurrency limits, output limits, and
+/// redaction before results become visible to agents.
+pub struct GuardedTransport<T> {
+    inner: T,
+    policy: ServerProtectionPolicy,
+    exec_semaphore: Arc<Semaphore>,
+    redactor: SecretRedactor,
+}
+
+impl<T> GuardedTransport<T> {
+    /// Creates a guarded transport.
+    pub fn new(inner: T, policy: ServerProtectionPolicy) -> Self {
+        let exec_limit = usize::try_from(policy.max_parallel_exec_channels_per_host).unwrap_or(1);
+        Self {
+            inner,
+            policy,
+            exec_semaphore: Arc::new(Semaphore::new(exec_limit.max(1))),
+            redactor: SecretRedactor::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl<T> RemoteTransport for GuardedTransport<T>
+where
+    T: RemoteTransport,
+{
+    fn transport_telemetry(&self) -> Option<SshTransportTelemetry> {
+        self.inner.transport_telemetry()
+    }
+
+    async fn check(&self, request: CheckRequest) -> Result<CheckResult, TransportError> {
+        self.inner.check(request).await
+    }
+
+    async fn exec(&self, request: ExecRequest) -> Result<ExecResult, TransportError> {
+        request
+            .profile
+            .validate()
+            .map_err(|error| TransportError::PolicyDenied(error.to_string()))?;
+
+        let _permit = self
+            .exec_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                TransportError::PolicyDenied(format!(
+                    "parallel exec channel limit reached: {}",
+                    self.policy.max_parallel_exec_channels_per_host
+                ))
+            })?;
+
+        let output_limit = request.profile.output_limit_bytes;
+        let mut result = self.inner.exec(request).await?;
+        let (stdout, stdout_truncated) =
+            redact_and_truncate(&self.redactor, &result.stdout, output_limit);
+        let (stderr, stderr_truncated) =
+            redact_and_truncate(&self.redactor, &result.stderr, output_limit);
+        result.stdout = stdout;
+        result.stderr = stderr;
+        result.truncated = result.truncated || stdout_truncated || stderr_truncated;
+        Ok(result)
+    }
+
+    async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+        request
+            .spec
+            .validate()
+            .map_err(|error| TransportError::FileTransfer(error.to_string()))?;
+        let _permit = self
+            .exec_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                TransportError::PolicyDenied(format!(
+                    "parallel SSH channel limit reached: {}",
+                    self.policy.max_parallel_exec_channels_per_host
+                ))
+            })?;
+        self.inner.sftp(request).await
+    }
+
+    async fn open_forward(&self, request: ForwardRequest) -> Result<ForwardHandle, TransportError> {
+        self.inner.open_forward(request).await
+    }
+}
+
+fn redact_and_truncate(
+    redactor: &SecretRedactor,
+    value: &str,
+    output_limit: usize,
+) -> (String, bool) {
+    let redacted = redactor.redact(value);
+    if redacted.len() <= output_limit {
+        return (redacted, false);
+    }
+
+    let mut truncated = String::from_utf8_lossy(&redacted.as_bytes()[..output_limit]).to_string();
+    truncated.push_str("\n<truncated>");
+    (truncated, true)
+}
+
+/// Provides the pooled transport for a claimed operation.
+#[async_trait]
+pub trait RemoteTransportProvider: Send + Sync {
+    /// Returns a transport for the operation's access path.
+    async fn transport_for(
+        &self,
+        operation: &OperationRun,
+    ) -> Result<Arc<dyn RemoteTransport>, String>;
+}
+
+/// Static provider useful for one-access-path connectors and tests.
+#[derive(Clone)]
+pub struct StaticTransportProvider {
+    transport: Arc<dyn RemoteTransport>,
+}
+
+impl StaticTransportProvider {
+    /// Creates a static transport provider.
+    pub fn new<T>(transport: T) -> Self
+    where
+        T: RemoteTransport + 'static,
+    {
+        Self {
+            transport: Arc::new(transport),
+        }
+    }
+}
+
+#[async_trait]
+impl RemoteTransportProvider for StaticTransportProvider {
+    async fn transport_for(
+        &self,
+        _operation: &OperationRun,
+    ) -> Result<Arc<dyn RemoteTransport>, String> {
+        Ok(Arc::clone(&self.transport))
+    }
+}
+
+#[derive(Clone)]
+struct SharedRemoteTransport<T> {
+    inner: Arc<T>,
+}
+
+impl<T> SharedRemoteTransport<T> {
+    fn new(inner: Arc<T>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl<T> RemoteTransport for SharedRemoteTransport<T>
+where
+    T: RemoteTransport + 'static,
+{
+    fn transport_telemetry(&self) -> Option<SshTransportTelemetry> {
+        self.inner.transport_telemetry()
+    }
+
+    async fn check(&self, request: CheckRequest) -> Result<CheckResult, TransportError> {
+        self.inner.check(request).await
+    }
+
+    async fn exec(&self, request: ExecRequest) -> Result<ExecResult, TransportError> {
+        self.inner.exec(request).await
+    }
+
+    async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+        self.inner.sftp(request).await
+    }
+
+    async fn open_forward(&self, request: ForwardRequest) -> Result<ForwardHandle, TransportError> {
+        self.inner.open_forward(request).await
+    }
+}
+
+fn access_path_requires_multi_hop(access_path: &AccessPath) -> bool {
+    access_path.requires_multi_hop_transport()
+}
+
+async fn reject_unsupported_multi_hop_route<T>(
+    repositories: &Repositories,
+    cache: &Mutex<BTreeMap<AccessPathId, Arc<T>>>,
+    access_path: &AccessPath,
+    backend: &str,
+) -> Result<(), String> {
+    if !access_path_requires_multi_hop(access_path) {
+        return Ok(());
+    }
+
+    cache.lock().await.remove(&access_path.id);
+    let now = now_utc();
+    let state = AuthorizedKeyBootstrap {
+        access_path_id: access_path.id,
+        state: AuthorizedKeyBootstrapState::Skipped,
+        reason: Some(AuthorizedKeyBootstrapReason::MultiHopUnsupported),
+        public_key_fingerprint: None,
+        failure_count: 0,
+        attempted_at: now,
+        next_retry_at: None,
+        updated_at: now,
+    };
+    if let Err(error) = repositories.authorized_key_bootstrap.upsert(&state).await {
+        tracing::warn!(
+            access_path_id = %access_path.id,
+            %error,
+            "failed to persist unsupported multi-hop route state"
+        );
+    }
+    Err(format!(
+        "multi-hop SSH route is not supported by the active {backend} transport; connection rejected before SSH handshake"
+    ))
+}
+
+/// Shared OpenSSH transport pool with one raw ControlMaster-backed transport per access path.
+pub struct OpenSshTransportPool {
+    repositories: Repositories,
+    host_key_policy: HostKeyPolicy,
+    connect_timeout_seconds: u64,
+    max_new_ssh_handshakes_per_10_min: u32,
+    global_handshake_limiter: Arc<DirectRateLimiter>,
+    cache: Mutex<BTreeMap<AccessPathId, Arc<OpenSshTransport>>>,
+}
+
+impl OpenSshTransportPool {
+    /// Creates a raw OpenSSH transport pool.
+    pub fn new(
+        repositories: Repositories,
+        host_key_policy: HostKeyPolicy,
+        connect_timeout_seconds: u64,
+        max_new_ssh_handshakes_per_10_min: u32,
+    ) -> Self {
+        Self {
+            repositories,
+            host_key_policy,
+            connect_timeout_seconds,
+            max_new_ssh_handshakes_per_10_min,
+            global_handshake_limiter: HandshakeLimiter::shared_global(
+                max_new_ssh_handshakes_per_10_min,
+            ),
+            cache: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Returns the shared raw OpenSSH transport for an access path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the access path cannot be loaded.
+    pub async fn transport_for_access_path(
+        &self,
+        access_path_id: AccessPathId,
+    ) -> Result<Arc<OpenSshTransport>, String> {
+        let access_path = self
+            .repositories
+            .access_paths
+            .get(access_path_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("access path not found: {access_path_id}"))?;
+        reject_unsupported_multi_hop_route(
+            &self.repositories,
+            &self.cache,
+            &access_path,
+            "OpenSSH",
+        )
+        .await?;
+        let config = OpenSshTransportConfig {
+            destination: OpenSshTransport::destination(
+                &access_path.username,
+                &access_path.address,
+                access_path.port,
+            ),
+            host_key_policy: self.host_key_policy,
+            connect_timeout_seconds: self.connect_timeout_seconds,
+            idle_ttl_seconds: access_path.idle_ttl_seconds,
+            keepalive_seconds: access_path.keepalive_seconds,
+            max_new_connections_per_minute: access_path.max_new_connections_per_minute,
+            max_new_ssh_handshakes_per_10_min: self.max_new_ssh_handshakes_per_10_min,
+        };
+        {
+            let mut cache = self.cache.lock().await;
+            if let Some(transport) = cache.get(&access_path_id) {
+                if transport.config == config {
+                    return Ok(Arc::clone(transport));
+                }
+                cache.remove(&access_path_id);
+            }
+        }
+        let transport = Arc::new(OpenSshTransport::with_shared_handshake_budget(
+            config,
+            Arc::clone(&self.global_handshake_limiter),
+        ));
+
+        let mut cache = self.cache.lock().await;
+        let cached = cache
+            .entry(access_path_id)
+            .or_insert_with(|| Arc::clone(&transport));
+        Ok(Arc::clone(cached))
+    }
+}
+
+/// OpenSSH transport provider with one cached guarded transport per access path.
+pub struct OpenSshTransportProvider {
+    pool: Arc<OpenSshTransportPool>,
+    policy: ServerProtectionPolicy,
+    cache: Mutex<BTreeMap<AccessPathId, OpenSshGuardedTransportCacheEntry>>,
+}
+
+struct OpenSshGuardedTransportCacheEntry {
+    pooled: Arc<OpenSshTransport>,
+    transport: Arc<dyn RemoteTransport>,
+}
+
+impl OpenSshTransportProvider {
+    /// Creates an OpenSSH provider.
+    pub fn new(
+        repositories: Repositories,
+        host_key_policy: HostKeyPolicy,
+        connect_timeout_seconds: u64,
+        policy: ServerProtectionPolicy,
+    ) -> Self {
+        let pool = Arc::new(OpenSshTransportPool::new(
+            repositories,
+            host_key_policy,
+            connect_timeout_seconds,
+            policy.max_new_ssh_handshakes_per_10_min,
+        ));
+        Self::with_pool(pool, policy)
+    }
+
+    /// Creates a provider from a shared raw OpenSSH transport pool.
+    pub fn with_pool(pool: Arc<OpenSshTransportPool>, policy: ServerProtectionPolicy) -> Self {
+        Self {
+            pool,
+            policy,
+            cache: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    async fn cached_transport(
+        &self,
+        access_path_id: AccessPathId,
+    ) -> Result<Arc<dyn RemoteTransport>, String> {
+        let pooled = self.pool.transport_for_access_path(access_path_id).await?;
+        {
+            let cache = self.cache.lock().await;
+            if let Some(entry) = cache.get(&access_path_id)
+                && Arc::ptr_eq(&entry.pooled, &pooled)
+            {
+                return Ok(Arc::clone(&entry.transport));
+            }
+        }
+        let transport = GuardedTransport::new(
+            SharedRemoteTransport::new(Arc::clone(&pooled)),
+            self.policy.clone(),
+        );
+        let transport: Arc<dyn RemoteTransport> = Arc::new(transport);
+        let mut cache = self.cache.lock().await;
+        cache.insert(
+            access_path_id,
+            OpenSshGuardedTransportCacheEntry {
+                pooled,
+                transport: Arc::clone(&transport),
+            },
+        );
+        Ok(transport)
+    }
+}
+
+#[async_trait]
+impl RemoteTransportProvider for OpenSshTransportProvider {
+    async fn transport_for(
+        &self,
+        operation: &OperationRun,
+    ) -> Result<Arc<dyn RemoteTransport>, String> {
+        self.cached_transport(operation.access_path_id).await
+    }
+}
+
+/// Credential material resolved inside the connector process for native SSH.
+///
+/// This type intentionally does not implement `Debug` or `Serialize`.
+pub struct SshCredentialSecret {
+    password: Option<SecretString>,
+    private_key_pem: Option<SecretString>,
+    private_key_passphrase: Option<SecretString>,
+    use_ssh_agent: bool,
+}
+
+impl SshCredentialSecret {
+    /// Creates a secret from an internal vault secret.
+    #[must_use]
+    pub fn from_vault_secret(mut secret: CredentialSecret) -> Self {
+        Self {
+            password: secret.password.take().map(SecretString::from),
+            private_key_pem: secret.private_key_pem.take().map(SecretString::from),
+            private_key_passphrase: secret.private_key_passphrase.take().map(SecretString::from),
+            use_ssh_agent: secret.use_ssh_agent,
+        }
+    }
+
+    fn has_ssh_material(&self) -> bool {
+        self.password.is_some() || self.private_key_pem.is_some() || self.use_ssh_agent
+    }
+}
+
+/// Errors while resolving connector-local SSH credential material.
+#[derive(Debug, thiserror::Error)]
+pub enum SshCredentialError {
+    /// Credential row is missing.
+    #[error("credential not found")]
+    NotFound,
+    /// Credential row cannot be decoded.
+    #[error("credential blob is invalid")]
+    InvalidBlob,
+    /// Vault is locked or the provided master password cannot decrypt the credential.
+    #[error("credential vault is locked or cannot decrypt this credential")]
+    VaultLocked,
+    /// Credential does not contain SSH authentication material.
+    #[error("credential does not contain ssh password or private key material")]
+    MissingSshMaterial,
+    /// Database error.
+    #[error("database error: {0}")]
+    Database(#[from] DbError),
+}
+
+/// Resolves SSH credentials for native connector transports.
+#[async_trait]
+pub trait SshCredentialProvider: Send + Sync {
+    /// Returns SSH authentication material for an access path.
+    async fn credential_for(
+        &self,
+        access_path_id: AccessPathId,
+    ) -> Result<SshCredentialSecret, SshCredentialError>;
+}
+
+/// Vault-backed credential provider for native SSH transports.
+pub struct VaultSshCredentialProvider {
+    repositories: Repositories,
+    master_password: SecretString,
+}
+
+impl VaultSshCredentialProvider {
+    /// Creates a vault-backed credential provider.
+    pub fn new(repositories: Repositories, master_password: SecretString) -> Self {
+        Self {
+            repositories,
+            master_password,
+        }
+    }
+}
+
+fn is_openssh_agent_reference(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(serde_json::Value::as_str) == Some("external_reference")
+        && value
+            .get("external_ref")
+            .and_then(serde_json::Value::as_str)
+            == Some("openssh-agent")
+}
+
+#[async_trait]
+impl SshCredentialProvider for VaultSshCredentialProvider {
+    async fn credential_for(
+        &self,
+        access_path_id: AccessPathId,
+    ) -> Result<SshCredentialSecret, SshCredentialError> {
+        let access_path = self
+            .repositories
+            .access_paths
+            .get(access_path_id)
+            .await?
+            .ok_or(SshCredentialError::NotFound)?;
+        let stored = self
+            .repositories
+            .credentials
+            .get(access_path.credential_id)
+            .await?
+            .ok_or(SshCredentialError::NotFound)?;
+        if is_openssh_agent_reference(&stored.encrypted_blob_json) {
+            return Ok(SshCredentialSecret {
+                password: None,
+                private_key_pem: None,
+                private_key_passphrase: None,
+                use_ssh_agent: true,
+            });
+        }
+        let blob: EncryptedCredentialBlob = serde_json::from_value(stored.encrypted_blob_json)
+            .map_err(|_| SshCredentialError::InvalidBlob)?;
+        let secret = CredentialVault::decrypt(&self.master_password, &blob)
+            .map_err(|_| SshCredentialError::VaultLocked)?;
+        let secret = SshCredentialSecret::from_vault_secret(secret);
+        if !secret.has_ssh_material() {
+            return Err(SshCredentialError::MissingSshMaterial);
+        }
+        Ok(secret)
+    }
+}
+
+/// Native `russh` transport configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RusshTransportConfig {
+    /// Access path id.
+    pub access_path_id: AccessPathId,
+    /// Remote address.
+    pub address: String,
+    /// Remote SSH port.
+    pub port: u16,
+    /// Remote username.
+    pub username: String,
+    /// Whether the target uses Windows OpenSSH shell conventions.
+    pub windows: bool,
+    /// Use a managed exec data stream when this gateway route cannot carry SFTP writes.
+    pub use_exec_file_transfer: bool,
+    /// Host key policy.
+    pub host_key_policy: HostKeyPolicy,
+    /// Optional `known_hosts` path.
+    pub known_hosts_path: Option<PathBuf>,
+    /// Connect timeout in seconds.
+    pub connect_timeout_seconds: u64,
+    /// Inactivity timeout in seconds.
+    pub inactivity_timeout_seconds: u64,
+    /// SSH keepalive interval in seconds.
+    pub keepalive_seconds: u64,
+    /// Access-path handshake budget per minute.
+    pub max_new_connections_per_minute: u16,
+    /// Global handshake budget per ten minutes.
+    pub max_new_ssh_handshakes_per_10_min: u32,
+}
+
+/// Native async SSH transport backed by `russh`.
+pub struct RusshTransport<C> {
+    config: RusshTransportConfig,
+    credentials: Arc<C>,
+    authorized_key_bootstrap: AuthorizedKeyBootstrapRepository,
+    session: Mutex<Option<Arc<client::Handle<RusshClientHandler>>>>,
+    handshake_limiter: HandshakeLimiter,
+    telemetry: TransportTelemetryTracker,
+}
+
+impl<C> RusshTransport<C> {
+    /// Creates a native SSH transport.
+    pub fn new(
+        config: RusshTransportConfig,
+        credentials: Arc<C>,
+        authorized_key_bootstrap: AuthorizedKeyBootstrapRepository,
+    ) -> Self {
+        let global = HandshakeLimiter::shared_global(config.max_new_ssh_handshakes_per_10_min);
+        Self::with_shared_handshake_budget(config, credentials, authorized_key_bootstrap, global)
+    }
+
+    fn with_shared_handshake_budget(
+        config: RusshTransportConfig,
+        credentials: Arc<C>,
+        authorized_key_bootstrap: AuthorizedKeyBootstrapRepository,
+        global: Arc<DirectRateLimiter>,
+    ) -> Self {
+        let handshake_limiter =
+            HandshakeLimiter::with_shared_global(config.max_new_connections_per_minute, global);
+        let file_transfer_mode = if config.use_exec_file_transfer {
+            SshFileTransferMode::ExecFramed
+        } else {
+            SshFileTransferMode::Sftp
+        };
+        Self {
+            config,
+            credentials,
+            authorized_key_bootstrap,
+            session: Mutex::new(None),
+            handshake_limiter,
+            telemetry: TransportTelemetryTracker::new(
+                SshTransportBackend::Russh,
+                SshTransportCapabilities::pooled(file_transfer_mode),
+            ),
+        }
+    }
+}
+
+impl<C> RusshTransport<C>
+where
+    C: SshCredentialProvider,
+{
+    async fn session(&self) -> Result<Arc<client::Handle<RusshClientHandler>>, TransportError> {
+        let mut guard = self.session.lock().await;
+        if let Some(session) = guard.as_ref() {
+            if session.send_ping().await.is_ok() {
+                self.telemetry.session_reused(now_utc());
+                return Ok(Arc::clone(session));
+            }
+            *guard = None;
+            self.telemetry.disconnected();
+        }
+
+        self.handshake_limiter.try_acquire()?;
+        self.telemetry.connection_attempted();
+        let connect_timeout = Duration::from_secs(self.config.connect_timeout_seconds);
+        let config = Arc::new(client::Config {
+            inactivity_timeout: Some(Duration::from_secs(self.config.inactivity_timeout_seconds)),
+            keepalive_interval: (self.config.keepalive_seconds > 0)
+                .then(|| Duration::from_secs(self.config.keepalive_seconds)),
+            keepalive_max: 4,
+            nodelay: true,
+            ..Default::default()
+        });
+        let handler = RusshClientHandler {
+            host: self.config.address.clone(),
+            port: self.config.port,
+            policy: self.config.host_key_policy,
+            known_hosts_path: self.config.known_hosts_path.clone(),
+        };
+        let connect = client::connect(
+            config,
+            (self.config.address.as_str(), self.config.port),
+            handler,
+        );
+        let mut session = match tokio::time::timeout(connect_timeout, connect).await {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => {
+                self.telemetry.disconnected();
+                return Err(TransportError::Backend(error.to_string()));
+            }
+            Err(_) => {
+                self.telemetry.disconnected();
+                return Err(TransportError::Timeout);
+            }
+        };
+        let credential = match self
+            .credentials
+            .credential_for(self.config.access_path_id)
+            .await
+        {
+            Ok(credential) => credential,
+            Err(error) => {
+                self.telemetry.disconnected();
+                return Err(TransportError::Backend(error.to_string()));
+            }
+        };
+        let authentication = match authenticate_russh_session(
+            &mut session,
+            &self.config.username,
+            &credential,
+        )
+        .await
+        {
+            Ok(authentication) => authentication,
+            Err(error) => {
+                self.telemetry.disconnected();
+                return Err(error);
+            }
+        };
+        let session = Arc::new(session);
+        *guard = Some(Arc::clone(&session));
+        self.telemetry.handshake_succeeded(now_utc());
+        drop(guard);
+        if authentication.used_password {
+            self.schedule_authorized_key_bootstrap(
+                Arc::clone(&session),
+                authentication.bootstrap_public_key,
+            )
+            .await;
+        }
+        Ok(session)
+    }
+
+    async fn schedule_authorized_key_bootstrap(
+        &self,
+        session: Arc<client::Handle<RusshClientHandler>>,
+        public_key: Option<PublicKey>,
+    ) {
+        let Some(public_key) = public_key else {
+            self.record_missing_bootstrap_key().await;
+            return;
+        };
+        let Some((fingerprint, previous_failure_count)) =
+            self.begin_authorized_key_bootstrap(&public_key).await
+        else {
+            return;
+        };
+
+        let access_path_id = self.config.access_path_id;
+        let windows = self.config.windows;
+        let repository = self.authorized_key_bootstrap.clone();
+        tokio::spawn(async move {
+            let result = install_authorized_key(session, &public_key, windows).await;
+            let completed_at = now_utc();
+            let state = match result {
+                Ok(()) => AuthorizedKeyBootstrap {
+                    access_path_id,
+                    state: AuthorizedKeyBootstrapState::Installed,
+                    reason: None,
+                    public_key_fingerprint: Some(fingerprint),
+                    failure_count: previous_failure_count,
+                    attempted_at: completed_at,
+                    next_retry_at: None,
+                    updated_at: completed_at,
+                },
+                Err(error) => authorized_key_bootstrap_failure_state(
+                    access_path_id,
+                    &fingerprint,
+                    previous_failure_count,
+                    error,
+                    completed_at,
+                ),
+            };
+            persist_authorized_key_bootstrap_result(&repository, &state).await;
+        });
+    }
+
+    async fn record_missing_bootstrap_key(&self) {
+        let now = now_utc();
+        let state = AuthorizedKeyBootstrap {
+            access_path_id: self.config.access_path_id,
+            state: AuthorizedKeyBootstrapState::Skipped,
+            reason: Some(AuthorizedKeyBootstrapReason::NoLocalPublicKey),
+            public_key_fingerprint: None,
+            failure_count: 0,
+            attempted_at: now,
+            next_retry_at: None,
+            updated_at: now,
+        };
+        if let Err(error) = self.authorized_key_bootstrap.upsert(&state).await {
+            tracing::warn!(
+                access_path_id = %self.config.access_path_id,
+                %error,
+                "failed to persist missing-key bootstrap state"
+            );
+        }
+    }
+
+    async fn begin_authorized_key_bootstrap(
+        &self,
+        public_key: &PublicKey,
+    ) -> Option<(String, u32)> {
+        let now = now_utc();
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        let existing = match self
+            .authorized_key_bootstrap
+            .get(self.config.access_path_id)
+            .await
+        {
+            Ok(existing) => existing,
+            Err(error) => {
+                tracing::warn!(
+                    access_path_id = %self.config.access_path_id,
+                    %error,
+                    "skipping public-key bootstrap because its retry guard could not be loaded"
+                );
+                return None;
+            }
+        };
+        if !authorized_key_bootstrap_is_eligible(existing.as_ref(), &fingerprint, now) {
+            tracing::debug!(
+                access_path_id = %self.config.access_path_id,
+                "public-key bootstrap suppressed by persisted state"
+            );
+            return None;
+        }
+        let previous_failure_count = existing
+            .as_ref()
+            .filter(|state| state.public_key_fingerprint.as_deref() == Some(fingerprint.as_str()))
+            .map_or(0, |state| state.failure_count);
+        let attempting = AuthorizedKeyBootstrap {
+            access_path_id: self.config.access_path_id,
+            state: AuthorizedKeyBootstrapState::Attempting,
+            reason: None,
+            public_key_fingerprint: Some(fingerprint.clone()),
+            failure_count: previous_failure_count,
+            attempted_at: now,
+            next_retry_at: Some(now + time::Duration::minutes(2)),
+            updated_at: now,
+        };
+        if let Err(error) = self.authorized_key_bootstrap.upsert(&attempting).await {
+            tracing::warn!(
+                access_path_id = %self.config.access_path_id,
+                %error,
+                "skipping public-key bootstrap because its retry guard could not be persisted"
+            );
+            return None;
+        }
+        Some((fingerprint, previous_failure_count))
+    }
+}
+
+#[async_trait]
+impl<C> RemoteTransport for RusshTransport<C>
+where
+    C: SshCredentialProvider + 'static,
+{
+    fn transport_telemetry(&self) -> Option<SshTransportTelemetry> {
+        Some(self.telemetry.snapshot())
+    }
+
+    async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
+        let session = self.session().await?;
+        session
+            .send_ping()
+            .await
+            .map_err(|error| TransportError::Backend(error.to_string()))?;
+        Ok(CheckResult {
+            ok: true,
+            latency_ms: None,
+            message: "russh native session is healthy".to_owned(),
+        })
+    }
+
+    async fn exec(&self, request: ExecRequest) -> Result<ExecResult, TransportError> {
+        request
+            .profile
+            .validate()
+            .map_err(|error| TransportError::PolicyDenied(error.to_string()))?;
+        let session = self.session().await?;
+        let command = ssh_exec_command(&request.profile, self.config.windows);
+        tokio::time::timeout(
+            Duration::from_secs(request.profile.timeout_seconds),
+            execute_russh_command(session, command, request.profile.output_limit_bytes),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)?
+    }
+
+    async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+        request
+            .spec
+            .validate()
+            .map_err(|error| TransportError::FileTransfer(error.to_string()))?;
+        let timeout = Duration::from_secs(request.spec.timeout_seconds);
+        let session = self.session().await?;
+        if self.config.use_exec_file_transfer {
+            tokio::time::timeout(timeout, execute_russh_exec_file_transfer(session, request))
+                .await
+                .map_err(|_| TransportError::Timeout)?
+        } else {
+            tokio::time::timeout(timeout, execute_russh_sftp(session, request))
+                .await
+                .map_err(|_| TransportError::Timeout)?
+        }
+    }
+
+    async fn open_forward(
+        &self,
+        _request: ForwardRequest,
+    ) -> Result<ForwardHandle, TransportError> {
+        Err(TransportError::Backend(
+            "russh port forwarding is not implemented yet".to_owned(),
+        ))
+    }
+}
+
+async fn execute_russh_exec_file_transfer(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    request: SftpRequest,
+) -> Result<SftpResult, TransportError> {
+    match request.spec.direction {
+        SftpDirection::Upload => execute_russh_exec_upload(session, &request).await,
+        SftpDirection::Download => execute_russh_exec_download(session, &request).await,
+    }
+}
+
+async fn execute_russh_exec_upload(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    request: &SftpRequest,
+) -> Result<SftpResult, TransportError> {
+    let spec = &request.spec;
+    let (local_size, local_sha256) =
+        hash_local_source(Path::new(&spec.local_path), spec.max_size_bytes).await?;
+    ensure_expected_sha256(spec, &local_sha256)?;
+    let temporary_path = remote_temporary_path(&spec.remote_path, request.operation_id)?;
+    let transfer = async {
+        let initialize = russh_exec_upload_initialize_command(spec, &temporary_path);
+        let outcome = execute_russh_transfer_command(
+            Arc::clone(&session),
+            initialize,
+            "initialize pooled exec upload",
+        )
+        .await?;
+        require_exec_transfer_marker(
+            &outcome,
+            "REMOTE_HOSTS_UPLOAD_READY",
+            "initialize pooled exec upload",
+            &spec.remote_path,
+            &temporary_path,
+        )?;
+
+        let mut local = tokio::fs::File::open(&spec.local_path)
+            .await
+            .map_err(file_transfer_io)?;
+        let (bytes_transferred, streamed_sha256) = stream_base64_upload_via_exec(
+            Arc::clone(&session),
+            &mut local,
+            &temporary_path,
+            spec.max_size_bytes,
+            &spec.remote_path,
+        )
+        .await?;
+
+        let finalize = russh_exec_upload_finalize_command(
+            spec,
+            &temporary_path,
+            local_size,
+            &local_sha256,
+        );
+        let outcome =
+            execute_russh_transfer_command(Arc::clone(&session), finalize, "finalize pooled upload")
+                .await?;
+        require_exec_transfer_success(
+            &outcome,
+            "finalize pooled upload",
+            &spec.remote_path,
+            &temporary_path,
+        )?;
+        let (remote_size, remote_sha256) =
+            parse_transfer_marker(&outcome.stdout, "REMOTE_HOSTS_TRANSFER_OK")?;
+        if bytes_transferred != local_size
+            || streamed_sha256 != local_sha256
+            || remote_size != local_size
+            || remote_sha256 != local_sha256
+        {
+            return Err(TransportError::FileTransfer(format!(
+                "pooled exec upload verification failed: local_bytes={local_size}, streamed_bytes={bytes_transferred}, remote_bytes={remote_size}, local_sha256={local_sha256}, remote_sha256={remote_sha256}"
+            )));
+        }
+
+        Ok(SftpResult {
+            direction: spec.direction,
+            bytes_transferred,
+            sha256: local_sha256,
+            local_path: spec.local_path.clone(),
+            remote_path: spec.remote_path.clone(),
+            overwrite: spec.overwrite,
+        })
+    }
+    .await;
+
+    if transfer.is_err() {
+        let cleanup = russh_exec_upload_cleanup_command(&temporary_path);
+        let _ =
+            execute_russh_transfer_command(session, cleanup, "clean pooled upload temporary file")
+                .await;
+    }
+    transfer
+}
+
+async fn stream_base64_upload_via_exec(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    local: &mut tokio::fs::File,
+    temporary_path: &str,
+    max_size_bytes: u64,
+    remote_path: &str,
+) -> Result<(u64, String), TransportError> {
+    let mut buffer = vec![0_u8; EXEC_UPLOAD_CHUNK_BYTES];
+    let mut hasher = Sha256::new();
+    let mut bytes_transferred = 0_u64;
+    let mut chunk_index = 0_u64;
+    loop {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let read = local
+                .read(&mut buffer[filled..])
+                .await
+                .map_err(|error| file_transfer_io_context("read local upload source", error))?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+        bytes_transferred = bytes_transferred
+            .checked_add(u64::try_from(filled).map_err(file_transfer_conversion)?)
+            .ok_or_else(|| TransportError::FileTransfer("file size overflow".to_owned()))?;
+        ensure_size_within_limit(bytes_transferred, max_size_bytes)?;
+        hasher.update(&buffer[..filled]);
+        let encoded = BASE64_STANDARD.encode(&buffer[..filled]);
+        let command =
+            russh_exec_upload_chunk_command(temporary_path, chunk_index, encoded.as_str());
+        let outcome = execute_russh_transfer_command(
+            Arc::clone(&session),
+            command,
+            "append pooled upload chunk",
+        )
+        .await?;
+        require_exec_upload_chunk_success(&outcome, chunk_index, remote_path, temporary_path)?;
+        chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+            TransportError::FileTransfer("upload chunk index overflow".to_owned())
+        })?;
+        if filled < buffer.len() {
+            break;
+        }
+    }
+    Ok((bytes_transferred, format!("{:x}", hasher.finalize())))
+}
+
+async fn execute_russh_exec_download(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    request: &SftpRequest,
+) -> Result<SftpResult, TransportError> {
+    let spec = &request.spec;
+    let destination = Path::new(&spec.local_path);
+    ensure_local_destination(destination, spec.overwrite).await?;
+    let temporary_path = local_temporary_path(destination, request.operation_id)?;
+    cleanup_local_temporary_file(&temporary_path).await?;
+    let command = russh_exec_download_command(spec);
+    let transfer = async {
+        let mut channel = session
+            .channel_open_session()
+            .await
+            .map_err(|error| {
+                TransportError::FileTransfer(format!(
+                    "open pooled exec download channel: {error}"
+                ))
+            })?;
+        channel.exec(true, command).await.map_err(|error| {
+            TransportError::FileTransfer(format!("start pooled exec download: {error}"))
+        })?;
+        let mut local = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .await
+            .map_err(file_transfer_io)?;
+        let outcome =
+            receive_russh_exec_download(&mut channel, &mut local, spec.max_size_bytes).await?;
+        let _ = channel.close().await;
+        local
+            .shutdown()
+            .await
+            .map_err(|error| file_transfer_io_context("close local download file", error))?;
+        if outcome.truncated {
+            return Err(TransportError::FileTransfer(
+                "pooled exec download diagnostics exceeded the bounded limit".to_owned(),
+            ));
+        }
+        if outcome.exit_code != Some(0) {
+            return Err(TransportError::FileTransfer(format!(
+                "pooled exec download failed with exit_code={:?}: {}",
+                outcome.exit_code,
+                sanitized_transfer_diagnostics(&outcome.stderr, &spec.remote_path, "")
+            )));
+        }
+        let (remote_size, remote_sha256) =
+            parse_transfer_marker(&outcome.stderr, "REMOTE_HOSTS_TRANSFER_META")?;
+        if remote_size != outcome.bytes_transferred || remote_sha256 != outcome.sha256 {
+            return Err(TransportError::FileTransfer(format!(
+                "pooled exec download verification failed: remote_bytes={remote_size}, local_bytes={}, remote_sha256={remote_sha256}, local_sha256={}",
+                outcome.bytes_transferred, outcome.sha256
+            )));
+        }
+        ensure_expected_sha256(spec, &outcome.sha256)?;
+        if let Some(mode) = spec.mode {
+            set_local_mode(&temporary_path, mode).await?;
+        }
+        place_local_file(&temporary_path, destination, spec.overwrite).await?;
+        Ok(SftpResult {
+            direction: spec.direction,
+            bytes_transferred: outcome.bytes_transferred,
+            sha256: outcome.sha256,
+            local_path: spec.local_path.clone(),
+            remote_path: spec.remote_path.clone(),
+            overwrite: spec.overwrite,
+        })
+    }
+    .await;
+
+    if transfer.is_err() {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+    }
+    transfer
+}
+
+struct RusshExecDownloadOutcome {
+    bytes_transferred: u64,
+    sha256: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    truncated: bool,
+}
+
+async fn receive_russh_exec_download(
+    channel: &mut russh::Channel<client::Msg>,
+    local: &mut tokio::fs::File,
+    max_size_bytes: u64,
+) -> Result<RusshExecDownloadOutcome, TransportError> {
+    let mut hasher = Sha256::new();
+    let mut bytes_transferred = 0_u64;
+    let mut stderr = String::new();
+    let mut exit_code = None;
+    let mut truncated = false;
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => {
+                bytes_transferred = bytes_transferred
+                    .checked_add(u64::try_from(data.len()).map_err(file_transfer_conversion)?)
+                    .ok_or_else(|| TransportError::FileTransfer("file size overflow".to_owned()))?;
+                ensure_size_within_limit(bytes_transferred, max_size_bytes)?;
+                local.write_all(&data).await.map_err(|error| {
+                    file_transfer_io_context("write local download file", error)
+                })?;
+                hasher.update(&data);
+            }
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                append_limited_utf8(&mut stderr, &data, 64 * 1024, &mut truncated);
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit_code = i32::try_from(exit_status).ok();
+            }
+            ChannelMsg::ExitSignal { error_message, .. } => {
+                append_limited_utf8(
+                    &mut stderr,
+                    error_message.as_bytes(),
+                    64 * 1024,
+                    &mut truncated,
+                );
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    Ok(RusshExecDownloadOutcome {
+        bytes_transferred,
+        sha256: format!("{:x}", hasher.finalize()),
+        stderr,
+        exit_code,
+        truncated,
+    })
+}
+
+async fn execute_russh_transfer_command(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    command: String,
+    stage: &str,
+) -> Result<ExecResult, TransportError> {
+    execute_russh_command(session, command, EXEC_TRANSFER_OUTPUT_LIMIT_BYTES)
+        .await
+        .map_err(|error| file_transfer_context(stage, error))
+}
+
+fn require_exec_transfer_marker(
+    outcome: &ExecResult,
+    marker: &str,
+    stage: &str,
+    remote_path: &str,
+    temporary_path: &str,
+) -> Result<(), TransportError> {
+    require_exec_transfer_success(outcome, stage, remote_path, temporary_path)?;
+    if outcome.stdout.lines().any(|line| line == marker) {
+        return Ok(());
+    }
+    Err(TransportError::FileTransfer(format!(
+        "{stage} did not return marker {marker}; exit_code={:?}: {}",
+        outcome.exit_code,
+        sanitized_transfer_diagnostics(
+            &format!("{}{}", outcome.stdout, outcome.stderr),
+            remote_path,
+            temporary_path
+        )
+    )))
+}
+
+fn require_exec_upload_chunk_success(
+    outcome: &ExecResult,
+    chunk_index: u64,
+    remote_path: &str,
+    temporary_path: &str,
+) -> Result<(), TransportError> {
+    let stage = "append pooled upload chunk";
+    require_exec_transfer_success(outcome, stage, remote_path, temporary_path)?;
+    let marker = format!("REMOTE_HOSTS_CHUNK_OK {chunk_index}");
+    if outcome.stdout.lines().any(|line| line == marker) {
+        return Ok(());
+    }
+    Err(TransportError::FileTransfer(format!(
+        "{stage} did not return marker {marker}; exit_code={:?}: {}",
+        outcome.exit_code,
+        sanitized_transfer_diagnostics(
+            &format!("{}{}", outcome.stdout, outcome.stderr),
+            remote_path,
+            temporary_path
+        )
+    )))
+}
+
+fn require_exec_transfer_success(
+    outcome: &ExecResult,
+    stage: &str,
+    remote_path: &str,
+    temporary_path: &str,
+) -> Result<(), TransportError> {
+    if outcome.truncated {
+        return Err(TransportError::FileTransfer(format!(
+            "{stage} diagnostics exceeded the bounded limit"
+        )));
+    }
+    if outcome.exit_code.is_none_or(|exit_code| exit_code == 0) {
+        return Ok(());
+    }
+    Err(TransportError::FileTransfer(format!(
+        "{stage} failed with exit_code={:?}: {}",
+        outcome.exit_code,
+        sanitized_transfer_diagnostics(
+            &format!("{}{}", outcome.stdout, outcome.stderr),
+            remote_path,
+            temporary_path
+        )
+    )))
+}
+
+fn russh_exec_upload_initialize_command(spec: &FileTransferSpec, temporary_path: &str) -> String {
+    let destination = shell_quote(&spec.remote_path);
+    let temporary = shell_quote(temporary_path);
+    let destination_guard = match spec.overwrite {
+        SftpOverwritePolicy::Deny => {
+            "[ ! -e \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73".to_owned()
+        }
+        SftpOverwritePolicy::Replace => {
+            "if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; fi".to_owned()
+        }
+    };
+    format!(
+        "set -eu\ndest={destination}\ntmp={temporary}\nparent=${{dest%/*}}\n[ -n \"$parent\" ] || parent=/\n[ -d \"$parent\" ] && [ ! -L \"$parent\" ] || exit 72\n{destination_guard}\nif [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74; rm -f \"$tmp\"; fi\numask 077\n: > \"$tmp\"\nchmod 600 \"$tmp\"\nprintf 'REMOTE_HOSTS_UPLOAD_READY\\n'\n"
+    )
+}
+
+fn russh_exec_upload_chunk_command(
+    temporary_path: &str,
+    chunk_index: u64,
+    encoded: &str,
+) -> String {
+    let temporary = shell_quote(temporary_path);
+    let payload = shell_quote(encoded);
+    format!(
+        "set -eu\ntmp={temporary}\n[ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74\ndecode_payload() {{ if base64 -d </dev/null >/dev/null 2>&1; then base64 -d; else base64 -D; fi; }}\nprintf '%s' {payload} | decode_payload >> \"$tmp\"\nprintf 'REMOTE_HOSTS_CHUNK_OK {chunk_index}\\n'\n"
+    )
+}
+
+fn russh_exec_upload_finalize_command(
+    spec: &FileTransferSpec,
+    temporary_path: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> String {
+    let destination = shell_quote(&spec.remote_path);
+    let temporary = shell_quote(temporary_path);
+    let mode = spec
+        .mode
+        .map_or_else(String::new, |mode| format!("chmod {mode:o} \"$tmp\"\n"));
+    let placement = match spec.overwrite {
+        SftpOverwritePolicy::Deny => {
+            "[ ! -e \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73\nln \"$tmp\" \"$dest\"\nrm -f \"$tmp\"".to_owned()
+        }
+        SftpOverwritePolicy::Replace => {
+            "if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; fi\nmv -f \"$tmp\" \"$dest\"".to_owned()
+        }
+    };
+    format!(
+        "set -eu\ndest={destination}\ntmp={temporary}\n[ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74\nbytes=$(wc -c < \"$tmp\" | tr -d '[:space:]')\nif command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum \"$tmp\"); digest=${{digest%% *}}; elif command -v shasum >/dev/null 2>&1; then digest=$(shasum -a 256 \"$tmp\"); digest=${{digest%% *}}; else exit 75; fi\n[ \"$bytes\" = \"{expected_size}\" ] && [ \"$digest\" = \"{expected_sha256}\" ] || exit 76\n{mode}{placement}\nprintf 'REMOTE_HOSTS_TRANSFER_OK %s %s\\n' \"$bytes\" \"$digest\"\n"
+    )
+}
+
+fn russh_exec_upload_cleanup_command(temporary_path: &str) -> String {
+    let temporary = shell_quote(temporary_path);
+    format!(
+        "tmp={temporary}\nif [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] && rm -f \"$tmp\"; fi\n"
+    )
+}
+
+fn russh_exec_download_command(spec: &FileTransferSpec) -> String {
+    let source = shell_quote(&spec.remote_path);
+    let expected_digest = spec
+        .expected_sha256
+        .as_deref()
+        .map_or_else(String::new, |digest| {
+            format!("[ \"$digest\" = \"{digest}\" ] || exit 76\n")
+        });
+    format!(
+        "set -eu\nsrc={source}\n[ -f \"$src\" ] && [ ! -L \"$src\" ] || exit 71\nbytes=$(wc -c < \"$src\" | tr -d '[:space:]')\n[ \"$bytes\" -le \"{}\" ] || exit 77\nif command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum \"$src\"); digest=${{digest%% *}}; elif command -v shasum >/dev/null 2>&1; then digest=$(shasum -a 256 \"$src\"); digest=${{digest%% *}}; else exit 75; fi\n{expected_digest}printf 'REMOTE_HOSTS_TRANSFER_META %s %s\\n' \"$bytes\" \"$digest\" >&2\ncat \"$src\"\n",
+        spec.max_size_bytes
+    )
+}
+
+fn parse_transfer_marker(output: &str, marker: &str) -> Result<(u64, String), TransportError> {
+    let line = output
+        .lines()
+        .find(|line| line.starts_with(marker))
+        .ok_or_else(|| {
+            TransportError::FileTransfer(format!(
+                "remote transfer did not return the required {marker} marker"
+            ))
+        })?;
+    let mut fields = line.split_ascii_whitespace();
+    if fields.next() != Some(marker) {
+        return Err(TransportError::FileTransfer(
+            "remote transfer marker is malformed".to_owned(),
+        ));
+    }
+    let size = fields
+        .next()
+        .ok_or_else(|| TransportError::FileTransfer("remote size is missing".to_owned()))?
+        .parse::<u64>()
+        .map_err(|error| TransportError::FileTransfer(format!("parse remote size: {error}")))?;
+    let sha256 = fields
+        .next()
+        .ok_or_else(|| TransportError::FileTransfer("remote SHA-256 is missing".to_owned()))?
+        .to_ascii_lowercase();
+    if fields.next().is_some()
+        || sha256.len() != 64
+        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(TransportError::FileTransfer(
+            "remote transfer marker is malformed".to_owned(),
+        ));
+    }
+    Ok((size, sha256))
+}
+
+fn sanitized_transfer_diagnostics(
+    diagnostics: &str,
+    remote_path: &str,
+    temporary_path: &str,
+) -> String {
+    let redacted = diagnostics.replace(remote_path, "<remote-path>");
+    if temporary_path.is_empty() {
+        redacted
+    } else {
+        redacted.replace(temporary_path, "<remote-temporary-path>")
+    }
+}
+
+async fn execute_russh_sftp(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    request: SftpRequest,
+) -> Result<SftpResult, TransportError> {
+    let channel = session.channel_open_session().await.map_err(|error| {
+        TransportError::FileTransfer(format!("open SFTP channel on pooled SSH session: {error}"))
+    })?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|error| {
+            TransportError::FileTransfer(format!("request SFTP subsystem: {error}"))
+        })?;
+    let sftp = RusshSftp::new(channel.into_stream())
+        .await
+        .map_err(|error| {
+            TransportError::FileTransfer(format!("initialize SFTP subsystem: {error}"))
+        })?;
+    sftp.set_timeout(request.spec.timeout_seconds);
+    let result = match request.spec.direction {
+        SftpDirection::Upload => russh_upload(&sftp, &request).await,
+        SftpDirection::Download => russh_download(&sftp, &request).await,
+    };
+    let close_result = sftp
+        .close()
+        .await
+        .map_err(|error| TransportError::FileTransfer(format!("close SFTP subsystem: {error}")));
+    match (result, close_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn russh_upload(
+    sftp: &RusshSftp,
+    request: &SftpRequest,
+) -> Result<SftpResult, TransportError> {
+    let spec = &request.spec;
+    let (local_size, local_sha256) =
+        hash_local_source(Path::new(&spec.local_path), spec.max_size_bytes).await?;
+    ensure_expected_sha256(spec, &local_sha256)?;
+
+    ensure_russh_remote_parent(sftp, &spec.remote_path).await?;
+    ensure_russh_remote_destination(sftp, &spec.remote_path, spec.overwrite).await?;
+    let temporary_path = remote_temporary_path(&spec.remote_path, request.operation_id)?;
+    cleanup_russh_temporary_file(sftp, &temporary_path).await?;
+
+    let transfer = async {
+        let mut local = tokio::fs::File::open(&spec.local_path)
+            .await
+            .map_err(file_transfer_io)?;
+        let attributes = RusshSftpMetadata {
+            permissions: spec.mode,
+            ..RusshSftpMetadata::empty()
+        };
+        let remote = sftp
+            .open_with_flags_and_attributes(
+                temporary_path.clone(),
+                RusshSftpOpenFlags::CREATE
+                    | RusshSftpOpenFlags::EXCLUDE
+                    | RusshSftpOpenFlags::WRITE,
+                attributes,
+            )
+            .await
+            .map_err(|error| {
+                russh_file_transfer_error("create remote temporary file", error)
+            })?;
+        let mut remote = Box::pin(remote);
+        let (bytes_transferred, transfer_sha256) =
+            copy_bounded_and_hash(Pin::new(&mut local), remote.as_mut(), spec.max_size_bytes)
+                .await
+                .map_err(|error| {
+                    file_transfer_context("stream upload to remote temporary file", error)
+                })?;
+        remote
+            .as_mut()
+            .shutdown()
+            .await
+            .map_err(|error| file_transfer_io_context("close remote temporary file", error))?;
+        if bytes_transferred != local_size || transfer_sha256 != local_sha256 {
+            return Err(TransportError::FileTransfer(
+                "local file changed while it was being uploaded".to_owned(),
+            ));
+        }
+        if let Some(mode) = spec.mode {
+            sftp.set_metadata(
+                temporary_path.clone(),
+                RusshSftpMetadata {
+                    permissions: Some(mode),
+                    ..RusshSftpMetadata::empty()
+                },
+            )
+            .await
+            .map_err(|error| {
+                russh_file_transfer_error("set remote temporary file mode", error)
+            })?;
+        }
+        let (remote_size, remote_sha256) =
+            hash_russh_remote_file(sftp, &temporary_path, spec.max_size_bytes).await?;
+        if remote_size != local_size || remote_sha256 != local_sha256 {
+            return Err(TransportError::FileTransfer(format!(
+                "remote SHA-256 verification failed: local={local_sha256}, remote={remote_sha256}"
+            )));
+        }
+        sftp.rename(temporary_path.clone(), spec.remote_path.clone())
+            .await
+            .map_err(|error| {
+                TransportError::FileTransfer(format!(
+                    "atomic remote placement failed; destination may not support the requested overwrite policy: {error}"
+                ))
+            })?;
+        Ok(SftpResult {
+            direction: spec.direction,
+            bytes_transferred,
+            sha256: local_sha256,
+            local_path: spec.local_path.clone(),
+            remote_path: spec.remote_path.clone(),
+            overwrite: spec.overwrite,
+        })
+    }
+    .await;
+
+    if transfer.is_err() {
+        let _ = sftp.remove_file(temporary_path).await;
+    }
+    transfer
+}
+
+async fn russh_download(
+    sftp: &RusshSftp,
+    request: &SftpRequest,
+) -> Result<SftpResult, TransportError> {
+    let spec = &request.spec;
+    let source = russh_lstat(sftp, &spec.remote_path, "inspect remote source")
+        .await?
+        .ok_or_else(|| TransportError::FileTransfer("remote source does not exist".to_owned()))?;
+    ensure_russh_regular_file(&source, "remote source")?;
+    let source_size = source
+        .size
+        .ok_or_else(|| TransportError::FileTransfer("remote source size is unknown".to_owned()))?;
+    ensure_size_within_limit(source_size, spec.max_size_bytes)?;
+
+    let destination = Path::new(&spec.local_path);
+    ensure_local_destination(destination, spec.overwrite).await?;
+    let temporary_path = local_temporary_path(destination, request.operation_id)?;
+    cleanup_local_temporary_file(&temporary_path).await?;
+
+    let transfer = async {
+        let remote = sftp
+            .open(spec.remote_path.clone())
+            .await
+            .map_err(|error| russh_file_transfer_error("open remote source", error))?;
+        let mut remote = Box::pin(remote);
+        let mut local = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .await
+            .map_err(file_transfer_io)?;
+        let (bytes_transferred, remote_sha256) =
+            copy_bounded_and_hash(remote.as_mut(), Pin::new(&mut local), spec.max_size_bytes)
+                .await
+                .map_err(|error| {
+                    file_transfer_context("stream remote source to local file", error)
+                })?;
+        local.shutdown().await.map_err(file_transfer_io)?;
+        remote
+            .as_mut()
+            .shutdown()
+            .await
+            .map_err(|error| file_transfer_io_context("close remote source", error))?;
+        if bytes_transferred != source_size {
+            return Err(TransportError::FileTransfer(format!(
+                "remote source changed while it was being downloaded: expected_bytes={source_size}, transferred_bytes={bytes_transferred}"
+            )));
+        }
+        ensure_expected_sha256(spec, &remote_sha256)?;
+        let (local_size, local_sha256) =
+            hash_local_source(&temporary_path, spec.max_size_bytes).await?;
+        if local_size != source_size || local_sha256 != remote_sha256 {
+            return Err(TransportError::FileTransfer(format!(
+                "local SHA-256 verification failed: remote={remote_sha256}, local={local_sha256}"
+            )));
+        }
+        if let Some(mode) = spec.mode {
+            set_local_mode(&temporary_path, mode).await?;
+        }
+        place_local_file(&temporary_path, destination, spec.overwrite).await?;
+        Ok(SftpResult {
+            direction: spec.direction,
+            bytes_transferred,
+            sha256: remote_sha256,
+            local_path: spec.local_path.clone(),
+            remote_path: spec.remote_path.clone(),
+            overwrite: spec.overwrite,
+        })
+    }
+    .await;
+
+    if transfer.is_err() {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+    }
+    transfer
+}
+
+async fn russh_lstat(
+    sftp: &RusshSftp,
+    path: &str,
+    context: &str,
+) -> Result<Option<RusshSftpMetadata>, TransportError> {
+    match sftp.symlink_metadata(path.to_owned()).await {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(RusshSftpError::Status(status))
+            if status.status_code == RusshSftpStatusCode::NoSuchFile =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(russh_file_transfer_error(context, error)),
+    }
+}
+
+async fn ensure_russh_remote_parent(sftp: &RusshSftp, path: &str) -> Result<(), TransportError> {
+    let parent = remote_parent(path)?;
+    let metadata = russh_lstat(sftp, parent, "inspect remote parent directory")
+        .await?
+        .ok_or_else(|| {
+            TransportError::FileTransfer("remote parent directory is missing".to_owned())
+        })?;
+    if !metadata.is_dir() {
+        return Err(TransportError::FileTransfer(
+            "remote parent path is not a directory".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_russh_remote_destination(
+    sftp: &RusshSftp,
+    path: &str,
+    overwrite: SftpOverwritePolicy,
+) -> Result<(), TransportError> {
+    let Some(metadata) = russh_lstat(sftp, path, "inspect remote destination").await? else {
+        return Ok(());
+    };
+    ensure_russh_regular_file(&metadata, "remote destination")?;
+    if overwrite == SftpOverwritePolicy::Deny {
+        return Err(TransportError::FileTransfer(
+            "remote destination already exists and overwrite=deny".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_russh_regular_file(
+    metadata: &RusshSftpMetadata,
+    label: &str,
+) -> Result<(), TransportError> {
+    if !metadata.is_regular() {
+        return Err(TransportError::FileTransfer(format!(
+            "{label} is not a regular file"
+        )));
+    }
+    Ok(())
+}
+
+async fn cleanup_russh_temporary_file(sftp: &RusshSftp, path: &str) -> Result<(), TransportError> {
+    let Some(metadata) = russh_lstat(sftp, path, "inspect stale remote temporary file").await?
+    else {
+        return Ok(());
+    };
+    ensure_russh_regular_file(&metadata, "stale remote temporary path")?;
+    sftp.remove_file(path.to_owned())
+        .await
+        .map_err(|error| russh_file_transfer_error("remove stale remote temporary file", error))
+}
+
+async fn hash_russh_remote_file(
+    sftp: &RusshSftp,
+    path: &str,
+    max_size_bytes: u64,
+) -> Result<(u64, String), TransportError> {
+    let remote = sftp.open(path.to_owned()).await.map_err(|error| {
+        russh_file_transfer_error("open remote temporary file for verification", error)
+    })?;
+    let mut remote = Box::pin(remote);
+    let result = hash_reader(remote.as_mut(), max_size_bytes)
+        .await
+        .map_err(|error| file_transfer_context("hash remote temporary file", error));
+    let close_result = remote
+        .as_mut()
+        .shutdown()
+        .await
+        .map_err(|error| file_transfer_io_context("close remote verification stream", error));
+    match (result, close_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn russh_file_transfer_error(context: &str, error: RusshSftpError) -> TransportError {
+    let message = error.to_string();
+    drop(error);
+    TransportError::FileTransfer(format!("{context}: {message}"))
+}
+
+/// Shared native `russh` transport pool with one SSH session cache per access path.
+pub struct RusshTransportPool<C> {
+    repositories: Repositories,
+    credentials: Arc<C>,
+    host_key_policy: HostKeyPolicy,
+    known_hosts_path: Option<PathBuf>,
+    connect_timeout_seconds: u64,
+    inactivity_timeout_seconds: u64,
+    max_new_ssh_handshakes_per_10_min: u32,
+    global_handshake_limiter: Arc<DirectRateLimiter>,
+    cache: Mutex<BTreeMap<AccessPathId, Arc<RusshTransport<C>>>>,
+}
+
+impl<C> RusshTransportPool<C> {
+    /// Creates a native `russh` transport pool.
+    pub fn new(
+        repositories: Repositories,
+        credentials: Arc<C>,
+        host_key_policy: HostKeyPolicy,
+        known_hosts_path: Option<PathBuf>,
+        connect_timeout_seconds: u64,
+        inactivity_timeout_seconds: u64,
+        max_new_ssh_handshakes_per_10_min: u32,
+    ) -> Self {
+        Self {
+            repositories,
+            credentials,
+            host_key_policy,
+            known_hosts_path,
+            connect_timeout_seconds,
+            inactivity_timeout_seconds,
+            max_new_ssh_handshakes_per_10_min,
+            global_handshake_limiter: HandshakeLimiter::shared_global(
+                max_new_ssh_handshakes_per_10_min,
+            ),
+            cache: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl<C> RusshTransportPool<C>
+where
+    C: SshCredentialProvider + 'static,
+{
+    /// Returns a cached native SSH transport for an access path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the access path cannot be loaded.
+    pub async fn transport_for_access_path(
+        &self,
+        access_path_id: AccessPathId,
+    ) -> Result<Arc<RusshTransport<C>>, String> {
+        let access_path = self
+            .repositories
+            .access_paths
+            .get(access_path_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("access path not found: {access_path_id}"))?;
+        reject_unsupported_multi_hop_route(
+            &self.repositories,
+            &self.cache,
+            &access_path,
+            "native russh",
+        )
+        .await?;
+        let host = self
+            .repositories
+            .hosts
+            .get(access_path.host_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("host not found: {}", access_path.host_id))?;
+        let windows = matches!(host.kind, HostKind::Windows);
+        let use_exec_file_transfer = !windows
+            && access_path.route_type == RouteType::Bastion
+            && access_path.proxy_chain.is_empty();
+        let config = RusshTransportConfig {
+            access_path_id,
+            address: access_path.address,
+            port: access_path.port,
+            username: access_path.username,
+            windows,
+            use_exec_file_transfer,
+            host_key_policy: self.host_key_policy,
+            known_hosts_path: self.known_hosts_path.clone(),
+            connect_timeout_seconds: self.connect_timeout_seconds,
+            inactivity_timeout_seconds: self.inactivity_timeout_seconds,
+            keepalive_seconds: access_path.keepalive_seconds,
+            max_new_connections_per_minute: access_path.max_new_connections_per_minute,
+            max_new_ssh_handshakes_per_10_min: self.max_new_ssh_handshakes_per_10_min,
+        };
+        {
+            let mut cache = self.cache.lock().await;
+            if let Some(transport) = cache.get(&access_path_id) {
+                if transport.config == config {
+                    return Ok(Arc::clone(transport));
+                }
+                cache.remove(&access_path_id);
+            }
+        }
+        let transport = Arc::new(RusshTransport::with_shared_handshake_budget(
+            config,
+            Arc::clone(&self.credentials),
+            self.repositories.authorized_key_bootstrap.clone(),
+            Arc::clone(&self.global_handshake_limiter),
+        ));
+
+        let mut cache = self.cache.lock().await;
+        let cached = cache
+            .entry(access_path_id)
+            .or_insert_with(|| Arc::clone(&transport));
+        Ok(Arc::clone(cached))
+    }
+}
+
+/// Native `russh` transport provider with one guarded transport per access path.
+pub struct RusshTransportProvider<C> {
+    pool: Arc<RusshTransportPool<C>>,
+    policy: ServerProtectionPolicy,
+    cache: Mutex<BTreeMap<AccessPathId, RusshGuardedTransportCacheEntry<C>>>,
+}
+
+struct RusshGuardedTransportCacheEntry<C> {
+    pooled: Arc<RusshTransport<C>>,
+    transport: Arc<dyn RemoteTransport>,
+}
+
+impl<C> RusshTransportProvider<C> {
+    /// Creates a native `russh` provider.
+    pub fn new(
+        repositories: Repositories,
+        credentials: Arc<C>,
+        host_key_policy: HostKeyPolicy,
+        known_hosts_path: Option<PathBuf>,
+        connect_timeout_seconds: u64,
+        inactivity_timeout_seconds: u64,
+        policy: ServerProtectionPolicy,
+    ) -> Self {
+        Self::with_pool(
+            Arc::new(RusshTransportPool::new(
+                repositories,
+                credentials,
+                host_key_policy,
+                known_hosts_path,
+                connect_timeout_seconds,
+                inactivity_timeout_seconds,
+                policy.max_new_ssh_handshakes_per_10_min,
+            )),
+            policy,
+        )
+    }
+
+    /// Creates a provider from an existing native `russh` pool.
+    pub fn with_pool(pool: Arc<RusshTransportPool<C>>, policy: ServerProtectionPolicy) -> Self {
+        Self {
+            pool,
+            policy,
+            cache: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl<C> RusshTransportProvider<C>
+where
+    C: SshCredentialProvider + 'static,
+{
+    async fn cached_transport(
+        &self,
+        access_path_id: AccessPathId,
+    ) -> Result<Arc<dyn RemoteTransport>, String> {
+        let pooled = self.pool.transport_for_access_path(access_path_id).await?;
+        {
+            let cache = self.cache.lock().await;
+            if let Some(entry) = cache.get(&access_path_id)
+                && Arc::ptr_eq(&entry.pooled, &pooled)
+            {
+                return Ok(Arc::clone(&entry.transport));
+            }
+        }
+        let transport = GuardedTransport::new(
+            SharedRemoteTransport::new(Arc::clone(&pooled)),
+            self.policy.clone(),
+        );
+        let transport: Arc<dyn RemoteTransport> = Arc::new(transport);
+
+        let mut cache = self.cache.lock().await;
+        cache.insert(
+            access_path_id,
+            RusshGuardedTransportCacheEntry {
+                pooled,
+                transport: Arc::clone(&transport),
+            },
+        );
+        Ok(transport)
+    }
+}
+
+#[async_trait]
+impl<C> RemoteTransportProvider for RusshTransportProvider<C>
+where
+    C: SshCredentialProvider + 'static,
+{
+    async fn transport_for(
+        &self,
+        operation: &OperationRun,
+    ) -> Result<Arc<dyn RemoteTransport>, String> {
+        self.cached_transport(operation.access_path_id).await
+    }
+}
+
+/// Native `russh` PTY backend factory keyed by access path.
+pub struct RusshPtyBackendFactory<C> {
+    repositories: Repositories,
+    pool: Arc<RusshTransportPool<C>>,
+    term: String,
+    columns: u32,
+    rows: u32,
+}
+
+impl<C> RusshPtyBackendFactory<C> {
+    /// Creates a native `russh` PTY backend factory.
+    pub fn new(
+        repositories: Repositories,
+        credentials: Arc<C>,
+        host_key_policy: HostKeyPolicy,
+        known_hosts_path: Option<PathBuf>,
+        connect_timeout_seconds: u64,
+        inactivity_timeout_seconds: u64,
+    ) -> Self {
+        Self::with_pool(
+            repositories.clone(),
+            Arc::new(RusshTransportPool::new(
+                repositories,
+                credentials,
+                host_key_policy,
+                known_hosts_path,
+                connect_timeout_seconds,
+                inactivity_timeout_seconds,
+                ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+            )),
+        )
+    }
+
+    /// Creates a native `russh` PTY backend factory from an existing pool.
+    pub fn with_pool(repositories: Repositories, pool: Arc<RusshTransportPool<C>>) -> Self {
+        Self {
+            repositories,
+            pool,
+            term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned()),
+            columns: 120,
+            rows: 40,
+        }
+    }
+
+    /// Overrides terminal characteristics sent in `request-pty`.
+    #[must_use]
+    pub fn with_terminal(mut self, term: impl Into<String>, columns: u32, rows: u32) -> Self {
+        self.term = term.into();
+        self.columns = columns.max(1);
+        self.rows = rows.max(1);
+        self
+    }
+
+    async fn transport_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Arc<RusshTransport<C>>, ConnectorPtyError>
+    where
+        C: SshCredentialProvider + 'static,
+    {
+        let connection = self
+            .repositories
+            .connection_sessions
+            .get(session_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!("connection session not found: {session_id}"))
+            })?;
+        self.pool
+            .transport_for_access_path(connection.access_path_id)
+            .await
+            .map_err(ConnectorPtyError::Backend)
+    }
+}
+
+#[async_trait]
+impl<C> ManagedPtyBackend for RusshPtyBackendFactory<C>
+where
+    C: SshCredentialProvider + 'static,
+{
+    fn capabilities(&self) -> PtyBackendCapabilities {
+        PtyBackendCapabilities::russh_native_pty()
+    }
+
+    async fn spawn(
+        &self,
+        request: PtyBackendSpawnRequest,
+    ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
+        let transport = self.transport_for_session(request.session_id).await?;
+        let before = transport.transport_telemetry();
+        let session = transport.session().await?;
+        let channel = session
+            .channel_open_session()
+            .await
+            .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
+        channel
+            .request_pty(false, &self.term, self.columns, self.rows, 0, 0, &[])
+            .await
+            .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
+        channel
+            .request_shell(true)
+            .await
+            .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
+
+        let (input_tx, input_rx) = mpsc::channel::<String>(64);
+        let (output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(128);
+        let (close_tx, close_rx) = oneshot::channel::<()>();
+        let initial_input = shell_change_dir_input(request.cwd.as_deref());
+        tokio::spawn(run_russh_pty_channel(
+            channel,
+            input_rx,
+            output_tx,
+            close_rx,
+            initial_input,
+        ));
+
+        Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx)
+            .with_transport_observation(before.as_ref(), transport.transport_telemetry()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RusshClientHandler {
+    host: String,
+    port: u16,
+    policy: HostKeyPolicy,
+    known_hosts_path: Option<PathBuf>,
+}
+
+impl client::Handler for RusshClientHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        match self.policy {
+            HostKeyPolicy::Accept => Ok(true),
+            HostKeyPolicy::Strict => Ok(self.check_known_host(server_public_key)),
+            HostKeyPolicy::Add => {
+                if self.check_known_host(server_public_key) {
+                    return Ok(true);
+                }
+                Ok(self.learn_known_host(server_public_key))
+            }
+        }
+    }
+}
+
+impl RusshClientHandler {
+    fn check_known_host(&self, server_public_key: &russh::keys::ssh_key::PublicKey) -> bool {
+        self.known_hosts_path.as_ref().map_or_else(
+            || check_known_hosts(&self.host, self.port, server_public_key).unwrap_or(false),
+            |path| {
+                check_known_hosts_path(&self.host, self.port, server_public_key, path)
+                    .unwrap_or(false)
+            },
+        )
+    }
+
+    fn learn_known_host(&self, server_public_key: &russh::keys::ssh_key::PublicKey) -> bool {
+        self.known_hosts_path.as_ref().map_or_else(
+            || learn_known_hosts(&self.host, self.port, server_public_key).is_ok(),
+            |path| learn_known_hosts_path(&self.host, self.port, server_public_key, path).is_ok(),
+        )
+    }
+}
+
+struct RusshAuthentication {
+    used_password: bool,
+    bootstrap_public_key: Option<PublicKey>,
+}
+
+struct AgentAuthentication {
+    authenticated: bool,
+    bootstrap_public_key: Option<PublicKey>,
+    attempted_identities: usize,
+}
+
+type DynamicSshAgent =
+    AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin + 'static>>;
+
+#[cfg(unix)]
+async fn connect_local_ssh_agent() -> Result<DynamicSshAgent, russh::keys::Error> {
+    AgentClient::connect_env().await.map(AgentClient::dynamic)
+}
+
+#[cfg(windows)]
+async fn connect_local_ssh_agent() -> Result<DynamicSshAgent, russh::keys::Error> {
+    if let Ok(path) = std::env::var("SSH_AUTH_SOCK") {
+        AgentClient::connect_named_pipe(path)
+            .await
+            .map(AgentClient::dynamic)
+    } else {
+        AgentClient::connect_pageant()
+            .await
+            .map(AgentClient::dynamic)
+    }
+}
+
+async fn authenticate_with_ssh_agent(
+    session: &mut client::Handle<RusshClientHandler>,
+    username: &str,
+) -> Result<AgentAuthentication, String> {
+    let mut agent = connect_local_ssh_agent()
+        .await
+        .map_err(|error| format!("connect to local SSH agent: {error}"))?;
+    let identities = agent
+        .request_identities()
+        .await
+        .map_err(|error| format!("list local SSH agent identities: {error}"))?;
+    let bootstrap_public_key = identities.iter().find_map(|identity| match identity {
+        AgentIdentity::PublicKey { key, .. } => Some(key.clone()),
+        AgentIdentity::Certificate { .. } => None,
+    });
+    let hash_alg = session
+        .best_supported_rsa_hash()
+        .await
+        .map_err(|error| format!("negotiate SSH agent RSA hash: {error}"))?
+        .flatten();
+
+    for identity in identities
+        .iter()
+        .take(MAX_SSH_AGENT_IDENTITIES_PER_HANDSHAKE)
+    {
+        let result = match identity {
+            AgentIdentity::PublicKey { key, .. } => {
+                session
+                    .authenticate_publickey_with(username, key.clone(), hash_alg, &mut agent)
+                    .await
+            }
+            AgentIdentity::Certificate { certificate, .. } => {
+                session
+                    .authenticate_certificate_with(
+                        username,
+                        certificate.clone(),
+                        hash_alg,
+                        &mut agent,
+                    )
+                    .await
+            }
+        };
+        match result {
+            Ok(authentication) if authentication.success() => {
+                return Ok(AgentAuthentication {
+                    authenticated: true,
+                    bootstrap_public_key,
+                    attempted_identities: identities
+                        .len()
+                        .min(MAX_SSH_AGENT_IDENTITIES_PER_HANDSHAKE),
+                });
+            }
+            Ok(_) => {}
+            Err(error) => tracing::debug!(%error, "SSH-agent identity authentication failed"),
+        }
+    }
+
+    Ok(AgentAuthentication {
+        authenticated: false,
+        bootstrap_public_key,
+        attempted_identities: identities.len().min(MAX_SSH_AGENT_IDENTITIES_PER_HANDSHAKE),
+    })
+}
+
+fn default_private_key_paths() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let ssh_dir = PathBuf::from(home).join(".ssh");
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .into_iter()
+        .map(|name| ssh_dir.join(name))
+        .collect()
+}
+
+async fn load_default_private_keys() -> Vec<PrivateKey> {
+    let mut keys = Vec::new();
+    for path in default_private_key_paths() {
+        let Ok(material) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        let material = Zeroizing::new(material);
+        match decode_secret_key(material.as_str(), None) {
+            Ok(key) => keys.push(key),
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "default SSH key is unavailable without a passphrase");
+            }
+        }
+        if keys.len() >= MAX_SSH_AGENT_IDENTITIES_PER_HANDSHAKE {
+            break;
+        }
+    }
+    keys
+}
+
+async fn authenticate_with_default_private_keys(
+    session: &mut client::Handle<RusshClientHandler>,
+    username: &str,
+) -> Result<AgentAuthentication, String> {
+    let keys = load_default_private_keys().await;
+    let bootstrap_public_key = keys.first().map(|key| key.public_key().clone());
+    let attempted_identities = keys.len();
+    let hash_alg = session
+        .best_supported_rsa_hash()
+        .await
+        .map_err(|error| format!("negotiate default-key RSA hash: {error}"))?
+        .flatten();
+    for key in keys {
+        match session
+            .authenticate_publickey(
+                username,
+                PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+            )
+            .await
+        {
+            Ok(authentication) if authentication.success() => {
+                return Ok(AgentAuthentication {
+                    authenticated: true,
+                    bootstrap_public_key,
+                    attempted_identities,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => tracing::debug!(%error, "default private-key authentication failed"),
+        }
+    }
+    Ok(AgentAuthentication {
+        authenticated: false,
+        bootstrap_public_key,
+        attempted_identities,
+    })
+}
+
+async fn authenticate_russh_session(
+    session: &mut client::Handle<RusshClientHandler>,
+    username: &str,
+    credential: &SshCredentialSecret,
+) -> Result<RusshAuthentication, TransportError> {
+    if let Some(private_key_pem) = &credential.private_key_pem {
+        let private_key = decode_secret_key(
+            private_key_pem.expose_secret(),
+            credential
+                .private_key_passphrase
+                .as_ref()
+                .map(SecretString::expose_secret),
+        );
+        match private_key {
+            Ok(private_key) => {
+                let hash_alg = session
+                    .best_supported_rsa_hash()
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten();
+                match session
+                    .authenticate_publickey(
+                        username,
+                        PrivateKeyWithHashAlg::new(Arc::new(private_key), hash_alg),
+                    )
+                    .await
+                {
+                    Ok(authentication) if authentication.success() => {
+                        return Ok(RusshAuthentication {
+                            used_password: false,
+                            bootstrap_public_key: None,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "stored private-key authentication failed");
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "stored private key could not be decoded"),
+        }
+    }
+
+    let mut bootstrap_public_key = None;
+    if credential.use_ssh_agent {
+        let mut agent_attempted_identities = 0;
+        match authenticate_with_ssh_agent(session, username).await {
+            Ok(agent_authentication) if agent_authentication.authenticated => {
+                return Ok(RusshAuthentication {
+                    used_password: false,
+                    bootstrap_public_key: None,
+                });
+            }
+            Ok(agent_authentication) => {
+                agent_attempted_identities = agent_authentication.attempted_identities;
+                bootstrap_public_key = agent_authentication.bootstrap_public_key;
+            }
+            Err(error) => tracing::debug!(%error, "local SSH-agent authentication unavailable"),
+        }
+        if agent_attempted_identities == 0 {
+            match authenticate_with_default_private_keys(session, username).await {
+                Ok(default_authentication) if default_authentication.authenticated => {
+                    return Ok(RusshAuthentication {
+                        used_password: false,
+                        bootstrap_public_key: None,
+                    });
+                }
+                Ok(default_authentication) => {
+                    bootstrap_public_key = default_authentication.bootstrap_public_key;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "default local SSH-key authentication unavailable");
+                }
+            }
+        }
+    }
+
+    if let Some(password) = &credential.password {
+        let auth = session
+            .authenticate_password(username, password.expose_secret().to_owned())
+            .await
+            .map_err(|error| TransportError::Backend(error.to_string()))?;
+        if auth.success() {
+            return Ok(RusshAuthentication {
+                used_password: true,
+                bootstrap_public_key,
+            });
+        }
+    }
+
+    Err(TransportError::Backend(
+        "ssh authentication failed".to_owned(),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum AuthorizedKeyInstallError {
+    #[error("authorized-keys update timed out")]
+    Timeout,
+    #[error("remote account cannot update authorized keys")]
+    WriteDenied,
+    #[error("remote authorized-keys location is read-only")]
+    ReadOnlyFilesystem,
+    #[error("remote shell does not support the bootstrap command")]
+    UnsupportedTargetShell,
+    #[error("remote authorized-keys command failed")]
+    RemoteCommandFailed,
+}
+
+impl AuthorizedKeyInstallError {
+    fn reason(self) -> AuthorizedKeyBootstrapReason {
+        match self {
+            Self::Timeout => AuthorizedKeyBootstrapReason::Timeout,
+            Self::WriteDenied => AuthorizedKeyBootstrapReason::WriteDenied,
+            Self::ReadOnlyFilesystem => AuthorizedKeyBootstrapReason::ReadOnlyFilesystem,
+            Self::UnsupportedTargetShell => AuthorizedKeyBootstrapReason::UnsupportedTargetShell,
+            Self::RemoteCommandFailed => AuthorizedKeyBootstrapReason::RemoteCommandFailed,
+        }
+    }
+
+    fn is_permanent(self) -> bool {
+        matches!(
+            self,
+            Self::WriteDenied | Self::ReadOnlyFilesystem | Self::UnsupportedTargetShell
+        )
+    }
+}
+
+fn authorized_key_bootstrap_is_eligible(
+    existing: Option<&AuthorizedKeyBootstrap>,
+    public_key_fingerprint: &str,
+    now: time::OffsetDateTime,
+) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+    if existing.public_key_fingerprint.as_deref() != Some(public_key_fingerprint) {
+        return true;
+    }
+    match existing.state {
+        AuthorizedKeyBootstrapState::Installed | AuthorizedKeyBootstrapState::Skipped => false,
+        AuthorizedKeyBootstrapState::Attempting | AuthorizedKeyBootstrapState::Deferred => existing
+            .next_retry_at
+            .is_some_and(|retry_at| retry_at <= now),
+    }
+}
+
+fn authorized_key_bootstrap_failure_state(
+    access_path_id: AccessPathId,
+    public_key_fingerprint: &str,
+    previous_failure_count: u32,
+    error: AuthorizedKeyInstallError,
+    now: time::OffsetDateTime,
+) -> AuthorizedKeyBootstrap {
+    let failure_count = previous_failure_count.saturating_add(1);
+    let exhausted = failure_count >= AUTHORIZED_KEY_BOOTSTRAP_MAX_FAILURES;
+    let state = if error.is_permanent() || exhausted {
+        AuthorizedKeyBootstrapState::Skipped
+    } else {
+        AuthorizedKeyBootstrapState::Deferred
+    };
+    let reason = if exhausted && !error.is_permanent() {
+        AuthorizedKeyBootstrapReason::AttemptsExhausted
+    } else {
+        error.reason()
+    };
+    let next_retry_at = (state == AuthorizedKeyBootstrapState::Deferred).then(|| {
+        let multiplier = 1_i64 << failure_count.saturating_sub(1).min(2);
+        now + time::Duration::minutes(15 * multiplier)
+    });
+    AuthorizedKeyBootstrap {
+        access_path_id,
+        state,
+        reason: Some(reason),
+        public_key_fingerprint: Some(public_key_fingerprint.to_owned()),
+        failure_count,
+        attempted_at: now,
+        next_retry_at,
+        updated_at: now,
+    }
+}
+
+async fn persist_authorized_key_bootstrap_result(
+    repository: &AuthorizedKeyBootstrapRepository,
+    state: &AuthorizedKeyBootstrap,
+) {
+    let access_path_id = state.access_path_id;
+    if let Err(error) = repository.upsert(state).await {
+        tracing::warn!(
+            %access_path_id,
+            %error,
+            "failed to persist final public-key bootstrap state"
+        );
+    } else if state.state == AuthorizedKeyBootstrapState::Installed {
+        tracing::info!(%access_path_id, "installed managed SSH public key");
+    } else {
+        tracing::warn!(
+            %access_path_id,
+            state = ?state.state,
+            reason = ?state.reason,
+            "managed SSH public-key bootstrap did not complete"
+        );
+    }
+}
+
+async fn install_authorized_key(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    public_key: &PublicKey,
+    windows: bool,
+) -> Result<(), AuthorizedKeyInstallError> {
+    let managed_key = PublicKey::new(public_key.key_data().clone(), "remote-hosts-managed");
+    let key = managed_key
+        .to_openssh()
+        .map_err(|_| AuthorizedKeyInstallError::RemoteCommandFailed)?;
+    let command = authorized_keys_install_command(&key, windows);
+    execute_authorized_key_install_with_timeout(
+        AUTHORIZED_KEY_BOOTSTRAP_TIMEOUT,
+        execute_russh_command(session, command, 16 * 1024),
+    )
+    .await
+}
+
+async fn execute_authorized_key_install_with_timeout<F>(
+    timeout: Duration,
+    execute: F,
+) -> Result<(), AuthorizedKeyInstallError>
+where
+    F: Future<Output = Result<ExecResult, TransportError>>,
+{
+    let result = tokio::time::timeout(timeout, execute)
+        .await
+        .map_err(|_| AuthorizedKeyInstallError::Timeout)?
+        .map_err(|error| match error {
+            TransportError::Timeout => AuthorizedKeyInstallError::Timeout,
+            TransportError::PolicyDenied(_)
+            | TransportError::LocalHandshakeBudgetExhausted { .. }
+            | TransportError::Backend(_)
+            | TransportError::FileTransfer(_) => AuthorizedKeyInstallError::RemoteCommandFailed,
+        })?;
+    if result.exit_code == Some(0) {
+        return Ok(());
+    }
+    Err(classify_authorized_key_install_failure(&result.stderr))
+}
+
+fn classify_authorized_key_install_failure(stderr: &str) -> AuthorizedKeyInstallError {
+    let stderr = stderr.to_ascii_lowercase();
+    if [
+        "read-only file system",
+        "read only file system",
+        "media is write protected",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+    {
+        AuthorizedKeyInstallError::ReadOnlyFilesystem
+    } else if [
+        "permission denied",
+        "access is denied",
+        "unauthorizedaccessexception",
+        "requested operation requires elevation",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+    {
+        AuthorizedKeyInstallError::WriteDenied
+    } else if [
+        "command not found",
+        "not recognized as the name of a cmdlet",
+        "is not recognized as an internal or external command",
+        "powershell.exe: not found",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+    {
+        AuthorizedKeyInstallError::UnsupportedTargetShell
+    } else {
+        AuthorizedKeyInstallError::RemoteCommandFailed
+    }
+}
+
+fn authorized_keys_install_command(key: &str, windows: bool) -> String {
+    if windows {
+        let key = key.replace('\'', "''");
+        format!(
+            "powershell.exe -NoProfile -NonInteractive -Command \"$ErrorActionPreference='Stop'; $d=Join-Path $HOME '.ssh'; New-Item -ItemType Directory -Force -Path $d | Out-Null; $u=Join-Path $d 'authorized_keys'; $isAdmin=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); $f=if ($isAdmin) {{ Join-Path $env:ProgramData 'ssh\\administrators_authorized_keys' }} else {{ $u }}; if (-not (Test-Path -LiteralPath $f)) {{ New-Item -ItemType File -Force -Path $f | Out-Null }}; $k='{key}'; $lines=@(Get-Content -LiteralPath $f -ErrorAction SilentlyContinue); if ($lines -notcontains $k) {{ Add-Content -LiteralPath $f -Value $k -Encoding ascii }}; if ($isAdmin) {{ & icacls.exe $f /inheritance:r /grant:r '*S-1-5-32-544:F' /grant:r '*S-1-5-18:F' | Out-Null; if ($LASTEXITCODE -ne 0) {{ throw 'failed to secure administrators_authorized_keys' }} }}\""
+        )
+    } else {
+        format!(
+            "umask 077; mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\" && touch \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\" && key={} && (grep -qxF -- \"$key\" \"$HOME/.ssh/authorized_keys\" || printf '%s\\n' \"$key\" >> \"$HOME/.ssh/authorized_keys\")",
+            shell_quote(key)
+        )
+    }
+}
+
+async fn execute_russh_command(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    command: String,
+    output_limit_bytes: usize,
+) -> Result<ExecResult, TransportError> {
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|error| TransportError::Backend(error.to_string()))?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|error| TransportError::Backend(error.to_string()))?;
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = None;
+    let mut truncated = false;
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => {
+                append_limited_utf8(&mut stdout, &data, output_limit_bytes, &mut truncated);
+            }
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                append_limited_utf8(&mut stderr, &data, output_limit_bytes, &mut truncated);
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit_code = i32::try_from(exit_status).ok();
+            }
+            ChannelMsg::ExitSignal { error_message, .. } => {
+                if !error_message.is_empty() {
+                    append_limited_utf8(
+                        &mut stderr,
+                        error_message.as_bytes(),
+                        output_limit_bytes,
+                        &mut truncated,
+                    );
+                }
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    let _ = channel.close().await;
+    Ok(ExecResult {
+        exit_code,
+        stdout,
+        stderr,
+        truncated,
+    })
+}
+
+async fn run_russh_pty_channel(
+    mut channel: russh::Channel<client::Msg>,
+    mut input_rx: mpsc::Receiver<String>,
+    output_tx: mpsc::Sender<PtyBackendOutput>,
+    mut close_rx: oneshot::Receiver<()>,
+    initial_input: Option<String>,
+) {
+    if let Some(initial_input) = initial_input
+        && let Err(error) = channel.data_bytes(initial_input.into_bytes()).await
+    {
+        let _ = send_pty_backend_output(
+            &output_tx,
+            OutputStream::System,
+            format!("russh pty initial input failed: {error}"),
+        )
+        .await;
+        let _ = channel.close().await;
+        return;
+    }
+
+    let mut input_closed = false;
+    loop {
+        tokio::select! {
+            _ = &mut close_rx => {
+                let _ = channel.close().await;
+                break;
+            }
+            input = input_rx.recv(), if !input_closed => {
+                if let Some(input) = input {
+                    if let Err(error) = channel.data_bytes(input.into_bytes()).await {
+                        let sent = send_pty_backend_output(
+                            &output_tx,
+                            OutputStream::System,
+                            format!("russh pty input failed: {error}"),
+                        )
+                        .await;
+                        if !sent {
+                            break;
+                        }
+                        let _ = channel.close().await;
+                        break;
+                    }
+                } else {
+                    input_closed = true;
+                    let _ = channel.eof().await;
+                }
+            }
+            message = channel.wait() => {
+                let Some(message) = message else {
+                    break;
+                };
+                if !handle_russh_pty_message(&output_tx, message).await {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn handle_russh_pty_message(
+    output_tx: &mpsc::Sender<PtyBackendOutput>,
+    message: ChannelMsg,
+) -> bool {
+    match message {
+        ChannelMsg::Data { data } => {
+            send_pty_backend_output(
+                output_tx,
+                OutputStream::Stdout,
+                String::from_utf8_lossy(&data).to_string(),
+            )
+            .await
+        }
+        ChannelMsg::ExtendedData { data, ext: 1 } => {
+            send_pty_backend_output(
+                output_tx,
+                OutputStream::Stderr,
+                String::from_utf8_lossy(&data).to_string(),
+            )
+            .await
+        }
+        ChannelMsg::ExtendedData { data, ext } => {
+            send_pty_backend_output(
+                output_tx,
+                OutputStream::System,
+                format!(
+                    "russh pty extended data ext={ext}: {}",
+                    String::from_utf8_lossy(&data)
+                ),
+            )
+            .await
+        }
+        ChannelMsg::ExitStatus { exit_status } => {
+            send_pty_backend_output(
+                output_tx,
+                OutputStream::System,
+                format!("russh pty shell exited: status={exit_status}"),
+            )
+            .await
+        }
+        ChannelMsg::ExitSignal {
+            signal_name,
+            core_dumped,
+            error_message,
+            ..
+        } => {
+            send_pty_backend_output(
+                output_tx,
+                OutputStream::System,
+                russh_exit_signal_message(&signal_name, core_dumped, &error_message),
+            )
+            .await
+        }
+        ChannelMsg::Failure => {
+            send_pty_backend_output(
+                output_tx,
+                OutputStream::System,
+                "russh pty request failed".to_owned(),
+            )
+            .await
+        }
+        ChannelMsg::Close => false,
+        _ => true,
+    }
+}
+
+fn russh_exit_signal_message(
+    signal_name: &russh::Sig,
+    core_dumped: bool,
+    error_message: &str,
+) -> String {
+    if error_message.is_empty() {
+        format!("russh pty shell exited by signal: {signal_name:?}, core_dumped={core_dumped}")
+    } else {
+        format!(
+            "russh pty shell exited by signal: {signal_name:?}, core_dumped={core_dumped}, message={error_message}"
+        )
+    }
+}
+
+async fn send_pty_backend_output(
+    output_tx: &mpsc::Sender<PtyBackendOutput>,
+    stream: OutputStream,
+    text: String,
+) -> bool {
+    output_tx
+        .send(PtyBackendOutput {
+            stream,
+            text,
+            truncated: false,
+        })
+        .await
+        .is_ok()
+}
+
+fn append_limited_utf8(output: &mut String, bytes: &[u8], limit: usize, truncated: &mut bool) {
+    if output.len() >= limit {
+        *truncated = true;
+        return;
+    }
+    let remaining = limit - output.len();
+    let take = remaining.min(bytes.len());
+    output.push_str(&String::from_utf8_lossy(&bytes[..take]));
+    if take < bytes.len() {
+        *truncated = true;
+    }
+}
+
+fn ssh_exec_command(profile: &CommandProfile, windows: bool) -> String {
+    let quote = if windows {
+        windows_command_quote
+    } else {
+        shell_quote
+    };
+    std::iter::once(quote(&profile.program))
+        .chain(profile.args.iter().map(|arg| quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn windows_command_quote(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"-._/,=:\\".contains(&byte))
+    {
+        value.to_owned()
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
+}
+
+/// Connector worker configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorOperationWorkerConfig {
+    /// Connector that owns the worker.
+    pub connector_id: ConnectorId,
+    /// Lease duration for one claimed operation.
+    pub lease_seconds: u64,
+    /// Maximum attempts before the worker stops claiming an operation.
+    pub max_attempts: u32,
+    /// Output size threshold above which content is written to a file artifact.
+    pub artifact_threshold_bytes: usize,
+    /// Preview bytes stored in the agent-visible summary chunk and artifact metadata.
+    pub artifact_preview_bytes: usize,
+}
+
+impl ConnectorOperationWorkerConfig {
+    /// Builds a production default config for a connector.
+    #[must_use]
+    pub fn production_default(connector_id: ConnectorId) -> Self {
+        Self {
+            connector_id,
+            lease_seconds: 300,
+            max_attempts: 3,
+            artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+            artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+        }
+    }
+}
+
+/// Result of one worker iteration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorOperationOutcome {
+    /// Operation id.
+    pub operation_id: OperationId,
+    /// Workspace id.
+    pub workspace_id: WorkspaceId,
+    /// Final operation state.
+    pub state: OperationState,
+    /// Final workspace state.
+    pub workspace_state: WorkspaceState,
+    /// Exit code, when available.
+    pub exit_code: Option<i32>,
+}
+
+/// Errors returned by connector operation workers.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectorWorkerError {
+    /// Database error.
+    #[error(transparent)]
+    Database(#[from] DbError),
+    /// Filesystem error.
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Operation has no workspace id.
+    #[error("claimed operation has no workspace id")]
+    MissingWorkspace,
+    /// Operation has no serialized command profile.
+    #[error("claimed operation has no command profile")]
+    MissingCommandProfile,
+    /// Operation has no claim token.
+    #[error("claimed operation has no claim token")]
+    MissingClaimToken,
+    /// Operation lease was lost before completion.
+    #[error("operation lease was lost before completion")]
+    LeaseLost,
+    /// Host write lease was lost while a mutating operation was running.
+    #[error("host write lease was lost before mutating operation completion")]
+    WriteLeaseLost,
+    /// Artifact path is invalid or outside the artifact root.
+    #[error("invalid artifact path: {0}")]
+    InvalidArtifactPath(String),
+    /// Command profile JSON is invalid.
+    #[error("invalid command profile json: {0}")]
+    CommandProfileJson(#[from] serde_json::Error),
+    /// Command profile failed validation.
+    #[error("invalid command profile: {0}")]
+    CommandValidation(#[from] CommandValidationError),
+    /// File-transfer payload failed validation.
+    #[error("invalid file transfer payload: {0}")]
+    InvalidFileTransfer(String),
+    /// Transport provider failed.
+    #[error("transport provider failed: {0}")]
+    TransportProvider(String),
+    /// Transport failed.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+    /// Integer conversion failed.
+    #[error("integer conversion error: {0}")]
+    Int(#[from] std::num::TryFromIntError),
+}
+
+/// Connector PTY manager configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorPtyManagerConfig {
+    /// Connector that owns PTY sessions.
+    pub connector_id: ConnectorId,
+    /// Maximum input bytes per write.
+    pub max_input_bytes: usize,
+    /// Maximum output bytes per stored chunk.
+    pub output_limit_bytes: usize,
+    /// Claim lease duration for queued PTY input events.
+    pub input_lease_seconds: u64,
+    /// Maximum attempts for queued PTY input delivery.
+    pub input_max_attempts: u32,
+}
+
+impl ConnectorPtyManagerConfig {
+    /// Builds a production default config.
+    pub fn production_default(connector_id: ConnectorId) -> Self {
+        Self {
+            connector_id,
+            max_input_bytes: 16 * 1024,
+            output_limit_bytes: 64 * 1024,
+            input_lease_seconds: 30,
+            input_max_attempts: 3,
+        }
+    }
+}
+
+/// Result of opening a managed PTY.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConnectorPtyOpenOutcome {
+    /// PTY session record.
+    pub pty_session: PtySession,
+}
+
+/// Result of writing PTY input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorPtyInputOutcome {
+    /// PTY session id.
+    pub pty_session_id: PtySessionId,
+    /// Number of bytes accepted for delivery.
+    pub byte_len: usize,
+}
+
+/// Result of delivering one queued PTY input event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorPtyInputDeliveryOutcome {
+    /// Input event id.
+    pub input_event_id: PtyInputEventId,
+    /// PTY session id.
+    pub pty_session_id: PtySessionId,
+    /// Final queue state for the event.
+    pub state: PtyInputEventState,
+    /// Number of input bytes processed.
+    pub byte_len: usize,
+    /// Redacted delivery error, when delivery failed.
+    pub error: Option<String>,
+}
+
+/// Claims queued PTY input and delivers it through connector-owned backends.
+#[async_trait]
+pub trait QueuedPtyInputPump: Send + Sync {
+    /// Reconciles persisted PTY state with the newly started connector runtime.
+    async fn reconcile_startup(&self) -> Result<u64, ConnectorPtyError> {
+        Ok(0)
+    }
+
+    /// Activates one pending PTY before its first input is queued.
+    async fn activate_next(&self) -> Result<Option<PtySessionId>, ConnectorPtyError> {
+        Ok(None)
+    }
+
+    /// Delivers one queued PTY input event when available.
+    async fn deliver_next(
+        &self,
+    ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, ConnectorPtyError>;
+}
+
+enum PtyPumpOutcome {
+    Activated,
+    Input(ConnectorPtyInputDeliveryOutcome),
+}
+
+async fn poll_pty_pump(
+    pump: &dyn QueuedPtyInputPump,
+) -> Result<Option<PtyPumpOutcome>, ConnectorPtyError> {
+    if pump.activate_next().await?.is_some() {
+        return Ok(Some(PtyPumpOutcome::Activated));
+    }
+    Ok(pump.deliver_next().await?.map(PtyPumpOutcome::Input))
+}
+
+/// Connector PTY manager errors.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectorPtyError {
+    /// Database error.
+    #[error(transparent)]
+    Database(#[from] DbError),
+    /// Transport error.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+    /// Supervisor rejected the PTY lifecycle operation.
+    #[error(transparent)]
+    Supervisor(#[from] PtySessionSupervisorError),
+    /// Backend failed.
+    #[error("pty backend failed: {0}")]
+    Backend(String),
+    /// PTY session does not belong to this connector.
+    #[error("pty session does not belong to this connector")]
+    ConnectorMismatch,
+    /// PTY session has no active backend process.
+    #[error("pty session is not active in this connector process")]
+    NotActive,
+    /// A persisted active PTY no longer has its original connector-local runtime.
+    #[error("pty runtime continuity was lost; open a new PTY session instead of retrying input")]
+    RuntimeContinuityLost,
+    /// PTY session is not accepting input.
+    #[error("pty session input is not currently allowed")]
+    InputNotAllowed,
+    /// PTY input is invalid.
+    #[error("pty input must be non-empty, at most {0} bytes, and must not contain NUL")]
+    InvalidInput(usize),
+    /// PTY input could not be delivered.
+    #[error("pty input channel is closed")]
+    InputClosed,
+    /// Integer conversion failed.
+    #[error("integer conversion error: {0}")]
+    Int(#[from] std::num::TryFromIntError),
+}
+
+struct ActivePtyHandle {
+    input_tx: mpsc::Sender<String>,
+    close_tx: Option<oneshot::Sender<()>>,
+}
+
+/// Connector-local manager for persistent PTY backend processes.
+pub struct ConnectorPtyManager<B> {
+    repositories: Repositories,
+    backend: B,
+    config: ConnectorPtyManagerConfig,
+    active: Arc<Mutex<BTreeMap<PtySessionId, ActivePtyHandle>>>,
+}
+
+impl<B> ConnectorPtyManager<B>
+where
+    B: ManagedPtyBackend + 'static,
+{
+    /// Creates a PTY manager.
+    pub fn new(repositories: Repositories, backend: B, config: ConnectorPtyManagerConfig) -> Self {
+        Self {
+            repositories,
+            backend,
+            config,
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Reconciles stale active PTY records left by an earlier connector process.
+    ///
+    /// A connector-local PTY handle cannot be reconstructed after process exit. Marking these
+    /// records failed prevents a new shell from being mistaken for the original runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persisted PTY or workspace state cannot be updated.
+    pub async fn reconcile_startup(&self) -> Result<u64, ConnectorPtyError> {
+        let observed_at = now_utc();
+        let sessions = self
+            .repositories
+            .pty_sessions
+            .mark_active_backends_lost_for_connector(self.config.connector_id, observed_at)
+            .await?;
+        for session in &sessions {
+            self.mark_connection_channel_closed(session.session_id)
+                .await?;
+            self.repositories
+                .workspaces
+                .update_state(session.workspace_id, WorkspaceState::Blocked, observed_at)
+                .await?;
+            if let Some(workspace) = self
+                .repositories
+                .workspaces
+                .get(session.workspace_id)
+                .await?
+                && let Some(agent_session_id) = workspace.agent_session_id
+            {
+                shorten_host_write_lease(
+                    &self.repositories,
+                    workspace.host_id,
+                    agent_session_id,
+                    observed_at,
+                )
+                .await?;
+            }
+            self.append_pty_system_output(
+                session,
+                "connector runtime restarted; previous PTY backend continuity was lost; open a new PTY session",
+            )
+            .await?;
+        }
+        Ok(u64::try_from(sessions.len())?)
+    }
+
+    /// Opens a persistent PTY backend process for a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when repository state, policy, or backend spawning fails.
+    pub async fn open(
+        &self,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        cwd: Option<String>,
+    ) -> Result<ConnectorPtyOpenOutcome, ConnectorPtyError> {
+        let workspace = self
+            .repositories
+            .workspaces
+            .get(workspace_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!("workspace not found: {workspace_id}"))
+            })?;
+        if workspace.connector_id != self.config.connector_id {
+            return Err(ConnectorPtyError::ConnectorMismatch);
+        }
+        let connection = self
+            .repositories
+            .connection_sessions
+            .get(session_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!("connection session not found: {session_id}"))
+            })?;
+        let active_ptys = self
+            .repositories
+            .pty_sessions
+            .count_active_for_workspace(workspace_id)
+            .await?;
+        let mut pty_session = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            active_ptys,
+            PtySessionOpenCommand { session_id, cwd },
+        )?;
+        let process = match self.spawn_backend_process(&pty_session).await {
+            Ok(process) => process,
+            Err(error) => {
+                pty_session.backend_state = PtyBackendState::Failed;
+                pty_session.last_activity_at = now_utc();
+                self.repositories.pty_sessions.upsert(&pty_session).await?;
+                return Err(error);
+            }
+        };
+        self.apply_backend_active(&mut pty_session, &process);
+        self.persist_pty_transport_runtime(&connection, process.transport_telemetry.as_ref())
+            .await;
+        self.mark_connection_channel_open(connection).await?;
+        self.repositories.pty_sessions.upsert(&pty_session).await?;
+        self.register_active_process(&pty_session, process).await;
+        Ok(ConnectorPtyOpenOutcome { pty_session })
+    }
+
+    /// Activates the oldest pending PTY owned by this connector.
+    ///
+    /// This lets agents observe the remote banner or interactive menu before sending input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when pending state cannot be read or the backend cannot be activated.
+    pub async fn activate_next_pending(&self) -> Result<Option<PtySessionId>, ConnectorPtyError> {
+        let Some(session) = self
+            .repositories
+            .pty_sessions
+            .next_pending_for_connector(self.config.connector_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        match self.activate_existing(session.pty_session_id).await {
+            Ok(()) => Ok(Some(session.pty_session_id)),
+            Err(error) => {
+                let terminalized = self
+                    .repositories
+                    .pty_sessions
+                    .get(session.pty_session_id)
+                    .await?
+                    .is_some_and(|pty| {
+                        pty.backend_state == PtyBackendState::Failed && !pty.input_allowed
+                    });
+                if terminalized {
+                    tracing::warn!(
+                        pty_session_id = %session.pty_session_id,
+                        %error,
+                        "pending PTY activation failed and was terminalized"
+                    );
+                    Ok(Some(session.pty_session_id))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// Writes input to an active PTY backend process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when input is invalid or the PTY is not active.
+    pub async fn write_input(
+        &self,
+        pty_session_id: PtySessionId,
+        input: String,
+    ) -> Result<ConnectorPtyInputOutcome, ConnectorPtyError> {
+        validate_pty_input(&input, self.config.max_input_bytes)?;
+        let input_tx = {
+            let active = self.active.lock().await;
+            active
+                .get(&pty_session_id)
+                .map(|handle| handle.input_tx.clone())
+                .ok_or(ConnectorPtyError::NotActive)?
+        };
+        input_tx
+            .send(input.clone())
+            .await
+            .map_err(|_| ConnectorPtyError::InputClosed)?;
+        Ok(ConnectorPtyInputOutcome {
+            pty_session_id,
+            byte_len: input.len(),
+        })
+    }
+
+    /// Claims and delivers one queued PTY input event owned by this connector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue cannot be claimed or updated.
+    pub async fn deliver_next_queued_input(
+        &self,
+        lease_seconds: u64,
+        max_attempts: u32,
+    ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, ConnectorPtyError> {
+        let claimed_at = now_utc();
+        let claim_token = Uuid::new_v4().to_string();
+        let lease_expires_at = claimed_at + time::Duration::seconds(i64::try_from(lease_seconds)?);
+        let Some(claimed) = self
+            .repositories
+            .pty_input_events
+            .claim_next_for_connector(
+                self.config.connector_id,
+                &claim_token,
+                claimed_at,
+                lease_expires_at,
+                max_attempts,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let input_event_id = claimed.event.id;
+        let pty_session_id = claimed.event.pty_session_id;
+        let byte_len = claimed.input_text.len();
+        if !self
+            .acquire_pty_input_write_lease(&claimed.event, lease_seconds)
+            .await?
+        {
+            if !self
+                .repositories
+                .pty_input_events
+                .defer_claimed_for_write_lease(input_event_id, &claimed.claim_token)
+                .await?
+            {
+                return Err(ConnectorPtyError::Backend(format!(
+                    "lost PTY input claim for event {input_event_id}"
+                )));
+            }
+            return Ok(Some(ConnectorPtyInputDeliveryOutcome {
+                input_event_id,
+                pty_session_id,
+                state: PtyInputEventState::Queued,
+                byte_len: 0,
+                error: None,
+            }));
+        }
+        match self
+            .deliver_input_text(pty_session_id, claimed.input_text)
+            .await
+        {
+            Ok(_) => {
+                let finished = self
+                    .repositories
+                    .pty_input_events
+                    .finish_claimed(input_event_id, &claimed.claim_token, now_utc())
+                    .await?;
+                if !finished {
+                    return Err(ConnectorPtyError::Backend(format!(
+                        "lost PTY input claim for event {input_event_id}"
+                    )));
+                }
+                Ok(Some(ConnectorPtyInputDeliveryOutcome {
+                    input_event_id,
+                    pty_session_id,
+                    state: PtyInputEventState::Delivered,
+                    byte_len,
+                    error: None,
+                }))
+            }
+            Err(error) => {
+                let redacted_error = SecretRedactor::default().redact(&error.to_string());
+                self.repositories
+                    .pty_input_events
+                    .fail_claimed(
+                        input_event_id,
+                        &claimed.claim_token,
+                        now_utc(),
+                        &redacted_error,
+                    )
+                    .await?;
+                self.shorten_pty_input_write_lease(&claimed.event).await?;
+                Ok(Some(ConnectorPtyInputDeliveryOutcome {
+                    input_event_id,
+                    pty_session_id,
+                    state: PtyInputEventState::Failed,
+                    byte_len,
+                    error: Some(redacted_error),
+                }))
+            }
+        }
+    }
+
+    async fn acquire_pty_input_write_lease(
+        &self,
+        event: &remote_hosts_domain::PtyInputEvent,
+        lease_seconds: u64,
+    ) -> Result<bool, ConnectorPtyError> {
+        let Some(agent_session_id) = event.agent_session_id else {
+            return Ok(true);
+        };
+        let observed_at = now_utc();
+        let lease_seconds = i64::try_from(lease_seconds)?.max(PTY_WRITE_LEASE_SECONDS);
+        Ok(self
+            .repositories
+            .host_write_leases
+            .try_acquire(
+                &HostWriteLease {
+                    host_id: event.host_id,
+                    holder_agent_session_id: agent_session_id,
+                    holder_workspace_id: event.workspace_id,
+                    acquired_at: observed_at,
+                    heartbeat_at: observed_at,
+                    expires_at: observed_at + time::Duration::seconds(lease_seconds),
+                },
+                observed_at,
+            )
+            .await?
+            .is_some())
+    }
+
+    async fn shorten_pty_input_write_lease(
+        &self,
+        event: &remote_hosts_domain::PtyInputEvent,
+    ) -> Result<(), ConnectorPtyError> {
+        let Some(agent_session_id) = event.agent_session_id else {
+            return Ok(());
+        };
+        shorten_host_write_lease(
+            &self.repositories,
+            event.host_id,
+            agent_session_id,
+            now_utc(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Closes an active PTY backend process and session record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PTY does not exist or cannot be updated.
+    pub async fn close(
+        &self,
+        pty_session_id: PtySessionId,
+        last_exit_code: Option<i32>,
+    ) -> Result<PtySession, ConnectorPtyError> {
+        if let Some(mut handle) = self.active.lock().await.remove(&pty_session_id)
+            && let Some(close_tx) = handle.close_tx.take()
+        {
+            let _ = close_tx.send(());
+        }
+        let session = self
+            .repositories
+            .pty_sessions
+            .get(pty_session_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!("pty session not found: {pty_session_id}"))
+            })?;
+        let connection_session_id = session.session_id;
+        let channel_was_active = session.backend_state == PtyBackendState::Active;
+        let workspace = self
+            .repositories
+            .workspaces
+            .get(session.workspace_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!("workspace not found: {}", session.workspace_id))
+            })?;
+        if workspace.connector_id != self.config.connector_id {
+            return Err(ConnectorPtyError::ConnectorMismatch);
+        }
+        let closed = PtySessionSupervisor::default().close(session, last_exit_code);
+        self.repositories.pty_sessions.upsert(&closed).await?;
+        if channel_was_active {
+            self.mark_connection_channel_closed(connection_session_id)
+                .await?;
+        }
+        if let Some(agent_session_id) = workspace.agent_session_id {
+            shorten_host_write_lease(
+                &self.repositories,
+                workspace.host_id,
+                agent_session_id,
+                closed.last_activity_at,
+            )
+            .await?;
+        }
+        Ok(closed)
+    }
+
+    async fn deliver_input_text(
+        &self,
+        pty_session_id: PtySessionId,
+        input: String,
+    ) -> Result<ConnectorPtyInputOutcome, ConnectorPtyError> {
+        match self.write_input(pty_session_id, input.clone()).await {
+            Err(ConnectorPtyError::NotActive) => {
+                self.activate_existing(pty_session_id).await?;
+                self.write_input(pty_session_id, input).await
+            }
+            result => result,
+        }
+    }
+
+    async fn activate_existing(
+        &self,
+        pty_session_id: PtySessionId,
+    ) -> Result<(), ConnectorPtyError> {
+        if self.active.lock().await.contains_key(&pty_session_id) {
+            return Ok(());
+        }
+        let pty_session = self
+            .repositories
+            .pty_sessions
+            .get(pty_session_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!("pty session not found: {pty_session_id}"))
+            })?;
+        if pty_session.backend_state == PtyBackendState::Active {
+            self.mark_runtime_lost(pty_session).await?;
+            return Err(ConnectorPtyError::RuntimeContinuityLost);
+        }
+        if pty_session.backend_state != PtyBackendState::Pending {
+            return Err(ConnectorPtyError::RuntimeContinuityLost);
+        }
+        if !pty_session.input_allowed
+            || !matches!(
+                pty_session.state,
+                WorkspaceState::Idle | WorkspaceState::Working
+            )
+        {
+            return Err(ConnectorPtyError::InputNotAllowed);
+        }
+        let Some(workspace) = self
+            .repositories
+            .workspaces
+            .get(pty_session.workspace_id)
+            .await?
+        else {
+            let error = ConnectorPtyError::Backend(format!(
+                "workspace not found: {}",
+                pty_session.workspace_id
+            ));
+            self.mark_activation_failed(pty_session, &error.to_string(), false)
+                .await?;
+            return Err(error);
+        };
+        if workspace.connector_id != self.config.connector_id {
+            return Err(ConnectorPtyError::ConnectorMismatch);
+        }
+        if !matches!(
+            workspace.state,
+            WorkspaceState::Idle | WorkspaceState::Working
+        ) {
+            let error = ConnectorPtyError::Backend(format!(
+                "pty backing workspace is not activatable: {:?}",
+                workspace.state
+            ));
+            self.mark_activation_failed(pty_session, &error.to_string(), false)
+                .await?;
+            return Err(error);
+        }
+        let Some(connection) = self
+            .repositories
+            .connection_sessions
+            .get(pty_session.session_id)
+            .await?
+        else {
+            let error = ConnectorPtyError::Backend(format!(
+                "connection session not found: {}",
+                pty_session.session_id
+            ));
+            self.mark_activation_failed(pty_session, &error.to_string(), true)
+                .await?;
+            return Err(error);
+        };
+        if !connection_is_usable_for_workspace(&connection, &workspace) {
+            let error = ConnectorPtyError::Backend(
+                "pty backing connection is not usable for this workspace".to_owned(),
+            );
+            self.mark_activation_failed(pty_session, &error.to_string(), true)
+                .await?;
+            return Err(error);
+        }
+
+        let mut active_session = pty_session;
+        let process = match self.spawn_backend_process(&active_session).await {
+            Ok(process) => process,
+            Err(error) => {
+                self.mark_activation_failed(active_session, &error.to_string(), true)
+                    .await?;
+                return Err(error);
+            }
+        };
+        self.apply_backend_active(&mut active_session, &process);
+        self.persist_pty_transport_runtime(&connection, process.transport_telemetry.as_ref())
+            .await;
+        self.mark_connection_channel_open(connection).await?;
+        self.repositories
+            .pty_sessions
+            .upsert(&active_session)
+            .await?;
+        self.register_active_process(&active_session, process).await;
+        Ok(())
+    }
+
+    fn apply_backend_active(&self, pty_session: &mut PtySession, process: &ManagedPtyProcess) {
+        pty_session.backend_state = PtyBackendState::Active;
+        pty_session.backend_capabilities = self.backend.capabilities();
+        pty_session
+            .transport_evidence
+            .clone_from(&process.transport_evidence);
+        pty_session.last_activity_at = now_utc();
+    }
+
+    async fn persist_pty_transport_runtime(
+        &self,
+        connection: &ConnectionSession,
+        telemetry: Option<&SshTransportTelemetry>,
+    ) {
+        let Some(telemetry) = telemetry else {
+            return;
+        };
+        let runtime = SshTransportRuntime {
+            access_path_id: connection.access_path_id,
+            connector_id: connection.connector_id,
+            telemetry: telemetry.clone(),
+            updated_at: now_utc(),
+        };
+        if let Err(error) = self
+            .repositories
+            .ssh_transport_runtimes
+            .upsert(&runtime)
+            .await
+        {
+            tracing::warn!(
+                access_path_id = %connection.access_path_id,
+                session_id = %connection.session_id,
+                %error,
+                "failed to persist PTY SSH transport runtime telemetry"
+            );
+        }
+    }
+
+    async fn spawn_backend_process(
+        &self,
+        pty_session: &PtySession,
+    ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
+        self.backend
+            .spawn(PtyBackendSpawnRequest {
+                pty_session_id: pty_session.pty_session_id,
+                workspace_id: pty_session.workspace_id,
+                session_id: pty_session.session_id,
+                cwd: pty_session.cwd.clone(),
+            })
+            .await
+    }
+
+    async fn register_active_process(&self, pty_session: &PtySession, process: ManagedPtyProcess) {
+        let ManagedPtyProcess {
+            input_tx,
+            output_rx,
+            close_tx,
+            transport_telemetry: _,
+            transport_evidence: _,
+        } = process;
+        self.active.lock().await.insert(
+            pty_session.pty_session_id,
+            ActivePtyHandle {
+                input_tx,
+                close_tx: Some(close_tx),
+            },
+        );
+        self.spawn_output_writer(pty_session, output_rx);
+    }
+
+    fn spawn_output_writer(
+        &self,
+        pty_session: &PtySession,
+        mut output_rx: mpsc::Receiver<PtyBackendOutput>,
+    ) {
+        let repositories = self.repositories.clone();
+        let output_limit_bytes = self.config.output_limit_bytes;
+        let pty_session_id = pty_session.pty_session_id;
+        let workspace_id = pty_session.workspace_id;
+        let active = Arc::clone(&self.active);
+        tokio::spawn(async move {
+            let redactor = SecretRedactor::default();
+            let lease_owner = pty_lease_owner(&repositories, workspace_id).await;
+            let mut sequence = repositories
+                .pty_output_chunks
+                .next_sequence(pty_session_id)
+                .await
+                .unwrap_or(0);
+            while let Some(output) = output_rx.recv().await {
+                let (redacted_text, truncated) =
+                    redact_and_truncate(&redactor, &output.text, output_limit_bytes);
+                if redacted_text.is_empty() {
+                    continue;
+                }
+                let chunk = PtyOutputChunk {
+                    id: PtyOutputChunkId::new(),
+                    pty_session_id,
+                    workspace_id,
+                    stream: output.stream,
+                    sequence,
+                    byte_len: u64::try_from(redacted_text.len()).unwrap_or(u64::MAX),
+                    redacted_text,
+                    truncated: output.truncated || truncated,
+                    created_at: now_utc(),
+                };
+                record_pty_output_activity(
+                    &repositories,
+                    pty_session_id,
+                    workspace_id,
+                    lease_owner,
+                    chunk.created_at,
+                )
+                .await;
+                if repositories.pty_output_chunks.insert(&chunk).await.is_err() {
+                    break;
+                }
+                sequence = sequence.saturating_add(1);
+            }
+            active.lock().await.remove(&pty_session_id);
+            let Ok(Some(mut session)) = repositories.pty_sessions.get(pty_session_id).await else {
+                return;
+            };
+            if session.backend_state != PtyBackendState::Active {
+                return;
+            }
+            session.state = WorkspaceState::Done;
+            session.input_allowed = false;
+            session.foreground_process = None;
+            session.backend_state = PtyBackendState::Closed;
+            session.last_activity_at = now_utc();
+            if repositories.pty_sessions.upsert(&session).await.is_err() {
+                return;
+            }
+            if let Ok(Some(mut connection)) = repositories
+                .connection_sessions
+                .get(session.session_id)
+                .await
+            {
+                connection.open_channels = connection.open_channels.saturating_sub(1);
+                connection.last_used_at = session.last_activity_at;
+                let _ = repositories.connection_sessions.upsert(&connection).await;
+            }
+            if let Ok(Some(workspace)) = repositories.workspaces.get(workspace_id).await
+                && !matches!(
+                    workspace.state,
+                    WorkspaceState::Closed | WorkspaceState::Failed | WorkspaceState::Throttled
+                )
+            {
+                let _ = repositories
+                    .workspaces
+                    .update_state(workspace_id, WorkspaceState::Done, session.last_activity_at)
+                    .await;
+            }
+            if let Some((host_id, agent_session_id)) = lease_owner
+                && let Err(error) = shorten_host_write_lease(
+                    &repositories,
+                    host_id,
+                    agent_session_id,
+                    session.last_activity_at,
+                )
+                .await
+            {
+                tracing::warn!(
+                    %pty_session_id,
+                    %workspace_id,
+                    %error,
+                    "failed to shorten host write lease after PTY backend exit"
+                );
+            }
+        });
+    }
+
+    async fn mark_runtime_lost(&self, mut session: PtySession) -> Result<(), ConnectorPtyError> {
+        let observed_at = now_utc();
+        session.state = WorkspaceState::Blocked;
+        session.input_allowed = false;
+        session.foreground_process = None;
+        session.backend_state = PtyBackendState::Failed;
+        session.last_activity_at = observed_at;
+        self.repositories.pty_sessions.upsert(&session).await?;
+        self.mark_connection_channel_closed(session.session_id)
+            .await?;
+        self.repositories
+            .workspaces
+            .update_state(session.workspace_id, WorkspaceState::Blocked, observed_at)
+            .await?;
+        if let Some(workspace) = self
+            .repositories
+            .workspaces
+            .get(session.workspace_id)
+            .await?
+            && let Some(agent_session_id) = workspace.agent_session_id
+        {
+            shorten_host_write_lease(
+                &self.repositories,
+                workspace.host_id,
+                agent_session_id,
+                observed_at,
+            )
+            .await?;
+        }
+        self.append_pty_system_output(
+            &session,
+            "PTY backend handle is missing; runtime continuity was lost; open a new PTY session",
+        )
+        .await
+    }
+
+    async fn mark_activation_failed(
+        &self,
+        mut session: PtySession,
+        reason: &str,
+        block_workspace: bool,
+    ) -> Result<(), ConnectorPtyError> {
+        let observed_at = now_utc();
+        session.state = WorkspaceState::Blocked;
+        session.input_allowed = false;
+        session.foreground_process = None;
+        session.backend_state = PtyBackendState::Failed;
+        session.last_activity_at = observed_at;
+        self.repositories.pty_sessions.upsert(&session).await?;
+        if block_workspace
+            && let Some(workspace) = self
+                .repositories
+                .workspaces
+                .get(session.workspace_id)
+                .await?
+            && matches!(
+                workspace.state,
+                WorkspaceState::Idle | WorkspaceState::Working
+            )
+        {
+            self.repositories
+                .workspaces
+                .update_state(session.workspace_id, WorkspaceState::Blocked, observed_at)
+                .await?;
+        }
+        let reason = SecretRedactor::default().redact(reason);
+        self.append_pty_system_output(
+            &session,
+            &format!(
+                "PTY activation stopped: {reason}; automatic retry disabled; inspect the runtime snapshot and open a new PTY after recovering the workspace connection"
+            ),
+        )
+        .await
+    }
+
+    async fn mark_connection_channel_open(
+        &self,
+        mut connection: ConnectionSession,
+    ) -> Result<(), ConnectorPtyError> {
+        let access_path_id = connection.access_path_id;
+        let observed_at = now_utc();
+        let reused = matches!(
+            connection.state,
+            EntityState::Connected | EntityState::Healthy
+        );
+        connection.state = EntityState::Connected;
+        connection.last_used_at = observed_at;
+        connection.open_channels = connection.open_channels.saturating_add(1);
+        if reused {
+            connection.reused_count = connection.reused_count.saturating_add(1);
+        }
+        connection.failure_count = 0;
+        connection.last_error = None;
+        self.repositories
+            .connection_sessions
+            .upsert(&connection)
+            .await?;
+        self.repositories
+            .access_path_health
+            .upsert(&AccessPathHealth {
+                access_path_id,
+                state: EntityState::Connected,
+                last_checked_at: Some(observed_at),
+                latency_ms: None,
+                failure_count: 0,
+                last_error_code: None,
+                next_retry_at: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_connection_channel_closed(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), ConnectorPtyError> {
+        if let Some(mut connection) = self
+            .repositories
+            .connection_sessions
+            .get(session_id)
+            .await?
+        {
+            connection.open_channels = connection.open_channels.saturating_sub(1);
+            connection.last_used_at = now_utc();
+            self.repositories
+                .connection_sessions
+                .upsert(&connection)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn append_pty_system_output(
+        &self,
+        session: &PtySession,
+        message: &str,
+    ) -> Result<(), ConnectorPtyError> {
+        let sequence = self
+            .repositories
+            .pty_output_chunks
+            .next_sequence(session.pty_session_id)
+            .await?;
+        self.repositories
+            .pty_output_chunks
+            .insert(&PtyOutputChunk {
+                id: PtyOutputChunkId::new(),
+                pty_session_id: session.pty_session_id,
+                workspace_id: session.workspace_id,
+                stream: OutputStream::System,
+                sequence,
+                redacted_text: message.to_owned(),
+                byte_len: u64::try_from(message.len())?,
+                truncated: false,
+                created_at: now_utc(),
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<B> QueuedPtyInputPump for ConnectorPtyManager<B>
+where
+    B: ManagedPtyBackend + 'static,
+{
+    async fn reconcile_startup(&self) -> Result<u64, ConnectorPtyError> {
+        ConnectorPtyManager::reconcile_startup(self).await
+    }
+
+    async fn activate_next(&self) -> Result<Option<PtySessionId>, ConnectorPtyError> {
+        self.activate_next_pending().await
+    }
+
+    async fn deliver_next(
+        &self,
+    ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, ConnectorPtyError> {
+        self.deliver_next_queued_input(
+            self.config.input_lease_seconds,
+            self.config.input_max_attempts,
+        )
+        .await
+    }
+}
+
+/// Worker that claims queued operations and executes them through a reusable transport.
+pub struct ConnectorOperationWorker<P> {
+    repositories: Repositories,
+    provider: P,
+    config: ConnectorOperationWorkerConfig,
+    redactor: SecretRedactor,
+    artifact_store: Arc<dyn OutputArtifactStore>,
+}
+
+enum ClaimedOperationExecution {
+    Exec(CommandProfile),
+    Sftp(FileTransferSpec),
+}
+
+impl<P> ConnectorOperationWorker<P>
+where
+    P: RemoteTransportProvider,
+{
+    /// Creates a worker.
+    pub fn new(
+        repositories: Repositories,
+        provider: P,
+        config: ConnectorOperationWorkerConfig,
+    ) -> Self {
+        Self::with_artifact_store(
+            repositories,
+            provider,
+            config,
+            Arc::new(FileOutputArtifactStore::new(DEFAULT_ARTIFACT_ROOT)),
+        )
+    }
+
+    /// Creates a worker with an explicit output artifact store.
+    pub fn with_artifact_store(
+        repositories: Repositories,
+        provider: P,
+        config: ConnectorOperationWorkerConfig,
+        artifact_store: Arc<dyn OutputArtifactStore>,
+    ) -> Self {
+        Self {
+            repositories,
+            provider,
+            config,
+            redactor: SecretRedactor::default(),
+            artifact_store,
+        }
+    }
+
+    /// Claims and executes at most one operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for database failures or worker infrastructure failures. Operation-level
+    /// transport and validation failures are persisted to the operation before returning an
+    /// outcome.
+    pub async fn run_once(
+        &self,
+    ) -> Result<Option<ConnectorOperationOutcome>, ConnectorWorkerError> {
+        let claimed_at = now_utc();
+        if let Some(outcome) = self.exhaust_next_operation(claimed_at).await? {
+            return Ok(Some(outcome));
+        }
+
+        let lease_seconds = i64::try_from(self.config.lease_seconds)?;
+        let lease_expires_at = claimed_at + time::Duration::seconds(lease_seconds);
+        let claim_token = Uuid::new_v4().to_string();
+        let Some(operation) = self
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                self.config.connector_id,
+                &claim_token,
+                claimed_at,
+                lease_expires_at,
+                self.config.max_attempts,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        self.append_system_chunk(&operation, "operation claimed by connector worker")
+            .await?;
+        self.execute_claimed(operation).await.map(Some)
+    }
+
+    async fn exhaust_next_operation(
+        &self,
+        observed_at: time::OffsetDateTime,
+    ) -> Result<Option<ConnectorOperationOutcome>, ConnectorWorkerError> {
+        let summary = exhaustion_summary(self.config.max_attempts);
+        let Some(operation) = self
+            .repositories
+            .operations
+            .exhaust_next_for_connector(
+                self.config.connector_id,
+                observed_at,
+                self.config.max_attempts,
+                &summary,
+                &summary,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let workspace_id = operation
+            .workspace_id
+            .ok_or(ConnectorWorkerError::MissingWorkspace)?;
+        let message = format!(
+            "{} attempt_count={}; recovery_hint=inspect connector health, use an alternate access path, or queue a fresh operation after recovery",
+            summary, operation.attempt_count
+        );
+        self.append_system_chunk(&operation, &message).await?;
+        self.repositories
+            .workspaces
+            .update_state(workspace_id, WorkspaceState::Blocked, observed_at)
+            .await?;
+        Ok(Some(ConnectorOperationOutcome {
+            operation_id: operation.id,
+            workspace_id,
+            state: OperationState::Exhausted,
+            workspace_state: WorkspaceState::Blocked,
+            exit_code: None,
+        }))
+    }
+
+    async fn execute_claimed(
+        &self,
+        mut operation: OperationRun,
+    ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
+        operation
+            .workspace_id
+            .ok_or(ConnectorWorkerError::MissingWorkspace)?;
+        let execution = match Self::claimed_execution(&operation) {
+            Ok(execution) => execution,
+            Err(error) => {
+                let message = self.redactor.redact(&error.to_string());
+                self.append_system_chunk(&operation, &format!("operation rejected: {message}"))
+                    .await?;
+                return self
+                    .finish_operation(
+                        &operation,
+                        OperationState::Rejected,
+                        WorkspaceState::Failed,
+                        None,
+                        "operation rejected before execution",
+                        Some(&message),
+                    )
+                    .await;
+            }
+        };
+        if let Some(outcome) = self.defer_for_foreign_write_lease(&operation).await? {
+            return Ok(outcome);
+        }
+        if let Some((message, workspace_state)) = self.active_connection_block(&operation).await? {
+            self.append_system_chunk(&operation, &message).await?;
+            return self
+                .finish_operation(
+                    &operation,
+                    OperationState::Rejected,
+                    workspace_state,
+                    None,
+                    "operation blocked by connection protection state",
+                    Some(&message),
+                )
+                .await;
+        }
+        self.begin_connection_use(&mut operation).await?;
+        let transport = match self.provider.transport_for(&operation).await {
+            Ok(transport) => transport,
+            Err(error) => {
+                let message = self.redactor.redact(&error);
+                self.record_connection_failure(&operation, &message, None)
+                    .await?;
+                self.append_system_chunk(&operation, &format!("transport unavailable: {message}"))
+                    .await?;
+                return self
+                    .finish_operation(
+                        &operation,
+                        OperationState::Failed,
+                        WorkspaceState::Failed,
+                        None,
+                        "transport unavailable",
+                        Some(&message),
+                    )
+                    .await;
+            }
+        };
+        let before_telemetry = self
+            .transport_observation_baseline(&operation, transport.transport_telemetry())
+            .await;
+
+        match execution {
+            ClaimedOperationExecution::Exec(profile) => {
+                self.execute_exec_operation(
+                    &mut operation,
+                    transport,
+                    profile,
+                    before_telemetry.as_ref(),
+                )
+                .await
+            }
+            ClaimedOperationExecution::Sftp(spec) => {
+                self.execute_sftp_operation(
+                    &mut operation,
+                    transport,
+                    spec,
+                    before_telemetry.as_ref(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn defer_for_foreign_write_lease(
+        &self,
+        operation: &OperationRun,
+    ) -> Result<Option<ConnectorOperationOutcome>, ConnectorWorkerError> {
+        if !operation.requires_write_lease {
+            return Ok(None);
+        }
+        let (Some(agent_session_id), Some(workspace_id), Some(claim_token)) = (
+            operation.agent_session_id,
+            operation.workspace_id,
+            operation.claim_token.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let observed_at = now_utc();
+        let lease_seconds = i64::try_from(self.config.lease_seconds)?;
+        let acquired = self
+            .repositories
+            .host_write_leases
+            .try_acquire(
+                &HostWriteLease {
+                    host_id: operation.host_id,
+                    holder_agent_session_id: agent_session_id,
+                    holder_workspace_id: workspace_id,
+                    acquired_at: observed_at,
+                    heartbeat_at: observed_at,
+                    expires_at: observed_at + time::Duration::seconds(lease_seconds),
+                },
+                observed_at,
+            )
+            .await?;
+        if acquired.is_some() {
+            return Ok(None);
+        }
+        let summary = "operation is waiting for another agent session's host write lease to expire";
+        self.append_system_chunk(operation, summary).await?;
+        if !self
+            .repositories
+            .operations
+            .defer_claimed_for_write_lease(operation.id, claim_token, summary)
+            .await?
+        {
+            return Err(ConnectorWorkerError::LeaseLost);
+        }
+        Ok(Some(ConnectorOperationOutcome {
+            operation_id: operation.id,
+            workspace_id,
+            state: OperationState::Queued,
+            workspace_state: WorkspaceState::Working,
+            exit_code: None,
+        }))
+    }
+
+    async fn execute_exec_operation(
+        &self,
+        operation: &mut OperationRun,
+        transport: Arc<dyn RemoteTransport>,
+        profile: CommandProfile,
+        before_telemetry: Option<&SshTransportTelemetry>,
+    ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
+        let request = ExecRequest {
+            operation_id: operation.id,
+            host_id: operation.host_id,
+            access_path_id: operation.access_path_id,
+            profile: profile.clone(),
+        };
+        let result = self
+            .exec_with_lease_renewal(operation, Arc::clone(&transport), request)
+            .await;
+        self.record_transport_observation(
+            operation,
+            SshChannelKind::Exec,
+            before_telemetry,
+            transport.transport_telemetry(),
+        )
+        .await;
+        match result {
+            Ok(result) => self.persist_exec_result(operation, &profile, result).await,
+            Err(error) => self.persist_transport_error(operation, error).await,
+        }
+    }
+
+    async fn execute_sftp_operation(
+        &self,
+        operation: &mut OperationRun,
+        transport: Arc<dyn RemoteTransport>,
+        spec: FileTransferSpec,
+        before_telemetry: Option<&SshTransportTelemetry>,
+    ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
+        let request = SftpRequest {
+            operation_id: operation.id,
+            host_id: operation.host_id,
+            access_path_id: operation.access_path_id,
+            spec,
+        };
+        let result = self
+            .sftp_with_lease_renewal(operation, Arc::clone(&transport), request)
+            .await;
+        self.record_transport_observation(
+            operation,
+            SshChannelKind::FileTransfer,
+            before_telemetry,
+            transport.transport_telemetry(),
+        )
+        .await;
+        match result {
+            Ok(result) => self.persist_sftp_result(operation, result).await,
+            Err(error) => self.persist_transport_error(operation, error).await,
+        }
+    }
+
+    async fn record_transport_observation(
+        &self,
+        operation: &mut OperationRun,
+        channel_kind: SshChannelKind,
+        before: Option<&SshTransportTelemetry>,
+        after: Option<SshTransportTelemetry>,
+    ) {
+        let Some(after) = after else {
+            return;
+        };
+        let observed_at = now_utc();
+        let evidence =
+            SshChannelTransportEvidence::between(channel_kind, before, &after, observed_at);
+        let runtime = SshTransportRuntime {
+            access_path_id: operation.access_path_id,
+            connector_id: operation.connector_id,
+            telemetry: after,
+            updated_at: observed_at,
+        };
+        if let Err(error) = self
+            .repositories
+            .ssh_transport_runtimes
+            .upsert(&runtime)
+            .await
+        {
+            tracing::warn!(
+                operation_id = %operation.id,
+                access_path_id = %operation.access_path_id,
+                %error,
+                "failed to persist SSH transport runtime telemetry"
+            );
+        }
+        let Some(claim_token) = operation.claim_token.as_deref() else {
+            return;
+        };
+        match self
+            .repositories
+            .operations
+            .attach_transport_evidence(operation.id, claim_token, &evidence)
+            .await
+        {
+            Ok(true) => operation.transport_evidence = Some(evidence),
+            Ok(false) => {
+                tracing::warn!(
+                    operation_id = %operation.id,
+                    "SSH transport evidence was not attached because the operation lease changed"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %operation.id,
+                    %error,
+                    "failed to persist SSH transport evidence"
+                );
+            }
+        }
+    }
+
+    async fn transport_observation_baseline(
+        &self,
+        operation: &OperationRun,
+        current: Option<SshTransportTelemetry>,
+    ) -> Option<SshTransportTelemetry> {
+        let current = current?;
+        if current.generation > 0 {
+            return Some(current);
+        }
+        match self
+            .repositories
+            .ssh_transport_runtimes
+            .get(operation.access_path_id, operation.connector_id)
+            .await
+        {
+            Ok(Some(previous)) if previous.telemetry.runtime_id != current.runtime_id => {
+                Some(previous.telemetry)
+            }
+            Ok(_) => Some(current),
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %operation.id,
+                    access_path_id = %operation.access_path_id,
+                    %error,
+                    "failed to load previous SSH transport runtime telemetry"
+                );
+                Some(current)
+            }
+        }
+    }
+
+    async fn exec_with_lease_renewal(
+        &self,
+        operation: &OperationRun,
+        transport: Arc<dyn RemoteTransport>,
+        request: ExecRequest,
+    ) -> Result<ExecResult, TransportError> {
+        let claim_token = operation.claim_token.clone().ok_or_else(|| {
+            TransportError::Backend(ConnectorWorkerError::MissingClaimToken.to_string())
+        })?;
+        let renew_delay = self.lease_renew_delay();
+        let exec = transport.exec(request);
+        tokio::pin!(exec);
+
+        loop {
+            tokio::select! {
+                result = &mut exec => return result,
+                () = tokio::time::sleep(renew_delay) => {
+                    let lease_seconds = i64::try_from(self.config.lease_seconds)
+                        .map_err(|error| TransportError::Backend(error.to_string()))?;
+                    let renewed = self.repositories.operations
+                        .renew_claim(
+                            operation.id,
+                            &claim_token,
+                            now_utc() + time::Duration::seconds(lease_seconds),
+                        )
+                        .await
+                        .map_err(|error| TransportError::Backend(error.to_string()))?;
+                    if !renewed {
+                        return Err(TransportError::Backend(
+                            ConnectorWorkerError::LeaseLost.to_string(),
+                        ));
+                    }
+                    self.renew_write_lease(operation)
+                        .await
+                        .map_err(|error| TransportError::Backend(error.to_string()))?;
+                }
+            }
+        }
+    }
+
+    async fn sftp_with_lease_renewal(
+        &self,
+        operation: &OperationRun,
+        transport: Arc<dyn RemoteTransport>,
+        request: SftpRequest,
+    ) -> Result<SftpResult, TransportError> {
+        let claim_token = operation.claim_token.clone().ok_or_else(|| {
+            TransportError::Backend(ConnectorWorkerError::MissingClaimToken.to_string())
+        })?;
+        let renew_delay = self.lease_renew_delay();
+        let transfer = transport.sftp(request);
+        tokio::pin!(transfer);
+
+        loop {
+            tokio::select! {
+                result = &mut transfer => return result,
+                () = tokio::time::sleep(renew_delay) => {
+                    let lease_seconds = i64::try_from(self.config.lease_seconds)
+                        .map_err(|error| TransportError::Backend(error.to_string()))?;
+                    let renewed = self.repositories.operations
+                        .renew_claim(
+                            operation.id,
+                            &claim_token,
+                            now_utc() + time::Duration::seconds(lease_seconds),
+                        )
+                        .await
+                        .map_err(|error| TransportError::Backend(error.to_string()))?;
+                    if !renewed {
+                        return Err(TransportError::Backend(
+                            ConnectorWorkerError::LeaseLost.to_string(),
+                        ));
+                    }
+                    self.renew_write_lease(operation)
+                        .await
+                        .map_err(|error| TransportError::Backend(error.to_string()))?;
+                }
+            }
+        }
+    }
+
+    async fn renew_write_lease(
+        &self,
+        operation: &OperationRun,
+    ) -> Result<(), ConnectorWorkerError> {
+        if !operation.requires_write_lease {
+            return Ok(());
+        }
+        let (Some(agent_session_id), Some(workspace_id)) =
+            (operation.agent_session_id, operation.workspace_id)
+        else {
+            return Ok(());
+        };
+        let heartbeat_at = now_utc();
+        let lease_seconds = i64::try_from(self.config.lease_seconds)?;
+        if !self
+            .repositories
+            .host_write_leases
+            .renew(
+                operation.host_id,
+                agent_session_id,
+                workspace_id,
+                heartbeat_at,
+                heartbeat_at + time::Duration::seconds(lease_seconds),
+            )
+            .await?
+        {
+            return Err(ConnectorWorkerError::WriteLeaseLost);
+        }
+        Ok(())
+    }
+
+    fn lease_renew_delay(&self) -> Duration {
+        let lease_millis = self.config.lease_seconds.saturating_mul(1000);
+        Duration::from_millis((lease_millis / 3).clamp(250, 30_000))
+    }
+
+    fn command_profile(operation: &OperationRun) -> Result<CommandProfile, ConnectorWorkerError> {
+        let value = operation
+            .command_profile_json
+            .clone()
+            .ok_or(ConnectorWorkerError::MissingCommandProfile)?;
+        let profile: CommandProfile = serde_json::from_value(value)?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    fn claimed_execution(
+        operation: &OperationRun,
+    ) -> Result<ClaimedOperationExecution, ConnectorWorkerError> {
+        if operation.operation_type == remote_hosts_domain::OperationType::Sftp {
+            let value = operation
+                .command_profile_json
+                .clone()
+                .ok_or(ConnectorWorkerError::MissingCommandProfile)?;
+            let spec: FileTransferSpec = serde_json::from_value(value)?;
+            spec.validate()
+                .map_err(|error| ConnectorWorkerError::InvalidFileTransfer(error.to_string()))?;
+            return Ok(ClaimedOperationExecution::Sftp(spec));
+        }
+        Self::command_profile(operation).map(ClaimedOperationExecution::Exec)
+    }
+
+    async fn persist_exec_result(
+        &self,
+        operation: &OperationRun,
+        profile: &CommandProfile,
+        result: ExecResult,
+    ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
+        self.record_connection_success(operation).await?;
+        let (stdout, stdout_truncated) =
+            redact_and_truncate(&self.redactor, &result.stdout, profile.output_limit_bytes);
+        let (stderr, stderr_truncated) =
+            redact_and_truncate(&self.redactor, &result.stderr, profile.output_limit_bytes);
+        let output_truncated = result.truncated || stdout_truncated || stderr_truncated;
+        if !stdout.is_empty() {
+            self.append_stream_output(operation, OutputStream::Stdout, &stdout, output_truncated)
+                .await?;
+        }
+        if !stderr.is_empty() {
+            self.append_stream_output(operation, OutputStream::Stderr, &stderr, output_truncated)
+                .await?;
+        }
+
+        let state = if result.exit_code == Some(0) {
+            OperationState::Succeeded
+        } else {
+            OperationState::Failed
+        };
+        let workspace_state = if state == OperationState::Succeeded {
+            WorkspaceState::Done
+        } else {
+            WorkspaceState::Failed
+        };
+        let summary = format!(
+            "operation finished: state={state:?}, exit_code={:?}, stdout_bytes={}, stderr_bytes={}, truncated={output_truncated}",
+            result.exit_code,
+            stdout.len(),
+            stderr.len(),
+        );
+        self.append_system_chunk(operation, &summary).await?;
+        self.finish_operation(
+            operation,
+            state,
+            workspace_state,
+            result.exit_code,
+            &summary,
+            None,
+        )
+        .await
+    }
+
+    async fn persist_sftp_result(
+        &self,
+        operation: &OperationRun,
+        result: SftpResult,
+    ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
+        self.record_connection_success(operation).await?;
+        let direction = format!("{:?}", result.direction).to_lowercase();
+        let file_name = result.remote_path.rsplit('/').next().unwrap_or("<invalid>");
+        let summary = format!(
+            "file transfer finished: state=succeeded, direction={direction}, file={file_name}, bytes={}, sha256={}, overwrite={:?}, pooled_session=true",
+            result.bytes_transferred, result.sha256, result.overwrite
+        );
+        self.append_system_chunk(operation, &summary).await?;
+        self.finish_operation(
+            operation,
+            OperationState::Succeeded,
+            WorkspaceState::Done,
+            Some(0),
+            &summary,
+            None,
+        )
+        .await
+    }
+
+    async fn persist_transport_error(
+        &self,
+        operation: &OperationRun,
+        error: TransportError,
+    ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
+        let redacted = self.redactor.redact(&error.to_string());
+        if matches!(error, TransportError::FileTransfer(_)) {
+            self.record_connection_success(operation).await?;
+        } else {
+            self.record_connection_failure(operation, &redacted, Some(&error))
+                .await?;
+        }
+        let (state, workspace_state) = match error {
+            TransportError::PolicyDenied(_)
+            | TransportError::LocalHandshakeBudgetExhausted { .. } => {
+                (OperationState::Rejected, WorkspaceState::Throttled)
+            }
+            TransportError::Timeout => (OperationState::TimedOut, WorkspaceState::Failed),
+            TransportError::Backend(_) | TransportError::FileTransfer(_) => {
+                (OperationState::Failed, WorkspaceState::Failed)
+            }
+        };
+        self.append_system_chunk(operation, &format!("operation failed: {redacted}"))
+            .await?;
+        self.finish_operation(
+            operation,
+            state,
+            workspace_state,
+            None,
+            "operation failed during connector execution",
+            Some(&redacted),
+        )
+        .await
+    }
+
+    async fn begin_connection_use(
+        &self,
+        operation: &mut OperationRun,
+    ) -> Result<(), ConnectorWorkerError> {
+        let now = now_utc();
+        let mut session = match operation.session_id {
+            Some(session_id) => {
+                self.repositories
+                    .connection_sessions
+                    .get(session_id)
+                    .await?
+            }
+            None => {
+                self.repositories
+                    .connection_sessions
+                    .find_reusable(operation.access_path_id, operation.connector_id)
+                    .await?
+            }
+        }
+        .unwrap_or_else(|| ConnectionSession {
+            session_id: SessionId::new(),
+            access_path_id: operation.access_path_id,
+            connector_id: operation.connector_id,
+            state: EntityState::Resolving,
+            created_at: now,
+            last_used_at: now,
+            open_channels: 0,
+            reused_count: 0,
+            failure_count: 0,
+            last_error: None,
+        });
+        let reused = matches!(
+            session.state,
+            EntityState::Connected | EntityState::Healthy | EntityState::Resolving
+        );
+        session.state = if matches!(session.state, EntityState::Connected | EntityState::Healthy) {
+            EntityState::Connected
+        } else {
+            EntityState::Resolving
+        };
+        session.last_used_at = now;
+        session.open_channels = session.open_channels.saturating_add(1);
+        if reused {
+            session.reused_count = session.reused_count.saturating_add(1);
+        }
+        self.repositories
+            .connection_sessions
+            .upsert(&session)
+            .await?;
+        let claim_token = operation
+            .claim_token
+            .as_deref()
+            .ok_or(ConnectorWorkerError::MissingClaimToken)?;
+        if !self
+            .repositories
+            .operations
+            .attach_session(operation.id, claim_token, session.session_id)
+            .await?
+        {
+            return Err(ConnectorWorkerError::LeaseLost);
+        }
+        operation.session_id = Some(session.session_id);
+        Ok(())
+    }
+
+    async fn active_connection_block(
+        &self,
+        operation: &OperationRun,
+    ) -> Result<Option<(String, WorkspaceState)>, ConnectorWorkerError> {
+        let Some(health) = self
+            .repositories
+            .access_path_health
+            .get(operation.access_path_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if matches!(
+            health.state,
+            EntityState::AuthFailed | EntityState::HostKeyChanged
+        ) {
+            return Ok(Some((
+                format!(
+                    "connection blocked by {:?}; change credentials or verify the host key before retrying",
+                    health.state
+                ),
+                WorkspaceState::Blocked,
+            )));
+        }
+        if matches!(
+            health.state,
+            EntityState::RateLimited
+                | EntityState::Throttled
+                | EntityState::TargetOverloaded
+                | EntityState::CircuitOpen
+        ) && health
+            .next_retry_at
+            .is_none_or(|retry_at| retry_at > now_utc())
+        {
+            return Ok(Some((
+                format!(
+                    "connection cooldown is active: state={:?}, next_retry_at={:?}; reuse cached state and wait",
+                    health.state, health.next_retry_at
+                ),
+                WorkspaceState::Throttled,
+            )));
+        }
+        Ok(None)
+    }
+
+    async fn record_connection_success(
+        &self,
+        operation: &OperationRun,
+    ) -> Result<(), ConnectorWorkerError> {
+        let Some(session_id) = operation.session_id else {
+            return Ok(());
+        };
+        let now = now_utc();
+        if let Some(mut session) = self
+            .repositories
+            .connection_sessions
+            .get(session_id)
+            .await?
+        {
+            session.state = EntityState::Connected;
+            session.last_used_at = now;
+            session.open_channels = session.open_channels.saturating_sub(1);
+            session.failure_count = 0;
+            session.last_error = None;
+            self.repositories
+                .connection_sessions
+                .upsert(&session)
+                .await?;
+        }
+        self.repositories
+            .access_path_health
+            .upsert(&AccessPathHealth {
+                access_path_id: operation.access_path_id,
+                state: EntityState::Connected,
+                last_checked_at: Some(now),
+                latency_ms: None,
+                failure_count: 0,
+                last_error_code: None,
+                next_retry_at: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn record_connection_failure(
+        &self,
+        operation: &OperationRun,
+        message: &str,
+        error: Option<&TransportError>,
+    ) -> Result<(), ConnectorWorkerError> {
+        let Some(session_id) = operation.session_id else {
+            return Ok(());
+        };
+        let now = now_utc();
+        let local_handshake_budget = matches!(
+            error,
+            Some(TransportError::LocalHandshakeBudgetExhausted { .. })
+        );
+        let (mut state, mut reason_code, mut retry_after_seconds) = match error {
+            Some(TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds,
+            }) => (
+                EntityState::Throttled,
+                StateReasonCode::LocalHandshakeBudgetExhausted,
+                Some(*retry_after_seconds),
+            ),
+            Some(TransportError::PolicyDenied(_)) => (
+                EntityState::RateLimited,
+                StateReasonCode::TargetSshdRateLimited,
+                Some(60),
+            ),
+            Some(TransportError::Timeout) => (
+                EntityState::Degraded,
+                StateReasonCode::SshHandshakeFailed,
+                Some(30),
+            ),
+            Some(TransportError::FileTransfer(_)) => {
+                return self.record_connection_success(operation).await;
+            }
+            Some(TransportError::Backend(_)) | None => classify_connection_failure(message),
+        };
+        let mut failure_count = 1;
+        if let Some(mut session) = self
+            .repositories
+            .connection_sessions
+            .get(session_id)
+            .await?
+        {
+            session.last_used_at = now;
+            session.open_channels = session.open_channels.saturating_sub(1);
+            if !local_handshake_budget {
+                session.failure_count = session.failure_count.saturating_add(1);
+            }
+            failure_count = session.failure_count;
+            if !local_handshake_budget
+                && failure_count >= 3
+                && !matches!(state, EntityState::AuthFailed | EntityState::HostKeyChanged)
+            {
+                state = EntityState::CircuitOpen;
+                reason_code = StateReasonCode::CircuitOpen;
+                retry_after_seconds = Some(300);
+            }
+            session.state = state.clone();
+            session.last_error = Some(message.to_owned());
+            self.repositories
+                .connection_sessions
+                .upsert(&session)
+                .await?;
+        }
+        let next_retry_at = retry_after_seconds.map(|seconds| {
+            now + time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX))
+        });
+        self.repositories
+            .access_path_health
+            .upsert(&AccessPathHealth {
+                access_path_id: operation.access_path_id,
+                state,
+                last_checked_at: Some(now),
+                latency_ms: None,
+                failure_count,
+                last_error_code: Some(reason_code),
+                next_retry_at,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn finish_operation(
+        &self,
+        operation: &OperationRun,
+        state: OperationState,
+        workspace_state: WorkspaceState,
+        exit_code: Option<i32>,
+        summary: &str,
+        last_error: Option<&str>,
+    ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
+        let workspace_id = operation
+            .workspace_id
+            .ok_or(ConnectorWorkerError::MissingWorkspace)?;
+        let claim_token = operation
+            .claim_token
+            .as_deref()
+            .ok_or(ConnectorWorkerError::MissingClaimToken)?;
+        let finished_at = now_utc();
+        let finished = self
+            .repositories
+            .operations
+            .finish_claimed(ClaimedOperationFinish {
+                id: operation.id,
+                claim_token,
+                state: state.clone(),
+                finished_at,
+                exit_code,
+                redacted_output_summary: Some(summary),
+                last_error,
+            })
+            .await?;
+        if !finished {
+            return Err(ConnectorWorkerError::LeaseLost);
+        }
+        self.repositories
+            .workspaces
+            .update_state(workspace_id, workspace_state.clone(), finished_at)
+            .await?;
+        self.shorten_write_lease_after_completion(operation, finished_at)
+            .await?;
+        Ok(ConnectorOperationOutcome {
+            operation_id: operation.id,
+            workspace_id,
+            state,
+            workspace_state,
+            exit_code,
+        })
+    }
+
+    async fn shorten_write_lease_after_completion(
+        &self,
+        operation: &OperationRun,
+        finished_at: time::OffsetDateTime,
+    ) -> Result<(), ConnectorWorkerError> {
+        if !operation.requires_write_lease {
+            return Ok(());
+        }
+        let Some(agent_session_id) = operation.agent_session_id else {
+            return Ok(());
+        };
+        if self
+            .repositories
+            .host_write_leases
+            .has_pending_write_work(operation.host_id, agent_session_id)
+            .await?
+        {
+            return Ok(());
+        }
+        self.repositories
+            .host_write_leases
+            .shorten(
+                operation.host_id,
+                agent_session_id,
+                finished_at,
+                finished_at + time::Duration::seconds(WRITE_LEASE_HANDOFF_GRACE_SECONDS),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn append_system_chunk(
+        &self,
+        operation: &OperationRun,
+        message: &str,
+    ) -> Result<(), ConnectorWorkerError> {
+        self.append_output_chunk(operation, OutputStream::System, message, false)
+            .await
+    }
+
+    async fn append_stream_output(
+        &self,
+        operation: &OperationRun,
+        stream: OutputStream,
+        text: &str,
+        truncated: bool,
+    ) -> Result<(), ConnectorWorkerError> {
+        if text.len() <= self.config.artifact_threshold_bytes {
+            return self
+                .append_output_chunk(operation, stream, text, truncated)
+                .await;
+        }
+
+        let preview = preview_text(text, self.config.artifact_preview_bytes);
+        let artifact = self
+            .artifact_store
+            .write_artifact(OutputArtifactWriteRequest {
+                operation,
+                stream: stream.clone(),
+                redacted_text: text,
+                redacted_preview: preview,
+                truncated,
+            })
+            .await?;
+        self.repositories
+            .operation_output_artifacts
+            .insert(&artifact)
+            .await?;
+        let summary = format!(
+            "large {stream:?} output stored as artifact_id={} bytes={} sha256={} truncated={}\n{}",
+            artifact.id,
+            artifact.byte_len,
+            artifact.sha256,
+            artifact.truncated,
+            artifact.redacted_preview,
+        );
+        self.append_output_chunk(operation, stream, &summary, true)
+            .await
+    }
+
+    async fn append_output_chunk(
+        &self,
+        operation: &OperationRun,
+        stream: OutputStream,
+        text: &str,
+        truncated: bool,
+    ) -> Result<(), ConnectorWorkerError> {
+        let workspace_id = operation
+            .workspace_id
+            .ok_or(ConnectorWorkerError::MissingWorkspace)?;
+        let redacted_text = self.redactor.redact(text);
+        let sequence = self
+            .repositories
+            .operation_output_chunks
+            .next_sequence(operation.id)
+            .await?;
+        let chunk = OperationOutputChunk {
+            id: OperationOutputChunkId::new(),
+            operation_id: operation.id,
+            workspace_id,
+            stream,
+            sequence,
+            byte_len: u64::try_from(redacted_text.len())?,
+            redacted_text,
+            truncated,
+            created_at: now_utc(),
+        };
+        self.repositories
+            .operation_output_chunks
+            .insert(&chunk)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Long-running connector daemon configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorDaemonConfig {
+    /// Connector id.
+    pub connector_id: ConnectorId,
+    /// Connector version written into heartbeat records.
+    pub version: String,
+    /// Optional current network label.
+    pub current_network: Option<String>,
+    /// Heartbeat interval in milliseconds.
+    pub heartbeat_interval_ms: u64,
+    /// Minimum idle poll delay in milliseconds.
+    pub idle_min_delay_ms: u64,
+    /// Maximum idle poll delay in milliseconds.
+    pub idle_max_delay_ms: u64,
+    /// Backoff after infrastructure errors in milliseconds.
+    pub error_backoff_ms: u64,
+}
+
+impl ConnectorDaemonConfig {
+    /// Returns a normalized config with nonzero delays and a valid idle range.
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        if self.version.trim().is_empty() {
+            "unknown".clone_into(&mut self.version);
+        }
+        self.heartbeat_interval_ms = self.heartbeat_interval_ms.max(1);
+        self.idle_min_delay_ms = self.idle_min_delay_ms.max(1);
+        self.idle_max_delay_ms = self.idle_max_delay_ms.max(self.idle_min_delay_ms);
+        self.error_backoff_ms = self.error_backoff_ms.max(1);
+        self
+    }
+}
+
+/// Daemon stop reason.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorDaemonStopReason {
+    /// A shutdown signal was received.
+    ShutdownSignal,
+}
+
+/// Connector daemon execution summary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorDaemonReport {
+    /// Number of connector-local SSH sessions invalidated at connector startup.
+    pub reconciled_connection_sessions: u64,
+    /// Number of connector-local transport runtimes marked lost at startup.
+    pub reconciled_transport_runtimes: u64,
+    /// Number of stale active PTY records reconciled at connector startup.
+    pub reconciled_pty_sessions: u64,
+    /// Number of completed worker iterations with claimed operations.
+    pub completed_operations: u64,
+    /// Number of queued PTY input events delivered by an attached pump.
+    pub delivered_pty_inputs: u64,
+    /// Number of queued PTY input events marked failed by an attached pump.
+    pub failed_pty_inputs: u64,
+    /// Number of idle polls where no operation was available.
+    pub idle_polls: u64,
+    /// Number of infrastructure errors encountered by the loop.
+    pub infrastructure_errors: u64,
+    /// Stop reason.
+    pub stop_reason: ConnectorDaemonStopReason,
+}
+
+/// Connector daemon errors.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectorDaemonError {
+    /// Database error.
+    #[error(transparent)]
+    Database(#[from] DbError),
+    /// Connector is missing from registry.
+    #[error("connector not found: {0}")]
+    ConnectorNotFound(ConnectorId),
+}
+
+/// Long-running connector daemon with heartbeat, backoff, and graceful shutdown.
+pub struct ConnectorDaemon<P> {
+    repositories: Repositories,
+    worker: ConnectorOperationWorker<P>,
+    config: ConnectorDaemonConfig,
+    pty_input_pump: Option<Arc<dyn QueuedPtyInputPump>>,
+}
+
+impl<P> ConnectorDaemon<P>
+where
+    P: RemoteTransportProvider,
+{
+    /// Creates a daemon from repositories, provider, worker config, and daemon config.
+    pub fn new(
+        repositories: Repositories,
+        provider: P,
+        worker_config: ConnectorOperationWorkerConfig,
+        config: ConnectorDaemonConfig,
+    ) -> Self {
+        let worker = ConnectorOperationWorker::new(repositories.clone(), provider, worker_config);
+        Self {
+            repositories,
+            worker,
+            config: config.normalized(),
+            pty_input_pump: None,
+        }
+    }
+
+    /// Creates a daemon with an explicit output artifact store.
+    pub fn with_artifact_store(
+        repositories: Repositories,
+        provider: P,
+        worker_config: ConnectorOperationWorkerConfig,
+        config: ConnectorDaemonConfig,
+        artifact_store: Arc<dyn OutputArtifactStore>,
+    ) -> Self {
+        let worker = ConnectorOperationWorker::with_artifact_store(
+            repositories.clone(),
+            provider,
+            worker_config,
+            artifact_store,
+        );
+        Self {
+            repositories,
+            worker,
+            config: config.normalized(),
+            pty_input_pump: None,
+        }
+    }
+
+    /// Attaches a connector-owned PTY input pump to the daemon loop.
+    #[must_use]
+    pub fn with_pty_input_pump(mut self, pump: Arc<dyn QueuedPtyInputPump>) -> Self {
+        self.pty_input_pump = Some(pump);
+        self
+    }
+
+    /// Runs until the shutdown receiver becomes true or its sender is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when connector heartbeat persistence fails.
+    pub async fn run_until_stopped(
+        &self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<ConnectorDaemonReport, ConnectorDaemonError> {
+        let mut report = ConnectorDaemonReport {
+            reconciled_connection_sessions: 0,
+            reconciled_transport_runtimes: 0,
+            reconciled_pty_sessions: 0,
+            completed_operations: 0,
+            delivered_pty_inputs: 0,
+            failed_pty_inputs: 0,
+            idle_polls: 0,
+            infrastructure_errors: 0,
+            stop_reason: ConnectorDaemonStopReason::ShutdownSignal,
+        };
+        let mut idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
+        let max_idle_delay = Duration::from_millis(self.config.idle_max_delay_ms);
+        let heartbeat_interval = Duration::from_millis(self.config.heartbeat_interval_ms);
+        let mut next_heartbeat = Instant::now();
+
+        self.reconcile_runtime_startup(&mut report).await?;
+
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+
+            let now = Instant::now();
+            if now >= next_heartbeat {
+                self.record_connector_state(EntityState::Healthy).await?;
+                next_heartbeat = now + heartbeat_interval;
+            }
+
+            if let Some(pump) = &self.pty_input_pump {
+                match poll_pty_pump(pump.as_ref()).await {
+                    Ok(Some(PtyPumpOutcome::Activated)) => {
+                        idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
+                        continue;
+                    }
+                    Ok(Some(PtyPumpOutcome::Input(outcome))) => {
+                        match outcome.state {
+                            PtyInputEventState::Delivered => report.delivered_pty_inputs += 1,
+                            PtyInputEventState::Failed => report.failed_pty_inputs += 1,
+                            PtyInputEventState::Queued | PtyInputEventState::Claimed => {}
+                        }
+                        idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        report.infrastructure_errors += 1;
+                        tracing::warn!(%error, "connector daemon PTY pump error");
+                        self.record_connector_state(EntityState::Degraded).await?;
+                        if sleep_or_stop(
+                            Duration::from_millis(self.config.error_backoff_ms),
+                            &mut shutdown,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            match self.worker.run_once().await {
+                Ok(Some(_outcome)) => {
+                    report.completed_operations += 1;
+                    idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
+                }
+                Ok(None) => {
+                    report.idle_polls += 1;
+                    if sleep_or_stop(idle_delay, &mut shutdown).await {
+                        break;
+                    }
+                    idle_delay = doubled_duration(idle_delay, max_idle_delay);
+                }
+                Err(error) => {
+                    report.infrastructure_errors += 1;
+                    tracing::warn!(%error, "connector daemon infrastructure error");
+                    self.record_connector_state(EntityState::Degraded).await?;
+                    if sleep_or_stop(
+                        Duration::from_millis(self.config.error_backoff_ms),
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.record_connector_state(EntityState::ConnectorOffline)
+            .await?;
+        Ok(report)
+    }
+
+    async fn reconcile_runtime_startup(
+        &self,
+        report: &mut ConnectorDaemonReport,
+    ) -> Result<(), ConnectorDaemonError> {
+        let observed_at = now_utc();
+        report.reconciled_connection_sessions = self
+            .repositories
+            .connection_sessions
+            .mark_runtime_lost_for_connector(self.config.connector_id, observed_at)
+            .await?;
+        report.reconciled_transport_runtimes = self
+            .repositories
+            .ssh_transport_runtimes
+            .mark_runtime_lost_for_connector(self.config.connector_id, observed_at)
+            .await?;
+        self.record_connector_state(EntityState::Healthy).await?;
+        if let Some(pump) = &self.pty_input_pump {
+            match pump.reconcile_startup().await {
+                Ok(count) => report.reconciled_pty_sessions = count,
+                Err(error) => {
+                    report.infrastructure_errors += 1;
+                    tracing::warn!(%error, "connector daemon PTY startup reconciliation failed");
+                    self.record_connector_state(EntityState::Degraded).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_connector_state(&self, state: EntityState) -> Result<(), ConnectorDaemonError> {
+        let observed_at = now_utc();
+        let (old_state, connector) = self
+            .repositories
+            .connectors
+            .update_heartbeat(
+                self.config.connector_id,
+                state,
+                Some(&self.config.version),
+                self.config.current_network.as_deref(),
+                observed_at,
+            )
+            .await?
+            .ok_or(ConnectorDaemonError::ConnectorNotFound(
+                self.config.connector_id,
+            ))?;
+        let outcome = ConnectorStateTracker::record_heartbeat(
+            self.config.connector_id,
+            old_state,
+            connector.state,
+            observed_at,
+        );
+        if let Some(event) = outcome.event {
+            self.repositories.state_events.insert(&event).await?;
+        }
+        Ok(())
+    }
+}
+
+async fn sleep_or_stop(delay: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+
+    tokio::select! {
+        () = tokio::time::sleep(delay) => *shutdown.borrow(),
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+    }
+}
+
+fn doubled_duration(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
+}
+
+/// Request to create a file-backed output artifact.
+#[derive(Clone, Debug)]
+pub struct OutputArtifactWriteRequest<'a> {
+    /// Operation.
+    pub operation: &'a OperationRun,
+    /// Output stream.
+    pub stream: OutputStream,
+    /// Redacted output text.
+    pub redacted_text: &'a str,
+    /// Redacted preview text.
+    pub redacted_preview: String,
+    /// Whether the original output was truncated before storage.
+    pub truncated: bool,
+}
+
+/// Output artifact store.
+#[async_trait]
+pub trait OutputArtifactStore: Send + Sync {
+    /// Writes an output artifact and returns its metadata.
+    async fn write_artifact(
+        &self,
+        request: OutputArtifactWriteRequest<'_>,
+    ) -> Result<OperationOutputArtifact, ConnectorWorkerError>;
+
+    /// Reads a bounded prefix from an artifact.
+    async fn read_artifact_prefix(
+        &self,
+        artifact: &OperationOutputArtifact,
+        max_bytes: usize,
+    ) -> Result<String, ConnectorWorkerError>;
+}
+
+/// File-backed artifact store rooted in a configured directory.
+#[derive(Clone, Debug)]
+pub struct FileOutputArtifactStore {
+    root: PathBuf,
+}
+
+impl FileOutputArtifactStore {
+    /// Creates a file artifact store.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn relative_path(
+        artifact_id: OperationOutputArtifactId,
+        operation: &OperationRun,
+        stream: &OutputStream,
+    ) -> String {
+        format!(
+            "{}/{}/{}-{}.log",
+            operation.host_id,
+            operation.id,
+            artifact_id,
+            stream_name(stream)
+        )
+    }
+
+    fn absolute_path(&self, relative_path: &str) -> Result<PathBuf, ConnectorWorkerError> {
+        if relative_path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err(ConnectorWorkerError::InvalidArtifactPath(
+                relative_path.to_owned(),
+            ));
+        }
+        Ok(self.root.join(relative_path))
+    }
+}
+
+#[async_trait]
+impl OutputArtifactStore for FileOutputArtifactStore {
+    async fn write_artifact(
+        &self,
+        request: OutputArtifactWriteRequest<'_>,
+    ) -> Result<OperationOutputArtifact, ConnectorWorkerError> {
+        let workspace_id = request
+            .operation
+            .workspace_id
+            .ok_or(ConnectorWorkerError::MissingWorkspace)?;
+        let artifact_id = OperationOutputArtifactId::new();
+        let relative_path = Self::relative_path(artifact_id, request.operation, &request.stream);
+        let path = self.absolute_path(&relative_path)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let bytes = request.redacted_text.as_bytes();
+        tokio::fs::write(&path, bytes).await?;
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        Ok(OperationOutputArtifact {
+            id: artifact_id,
+            operation_id: request.operation.id,
+            workspace_id,
+            stream: request.stream,
+            relative_path,
+            byte_len: u64::try_from(bytes.len())?,
+            sha256,
+            redacted_preview: request.redacted_preview,
+            truncated: request.truncated,
+            created_at: now_utc(),
+        })
+    }
+
+    async fn read_artifact_prefix(
+        &self,
+        artifact: &OperationOutputArtifact,
+        max_bytes: usize,
+    ) -> Result<String, ConnectorWorkerError> {
+        let root = canonical_root(&self.root).await?;
+        let path = self.absolute_path(&artifact.relative_path)?;
+        let canonical_path = tokio::fs::canonicalize(&path).await?;
+        if !canonical_path.starts_with(&root) {
+            return Err(ConnectorWorkerError::InvalidArtifactPath(
+                artifact.relative_path.clone(),
+            ));
+        }
+        let bytes = tokio::fs::read(&canonical_path).await?;
+        let limit = max_bytes.min(bytes.len());
+        Ok(String::from_utf8_lossy(&bytes[..limit]).to_string())
+    }
+}
+
+async fn canonical_root(root: &Path) -> Result<PathBuf, ConnectorWorkerError> {
+    tokio::fs::create_dir_all(root).await?;
+    tokio::fs::canonicalize(root)
+        .await
+        .map_err(ConnectorWorkerError::from)
+}
+
+fn stream_name(stream: &OutputStream) -> &'static str {
+    match stream {
+        OutputStream::Stdout => "stdout",
+        OutputStream::Stderr => "stderr",
+        OutputStream::System => "system",
+    }
+}
+
+fn preview_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut preview = text[..end].to_owned();
+    preview.push_str("\n<artifact-preview-truncated>");
+    preview
+}
+
+fn validate_pty_input(input: &str, max_input_bytes: usize) -> Result<(), ConnectorPtyError> {
+    if input.is_empty() || input.len() > max_input_bytes || input.as_bytes().contains(&0) {
+        return Err(ConnectorPtyError::InvalidInput(max_input_bytes));
+    }
+    Ok(())
+}
+
+async fn shorten_host_write_lease(
+    repositories: &Repositories,
+    host_id: HostId,
+    agent_session_id: AgentSessionId,
+    observed_at: time::OffsetDateTime,
+) -> Result<(), DbError> {
+    if repositories
+        .host_write_leases
+        .has_pending_write_work(host_id, agent_session_id)
+        .await?
+    {
+        return Ok(());
+    }
+    repositories
+        .host_write_leases
+        .shorten(
+            host_id,
+            agent_session_id,
+            observed_at,
+            observed_at + time::Duration::seconds(WRITE_LEASE_HANDOFF_GRACE_SECONDS),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn record_pty_output_activity(
+    repositories: &Repositories,
+    pty_session_id: PtySessionId,
+    workspace_id: WorkspaceId,
+    lease_owner: Option<(HostId, AgentSessionId)>,
+    observed_at: time::OffsetDateTime,
+) {
+    match repositories
+        .pty_sessions
+        .touch_activity_if_active(pty_session_id, observed_at)
+        .await
+    {
+        Ok(true) => {
+            if let Some((host_id, agent_session_id)) = lease_owner
+                && let Err(error) = repositories
+                    .host_write_leases
+                    .renew(
+                        host_id,
+                        agent_session_id,
+                        workspace_id,
+                        observed_at,
+                        observed_at + time::Duration::seconds(PTY_WRITE_LEASE_SECONDS),
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    %pty_session_id,
+                    %workspace_id,
+                    %error,
+                    "failed to renew host write lease from PTY output activity"
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                %pty_session_id,
+                %workspace_id,
+                %error,
+                "failed to persist PTY output activity"
+            );
+        }
+    }
+}
+
+async fn pty_lease_owner(
+    repositories: &Repositories,
+    workspace_id: WorkspaceId,
+) -> Option<(HostId, AgentSessionId)> {
+    repositories
+        .workspaces
+        .get(workspace_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|workspace| {
+            workspace
+                .agent_session_id
+                .map(|agent_session_id| (workspace.host_id, agent_session_id))
+        })
+}
+
+fn shell_start_script(cwd: Option<&str>) -> String {
+    cwd.map_or_else(
+        || "exec ${SHELL:-sh} -i".to_owned(),
+        |cwd| format!("cd {} && exec ${{SHELL:-sh}} -i", shell_quote(cwd)),
+    )
+}
+
+fn shell_change_dir_input(cwd: Option<&str>) -> Option<String> {
+    cwd.map(|cwd| format!("cd -- {}\n", shell_quote(cwd)))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn exhaustion_summary(max_attempts: u32) -> String {
+    format!(
+        "automatic connector retry budget exhausted after max_attempts={max_attempts}; operation will not be claimed again automatically"
+    )
+}
+
+fn connection_is_usable_for_workspace(
+    connection: &ConnectionSession,
+    workspace: &AgentWorkspace,
+) -> bool {
+    connection.access_path_id == workspace.access_path_id
+        && connection.connector_id == workspace.connector_id
+        && matches!(
+            connection.state,
+            EntityState::Resolving | EntityState::Connected | EntityState::Healthy
+        )
+}
+
+fn classify_connection_failure(message: &str) -> (EntityState, StateReasonCode, Option<u64>) {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("host key") || normalized.contains("known_hosts") {
+        return (
+            EntityState::HostKeyChanged,
+            StateReasonCode::SshHandshakeFailed,
+            None,
+        );
+    }
+    if normalized.contains("permission denied")
+        || normalized.contains("authentication")
+        || normalized.contains("credential")
+    {
+        return (
+            EntityState::AuthFailed,
+            StateReasonCode::SshAuthFailed,
+            None,
+        );
+    }
+    if normalized.contains("rate limit")
+        || normalized.contains("too many connections")
+        || normalized.contains("maxstartups")
+    {
+        return (
+            EntityState::RateLimited,
+            StateReasonCode::TargetSshdRateLimited,
+            Some(300),
+        );
+    }
+    (
+        EntityState::SshHandshakeFailed,
+        StateReasonCode::SshHandshakeFailed,
+        Some(30),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use remote_hosts_core::{
+        CheckRequest, CheckResult, CommandClass, CommandProfile, CommandProfileCatalog,
+        DEFAULT_SFTP_MAX_SIZE_BYTES, DEFAULT_SFTP_TIMEOUT_SECONDS, ExecRequest, ExecResult,
+        FileTransferSpec, ForwardHandle, ForwardRequest, PtySessionOpenCommand,
+        PtySessionSupervisor, RemoteTransport, SftpDirection, SftpOverwritePolicy, SftpRequest,
+        SftpResult, WorkspaceFileTransfer, WorkspaceOperationSupervisor, WorkspaceRunCommand,
+        transport::TransportError,
+    };
+    use remote_hosts_db::{Repositories, connect_sqlite, migrate};
+    use remote_hosts_domain::{
+        AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId,
+        AgentSessionState, AgentWorkspace, AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason,
+        AuthorizedKeyBootstrapState, ConnectionMode, ConnectionSession, Connector, ConnectorId,
+        CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId,
+        EnvironmentKind, Host, HostId, HostKind, HostWriteLease, OperationId, OperationRun,
+        OperationState, OutputStream, Protocol, PtyBackendCapabilities, PtyBackendState,
+        PtyInputEvent, PtyInputEventId, PtyInputEventState, PtySessionId, RiskLevel, RouteType,
+        SessionId, SshChannelKind, SshConnectionUse, SshFileTransferMode, SshTransportBackend,
+        SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
+        SshTransportRuntimeState, SshTransportTelemetry, StateReasonCode, StoredCredential,
+        TrustLevel, WorkspaceId, WorkspaceState, now_utc,
+    };
+    use serde_json::json;
+    use tokio::sync::{mpsc, oneshot, watch};
+
+    use super::{
+        ConnectorDaemon, ConnectorDaemonConfig, ConnectorOperationWorker,
+        ConnectorOperationWorkerConfig, ConnectorPtyInputDeliveryOutcome, ConnectorPtyManager,
+        ConnectorPtyManagerConfig, DEFAULT_ARTIFACT_PREVIEW_BYTES,
+        DEFAULT_ARTIFACT_THRESHOLD_BYTES, FileOutputArtifactStore, GuardedTransport, HostKeyPolicy,
+        ManagedPtyBackend, ManagedPtyProcess, OpenSshTransport, OpenSshTransportPool,
+        OpenSshTransportProvider, OutputArtifactStore, PtyBackendOutput, PtyBackendSpawnRequest,
+        QueuedPtyInputPump, RemoteTransportProvider, RusshPtyBackendFactory, RusshTransportPool,
+        SshCredentialProvider, StaticTransportProvider, TransportTelemetryTracker,
+        authorized_key_bootstrap_failure_state, authorized_key_bootstrap_is_eligible,
+        execute_authorized_key_install_with_timeout,
+    };
+    use remote_hosts_core::ServerProtectionPolicy;
+    use remote_hosts_vault::{CredentialSecret, CredentialVault};
+    use secrecy::{ExposeSecret, SecretString};
+
+    struct FakeTransport;
+
+    struct TelemetryFakeTransport {
+        tracker: Arc<TransportTelemetryTracker>,
+    }
+
+    impl TelemetryFakeTransport {
+        fn new() -> Self {
+            Self {
+                tracker: Arc::new(TransportTelemetryTracker::new(
+                    SshTransportBackend::Russh,
+                    SshTransportCapabilities::pooled(SshFileTransferMode::Sftp),
+                )),
+            }
+        }
+
+        fn mark_channel_use(&self) {
+            if self.tracker.snapshot().state == SshTransportRuntimeState::Ready {
+                self.tracker.session_reused(now_utc());
+            } else {
+                self.tracker.connection_attempted();
+                self.tracker.handshake_succeeded(now_utc());
+            }
+        }
+    }
+
+    #[test]
+    fn transport_telemetry_tracks_handshake_reuse_and_disconnect() {
+        let tracker = TransportTelemetryTracker::new(
+            SshTransportBackend::Russh,
+            SshTransportCapabilities::pooled(SshFileTransferMode::Sftp),
+        );
+        assert_eq!(tracker.snapshot().state, SshTransportRuntimeState::Cold);
+
+        tracker.connection_attempted();
+        assert_eq!(
+            tracker.snapshot().state,
+            SshTransportRuntimeState::Connecting
+        );
+        tracker.handshake_succeeded(now_utc());
+        tracker.session_reused(now_utc());
+        let ready = tracker.snapshot();
+        assert_eq!(ready.state, SshTransportRuntimeState::Ready);
+        assert_eq!(ready.generation, 1);
+        assert_eq!(ready.connection_attempt_count, 1);
+        assert_eq!(ready.successful_handshake_count, 1);
+        assert_eq!(ready.reuse_count, 1);
+
+        tracker.disconnected();
+        assert_eq!(
+            tracker.snapshot().state,
+            SshTransportRuntimeState::Disconnected
+        );
+    }
+
+    struct OneShotPtyInputPump {
+        delivered: AtomicBool,
+    }
+
+    impl OneShotPtyInputPump {
+        fn new() -> Self {
+            Self {
+                delivered: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl QueuedPtyInputPump for OneShotPtyInputPump {
+        async fn deliver_next(
+            &self,
+        ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, super::ConnectorPtyError> {
+            if self.delivered.swap(true, Ordering::SeqCst) {
+                return Ok(None);
+            }
+            Ok(Some(ConnectorPtyInputDeliveryOutcome {
+                input_event_id: PtyInputEventId::new(),
+                pty_session_id: PtySessionId::new(),
+                state: PtyInputEventState::Delivered,
+                byte_len: 1,
+                error: None,
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteTransport for FakeTransport {
+        async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
+            Ok(CheckResult {
+                ok: true,
+                latency_ms: Some(1),
+                message: "ok".to_owned(),
+            })
+        }
+
+        async fn exec(&self, _request: ExecRequest) -> Result<ExecResult, TransportError> {
+            Ok(ExecResult {
+                exit_code: Some(0),
+                stdout: "password=hunter2\nhello".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            })
+        }
+
+        async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+            Ok(SftpResult {
+                direction: request.spec.direction,
+                bytes_transferred: 0,
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_owned(),
+                local_path: request.spec.local_path,
+                remote_path: request.spec.remote_path,
+                overwrite: request.spec.overwrite,
+            })
+        }
+
+        async fn open_forward(
+            &self,
+            _request: ForwardRequest,
+        ) -> Result<ForwardHandle, TransportError> {
+            Err(TransportError::Backend("not implemented".to_owned()))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteTransport for TelemetryFakeTransport {
+        fn transport_telemetry(&self) -> Option<SshTransportTelemetry> {
+            Some(self.tracker.snapshot())
+        }
+
+        async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
+            self.mark_channel_use();
+            Ok(CheckResult {
+                ok: true,
+                latency_ms: Some(1),
+                message: "ok".to_owned(),
+            })
+        }
+
+        async fn exec(&self, _request: ExecRequest) -> Result<ExecResult, TransportError> {
+            self.mark_channel_use();
+            Ok(ExecResult {
+                exit_code: Some(0),
+                stdout: "telemetry ok".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            })
+        }
+
+        async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+            self.mark_channel_use();
+            Ok(SftpResult {
+                direction: request.spec.direction,
+                bytes_transferred: 0,
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_owned(),
+                local_path: request.spec.local_path,
+                remote_path: request.spec.remote_path,
+                overwrite: request.spec.overwrite,
+            })
+        }
+
+        async fn open_forward(
+            &self,
+            _request: ForwardRequest,
+        ) -> Result<ForwardHandle, TransportError> {
+            Err(TransportError::Backend("not implemented".to_owned()))
+        }
+    }
+
+    struct SlowTransport(Duration);
+
+    #[async_trait]
+    impl RemoteTransport for SlowTransport {
+        async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
+            Ok(CheckResult {
+                ok: true,
+                latency_ms: Some(1),
+                message: "ok".to_owned(),
+            })
+        }
+
+        async fn exec(&self, _request: ExecRequest) -> Result<ExecResult, TransportError> {
+            tokio::time::sleep(self.0).await;
+            Ok(ExecResult {
+                exit_code: Some(0),
+                stdout: "slow ok".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            })
+        }
+
+        async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+            Ok(SftpResult {
+                direction: request.spec.direction,
+                bytes_transferred: 0,
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_owned(),
+                local_path: request.spec.local_path,
+                remote_path: request.spec.remote_path,
+                overwrite: request.spec.overwrite,
+            })
+        }
+
+        async fn open_forward(
+            &self,
+            _request: ForwardRequest,
+        ) -> Result<ForwardHandle, TransportError> {
+            Err(TransportError::Backend("not implemented".to_owned()))
+        }
+    }
+
+    struct LargeOutputTransport;
+
+    #[async_trait]
+    impl RemoteTransport for LargeOutputTransport {
+        async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
+            Ok(CheckResult {
+                ok: true,
+                latency_ms: Some(1),
+                message: "ok".to_owned(),
+            })
+        }
+
+        async fn exec(&self, _request: ExecRequest) -> Result<ExecResult, TransportError> {
+            Ok(ExecResult {
+                exit_code: Some(0),
+                stdout: format!("{}\npassword=hunter2\n{}", "A".repeat(128), "B".repeat(128)),
+                stderr: String::new(),
+                truncated: false,
+            })
+        }
+
+        async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+            Ok(SftpResult {
+                direction: request.spec.direction,
+                bytes_transferred: 0,
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_owned(),
+                local_path: request.spec.local_path,
+                remote_path: request.spec.remote_path,
+                overwrite: request.spec.overwrite,
+            })
+        }
+
+        async fn open_forward(
+            &self,
+            _request: ForwardRequest,
+        ) -> Result<ForwardHandle, TransportError> {
+            Err(TransportError::Backend("not implemented".to_owned()))
+        }
+    }
+
+    struct UnusedSshCredentialProvider;
+
+    #[async_trait]
+    impl SshCredentialProvider for UnusedSshCredentialProvider {
+        async fn credential_for(
+            &self,
+            _access_path_id: AccessPathId,
+        ) -> Result<super::SshCredentialSecret, super::SshCredentialError> {
+            Err(super::SshCredentialError::NotFound)
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturingPtyBackend {
+        inputs: Arc<tokio::sync::Mutex<Vec<String>>>,
+        output_tx: mpsc::Sender<PtyBackendOutput>,
+        output_rx: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<PtyBackendOutput>>>>,
+    }
+
+    struct EndingPtyBackend;
+
+    struct TelemetryPtyBackend {
+        tracker: Arc<TransportTelemetryTracker>,
+    }
+
+    impl TelemetryPtyBackend {
+        fn new() -> Self {
+            Self {
+                tracker: Arc::new(TransportTelemetryTracker::new(
+                    SshTransportBackend::Russh,
+                    SshTransportCapabilities::pooled(SshFileTransferMode::Sftp),
+                )),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ManagedPtyBackend for TelemetryPtyBackend {
+        fn capabilities(&self) -> PtyBackendCapabilities {
+            PtyBackendCapabilities::russh_native_pty()
+        }
+
+        async fn spawn(
+            &self,
+            _request: PtyBackendSpawnRequest,
+        ) -> Result<ManagedPtyProcess, super::ConnectorPtyError> {
+            let before = self.tracker.snapshot();
+            if before.state == SshTransportRuntimeState::Ready {
+                self.tracker.session_reused(now_utc());
+            } else {
+                self.tracker.connection_attempted();
+                self.tracker.handshake_succeeded(now_utc());
+            }
+            let (input_tx, _input_rx) = mpsc::channel::<String>(1);
+            let (_output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(1);
+            let (close_tx, _close_rx) = oneshot::channel();
+            Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx)
+                .with_transport_observation(Some(&before), Some(self.tracker.snapshot())))
+        }
+    }
+
+    #[async_trait]
+    impl ManagedPtyBackend for EndingPtyBackend {
+        fn capabilities(&self) -> PtyBackendCapabilities {
+            PtyBackendCapabilities::openssh_pipe_shell()
+        }
+
+        async fn spawn(
+            &self,
+            _request: PtyBackendSpawnRequest,
+        ) -> Result<ManagedPtyProcess, super::ConnectorPtyError> {
+            let (input_tx, _input_rx) = mpsc::channel::<String>(1);
+            let (_output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(1);
+            let (close_tx, _close_rx) = oneshot::channel();
+            Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx))
+        }
+    }
+
+    impl CapturingPtyBackend {
+        fn new() -> Self {
+            let (output_tx, output_rx) = mpsc::channel(16);
+            Self {
+                inputs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                output_tx,
+                output_rx: Arc::new(tokio::sync::Mutex::new(Some(output_rx))),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ManagedPtyBackend for CapturingPtyBackend {
+        fn capabilities(&self) -> PtyBackendCapabilities {
+            PtyBackendCapabilities::openssh_pipe_shell()
+        }
+
+        async fn spawn(
+            &self,
+            _request: PtyBackendSpawnRequest,
+        ) -> Result<ManagedPtyProcess, super::ConnectorPtyError> {
+            let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+            let inputs = Arc::clone(&self.inputs);
+            tokio::spawn(async move {
+                while let Some(input) = input_rx.recv().await {
+                    inputs.lock().await.push(input);
+                }
+            });
+            let output_rx =
+                self.output_rx.lock().await.take().ok_or_else(|| {
+                    super::ConnectorPtyError::Backend("already spawned".to_owned())
+                })?;
+            let (close_tx, _close_rx) = oneshot::channel();
+            Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx))
+        }
+    }
+
+    fn request(program: &str) -> ExecRequest {
+        ExecRequest {
+            operation_id: OperationId::new(),
+            host_id: HostId::new(),
+            access_path_id: AccessPathId::new(),
+            profile: CommandProfile {
+                name: "check".to_owned(),
+                program: program.to_owned(),
+                args: Vec::new(),
+                class: CommandClass::ReadOnly,
+                timeout_seconds: 30,
+                output_limit_bytes: 1024,
+                requires_tty: false,
+            },
+        }
+    }
+
+    #[test]
+    fn russh_exec_command_quotes_structured_arguments() {
+        let profile = CommandProfile {
+            name: "quote-test".to_owned(),
+            program: "printf".to_owned(),
+            args: vec!["hello world".to_owned(), "it's ok".to_owned()],
+            class: CommandClass::ReadOnly,
+            timeout_seconds: 30,
+            output_limit_bytes: 1024,
+            requires_tty: false,
+        };
+
+        assert_eq!(
+            super::ssh_exec_command(&profile, false),
+            "'printf' 'hello world' 'it'\\''s ok'"
+        );
+        assert_eq!(
+            super::ssh_exec_command(&profile, true),
+            "printf \"hello world\" \"it's ok\""
+        );
+
+        let whoami = CommandProfile {
+            name: "windows-whoami".to_owned(),
+            program: "whoami".to_owned(),
+            args: Vec::new(),
+            class: CommandClass::ReadOnly,
+            timeout_seconds: 30,
+            output_limit_bytes: 1024,
+            requires_tty: false,
+        };
+        assert_eq!(super::ssh_exec_command(&whoami, true), "whoami");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn vault_ssh_credential_provider_decrypts_connector_only_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&pool).await?;
+        let repositories = Repositories::new(pool);
+        let now = now_utc();
+        let host = Host {
+            id: HostId::new(),
+            name: "vault-host".to_owned(),
+            display_name: "Vault Host".to_owned(),
+            kind: HostKind::Linux,
+            owner: None,
+            tags: Vec::new(),
+            description: None,
+            risk_level: RiskLevel::Development,
+            created_at: now,
+            updated_at: now,
+        };
+        repositories.hosts.insert(&host).await?;
+        let environment = Environment {
+            id: EnvironmentId::new(),
+            name: "vault-env".to_owned(),
+            kind: EnvironmentKind::CompanyLan,
+            description: None,
+            trust_level: TrustLevel::Trusted,
+            notes: None,
+        };
+        repositories.environments.insert(&environment).await?;
+        let connector = Connector {
+            id: ConnectorId::new(),
+            name: "vault-connector".to_owned(),
+            environment_id: environment.id,
+            host_id: None,
+            version: "0.1.0".to_owned(),
+            state: EntityState::Healthy,
+            last_seen_at: Some(now),
+            current_network: Some("test".to_owned()),
+        };
+        repositories.connectors.upsert(&connector).await?;
+        let master = SecretString::from("unit-test-master".to_owned());
+        let blob = CredentialVault::encrypt(
+            &master,
+            &CredentialSecret {
+                password: Some("unit-test-credential".to_owned()),
+                private_key_pem: None,
+                private_key_passphrase: None,
+                sudo_password: None,
+                use_ssh_agent: false,
+            },
+        )?;
+        let credential_id = CredentialId::new();
+        repositories
+            .credentials
+            .insert(&StoredCredential {
+                metadata: CredentialMetadata {
+                    id: credential_id,
+                    name: "vault-credential".to_owned(),
+                    kind: CredentialKind::SshPassword,
+                    username_hint: Some("ops".to_owned()),
+                    created_at: now,
+                    updated_at: now,
+                    last_used_at: None,
+                },
+                encrypted_blob_json: serde_json::to_value(blob)?,
+            })
+            .await?;
+        let access_path = AccessPath {
+            id: AccessPathId::new(),
+            host_id: host.id,
+            environment_id: environment.id,
+            connector_id: Some(connector.id),
+            protocol: Protocol::Ssh,
+            address: "10.0.0.42".to_owned(),
+            port: 22,
+            username: "ops".to_owned(),
+            credential_id,
+            route_type: RouteType::Lan,
+            proxy_chain: Vec::new(),
+            priority: 1,
+            enabled: true,
+            connection_mode: ConnectionMode::Pooled,
+            idle_ttl_seconds: 600,
+            keepalive_seconds: 30,
+            max_concurrent_channels: 1,
+            max_new_connections_per_minute: 1,
+            requires_tty: false,
+            notes: None,
+        };
+        repositories.access_paths.insert(&access_path).await?;
+
+        let provider = super::VaultSshCredentialProvider::new(repositories.clone(), master);
+        let secret = provider.credential_for(access_path.id).await?;
+        assert_eq!(
+            secret.password.as_ref().map(SecretString::expose_secret),
+            Some("unit-test-credential")
+        );
+        assert!(secret.private_key_pem.is_none());
+
+        let wrong_provider = super::VaultSshCredentialProvider::new(
+            repositories.clone(),
+            SecretString::from("wrong-master".to_owned()),
+        );
+        let Err(error) = wrong_provider.credential_for(access_path.id).await else {
+            return Err("wrong master password should not decrypt".into());
+        };
+        assert!(matches!(error, super::SshCredentialError::VaultLocked));
+
+        repositories
+            .credentials
+            .upsert(&StoredCredential {
+                metadata: CredentialMetadata {
+                    id: credential_id,
+                    name: "vault-credential".to_owned(),
+                    kind: CredentialKind::SshPrivateKey,
+                    username_hint: Some("ops".to_owned()),
+                    created_at: now,
+                    updated_at: now,
+                    last_used_at: None,
+                },
+                encrypted_blob_json: serde_json::json!({
+                    "type": "external_reference",
+                    "external_ref": "openssh-agent"
+                }),
+            })
+            .await?;
+        let provider = super::VaultSshCredentialProvider::new(
+            repositories,
+            SecretString::from("master-is-unused-for-agent-reference".to_owned()),
+        );
+        let secret = provider.credential_for(access_path.id).await?;
+        assert!(secret.use_ssh_agent);
+        assert!(secret.password.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn authorized_key_bootstrap_commands_are_idempotent_for_posix_and_windows() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-hosts-managed";
+
+        let posix = super::authorized_keys_install_command(key, false);
+        assert!(posix.contains("grep -qxF"));
+        assert!(posix.contains("chmod 700"));
+        assert!(posix.contains("chmod 600"));
+        assert_eq!(posix.matches(key).count(), 1);
+
+        let windows = super::authorized_keys_install_command(key, true);
+        assert!(windows.contains("powershell.exe"));
+        assert!(windows.contains("-notcontains"));
+        assert!(windows.contains("Add-Content"));
+        assert!(windows.contains("administrators_authorized_keys"));
+        assert!(windows.contains("S-1-5-32-544"));
+        assert_eq!(windows.matches(key).count(), 1);
+    }
+
+    #[test]
+    fn authorized_key_bootstrap_suppresses_retries_until_key_or_cooldown_changes() {
+        let now = now_utc();
+        let access_path_id = AccessPathId::new();
+        for state in [
+            AuthorizedKeyBootstrapState::Installed,
+            AuthorizedKeyBootstrapState::Skipped,
+        ] {
+            let existing = AuthorizedKeyBootstrap {
+                access_path_id,
+                state,
+                reason: None,
+                public_key_fingerprint: Some("SHA256:same".to_owned()),
+                failure_count: 1,
+                attempted_at: now,
+                next_retry_at: None,
+                updated_at: now,
+            };
+            assert!(!authorized_key_bootstrap_is_eligible(
+                Some(&existing),
+                "SHA256:same",
+                now
+            ));
+            assert!(authorized_key_bootstrap_is_eligible(
+                Some(&existing),
+                "SHA256:changed",
+                now
+            ));
+        }
+
+        let deferred = AuthorizedKeyBootstrap {
+            access_path_id,
+            state: AuthorizedKeyBootstrapState::Deferred,
+            reason: Some(AuthorizedKeyBootstrapReason::Timeout),
+            public_key_fingerprint: Some("SHA256:same".to_owned()),
+            failure_count: 1,
+            attempted_at: now,
+            next_retry_at: Some(now + time::Duration::minutes(5)),
+            updated_at: now,
+        };
+        assert!(!authorized_key_bootstrap_is_eligible(
+            Some(&deferred),
+            "SHA256:same",
+            now
+        ));
+        assert!(authorized_key_bootstrap_is_eligible(
+            Some(&deferred),
+            "SHA256:same",
+            now + time::Duration::minutes(5)
+        ));
+    }
+
+    #[test]
+    fn authorized_key_bootstrap_caps_transient_failures_and_skips_permanent_failures() {
+        let now = now_utc();
+        let access_path_id = AccessPathId::new();
+        let deferred = authorized_key_bootstrap_failure_state(
+            access_path_id,
+            "SHA256:test",
+            0,
+            super::AuthorizedKeyInstallError::Timeout,
+            now,
+        );
+        assert_eq!(deferred.state, AuthorizedKeyBootstrapState::Deferred);
+        assert_eq!(deferred.failure_count, 1);
+        assert_eq!(deferred.reason, Some(AuthorizedKeyBootstrapReason::Timeout));
+        assert!(deferred.next_retry_at.is_some_and(|retry| retry > now));
+
+        let exhausted = authorized_key_bootstrap_failure_state(
+            access_path_id,
+            "SHA256:test",
+            2,
+            super::AuthorizedKeyInstallError::RemoteCommandFailed,
+            now,
+        );
+        assert_eq!(exhausted.state, AuthorizedKeyBootstrapState::Skipped);
+        assert_eq!(
+            exhausted.reason,
+            Some(AuthorizedKeyBootstrapReason::AttemptsExhausted)
+        );
+        assert_eq!(exhausted.failure_count, 3);
+        assert_eq!(exhausted.next_retry_at, None);
+
+        let denied = authorized_key_bootstrap_failure_state(
+            access_path_id,
+            "SHA256:test",
+            0,
+            super::AuthorizedKeyInstallError::WriteDenied,
+            now,
+        );
+        assert_eq!(denied.state, AuthorizedKeyBootstrapState::Skipped);
+        assert_eq!(
+            denied.reason,
+            Some(AuthorizedKeyBootstrapReason::WriteDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_key_bootstrap_has_an_independent_hard_timeout() {
+        let result = execute_authorized_key_install_with_timeout(
+            Duration::from_millis(10),
+            std::future::pending::<Result<ExecResult, TransportError>>(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(super::AuthorizedKeyInstallError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn authorized_key_bootstrap_classifies_permanent_remote_failures() {
+        assert_eq!(
+            super::classify_authorized_key_install_failure("mkdir: Permission denied"),
+            super::AuthorizedKeyInstallError::WriteDenied
+        );
+        assert_eq!(
+            super::classify_authorized_key_install_failure("Read-only file system"),
+            super::AuthorizedKeyInstallError::ReadOnlyFilesystem
+        );
+        assert_eq!(
+            super::classify_authorized_key_install_failure(
+                "powershell.exe is not recognized as an internal or external command"
+            ),
+            super::AuthorizedKeyInstallError::UnsupportedTargetShell
+        );
+    }
+
+    #[test]
+    fn openssh_destination_uses_uri_with_port() {
+        let destination = OpenSshTransport::destination("ops", "10.0.0.10", 2222);
+        assert_eq!(destination, "ssh://ops@10.0.0.10:2222");
+    }
+
+    #[test]
+    fn handshake_limiter_rejects_burst_above_combined_budget() {
+        let limiter = super::HandshakeLimiter::new(60, 2);
+
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_ok());
+        assert!(matches!(
+            limiter.try_acquire(),
+            Err(TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds
+            }) if retry_after_seconds > 0
+        ));
+    }
+
+    #[test]
+    fn handshake_limiters_share_the_connector_global_budget_across_access_paths() {
+        let global = super::HandshakeLimiter::shared_global(1);
+        let first = super::HandshakeLimiter::with_shared_global(60, Arc::clone(&global));
+        let second = super::HandshakeLimiter::with_shared_global(60, global);
+
+        assert!(first.try_acquire().is_ok());
+        assert!(matches!(
+            second.try_acquire(),
+            Err(TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds
+            }) if retry_after_seconds > 0
+        ));
+    }
+
+    #[test]
+    fn per_path_handshake_cooldown_is_not_expanded_to_the_global_window() {
+        let limiter = super::HandshakeLimiter::new(1, 100);
+
+        assert!(limiter.try_acquire().is_ok());
+        assert!(matches!(
+            limiter.try_acquire(),
+            Err(TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds
+            }) if (1..=60).contains(&retry_after_seconds)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_handshake_budget_preserves_retry_without_target_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(FakeTransport),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+        let mut operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        operation.session_id = Some(fixture.session_id);
+        let before = now_utc();
+        let error = TransportError::LocalHandshakeBudgetExhausted {
+            retry_after_seconds: 164,
+        };
+
+        worker
+            .record_connection_failure(&operation, &error.to_string(), Some(&error))
+            .await?;
+
+        let session = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection session should exist")?;
+        assert_eq!(session.state, EntityState::Throttled);
+        assert_eq!(session.failure_count, 0);
+        let health = fixture
+            .repositories
+            .access_path_health
+            .get(operation.access_path_id)
+            .await?
+            .ok_or("access path health should exist")?;
+        assert_eq!(health.state, EntityState::Throttled);
+        assert_eq!(
+            health.last_error_code,
+            Some(StateReasonCode::LocalHandshakeBudgetExhausted)
+        );
+        let retry_after = health
+            .next_retry_at
+            .ok_or("local cooldown should have a retry time")?
+            - before;
+        assert!((164..=165).contains(&retry_after.whole_seconds()));
+        assert_eq!(health.failure_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guarded_transport_redacts_output() -> Result<(), TransportError> {
+        let guarded = GuardedTransport::new(FakeTransport, ServerProtectionPolicy::default());
+        let result = guarded.exec(request("uname")).await?;
+        assert!(!result.stdout.contains("hunter2"));
+        assert!(result.stdout.contains("<redacted>"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guarded_transport_rejects_dangerous_program() {
+        let guarded = GuardedTransport::new(FakeTransport, ServerProtectionPolicy::default());
+        let result = guarded.exec(request("rm")).await;
+        assert!(matches!(result, Err(TransportError::PolicyDenied(_))));
+    }
+
+    #[tokio::test]
+    async fn file_transfer_local_guards_reject_symlinks_size_and_hash_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.bin");
+        tokio::fs::write(&source, b"deployment-payload").await?;
+
+        let size_error = super::hash_local_source(&source, 4)
+            .await
+            .err()
+            .ok_or("oversized source should be rejected")?;
+        assert!(size_error.to_string().contains("max_size_bytes"));
+
+        let actual = super::hash_local_source(&source, 1024).await?.1;
+        let spec = FileTransferSpec {
+            direction: SftpDirection::Upload,
+            local_path: source.to_string_lossy().into_owned(),
+            remote_path: "/tmp/source.bin".to_owned(),
+            overwrite: SftpOverwritePolicy::Deny,
+            mode: None,
+            max_size_bytes: 1024,
+            expected_sha256: Some("0".repeat(64)),
+            timeout_seconds: DEFAULT_SFTP_TIMEOUT_SECONDS,
+        };
+        let hash_error = super::ensure_expected_sha256(&spec, &actual)
+            .err()
+            .ok_or("mismatched digest should be rejected")?;
+        assert!(hash_error.to_string().contains("SHA-256 mismatch"));
+
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("source-link");
+            tokio::fs::symlink(&source, &link).await?;
+            let link_error = super::hash_local_source(&link, 1024)
+                .await
+                .err()
+                .ok_or("symlink source should be rejected")?;
+            assert!(link_error.to_string().contains("cannot be a symlink"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_no_overwrite_placement_preserves_existing_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let temporary = directory.path().join(".download.part");
+        let destination = directory.path().join("download.bin");
+        tokio::fs::write(&temporary, b"new").await?;
+        tokio::fs::write(&destination, b"existing").await?;
+
+        let error = super::place_local_file(&temporary, &destination, SftpOverwritePolicy::Deny)
+            .await
+            .err()
+            .ok_or("deny policy should preserve existing destination")?;
+
+        assert!(error.to_string().contains("no-overwrite"));
+        assert_eq!(tokio::fs::read(&destination).await?, b"existing");
+        assert_eq!(tokio::fs::read(&temporary).await?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    fn exec_channel_file_transfer_commands_are_bounded_and_shell_quoted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = FileTransferSpec {
+            direction: SftpDirection::Upload,
+            local_path: "/tmp/local-payload.bin".to_owned(),
+            remote_path: "/tmp/release's payload.bin".to_owned(),
+            overwrite: SftpOverwritePolicy::Deny,
+            mode: Some(0o600),
+            max_size_bytes: 1024,
+            expected_sha256: Some("a".repeat(64)),
+            timeout_seconds: DEFAULT_SFTP_TIMEOUT_SECONDS,
+        };
+        let initialize = super::russh_exec_upload_initialize_command(&spec, "/tmp/.release-part");
+        assert!(initialize.contains("REMOTE_HOSTS_UPLOAD_READY"));
+        assert!(initialize.contains("'\\''"));
+        assert!(!initialize.contains("local-payload.bin"));
+
+        let chunk = super::russh_exec_upload_chunk_command("/tmp/.release-part", 7, "cGF5bG9hZA==");
+        assert!(chunk.contains("REMOTE_HOSTS_CHUNK_OK 7"));
+        assert!(chunk.contains("cGF5bG9hZA=="));
+        assert!(chunk.len() < 64 * 1024);
+        let missing_marker = super::require_exec_upload_chunk_success(
+            &ExecResult {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+            },
+            7,
+            &spec.remote_path,
+            "/tmp/.release-part",
+        );
+        assert!(missing_marker.is_err());
+        super::require_exec_upload_chunk_success(
+            &ExecResult {
+                exit_code: None,
+                stdout: "REMOTE_HOSTS_CHUNK_OK 7\n".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            },
+            7,
+            &spec.remote_path,
+            "/tmp/.release-part",
+        )?;
+
+        let finalize = super::russh_exec_upload_finalize_command(
+            &spec,
+            "/tmp/.release-part",
+            17,
+            &"a".repeat(64),
+        );
+        assert!(finalize.contains("REMOTE_HOSTS_TRANSFER_OK"));
+        assert!(finalize.contains("chmod 600 \"$tmp\""));
+        assert!(finalize.contains("'\\''"));
+        assert!(!finalize.contains("local-payload.bin"));
+
+        spec.direction = SftpDirection::Download;
+        let download = super::russh_exec_download_command(&spec);
+        assert!(download.contains("REMOTE_HOSTS_TRANSFER_META"));
+        assert!(download.contains("[ \"$bytes\" -le \"1024\" ]"));
+        assert!(download.contains("'\\''"));
+
+        let marker = format!("banner\nREMOTE_HOSTS_TRANSFER_OK 17 {}\n", "a".repeat(64));
+        assert_eq!(
+            super::parse_transfer_marker(&marker, "REMOTE_HOSTS_TRANSFER_OK")?,
+            (17, "a".repeat(64))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_claims_executes_and_redacts_workspace_operation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let provider = StaticTransportProvider::new(FakeTransport);
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            provider,
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+
+        let outcome = worker
+            .run_once()
+            .await?
+            .ok_or("worker should claim one operation")?;
+        assert_eq!(outcome.operation_id, fixture.operation_id);
+        assert_eq!(outcome.state, OperationState::Succeeded);
+        assert_eq!(outcome.workspace_state, WorkspaceState::Done);
+
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should still exist")?;
+        assert_eq!(operation.state, OperationState::Succeeded);
+        assert_eq!(operation.exit_code, Some(0));
+        assert_eq!(operation.attempt_count, 1);
+        assert_eq!(operation.session_id, Some(fixture.session_id));
+        assert!(operation.claim_token.is_none());
+        assert!(operation.lease_expires_at.is_none());
+
+        let session = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection session should exist")?;
+        assert_eq!(session.state, EntityState::Connected);
+        assert_eq!(session.reused_count, 1);
+        assert_eq!(session.failure_count, 0);
+        assert!(session.last_error.is_none());
+
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Done);
+
+        let chunks = fixture
+            .repositories
+            .operation_output_chunks
+            .list_for_workspace(fixture.workspace_id, Some(fixture.operation_id), None, 20)
+            .await?;
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.stream == OutputStream::Stdout)
+        );
+        let joined = chunks
+            .iter()
+            .map(|chunk| chunk.redacted_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("hunter2"));
+        assert!(joined.contains("<redacted>"));
+        assert!(worker.run_once().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn connector_worker_waits_for_foreign_write_lease_then_hands_off_after_completion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(FakeTransport),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+        worker
+            .run_once()
+            .await?
+            .ok_or("fixture read operation should run first")?;
+
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let foreign_session = AgentSession {
+            id: AgentSessionId::new(),
+            client_kind: "codex".to_owned(),
+            client_instance_id: "foreign-worker-test".to_owned(),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("foreign-conversation".to_owned()),
+            state: AgentSessionState::Active,
+            created_at: now_utc(),
+            last_seen_at: now_utc(),
+            expires_at: now_utc() + time::Duration::hours(24),
+        };
+        fixture
+            .repositories
+            .agent_sessions
+            .upsert(&foreign_session)
+            .await?;
+        let foreign_workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(foreign_session.id),
+            label: "foreign-agent".to_owned(),
+            ..workspace.clone()
+        };
+        fixture
+            .repositories
+            .workspaces
+            .insert(&foreign_workspace)
+            .await?;
+        let lease_at = now_utc();
+        fixture
+            .repositories
+            .host_write_leases
+            .try_acquire(
+                &HostWriteLease {
+                    host_id: fixture.host_id,
+                    holder_agent_session_id: foreign_session.id,
+                    holder_workspace_id: foreign_workspace.id,
+                    acquired_at: lease_at,
+                    heartbeat_at: lease_at,
+                    expires_at: lease_at + time::Duration::minutes(5),
+                },
+                lease_at,
+            )
+            .await?
+            .ok_or("foreign lease should be acquired")?;
+
+        let policy = ServerProtectionPolicy::default();
+        let profile = CommandProfileCatalog::resolve_builtin(
+            "shell.posix",
+            vec!["touch /tmp/remote-hosts-write-lease-test".to_owned()],
+            &policy,
+        )?;
+        let plan =
+            WorkspaceOperationSupervisor::new(policy).queue_operation(&WorkspaceRunCommand {
+                workspace,
+                command_profile: profile,
+                intent: Some("verify host write lease".to_owned()),
+                idempotency_key: Some("write-lease-test".to_owned()),
+                queued_operations: 0,
+                active_exec_channels: 0,
+                active_probe_jobs: 0,
+                overload_cooldown_active: false,
+            })?;
+        fixture
+            .repositories
+            .operations
+            .insert(&plan.operation)
+            .await?;
+        fixture
+            .repositories
+            .operation_output_chunks
+            .insert(&plan.initial_output_chunk)
+            .await?;
+        fixture
+            .repositories
+            .workspaces
+            .update_state(fixture.workspace_id, plan.workspace_state, now_utc())
+            .await?;
+
+        assert!(worker.run_once().await?.is_none());
+        assert_eq!(
+            fixture
+                .repositories
+                .operations
+                .get(plan.operation.id)
+                .await?
+                .ok_or("queued mutation should exist")?
+                .state,
+            OperationState::Queued
+        );
+
+        let handoff_at = now_utc();
+        fixture
+            .repositories
+            .host_write_leases
+            .shorten(fixture.host_id, foreign_session.id, handoff_at, handoff_at)
+            .await?;
+        let outcome = worker
+            .run_once()
+            .await?
+            .ok_or("mutation should run after lease handoff")?;
+        assert_eq!(outcome.operation_id, plan.operation.id);
+        assert_eq!(outcome.state, OperationState::Succeeded);
+        let observed_at = now_utc();
+        let lease = fixture
+            .repositories
+            .host_write_leases
+            .get_active(fixture.host_id, observed_at)
+            .await?
+            .ok_or("completed mutation should retain a short handoff grace")?;
+        assert_eq!(lease.holder_agent_session_id, fixture.agent_session_id);
+        assert!(lease.expires_at <= observed_at + time::Duration::seconds(16));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_persists_real_transport_reuse_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let queued = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("queued operation should exist")?;
+        let previous_runtime_id = seed_ssh_transport_runtime(
+            &fixture.repositories,
+            &queued,
+            SshTransportRuntimeState::RuntimeLost,
+            2,
+        )
+        .await?;
+        let provider = StaticTransportProvider::new(TelemetryFakeTransport::new());
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            provider,
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+
+        worker
+            .run_once()
+            .await?
+            .ok_or("first operation should run")?;
+        let first = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("first operation should exist")?;
+        let first_evidence = first
+            .transport_evidence
+            .as_ref()
+            .ok_or("first operation should expose transport evidence")?;
+        assert_eq!(
+            first_evidence.connection_use,
+            SshConnectionUse::FirstHandshake
+        );
+        assert!(first_evidence.runtime_replaced);
+        assert_ne!(first_evidence.runtime_id, previous_runtime_id);
+        assert_eq!(first_evidence.generation, 1);
+
+        let mut second = first.clone();
+        second.id = OperationId::new();
+        second.state = OperationState::Queued;
+        second.started_at = now_utc();
+        second.finished_at = None;
+        second.exit_code = None;
+        second.transport_evidence = None;
+        second.redacted_output_summary = Some("queued for reuse verification".to_owned());
+        second.attempt_count = 0;
+        second.claim_token = None;
+        second.claimed_at = None;
+        second.lease_expires_at = None;
+        second.last_error = None;
+        fixture.repositories.operations.insert(&second).await?;
+
+        worker
+            .run_once()
+            .await?
+            .ok_or("second operation should run")?;
+        let second = fixture
+            .repositories
+            .operations
+            .get(second.id)
+            .await?
+            .ok_or("second operation should exist")?;
+        let second_evidence = second
+            .transport_evidence
+            .as_ref()
+            .ok_or("second operation should expose transport evidence")?;
+        assert_eq!(second_evidence.connection_use, SshConnectionUse::Reused);
+        assert_eq!(second_evidence.runtime_id, first_evidence.runtime_id);
+        assert_eq!(second_evidence.generation, 1);
+
+        let runtime = fixture
+            .repositories
+            .ssh_transport_runtimes
+            .get(second.access_path_id, second.connector_id)
+            .await?
+            .ok_or("latest transport runtime should exist")?;
+        assert_eq!(runtime.telemetry.reuse_count, 1);
+        assert_eq!(runtime.telemetry.state, SshTransportRuntimeState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_executes_sftp_on_the_existing_logical_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        fixture
+            .repositories
+            .operations
+            .update_state(
+                fixture.operation_id,
+                OperationState::Succeeded,
+                Some(now_utc()),
+                Some(0),
+                Some("superseded by SFTP test"),
+            )
+            .await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .update_state(fixture.workspace_id, WorkspaceState::Idle, now_utc())
+            .await?
+            .ok_or("workspace should exist")?;
+        let plan = WorkspaceOperationSupervisor::default().queue_file_transfer(
+            &WorkspaceFileTransfer {
+                workspace,
+                spec: FileTransferSpec {
+                    direction: SftpDirection::Upload,
+                    local_path: "/tmp/manifest.yaml".to_owned(),
+                    remote_path: "/var/tmp/manifest.yaml".to_owned(),
+                    overwrite: SftpOverwritePolicy::Deny,
+                    mode: Some(0o600),
+                    max_size_bytes: DEFAULT_SFTP_MAX_SIZE_BYTES,
+                    expected_sha256: None,
+                    timeout_seconds: DEFAULT_SFTP_TIMEOUT_SECONDS,
+                },
+                intent: Some("upload deployment manifest".to_owned()),
+                idempotency_key: None,
+                queued_operations: 0,
+                active_exec_channels: 0,
+                overload_cooldown_active: false,
+            },
+        )?;
+        fixture
+            .repositories
+            .operations
+            .insert(&plan.operation)
+            .await?;
+        fixture
+            .repositories
+            .operation_output_chunks
+            .insert(&plan.initial_output_chunk)
+            .await?;
+        fixture
+            .repositories
+            .workspaces
+            .update_state(fixture.workspace_id, plan.workspace_state, now_utc())
+            .await?;
+
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(FakeTransport),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+        let outcome = worker
+            .run_once()
+            .await?
+            .ok_or("worker should claim the SFTP operation")?;
+
+        assert_eq!(outcome.operation_id, plan.operation.id);
+        assert_eq!(outcome.state, OperationState::Succeeded);
+        let operation = fixture
+            .repositories
+            .operations
+            .get(plan.operation.id)
+            .await?
+            .ok_or("SFTP operation should exist")?;
+        assert_eq!(operation.session_id, Some(fixture.session_id));
+        assert_eq!(operation.exit_code, Some(0));
+        let chunks = fixture
+            .repositories
+            .operation_output_chunks
+            .list_for_workspace(fixture.workspace_id, Some(plan.operation.id), None, 20)
+            .await?;
+        assert!(chunks.iter().any(|chunk| {
+            chunk.redacted_text.contains("pooled_session=true")
+                && chunk.redacted_text.contains("file=manifest.yaml")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_does_not_bypass_active_connection_circuit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        fixture
+            .repositories
+            .access_path_health
+            .upsert(&AccessPathHealth {
+                access_path_id: fixture
+                    .repositories
+                    .operations
+                    .get(fixture.operation_id)
+                    .await?
+                    .ok_or("operation should exist")?
+                    .access_path_id,
+                state: EntityState::CircuitOpen,
+                last_checked_at: Some(now_utc()),
+                latency_ms: None,
+                failure_count: 3,
+                last_error_code: Some(remote_hosts_domain::StateReasonCode::CircuitOpen),
+                next_retry_at: Some(now_utc() + time::Duration::minutes(5)),
+            })
+            .await?;
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(FakeTransport),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+
+        let outcome = worker
+            .run_once()
+            .await?
+            .ok_or("worker should reject one operation")?;
+        assert_eq!(outcome.state, OperationState::Rejected);
+        assert_eq!(outcome.workspace_state, WorkspaceState::Throttled);
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        assert!(operation.session_id.is_none());
+        assert!(
+            operation
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains("cooldown"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_renews_lease_during_slow_exec()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let provider = StaticTransportProvider::new(SlowTransport(Duration::from_millis(1500)));
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            provider,
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 1,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+        let repositories = fixture.repositories.clone();
+        let connector_id = fixture.connector_id;
+        let operation_id = fixture.operation_id;
+        let handle = tokio::spawn(async move { worker.run_once().await });
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let stolen = repositories
+            .operations
+            .claim_next_for_connector(
+                connector_id,
+                "steal",
+                now_utc(),
+                now_utc() + time::Duration::seconds(5),
+                3,
+            )
+            .await?;
+        assert!(stolen.is_none());
+
+        let outcome = handle.await??.ok_or("slow operation should finish")?;
+        assert_eq!(outcome.operation_id, operation_id);
+        assert_eq!(outcome.state, OperationState::Succeeded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_marks_expired_max_attempt_operation_exhausted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let first_claim = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "claim-1",
+                now_utc(),
+                now_utc() - time::Duration::seconds(1),
+                2,
+            )
+            .await?
+            .ok_or("first claim should succeed")?;
+        assert_eq!(first_claim.attempt_count, 1);
+        let second_claim = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "claim-2",
+                now_utc(),
+                now_utc() - time::Duration::seconds(1),
+                2,
+            )
+            .await?
+            .ok_or("second claim should succeed after expired lease")?;
+        assert_eq!(second_claim.attempt_count, 2);
+
+        let provider = StaticTransportProvider::new(FakeTransport);
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            provider,
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 2,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+        let outcome = worker
+            .run_once()
+            .await?
+            .ok_or("worker should exhaust the stale operation")?;
+        assert_eq!(outcome.operation_id, fixture.operation_id);
+        assert_eq!(outcome.state, OperationState::Exhausted);
+        assert_eq!(outcome.workspace_state, WorkspaceState::Blocked);
+
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should still exist")?;
+        assert_eq!(operation.state, OperationState::Exhausted);
+        assert_eq!(operation.attempt_count, 2);
+        assert!(operation.claim_token.is_none());
+        assert!(operation.lease_expires_at.is_none());
+        assert!(operation.finished_at.is_some());
+        assert!(
+            operation
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("retry budget exhausted")
+        );
+
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Blocked);
+
+        let chunks = fixture
+            .repositories
+            .operation_output_chunks
+            .list_for_workspace(fixture.workspace_id, Some(fixture.operation_id), None, 20)
+            .await?;
+        let joined = chunks
+            .iter()
+            .map(|chunk| chunk.redacted_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("automatic connector retry budget exhausted"));
+        assert!(joined.contains("recovery_hint="));
+        assert!(worker.run_once().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_stores_large_output_as_file_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let tempdir = tempfile::tempdir()?;
+        let provider = StaticTransportProvider::new(LargeOutputTransport);
+        let worker = ConnectorOperationWorker::with_artifact_store(
+            fixture.repositories.clone(),
+            provider,
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: 64,
+                artifact_preview_bytes: 48,
+            },
+            Arc::new(FileOutputArtifactStore::new(tempdir.path())),
+        );
+
+        let outcome = worker
+            .run_once()
+            .await?
+            .ok_or("worker should claim one operation")?;
+        assert_eq!(outcome.state, OperationState::Succeeded);
+
+        let artifacts = fixture
+            .repositories
+            .operation_output_artifacts
+            .list_for_workspace(fixture.workspace_id, Some(fixture.operation_id), 10)
+            .await?;
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].stream, OutputStream::Stdout);
+        assert!(artifacts[0].byte_len > 64);
+        assert!(!artifacts[0].redacted_preview.contains("hunter2"));
+
+        let store = FileOutputArtifactStore::new(tempdir.path());
+        let content = store.read_artifact_prefix(&artifacts[0], 4096).await?;
+        assert!(content.contains("<redacted>"));
+        assert!(!content.contains("hunter2"));
+
+        let chunks = fixture
+            .repositories
+            .operation_output_chunks
+            .list_for_workspace(fixture.workspace_id, Some(fixture.operation_id), None, 20)
+            .await?;
+        let joined = chunks
+            .iter()
+            .map(|chunk| chunk.redacted_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("artifact_id="));
+        assert!(!joined.contains("hunter2"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_persists_transport_runtime_and_channel_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            TelemetryPtyBackend::new(),
+            ConnectorPtyManagerConfig {
+                connector_id: fixture.connector_id,
+                max_input_bytes: 1024,
+                output_limit_bytes: 1024,
+                input_lease_seconds: 30,
+                input_max_attempts: 3,
+            },
+        );
+
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let evidence = opened
+            .pty_session
+            .transport_evidence
+            .as_ref()
+            .ok_or("PTY should expose transport evidence")?;
+        assert_eq!(evidence.channel_kind, SshChannelKind::Pty);
+        assert_eq!(evidence.connection_use, SshConnectionUse::FirstHandshake);
+        assert_eq!(evidence.generation, 1);
+
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection session should exist")?;
+        let runtime = fixture
+            .repositories
+            .ssh_transport_runtimes
+            .get(connection.access_path_id, connection.connector_id)
+            .await?
+            .ok_or("PTY transport runtime should be persisted")?;
+        assert_eq!(runtime.telemetry.runtime_id, evidence.runtime_id);
+        assert_eq!(runtime.telemetry.state, SshTransportRuntimeState::Ready);
+        manager
+            .close(opened.pty_session.pty_session_id, Some(0))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_streams_redacted_output_and_accepts_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let backend = CapturingPtyBackend::new();
+        let output_tx = backend.output_tx.clone();
+        let inputs = Arc::clone(&backend.inputs);
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig {
+                connector_id: fixture.connector_id,
+                max_input_bytes: 1024,
+                output_limit_bytes: 1024,
+                input_lease_seconds: 30,
+                input_max_attempts: 3,
+            },
+        );
+
+        let opened = manager
+            .open(
+                fixture.workspace_id,
+                fixture.session_id,
+                Some("/tmp".to_owned()),
+            )
+            .await?;
+        assert_eq!(opened.pty_session.workspace_id, fixture.workspace_id);
+        assert!(opened.pty_session.input_allowed);
+        assert_eq!(opened.pty_session.backend_state, PtyBackendState::Active);
+        assert_eq!(
+            opened.pty_session.backend_capabilities,
+            PtyBackendCapabilities::openssh_pipe_shell()
+        );
+
+        let input = manager
+            .write_input(opened.pty_session.pty_session_id, "echo hello\n".to_owned())
+            .await?;
+        assert_eq!(input.byte_len, "echo hello\n".len());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(inputs.lock().await.as_slice(), ["echo hello\n"]);
+
+        output_tx
+            .send(PtyBackendOutput {
+                stream: OutputStream::Stdout,
+                text: "password=hunter2\nhello\n".to_owned(),
+                truncated: false,
+            })
+            .await?;
+        wait_for_pty_output(
+            &fixture.repositories,
+            opened.pty_session.pty_session_id,
+            "<redacted>",
+        )
+        .await?;
+
+        let chunks = fixture
+            .repositories
+            .pty_output_chunks
+            .list_for_session(opened.pty_session.pty_session_id, None, 10)
+            .await?;
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].stream, OutputStream::Stdout);
+        assert!(!chunks[0].redacted_text.contains("hunter2"));
+        assert!(chunks[0].redacted_text.contains("<redacted>"));
+
+        let closed = manager
+            .close(opened.pty_session.pty_session_id, Some(0))
+            .await?;
+        assert_eq!(closed.state, WorkspaceState::Closed);
+        assert!(!closed.input_allowed);
+        assert_eq!(closed.last_exit_code, Some(0));
+        assert!(
+            manager
+                .write_input(
+                    opened.pty_session.pty_session_id,
+                    "after close\n".to_owned()
+                )
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_activates_pending_session_before_first_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        let pending = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: Some("/tmp".to_owned()),
+            },
+        )?;
+        fixture.repositories.pty_sessions.upsert(&pending).await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            CapturingPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+
+        let activated = manager.activate_next_pending().await?;
+
+        assert_eq!(activated, Some(pending.pty_session_id));
+        let active = fixture
+            .repositories
+            .pty_sessions
+            .get(pending.pty_session_id)
+            .await?
+            .ok_or("PTY session should exist")?;
+        assert_eq!(active.backend_state, PtyBackendState::Active);
+        assert_eq!(
+            active.backend_capabilities,
+            PtyBackendCapabilities::openssh_pipe_shell()
+        );
+        assert!(manager.activate_next_pending().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_activation_clears_expired_handshake_throttle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        fixture
+            .repositories
+            .access_path_health
+            .upsert(&AccessPathHealth {
+                access_path_id: connection.access_path_id,
+                state: EntityState::Throttled,
+                last_checked_at: Some(now_utc() - time::Duration::minutes(5)),
+                latency_ms: None,
+                failure_count: 0,
+                last_error_code: Some(StateReasonCode::LocalHandshakeBudgetExhausted),
+                next_retry_at: Some(now_utc() - time::Duration::minutes(1)),
+            })
+            .await?;
+        let pending = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: Some("/tmp".to_owned()),
+            },
+        )?;
+        fixture.repositories.pty_sessions.upsert(&pending).await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            CapturingPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+
+        assert_eq!(
+            manager.activate_next_pending().await?,
+            Some(pending.pty_session_id)
+        );
+        let health = fixture
+            .repositories
+            .access_path_health
+            .get(connection.access_path_id)
+            .await?
+            .ok_or("access path health should exist")?;
+        assert_eq!(health.state, EntityState::Connected);
+        assert_eq!(health.failure_count, 0);
+        assert_eq!(health.last_error_code, None);
+        assert_eq!(health.next_retry_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_skips_pending_sessions_for_terminal_workspaces()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for terminal_state in [
+            WorkspaceState::Done,
+            WorkspaceState::Failed,
+            WorkspaceState::Closed,
+        ] {
+            let fixture = WorkerFixture::new().await?;
+            let workspace = fixture
+                .repositories
+                .workspaces
+                .get(fixture.workspace_id)
+                .await?
+                .ok_or("workspace should exist")?;
+            let connection = fixture
+                .repositories
+                .connection_sessions
+                .get(fixture.session_id)
+                .await?
+                .ok_or("connection should exist")?;
+            let pending = PtySessionSupervisor::default().open_session(
+                &workspace,
+                &connection,
+                0,
+                PtySessionOpenCommand {
+                    session_id: fixture.session_id,
+                    cwd: Some("/tmp".to_owned()),
+                },
+            )?;
+            fixture.repositories.pty_sessions.upsert(&pending).await?;
+            fixture
+                .repositories
+                .workspaces
+                .update_state(fixture.workspace_id, terminal_state, now_utc())
+                .await?;
+            let manager = ConnectorPtyManager::new(
+                fixture.repositories.clone(),
+                CapturingPtyBackend::new(),
+                ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+            );
+
+            assert!(manager.activate_next_pending().await?.is_none());
+            let unchanged = fixture
+                .repositories
+                .pty_sessions
+                .get(pending.pty_session_id)
+                .await?
+                .ok_or("PTY session should exist")?;
+            assert_eq!(unchanged.backend_state, PtyBackendState::Pending);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_terminalizes_unusable_pending_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let mut connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        let pending = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: Some("/tmp".to_owned()),
+            },
+        )?;
+        fixture.repositories.pty_sessions.upsert(&pending).await?;
+        connection.state = EntityState::SshHandshakeFailed;
+        fixture
+            .repositories
+            .connection_sessions
+            .upsert(&connection)
+            .await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            CapturingPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+
+        assert_eq!(
+            manager.activate_next_pending().await?,
+            Some(pending.pty_session_id)
+        );
+        assert!(manager.activate_next_pending().await?.is_none());
+        let failed = fixture
+            .repositories
+            .pty_sessions
+            .get(pending.pty_session_id)
+            .await?
+            .ok_or("PTY session should exist")?;
+        assert_eq!(failed.state, WorkspaceState::Blocked);
+        assert_eq!(failed.backend_state, PtyBackendState::Failed);
+        assert!(!failed.input_allowed);
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Blocked);
+        let chunks = fixture
+            .repositories
+            .pty_output_chunks
+            .list_for_session(pending.pty_session_id, None, 10)
+            .await?;
+        assert!(chunks.iter().any(|chunk| {
+            chunk.stream == OutputStream::System
+                && chunk.redacted_text.contains("automatic retry disabled")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_reconciles_lost_active_runtime_on_startup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        let mut stale = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: Some("/tmp".to_owned()),
+            },
+        )?;
+        stale.state = WorkspaceState::Working;
+        stale.backend_state = PtyBackendState::Active;
+        stale.backend_capabilities = PtyBackendCapabilities::openssh_pipe_shell();
+        fixture.repositories.pty_sessions.upsert(&stale).await?;
+
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            CapturingPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let reconciled = manager.reconcile_startup().await?;
+
+        assert_eq!(reconciled, 1);
+        let lost = fixture
+            .repositories
+            .pty_sessions
+            .get(stale.pty_session_id)
+            .await?
+            .ok_or("pty session should exist")?;
+        assert_eq!(lost.state, WorkspaceState::Blocked);
+        assert_eq!(lost.backend_state, PtyBackendState::Failed);
+        assert!(!lost.input_allowed);
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Blocked);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_marks_backend_exit_in_persistent_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            EndingPtyBackend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let session = fixture
+                .repositories
+                .pty_sessions
+                .get(opened.pty_session.pty_session_id)
+                .await?
+                .ok_or("pty session should exist")?;
+            if session.backend_state != PtyBackendState::Active {
+                assert_eq!(session.backend_state, PtyBackendState::Closed);
+                assert_eq!(session.state, WorkspaceState::Done);
+                assert!(!session.input_allowed);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("backend exit did not update persistent PTY state".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_claims_and_delivers_queued_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let backend = CapturingPtyBackend::new();
+        let inputs = Arc::clone(&backend.inputs);
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig {
+                connector_id: fixture.connector_id,
+                max_input_bytes: 1024,
+                output_limit_bytes: 1024,
+                input_lease_seconds: 30,
+                input_max_attempts: 3,
+            },
+        );
+        let opened = manager
+            .open(
+                fixture.workspace_id,
+                fixture.session_id,
+                Some("/tmp".to_owned()),
+            )
+            .await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let event = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: opened.pty_session.pty_session_id,
+            workspace_id: fixture.workspace_id,
+            connector_id: fixture.connector_id,
+            host_id: workspace.host_id,
+            agent_session_id: workspace.agent_session_id,
+            idempotency_key: None,
+            input_fingerprint: None,
+            state: PtyInputEventState::Queued,
+            sequence: 0,
+            redacted_input_summary: "13 bytes queued for pty input".to_owned(),
+            byte_len: 13,
+            requested_by: Some("agent".to_owned()),
+            created_at: now_utc(),
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&event, "queued input\n")
+            .await?;
+
+        let outcome = manager
+            .deliver_next_queued_input(30, 3)
+            .await?
+            .ok_or("queued input should be delivered")?;
+        assert_eq!(outcome.input_event_id, event.id);
+        assert_eq!(outcome.state, PtyInputEventState::Delivered);
+        assert_eq!(outcome.error, None);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(inputs.lock().await.as_slice(), ["queued input\n"]);
+
+        let delivered = fixture
+            .repositories
+            .pty_input_events
+            .get(event.id)
+            .await?
+            .ok_or("event should exist")?;
+        assert_eq!(delivered.state, PtyInputEventState::Delivered);
+        assert!(delivered.delivered_at.is_some());
+        assert!(manager.deliver_next_queued_input(30, 3).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn connector_pty_write_lease_blocks_foreign_session_until_close_or_expiry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let backend = CapturingPtyBackend::new();
+        let output_tx = backend.output_tx.clone();
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let event = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: opened.pty_session.pty_session_id,
+            workspace_id: workspace.id,
+            connector_id: workspace.connector_id,
+            host_id: workspace.host_id,
+            agent_session_id: workspace.agent_session_id,
+            idempotency_key: Some("interactive-deploy-step".to_owned()),
+            input_fingerprint: Some("test-fingerprint".to_owned()),
+            state: PtyInputEventState::Queued,
+            sequence: 0,
+            redacted_input_summary: "18 bytes queued for pty input".to_owned(),
+            byte_len: 18,
+            requested_by: Some("agent".to_owned()),
+            created_at: now_utc(),
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&event, "run deployment\n")
+            .await?;
+        manager
+            .deliver_next_queued_input(30, 3)
+            .await?
+            .ok_or("PTY input should be delivered")?;
+
+        let observed_after_input = now_utc();
+        let initial_lease = fixture
+            .repositories
+            .host_write_leases
+            .get_active(workspace.host_id, observed_after_input)
+            .await?
+            .ok_or("PTY input should retain a write lease")?;
+        assert_eq!(
+            initial_lease.holder_agent_session_id,
+            fixture.agent_session_id
+        );
+        assert!(initial_lease.expires_at >= observed_after_input + time::Duration::seconds(250));
+
+        let foreign_session = AgentSession {
+            id: AgentSessionId::new(),
+            client_kind: "codex".to_owned(),
+            client_instance_id: "foreign-pty-session".to_owned(),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("foreign-pty-conversation".to_owned()),
+            state: AgentSessionState::Active,
+            created_at: observed_after_input,
+            last_seen_at: observed_after_input,
+            expires_at: observed_after_input + time::Duration::hours(24),
+        };
+        fixture
+            .repositories
+            .agent_sessions
+            .upsert(&foreign_session)
+            .await?;
+        let foreign_workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(foreign_session.id),
+            label: "foreign-pty-agent".to_owned(),
+            ..workspace.clone()
+        };
+        fixture
+            .repositories
+            .workspaces
+            .insert(&foreign_workspace)
+            .await?;
+        assert!(
+            fixture
+                .repositories
+                .host_write_leases
+                .try_acquire(
+                    &HostWriteLease {
+                        host_id: workspace.host_id,
+                        holder_agent_session_id: foreign_session.id,
+                        holder_workspace_id: foreign_workspace.id,
+                        acquired_at: observed_after_input,
+                        heartbeat_at: observed_after_input,
+                        expires_at: observed_after_input + time::Duration::minutes(5),
+                    },
+                    observed_after_input,
+                )
+                .await?
+                .is_none()
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        output_tx
+            .send(PtyBackendOutput {
+                stream: OutputStream::Stdout,
+                text: "deployment still running\n".to_owned(),
+                truncated: false,
+            })
+            .await?;
+        wait_for_pty_output(
+            &fixture.repositories,
+            opened.pty_session.pty_session_id,
+            "deployment still running",
+        )
+        .await?;
+        let renewed_lease = fixture
+            .repositories
+            .host_write_leases
+            .get_active(workspace.host_id, now_utc())
+            .await?
+            .ok_or("PTY output should keep the write lease active")?;
+        assert!(renewed_lease.heartbeat_at > initial_lease.heartbeat_at);
+        assert!(renewed_lease.expires_at > initial_lease.expires_at);
+        let active_pty = fixture
+            .repositories
+            .pty_sessions
+            .get(opened.pty_session.pty_session_id)
+            .await?
+            .ok_or("active PTY should still exist")?;
+        assert!(active_pty.last_activity_at >= renewed_lease.heartbeat_at);
+
+        manager
+            .close(opened.pty_session.pty_session_id, Some(0))
+            .await?;
+        let observed_after_close = now_utc();
+        let closing_lease = fixture
+            .repositories
+            .host_write_leases
+            .get_active(workspace.host_id, observed_after_close)
+            .await?
+            .ok_or("closed PTY should retain only a short handoff grace")?;
+        assert!(
+            closing_lease.expires_at
+                <= observed_after_close
+                    + time::Duration::seconds(super::WRITE_LEASE_HANDOFF_GRACE_SECONDS + 1)
+        );
+
+        let takeover_at = closing_lease.expires_at + time::Duration::milliseconds(1);
+        let takeover = fixture
+            .repositories
+            .host_write_leases
+            .try_acquire(
+                &HostWriteLease {
+                    host_id: workspace.host_id,
+                    holder_agent_session_id: foreign_session.id,
+                    holder_workspace_id: foreign_workspace.id,
+                    acquired_at: takeover_at,
+                    heartbeat_at: takeover_at,
+                    expires_at: takeover_at + time::Duration::minutes(5),
+                },
+                takeover_at,
+            )
+            .await?
+            .ok_or("foreign session should acquire the lease after PTY grace expires")?;
+        assert_eq!(takeover.holder_agent_session_id, foreign_session.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_activates_existing_session_for_queued_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let backend = CapturingPtyBackend::new();
+        let inputs = Arc::clone(&backend.inputs);
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig {
+                connector_id: fixture.connector_id,
+                max_input_bytes: 1024,
+                output_limit_bytes: 1024,
+                input_lease_seconds: 30,
+                input_max_attempts: 3,
+            },
+        );
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        let pty_session = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: Some("/tmp".to_owned()),
+            },
+        )?;
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&pty_session)
+            .await?;
+        let event = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: pty_session.pty_session_id,
+            workspace_id: fixture.workspace_id,
+            connector_id: fixture.connector_id,
+            host_id: workspace.host_id,
+            agent_session_id: workspace.agent_session_id,
+            idempotency_key: None,
+            input_fingerprint: None,
+            state: PtyInputEventState::Queued,
+            sequence: 0,
+            redacted_input_summary: "13 bytes queued for pty input".to_owned(),
+            byte_len: 13,
+            requested_by: Some("agent".to_owned()),
+            created_at: now_utc(),
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&event, "attach input\n")
+            .await?;
+
+        let outcome = manager
+            .deliver_next_queued_input(30, 3)
+            .await?
+            .ok_or("queued input should activate and deliver")?;
+        assert_eq!(outcome.state, PtyInputEventState::Delivered);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(inputs.lock().await.as_slice(), ["attach input\n"]);
+        let active_session = fixture
+            .repositories
+            .pty_sessions
+            .get(pty_session.pty_session_id)
+            .await?
+            .ok_or("pty session should exist")?;
+        assert_eq!(active_session.backend_state, PtyBackendState::Active);
+        assert_eq!(
+            active_session.backend_capabilities,
+            PtyBackendCapabilities::openssh_pipe_shell()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openssh_provider_reuses_cached_transport_per_access_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let provider = OpenSshTransportProvider::new(
+            fixture.repositories.clone(),
+            HostKeyPolicy::Add,
+            5,
+            ServerProtectionPolicy::default(),
+        );
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+
+        let first = provider.transport_for(&operation).await?;
+        let second = provider.transport_for(&operation).await?;
+        assert!(Arc::ptr_eq(&first, &second));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openssh_operation_and_pty_backends_share_one_raw_transport()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let pool = Arc::new(OpenSshTransportPool::new(
+            fixture.repositories.clone(),
+            HostKeyPolicy::Add,
+            5,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        ));
+        let provider = OpenSshTransportProvider::with_pool(
+            Arc::clone(&pool),
+            ServerProtectionPolicy::default(),
+        );
+        let backend = super::OpenSshPtyBackendFactory::with_pool(
+            fixture.repositories.clone(),
+            Arc::clone(&pool),
+        );
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+
+        let _guarded = provider.transport_for(&operation).await?;
+        let operation_transport = pool
+            .transport_for_access_path(operation.access_path_id)
+            .await?;
+        let pty_transport = backend.transport_for_session(fixture.session_id).await?;
+
+        assert!(Arc::ptr_eq(&operation_transport, &pty_transport));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn russh_transport_pool_reuses_raw_transport_per_access_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        let pool = RusshTransportPool::new(
+            fixture.repositories.clone(),
+            Arc::new(UnusedSshCredentialProvider),
+            HostKeyPolicy::Add,
+            None,
+            5,
+            30,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        );
+
+        let first = pool
+            .transport_for_access_path(operation.access_path_id)
+            .await?;
+        let second = pool
+            .transport_for_access_path(operation.access_path_id)
+            .await?;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!first.config.use_exec_file_transfer);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ssh_transport_pools_replace_cached_transports_when_route_metadata_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        let mut path = fixture
+            .repositories
+            .access_paths
+            .get(operation.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        let russh_pool = RusshTransportPool::new(
+            fixture.repositories.clone(),
+            Arc::new(UnusedSshCredentialProvider),
+            HostKeyPolicy::Add,
+            None,
+            5,
+            30,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        );
+        let openssh_pool = OpenSshTransportPool::new(
+            fixture.repositories.clone(),
+            HostKeyPolicy::Add,
+            5,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        );
+        let first_russh = russh_pool.transport_for_access_path(path.id).await?;
+        let first_openssh = openssh_pool.transport_for_access_path(path.id).await?;
+
+        path.address = "10.0.0.99".to_owned();
+        path.port = 2222;
+        path.route_type = RouteType::Bastion;
+        path.proxy_chain.clear();
+        fixture.repositories.access_paths.upsert(&path).await?;
+
+        let second_russh = russh_pool.transport_for_access_path(path.id).await?;
+        let second_openssh = openssh_pool.transport_for_access_path(path.id).await?;
+        assert!(!Arc::ptr_eq(&first_russh, &second_russh));
+        assert!(!Arc::ptr_eq(&first_openssh, &second_openssh));
+        assert_eq!(second_russh.config.address, "10.0.0.99");
+        assert_eq!(second_russh.config.port, 2222);
+        assert!(second_russh.config.use_exec_file_transfer);
+        assert_eq!(
+            second_openssh.config.destination,
+            "ssh://ops@10.0.0.99:2222"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guarded_transport_providers_follow_replaced_raw_transports()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        let mut path = fixture
+            .repositories
+            .access_paths
+            .get(operation.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        let russh_pool = Arc::new(RusshTransportPool::new(
+            fixture.repositories.clone(),
+            Arc::new(UnusedSshCredentialProvider),
+            HostKeyPolicy::Add,
+            None,
+            5,
+            30,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        ));
+        let russh_provider =
+            super::RusshTransportProvider::with_pool(russh_pool, ServerProtectionPolicy::default());
+        let openssh_pool = Arc::new(OpenSshTransportPool::new(
+            fixture.repositories.clone(),
+            HostKeyPolicy::Add,
+            5,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        ));
+        let openssh_provider =
+            OpenSshTransportProvider::with_pool(openssh_pool, ServerProtectionPolicy::default());
+        let first_russh = russh_provider.cached_transport(path.id).await?;
+        let first_openssh = openssh_provider.cached_transport(path.id).await?;
+
+        path.address = "10.0.0.100".to_owned();
+        fixture.repositories.access_paths.upsert(&path).await?;
+
+        let second_russh = russh_provider.cached_transport(path.id).await?;
+        let second_openssh = openssh_provider.cached_transport(path.id).await?;
+        assert!(!Arc::ptr_eq(&first_russh, &second_russh));
+        assert!(!Arc::ptr_eq(&first_openssh, &second_openssh));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn russh_empty_bastion_route_uses_pooled_exec_file_streams()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        let mut access_path = fixture
+            .repositories
+            .access_paths
+            .get(operation.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        access_path.route_type = RouteType::Bastion;
+        access_path.proxy_chain.clear();
+        fixture
+            .repositories
+            .access_paths
+            .upsert(&access_path)
+            .await?;
+        let pool = RusshTransportPool::new(
+            fixture.repositories.clone(),
+            Arc::new(UnusedSshCredentialProvider),
+            HostKeyPolicy::Add,
+            None,
+            5,
+            30,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        );
+
+        let transport = pool
+            .transport_for_access_path(operation.access_path_id)
+            .await?;
+
+        assert!(transport.config.use_exec_file_transfer);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ssh_transport_pools_fail_fast_for_multi_hop_routes_without_caching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        let mut path = fixture
+            .repositories
+            .access_paths
+            .get(operation.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        let russh_pool = RusshTransportPool::new(
+            fixture.repositories.clone(),
+            Arc::new(UnusedSshCredentialProvider),
+            HostKeyPolicy::Add,
+            None,
+            5,
+            30,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        );
+        let openssh_pool = OpenSshTransportPool::new(
+            fixture.repositories.clone(),
+            HostKeyPolicy::Add,
+            5,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        );
+        russh_pool.transport_for_access_path(path.id).await?;
+        openssh_pool.transport_for_access_path(path.id).await?;
+        assert_eq!(russh_pool.cache.lock().await.len(), 1);
+        assert_eq!(openssh_pool.cache.lock().await.len(), 1);
+
+        path.route_type = RouteType::Bastion;
+        path.proxy_chain = Vec::new();
+        fixture.repositories.access_paths.upsert(&path).await?;
+        russh_pool.transport_for_access_path(path.id).await?;
+        openssh_pool.transport_for_access_path(path.id).await?;
+
+        path.route_type = RouteType::ProxyJump;
+        path.proxy_chain = vec!["jump-user@jump.example:22".to_owned()];
+        fixture.repositories.access_paths.upsert(&path).await?;
+
+        let Err(russh_error) = russh_pool.transport_for_access_path(path.id).await else {
+            return Err("native transport silently accepted a multi-hop route".into());
+        };
+        assert!(russh_error.contains("multi-hop"));
+        assert!(russh_pool.cache.lock().await.is_empty());
+        let bootstrap = fixture
+            .repositories
+            .authorized_key_bootstrap
+            .get(path.id)
+            .await?
+            .ok_or("multi-hop decision should be visible")?;
+        assert_eq!(bootstrap.state, AuthorizedKeyBootstrapState::Skipped);
+        assert_eq!(
+            bootstrap.reason,
+            Some(AuthorizedKeyBootstrapReason::MultiHopUnsupported)
+        );
+
+        let Err(openssh_error) = openssh_pool.transport_for_access_path(path.id).await else {
+            return Err("OpenSSH transport silently ignored a proxy chain".into());
+        };
+        assert!(openssh_error.contains("multi-hop"));
+        assert!(openssh_pool.cache.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn russh_pty_backend_factory_reports_native_capabilities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let pool = Arc::new(RusshTransportPool::new(
+            fixture.repositories.clone(),
+            Arc::new(UnusedSshCredentialProvider),
+            HostKeyPolicy::Add,
+            None,
+            5,
+            30,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        ));
+        let backend = RusshPtyBackendFactory::with_pool(fixture.repositories.clone(), pool);
+
+        assert_eq!(
+            backend.capabilities(),
+            PtyBackendCapabilities::russh_native_pty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_daemon_processes_operations_heartbeats_and_stops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        seed_ssh_transport_runtime(
+            &fixture.repositories,
+            &operation,
+            SshTransportRuntimeState::Ready,
+            3,
+        )
+        .await?;
+        let provider = StaticTransportProvider::new(FakeTransport);
+        let daemon = ConnectorDaemon::new(
+            fixture.repositories.clone(),
+            provider,
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+            ConnectorDaemonConfig {
+                connector_id: fixture.connector_id,
+                version: "test-daemon".to_owned(),
+                current_network: Some("test-net".to_owned()),
+                heartbeat_interval_ms: 5,
+                idle_min_delay_ms: 5,
+                idle_max_delay_ms: 10,
+                error_backoff_ms: 5,
+            },
+        )
+        .with_pty_input_pump(Arc::new(OneShotPtyInputPump::new()));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { daemon.run_until_stopped(stop_rx).await });
+
+        wait_for_operation_state(
+            &fixture.repositories,
+            fixture.operation_id,
+            OperationState::Succeeded,
+        )
+        .await?;
+        stop_tx.send(true)?;
+        let report = handle.await??;
+
+        assert_eq!(report.reconciled_connection_sessions, 1);
+        assert_eq!(report.reconciled_transport_runtimes, 1);
+        assert_eq!(report.completed_operations, 1);
+        assert_eq!(report.delivered_pty_inputs, 1);
+        assert_eq!(report.failed_pty_inputs, 0);
+        let stale_session = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("pre-restart connection session should still exist")?;
+        assert_eq!(stale_session.state, EntityState::Unknown);
+        assert_eq!(stale_session.open_channels, 0);
+        assert!(
+            stale_session
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains("connector runtime restarted"))
+        );
+        let stale_runtime = fixture
+            .repositories
+            .ssh_transport_runtimes
+            .get(operation.access_path_id, operation.connector_id)
+            .await?
+            .ok_or("transport runtime should still be inspectable")?;
+        assert_eq!(
+            stale_runtime.telemetry.state,
+            SshTransportRuntimeState::RuntimeLost
+        );
+        let connector = fixture
+            .repositories
+            .connectors
+            .get(fixture.connector_id)
+            .await?
+            .ok_or("connector should exist")?;
+        assert_eq!(connector.state, EntityState::ConnectorOffline);
+        assert_eq!(connector.version, "test-daemon");
+        assert_eq!(connector.current_network.as_deref(), Some("test-net"));
+
+        let events = fixture
+            .repositories
+            .state_events
+            .list_for_entity("connector", &fixture.connector_id.to_string(), 10)
+            .await?;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.new_state == EntityState::ConnectorOffline)
+        );
+        Ok(())
+    }
+
+    async fn seed_ssh_transport_runtime(
+        repositories: &Repositories,
+        operation: &OperationRun,
+        state: SshTransportRuntimeState,
+        reuse_count: u64,
+    ) -> Result<SshTransportRuntimeId, Box<dyn std::error::Error>> {
+        let runtime_id = SshTransportRuntimeId::new();
+        let now = now_utc();
+        repositories
+            .ssh_transport_runtimes
+            .upsert(&SshTransportRuntime {
+                access_path_id: operation.access_path_id,
+                connector_id: operation.connector_id,
+                telemetry: SshTransportTelemetry {
+                    runtime_id,
+                    backend: SshTransportBackend::Russh,
+                    state,
+                    generation: 1,
+                    connection_attempt_count: 1,
+                    successful_handshake_count: 1,
+                    reuse_count,
+                    last_handshake_at: Some(now),
+                    last_validated_at: Some(now),
+                    capabilities: SshTransportCapabilities::pooled(SshFileTransferMode::Sftp),
+                },
+                updated_at: now,
+            })
+            .await?;
+        Ok(runtime_id)
+    }
+
+    async fn wait_for_operation_state(
+        repositories: &Repositories,
+        operation_id: OperationId,
+        expected: OperationState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..100 {
+            let operation = repositories
+                .operations
+                .get(operation_id)
+                .await?
+                .ok_or("operation should exist")?;
+            if operation.state == expected {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Err("operation did not reach expected state".into())
+    }
+
+    async fn wait_for_pty_output(
+        repositories: &Repositories,
+        pty_session_id: PtySessionId,
+        expected_text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..100 {
+            let chunks = repositories
+                .pty_output_chunks
+                .list_for_session(pty_session_id, None, 20)
+                .await?;
+            if chunks
+                .iter()
+                .any(|chunk| chunk.redacted_text.contains(expected_text))
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Err("pty output did not reach expected text".into())
+    }
+
+    struct WorkerFixture {
+        repositories: Repositories,
+        host_id: HostId,
+        agent_session_id: AgentSessionId,
+        connector_id: ConnectorId,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        operation_id: OperationId,
+    }
+
+    impl WorkerFixture {
+        #[allow(clippy::too_many_lines)]
+        async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+            let pool = connect_sqlite("sqlite::memory:").await?;
+            migrate(&pool).await?;
+            let repositories = Repositories::new(pool);
+            let now = now_utc();
+            let host = Host {
+                id: HostId::new(),
+                name: "worker-host".to_owned(),
+                display_name: "Worker Host".to_owned(),
+                kind: HostKind::Linux,
+                owner: None,
+                tags: Vec::new(),
+                description: None,
+                risk_level: RiskLevel::Development,
+                created_at: now,
+                updated_at: now,
+            };
+            repositories.hosts.insert(&host).await?;
+            let environment = Environment {
+                id: EnvironmentId::new(),
+                name: format!("worker-env-{}", host.id),
+                kind: EnvironmentKind::CompanyLan,
+                description: None,
+                trust_level: TrustLevel::Trusted,
+                notes: None,
+            };
+            repositories.environments.insert(&environment).await?;
+            let connector = Connector {
+                id: ConnectorId::new(),
+                name: format!("worker-connector-{}", host.id),
+                environment_id: environment.id,
+                host_id: None,
+                version: "0.1.0".to_owned(),
+                state: EntityState::Healthy,
+                last_seen_at: Some(now),
+                current_network: Some("test".to_owned()),
+            };
+            repositories.connectors.upsert(&connector).await?;
+            let credential_id = CredentialId::new();
+            repositories
+                .credentials
+                .insert(&StoredCredential {
+                    metadata: CredentialMetadata {
+                        id: credential_id,
+                        name: format!("worker-credential-{}", host.id),
+                        kind: CredentialKind::SshPrivateKey,
+                        username_hint: Some("ops".to_owned()),
+                        created_at: now,
+                        updated_at: now,
+                        last_used_at: None,
+                    },
+                    encrypted_blob_json: json!({"version": 1}),
+                })
+                .await?;
+            let access_path = AccessPath {
+                id: AccessPathId::new(),
+                host_id: host.id,
+                environment_id: environment.id,
+                connector_id: Some(connector.id),
+                protocol: Protocol::Ssh,
+                address: "10.0.0.40".to_owned(),
+                port: 22,
+                username: "ops".to_owned(),
+                credential_id,
+                route_type: RouteType::Lan,
+                proxy_chain: Vec::new(),
+                priority: 1,
+                enabled: true,
+                connection_mode: ConnectionMode::Pooled,
+                idle_ttl_seconds: 600,
+                keepalive_seconds: 30,
+                max_concurrent_channels: 1,
+                max_new_connections_per_minute: 1,
+                requires_tty: false,
+                notes: None,
+            };
+            repositories.access_paths.insert(&access_path).await?;
+            let session = ConnectionSession {
+                session_id: SessionId::new(),
+                access_path_id: access_path.id,
+                connector_id: connector.id,
+                state: EntityState::Connected,
+                created_at: now,
+                last_used_at: now,
+                open_channels: 1,
+                reused_count: 0,
+                failure_count: 0,
+                last_error: None,
+            };
+            repositories.connection_sessions.upsert(&session).await?;
+            repositories
+                .access_path_health
+                .upsert(&AccessPathHealth {
+                    access_path_id: access_path.id,
+                    state: EntityState::Healthy,
+                    last_checked_at: Some(now),
+                    latency_ms: Some(3),
+                    failure_count: 0,
+                    last_error_code: None,
+                    next_retry_at: None,
+                })
+                .await?;
+
+            let agent_session = AgentSession {
+                id: AgentSessionId::new(),
+                client_kind: "codex".to_owned(),
+                client_instance_id: "connector-worker-test".to_owned(),
+                project_key: Some("remote-hosts".to_owned()),
+                conversation_key: Some("worker-fixture".to_owned()),
+                state: AgentSessionState::Active,
+                created_at: now,
+                last_seen_at: now,
+                expires_at: now + time::Duration::hours(24),
+            };
+            repositories.agent_sessions.upsert(&agent_session).await?;
+            let workspace = AgentWorkspace {
+                id: WorkspaceId::new(),
+                agent_session_id: Some(agent_session.id),
+                host_id: host.id,
+                access_path_id: access_path.id,
+                connector_id: connector.id,
+                label: "agent-main".to_owned(),
+                cwd: Some("/tmp".to_owned()),
+                state: WorkspaceState::Idle,
+                policy_profile: "default".to_owned(),
+                created_at: now,
+                last_activity_at: now,
+                ttl_seconds: 3600,
+            };
+            repositories.workspaces.insert(&workspace).await?;
+
+            let policy = ServerProtectionPolicy::default();
+            let profile =
+                CommandProfileCatalog::resolve_builtin("host.uptime", Vec::new(), &policy)?;
+            let plan = WorkspaceOperationSupervisor::new(policy).queue_operation(
+                &WorkspaceRunCommand {
+                    workspace: workspace.clone(),
+                    command_profile: profile,
+                    intent: Some("worker smoke".to_owned()),
+                    idempotency_key: None,
+                    queued_operations: 0,
+                    active_exec_channels: 0,
+                    active_probe_jobs: 0,
+                    overload_cooldown_active: false,
+                },
+            )?;
+            repositories.operations.insert(&plan.operation).await?;
+            repositories
+                .operation_output_chunks
+                .insert(&plan.initial_output_chunk)
+                .await?;
+            repositories
+                .workspaces
+                .update_state(workspace.id, plan.workspace_state, now)
+                .await?;
+
+            Ok(Self {
+                repositories,
+                host_id: host.id,
+                agent_session_id: agent_session.id,
+                connector_id: connector.id,
+                workspace_id: workspace.id,
+                session_id: session.session_id,
+                operation_id: plan.operation.id,
+            })
+        }
+    }
+}

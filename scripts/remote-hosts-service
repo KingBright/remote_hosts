@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICE_NAME="remote-hosts"
+API_LABEL="com.remote-hosts.api"
+CONNECTOR_LABEL="com.remote-hosts.connector"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+CONFIG_DIR="${REMOTE_HOSTS_CONFIG_DIR:-${HOME}/.config/remote-hosts}"
+CONFIG_FILE="${REMOTE_HOSTS_SERVICE_ENV:-${CONFIG_DIR}/service.env}"
+DEFAULT_VAULT_MASTER_PASSWORD_FILE="${CONFIG_DIR}/vault-master-password"
+DATA_DIR="${REMOTE_HOSTS_DATA_DIR:-${HOME}/.local/share/remote-hosts}"
+STATE_DIR="${REMOTE_HOSTS_STATE_DIR:-${HOME}/.local/state/remote-hosts}"
+BIN_DIR="${REMOTE_HOSTS_BIN_DIR:-${HOME}/.local/bin}"
+BIN_PATH="${BIN_DIR}/remote-hosts"
+RUN_DIR="${DATA_DIR}/run"
+LOG_DIR="${STATE_DIR}/logs"
+LAUNCH_AGENT_DIR="${HOME}/Library/LaunchAgents"
+API_PLIST="${LAUNCH_AGENT_DIR}/${API_LABEL}.plist"
+CONNECTOR_PLIST="${LAUNCH_AGENT_DIR}/${CONNECTOR_LABEL}.plist"
+USER_DOMAIN="gui/$(id -u)"
+
+usage() {
+  cat <<EOF
+Usage: scripts/remote-hosts-service <command>
+
+Commands:
+  install        Build, install, migrate, register launchd services, and start them
+  update         Rebuild/reinstall binary, migrate database, refresh launchd files, restart
+  start          Start loaded launchd services
+  stop           Unload launchd services
+  restart        Restart loaded launchd services
+  status         Print launchd status for API and connector
+  logs           Tail API and connector logs
+  migrate        Run database migrations with the installed binary
+  doctor         Run remote-hosts doctor with the installed binary
+  print-config   Print service paths and config location
+
+Config:
+  ${CONFIG_FILE}
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "${CONFIG_DIR}" "${DATA_DIR}" "${STATE_DIR}" "${BIN_DIR}" "${RUN_DIR}" "${LOG_DIR}" "${LAUNCH_AGENT_DIR}"
+}
+
+default_connector_id() {
+  uuidgen | tr '[:upper:]' '[:lower:]'
+}
+
+default_environment_id() {
+  uuidgen | tr '[:upper:]' '[:lower:]'
+}
+
+write_default_config() {
+  ensure_dirs
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    return
+  fi
+
+  local connector_id
+  local environment_id
+  connector_id="$(default_connector_id)"
+  environment_id="$(default_environment_id)"
+  cat >"${CONFIG_FILE}" <<EOF
+# Remote Hosts local service config.
+# This file is sourced by local launchd wrapper scripts. Keep values shell-safe.
+REMOTE_HOSTS_BIN=${BIN_PATH}
+REMOTE_HOSTS_DATABASE_URL=sqlite://${DATA_DIR}/remote-hosts.sqlite
+REMOTE_HOSTS_BIND=127.0.0.1:8787
+REMOTE_HOSTS_ARTIFACT_ROOT=${DATA_DIR}/artifacts
+REMOTE_HOSTS_CONNECTOR_ID=${connector_id}
+REMOTE_HOSTS_CONNECTOR_NAME=local-macos-connector
+REMOTE_HOSTS_ENVIRONMENT_ID=${environment_id}
+REMOTE_HOSTS_ENVIRONMENT_NAME=local-macos
+REMOTE_HOSTS_CURRENT_NETWORK=local
+REMOTE_HOSTS_HOST_KEY_POLICY=add
+REMOTE_HOSTS_CONNECT_TIMEOUT_SECONDS=10
+REMOTE_HOSTS_SSH_BACKEND=russh
+REMOTE_HOSTS_PTY_BACKEND_MODE=auto
+REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE=${DEFAULT_VAULT_MASTER_PASSWORD_FILE}
+REMOTE_HOSTS_KNOWN_HOSTS_PATH=
+REMOTE_HOSTS_RUSSH_INACTIVITY_TIMEOUT_SECONDS=30
+REMOTE_HOSTS_LOG=remote_hosts=info,remote_hosts_cli=info
+EOF
+}
+
+load_config() {
+  write_default_config
+  set -a
+  # shellcheck disable=SC1090
+  . "${CONFIG_FILE}"
+  set +a
+}
+
+ensure_local_vault() {
+  load_config
+  local migrated_from_empty=0
+  if [[ -z "${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE:-}" ]]; then
+    update_config_key "REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE" "${DEFAULT_VAULT_MASTER_PASSWORD_FILE}"
+    migrated_from_empty=1
+    load_config
+  fi
+
+  mkdir -p "$(dirname "${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}")"
+  if [[ ! -s "${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}" ]]; then
+    local tmp
+    tmp="$(mktemp "${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}.tmp.XXXXXX")"
+    (
+      umask 077
+      dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -d '\r\n' >"${tmp}"
+      printf '\n' >>"${tmp}"
+    )
+    mv "${tmp}" "${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}"
+  fi
+  chmod 0600 "${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}"
+
+  if [[ "${migrated_from_empty}" == "1" && "${REMOTE_HOSTS_SSH_BACKEND:-openssh}" == "openssh" ]]; then
+    update_config_key "REMOTE_HOSTS_SSH_BACKEND" "russh"
+    load_config
+  fi
+}
+
+update_config_key() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  tmp="$(mktemp)"
+  awk -v key="${key}" -v value="${value}" '
+    BEGIN { found = 0 }
+    $0 ~ "^" key "=" { print key "=" value; found = 1; next }
+    { print }
+    END { if (found == 0) print key "=" value }
+  ' "${CONFIG_FILE}" >"${tmp}"
+  mv "${tmp}" "${CONFIG_FILE}"
+}
+
+sqlite_path_from_url() {
+  local url="$1"
+  if [[ "${url}" != sqlite://* ]]; then
+    echo "only sqlite:// database URLs are supported by this local service script: ${url}" >&2
+    return 1
+  fi
+  local path="${url#sqlite://}"
+  if [[ "${path}" != /* ]]; then
+    path="${ROOT_DIR}/${path}"
+  fi
+  printf '%s\n' "${path}"
+}
+
+sql_quote() {
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
+require_installed_binary() {
+  if [[ ! -x "${BIN_PATH}" ]]; then
+    echo "remote-hosts binary is not installed at ${BIN_PATH}; run install first" >&2
+    exit 1
+  fi
+}
+
+build_release() {
+  cargo build --release -p remote-hosts-cli --bin remote-hosts
+}
+
+cargo_target_dir() {
+  if command -v python3 >/dev/null 2>&1; then
+    cargo metadata --no-deps --format-version=1 \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
+  else
+    printf '%s\n' "${ROOT_DIR}/target"
+  fi
+}
+
+install_binary() {
+  local release_binary
+  release_binary="$(cargo_target_dir)/release/remote-hosts"
+  install -m 0755 "${release_binary}" "${BIN_PATH}"
+}
+
+run_migrate() {
+  load_config
+  require_installed_binary
+  "${BIN_PATH}" migrate --database-url "${REMOTE_HOSTS_DATABASE_URL}"
+}
+
+ensure_default_connector() {
+  load_config
+  local db_path
+  db_path="$(sqlite_path_from_url "${REMOTE_HOSTS_DATABASE_URL}")"
+  mkdir -p "$(dirname "${db_path}")" "${REMOTE_HOSTS_ARTIFACT_ROOT}"
+
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "sqlite3 is unavailable; skipping default connector bootstrap" >&2
+    return
+  fi
+
+  if [[ -z "${REMOTE_HOSTS_CONNECTOR_ID:-}" ]]; then
+    update_config_key "REMOTE_HOSTS_CONNECTOR_ID" "$(default_connector_id)"
+    load_config
+  fi
+  if [[ -z "${REMOTE_HOSTS_ENVIRONMENT_ID:-}" ]]; then
+    update_config_key "REMOTE_HOSTS_ENVIRONMENT_ID" "$(default_environment_id)"
+    load_config
+  fi
+
+  local env_name connector_name current_network
+  env_name="$(sql_quote "${REMOTE_HOSTS_ENVIRONMENT_NAME:-local-macos}")"
+  connector_name="$(sql_quote "${REMOTE_HOSTS_CONNECTOR_NAME:-local-macos-connector}")"
+  current_network="$(sql_quote "${REMOTE_HOSTS_CURRENT_NETWORK:-local}")"
+
+  sqlite3 "${db_path}" <<SQL
+INSERT OR IGNORE INTO environments (
+  id, name, kind_json, description, trust_level_json, notes
+) VALUES (
+  '${REMOTE_HOSTS_ENVIRONMENT_ID}',
+  '${env_name}',
+  '"home_lan"',
+  'Local macOS launchd environment',
+  '"owned"',
+  'Created by scripts/remote-hosts-service'
+);
+
+INSERT INTO connectors (
+  id, name, environment_id, host_id, version, state_json, last_seen_at, current_network
+) VALUES (
+  '${REMOTE_HOSTS_CONNECTOR_ID}',
+  '${connector_name}',
+  '${REMOTE_HOSTS_ENVIRONMENT_ID}',
+  NULL,
+  '0.1.0',
+  '"not_configured"',
+  NULL,
+  '${current_network}'
+)
+ON CONFLICT(id) DO UPDATE SET
+  name = excluded.name,
+  environment_id = excluded.environment_id,
+  version = excluded.version,
+  current_network = excluded.current_network;
+SQL
+}
+
+write_wrappers() {
+  load_config
+  mkdir -p "${RUN_DIR}"
+
+  cat >"${RUN_DIR}/remote-hosts-api" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+. "${CONFIG_FILE}"
+set +a
+export RUST_LOG="\${REMOTE_HOSTS_LOG:-remote_hosts=info,remote_hosts_cli=info}"
+exec "\${REMOTE_HOSTS_BIN}" serve \\
+  --database-url "\${REMOTE_HOSTS_DATABASE_URL}" \\
+  --bind "\${REMOTE_HOSTS_BIND:-127.0.0.1:8787}"
+EOF
+
+  cat >"${RUN_DIR}/remote-hosts-connector" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+. "${CONFIG_FILE}"
+set +a
+export RUST_LOG="\${REMOTE_HOSTS_LOG:-remote_hosts=info,remote_hosts_cli=info}"
+if [[ -z "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE:-}" ]]; then
+  unset REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE
+fi
+if [[ -z "\${REMOTE_HOSTS_KNOWN_HOSTS_PATH:-}" ]]; then
+  unset REMOTE_HOSTS_KNOWN_HOSTS_PATH
+fi
+if [[ -z "\${REMOTE_HOSTS_CONNECTOR_ID:-}" ]]; then
+  echo "REMOTE_HOSTS_CONNECTOR_ID is empty in ${CONFIG_FILE}" >&2
+  exit 78
+fi
+args=(
+  worker-daemon
+  --database-url "\${REMOTE_HOSTS_DATABASE_URL}"
+  --connector-id "\${REMOTE_HOSTS_CONNECTOR_ID}"
+  --current-network "\${REMOTE_HOSTS_CURRENT_NETWORK:-local}"
+  --host-key-policy "\${REMOTE_HOSTS_HOST_KEY_POLICY:-add}"
+  --connect-timeout-seconds "\${REMOTE_HOSTS_CONNECT_TIMEOUT_SECONDS:-10}"
+  --ssh-backend "\${REMOTE_HOSTS_SSH_BACKEND:-openssh}"
+  --pty-backend-mode "\${REMOTE_HOSTS_PTY_BACKEND_MODE:-auto}"
+  --russh-inactivity-timeout-seconds "\${REMOTE_HOSTS_RUSSH_INACTIVITY_TIMEOUT_SECONDS:-30}"
+  --artifact-root "\${REMOTE_HOSTS_ARTIFACT_ROOT}"
+)
+if [[ -n "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE:-}" ]]; then
+  args+=(--vault-master-password-file "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}")
+fi
+if [[ -n "\${REMOTE_HOSTS_KNOWN_HOSTS_PATH:-}" ]]; then
+  args+=(--known-hosts-path "\${REMOTE_HOSTS_KNOWN_HOSTS_PATH}")
+fi
+exec "\${REMOTE_HOSTS_BIN}" "\${args[@]}"
+EOF
+
+  chmod 0755 "${RUN_DIR}/remote-hosts-api" "${RUN_DIR}/remote-hosts-connector"
+}
+
+write_plists() {
+  load_config
+  cat >"${API_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${API_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${RUN_DIR}/remote-hosts-api</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${ROOT_DIR}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/api.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/api.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>REMOTE_HOSTS_SERVICE</key>
+    <string>api</string>
+  </dict>
+</dict>
+</plist>
+EOF
+
+  cat >"${CONNECTOR_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${CONNECTOR_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${RUN_DIR}/remote-hosts-connector</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${ROOT_DIR}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/connector.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/connector.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>REMOTE_HOSTS_SERVICE</key>
+    <string>connector</string>
+  </dict>
+</dict>
+</plist>
+EOF
+}
+
+bootout_if_loaded() {
+  local label="$1"
+  local plist="$2"
+  launchctl bootout "${USER_DOMAIN}" "${plist}" >/dev/null 2>&1 || true
+  launchctl bootout "${USER_DOMAIN}/${label}" >/dev/null 2>&1 || true
+}
+
+bootstrap_service() {
+  local plist="$1"
+  launchctl bootstrap "${USER_DOMAIN}" "${plist}"
+}
+
+install_services() {
+  ensure_dirs
+  write_default_config
+  ensure_local_vault
+  build_release
+  install_binary
+  run_migrate
+  ensure_default_connector
+  write_wrappers
+  write_plists
+  bootout_if_loaded "${API_LABEL}" "${API_PLIST}"
+  bootout_if_loaded "${CONNECTOR_LABEL}" "${CONNECTOR_PLIST}"
+  bootstrap_service "${API_PLIST}"
+  bootstrap_service "${CONNECTOR_PLIST}"
+  start_services
+}
+
+update_services() {
+  ensure_dirs
+  write_default_config
+  ensure_local_vault
+  build_release
+  install_binary
+  run_migrate
+  ensure_default_connector
+  write_wrappers
+  write_plists
+  restart_services
+}
+
+start_services() {
+  launchctl kickstart -k "${USER_DOMAIN}/${API_LABEL}" >/dev/null 2>&1 || bootstrap_service "${API_PLIST}"
+  launchctl kickstart -k "${USER_DOMAIN}/${CONNECTOR_LABEL}" >/dev/null 2>&1 || bootstrap_service "${CONNECTOR_PLIST}"
+}
+
+stop_services() {
+  bootout_if_loaded "${API_LABEL}" "${API_PLIST}"
+  bootout_if_loaded "${CONNECTOR_LABEL}" "${CONNECTOR_PLIST}"
+}
+
+restart_services() {
+  stop_services
+  bootstrap_service "${API_PLIST}"
+  bootstrap_service "${CONNECTOR_PLIST}"
+  start_services
+}
+
+status_services() {
+  echo "== ${API_LABEL} =="
+  launchctl print "${USER_DOMAIN}/${API_LABEL}" 2>/dev/null || echo "not loaded"
+  echo
+  echo "== ${CONNECTOR_LABEL} =="
+  launchctl print "${USER_DOMAIN}/${CONNECTOR_LABEL}" 2>/dev/null || echo "not loaded"
+}
+
+tail_logs() {
+  ensure_dirs
+  touch "${LOG_DIR}/api.out.log" "${LOG_DIR}/api.err.log" "${LOG_DIR}/connector.out.log" "${LOG_DIR}/connector.err.log"
+  tail -n 80 -f "${LOG_DIR}/api.out.log" "${LOG_DIR}/api.err.log" "${LOG_DIR}/connector.out.log" "${LOG_DIR}/connector.err.log"
+}
+
+print_config() {
+  cat <<EOF
+Root:        ${ROOT_DIR}
+Binary:      ${BIN_PATH}
+Config:      ${CONFIG_FILE}
+Data:        ${DATA_DIR}
+Logs:        ${LOG_DIR}
+API plist:   ${API_PLIST}
+Worker plist:${CONNECTOR_PLIST}
+EOF
+}
+
+command="${1:-}"
+case "${command}" in
+  install)
+    install_services
+    print_config
+    ;;
+  update)
+    update_services
+    print_config
+    ;;
+  start)
+    start_services
+    ;;
+  stop)
+    stop_services
+    ;;
+  restart)
+    restart_services
+    ;;
+  status)
+    status_services
+    ;;
+  logs)
+    tail_logs
+    ;;
+  migrate)
+    run_migrate
+    ensure_default_connector
+    ;;
+  doctor)
+    require_installed_binary
+    "${BIN_PATH}" doctor
+    ;;
+  print-config)
+    print_config
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "unknown command: ${command}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
