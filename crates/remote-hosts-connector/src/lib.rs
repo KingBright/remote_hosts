@@ -7398,6 +7398,8 @@ mod tests {
                 private_key_pem: None,
                 private_key_passphrase: None,
                 sudo_password: None,
+                token: None,
+                secret_text: None,
                 use_ssh_agent: false,
             },
         )?;

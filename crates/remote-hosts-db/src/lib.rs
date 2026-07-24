@@ -5,14 +5,15 @@ use std::{io, str::FromStr};
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentWorkspace,
     AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason, AuthorizedKeyBootstrapState,
-    ClaimedPtyInputEvent, ConnectionSession, Connector, ConnectorId, CredentialId, CredentialKind,
-    CredentialMetadata, EntityState, Environment, EnvironmentId, Host, HostFact, HostId,
-    HostWriteLease, KnowledgeItem, OperationId, OperationOutputArtifact, OperationOutputArtifactId,
-    OperationOutputChunk, OperationRun, OperationState, PtyBackendCapabilities, PtyBackendState,
-    PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyOutputChunk, PtySession, PtySessionId,
-    SequencedStateEvent, SessionId, SoftwareInstall, SshChannelTransportEvidence,
-    SshTransportRuntime, SshTransportRuntimeId, SshTransportRuntimeState, StateEvent,
-    StateReasonCode, StoredCredential, WorkspaceId, WorkspaceState,
+    ClaimedPtyInputEvent, ConnectionSession, Connector, ConnectorId, CredentialBinding,
+    CredentialBindingView, CredentialId, CredentialKind, CredentialMetadata, EntityState,
+    Environment, EnvironmentId, Host, HostFact, HostId, HostWriteLease, KnowledgeItem, OperationId,
+    OperationOutputArtifact, OperationOutputArtifactId, OperationOutputChunk, OperationRun,
+    OperationState, PtyBackendCapabilities, PtyBackendState, PtyInputEvent, PtyInputEventId,
+    PtyInputEventState, PtyOutputChunk, PtySession, PtySessionId, SequencedStateEvent, SessionId,
+    SoftwareInstall, SshChannelTransportEvidence, SshTransportRuntime, SshTransportRuntimeId,
+    SshTransportRuntimeState, StateEvent, StateReasonCode, StoredCredential, TopologyEdge,
+    TopologyNode, TopologyNodeId, TopologySyncRun, TopologySyncRunId, WorkspaceId, WorkspaceState,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -120,6 +121,10 @@ pub struct Repositories {
     pub knowledge: KnowledgeItemRepository,
     /// State event repository.
     pub state_events: StateEventRepository,
+    /// Infrastructure topology graph and snapshot reconciliation repository.
+    pub topology: TopologyRepository,
+    /// Links topology resources to encrypted credentials.
+    pub credential_bindings: CredentialBindingRepository,
 }
 
 impl Repositories {
@@ -147,7 +152,9 @@ impl Repositories {
             operation_output_chunks: OperationOutputChunkRepository::new(pool.clone()),
             operation_output_artifacts: OperationOutputArtifactRepository::new(pool.clone()),
             knowledge: KnowledgeItemRepository::new(pool.clone()),
-            state_events: StateEventRepository::new(pool),
+            state_events: StateEventRepository::new(pool.clone()),
+            topology: TopologyRepository::new(pool.clone()),
+            credential_bindings: CredentialBindingRepository::new(pool),
         }
     }
 }
@@ -191,6 +198,8 @@ repo!(OperationOutputChunkRepository);
 repo!(OperationOutputArtifactRepository);
 repo!(KnowledgeItemRepository);
 repo!(StateEventRepository);
+repo!(TopologyRepository);
+repo!(CredentialBindingRepository);
 
 /// Update used to finish an operation while the connector still owns the claim.
 #[derive(Clone, Debug)]
@@ -3243,6 +3252,447 @@ impl KnowledgeItemRepository {
     }
 }
 
+impl TopologyRepository {
+    /// Gets a topology node by its public stable key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn get_node_by_external_key(
+        &self,
+        external_key: &str,
+    ) -> Result<Option<TopologyNode>, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT n.*,
+                   EXISTS(
+                       SELECT 1 FROM topology_node_memberships m
+                       WHERE m.node_id = n.id AND m.active = 1
+                   ) AS active
+            FROM topology_nodes n
+            WHERE n.external_key = ?
+            ",
+        )
+        .bind(external_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_topology_node).transpose()
+    }
+
+    /// Gets a topology node by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn get_node(&self, id: TopologyNodeId) -> Result<Option<TopologyNode>, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT n.*,
+                   EXISTS(
+                       SELECT 1 FROM topology_node_memberships m
+                       WHERE m.node_id = n.id AND m.active = 1
+                   ) AS active
+            FROM topology_nodes n
+            WHERE n.id = ?
+            ",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_topology_node).transpose()
+    }
+
+    /// Gets a topology edge by its public stable key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn get_edge_by_external_key(
+        &self,
+        external_key: &str,
+    ) -> Result<Option<TopologyEdge>, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT e.*,
+                   (
+                       EXISTS(
+                           SELECT 1 FROM topology_edge_memberships m
+                           WHERE m.edge_id = e.id AND m.active = 1
+                       )
+                       AND EXISTS(
+                           SELECT 1 FROM topology_node_memberships source_membership
+                           WHERE source_membership.node_id = e.source_node_id
+                             AND source_membership.active = 1
+                       )
+                       AND EXISTS(
+                           SELECT 1 FROM topology_node_memberships target_membership
+                           WHERE target_membership.node_id = e.target_node_id
+                             AND target_membership.active = 1
+                       )
+                   ) AS active
+            FROM topology_edges e
+            WHERE e.external_key = ?
+            ",
+        )
+        .bind(external_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_topology_edge).transpose()
+    }
+
+    /// Lists the topology graph, optionally including stale observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_graph(
+        &self,
+        include_inactive: bool,
+    ) -> Result<(Vec<TopologyNode>, Vec<TopologyEdge>), DbError> {
+        let nodes = if include_inactive {
+            sqlx::query(
+                r"
+                SELECT n.*,
+                       EXISTS(
+                           SELECT 1 FROM topology_node_memberships m
+                           WHERE m.node_id = n.id AND m.active = 1
+                       ) AS active
+                FROM topology_nodes n
+                ORDER BY n.name, n.external_key
+                ",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r"
+                SELECT n.*, 1 AS active
+                FROM topology_nodes n
+                WHERE EXISTS(
+                    SELECT 1 FROM topology_node_memberships m
+                    WHERE m.node_id = n.id AND m.active = 1
+                )
+                ORDER BY n.name, n.external_key
+                ",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+        let edges = if include_inactive {
+            sqlx::query(
+                r"
+                SELECT e.*,
+                       (
+                           EXISTS(
+                               SELECT 1 FROM topology_edge_memberships m
+                               WHERE m.edge_id = e.id AND m.active = 1
+                           )
+                           AND EXISTS(
+                               SELECT 1 FROM topology_node_memberships source_membership
+                               WHERE source_membership.node_id = e.source_node_id
+                                 AND source_membership.active = 1
+                           )
+                           AND EXISTS(
+                               SELECT 1 FROM topology_node_memberships target_membership
+                               WHERE target_membership.node_id = e.target_node_id
+                                 AND target_membership.active = 1
+                           )
+                       ) AS active
+                FROM topology_edges e
+                ORDER BY e.external_key
+                ",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r"
+                SELECT e.*, 1 AS active
+                FROM topology_edges e
+                WHERE EXISTS(
+                    SELECT 1 FROM topology_edge_memberships m
+                    WHERE m.edge_id = e.id AND m.active = 1
+                )
+                AND EXISTS(
+                    SELECT 1 FROM topology_node_memberships source_membership
+                    WHERE source_membership.node_id = e.source_node_id
+                      AND source_membership.active = 1
+                )
+                AND EXISTS(
+                    SELECT 1 FROM topology_node_memberships target_membership
+                    WHERE target_membership.node_id = e.target_node_id
+                      AND target_membership.active = 1
+                )
+                ORDER BY e.external_key
+                ",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok((
+            nodes
+                .iter()
+                .map(row_to_topology_node)
+                .collect::<Result<_, _>>()?,
+            edges
+                .iter()
+                .map(row_to_topology_edge)
+                .collect::<Result<_, _>>()?,
+        ))
+    }
+
+    /// Reconciles one source-owned, scope-owned topology snapshot atomically.
+    ///
+    /// Items absent from the new snapshot are made inactive only for this source and scope. The
+    /// underlying graph objects remain available for history and can stay active through another
+    /// source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the transaction cannot be committed.
+    #[allow(clippy::too_many_lines)]
+    pub async fn sync_snapshot(
+        &self,
+        scope_key: &str,
+        source: &str,
+        nodes: &[TopologyNode],
+        edges: &[TopologyEdge],
+        run_id: TopologySyncRunId,
+        observed_at: OffsetDateTime,
+    ) -> Result<TopologySyncRun, DbError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            r"
+            INSERT INTO topology_sync_runs (
+                id, scope_key, source, active_node_count, inactive_node_count,
+                active_edge_count, inactive_edge_count, completed_at
+            )
+            VALUES (?, ?, ?, 0, 0, 0, 0, ?)
+            ",
+        )
+        .bind(run_id.to_string())
+        .bind(scope_key)
+        .bind(source)
+        .bind(observed_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        for node in nodes {
+            sqlx::query(
+                r"
+                INSERT INTO topology_nodes (
+                    id, external_key, host_id, name, kind_json, status_json, address,
+                    ports_json, metadata_json, created_at, updated_at, last_observed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(external_key) DO UPDATE SET
+                    host_id = excluded.host_id,
+                    name = excluded.name,
+                    kind_json = excluded.kind_json,
+                    status_json = excluded.status_json,
+                    address = excluded.address,
+                    ports_json = excluded.ports_json,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at,
+                    last_observed_at = excluded.last_observed_at
+                ",
+            )
+            .bind(node.id.to_string())
+            .bind(&node.external_key)
+            .bind(node.host_id.map(|id| id.to_string()))
+            .bind(&node.name)
+            .bind(to_json(&node.kind)?)
+            .bind(to_json(&node.status)?)
+            .bind(&node.address)
+            .bind(to_json(&node.ports)?)
+            .bind(to_json(&node.metadata)?)
+            .bind(node.created_at)
+            .bind(node.updated_at)
+            .bind(node.last_observed_at)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                r"
+                INSERT INTO topology_node_memberships (
+                    scope_key, source, node_id, last_sync_run_id, active, observed_at
+                )
+                VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT(scope_key, source, node_id) DO UPDATE SET
+                    last_sync_run_id = excluded.last_sync_run_id,
+                    active = 1,
+                    observed_at = excluded.observed_at
+                ",
+            )
+            .bind(scope_key)
+            .bind(source)
+            .bind(node.id.to_string())
+            .bind(run_id.to_string())
+            .bind(observed_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let inactive_node_count = u32::try_from(
+            sqlx::query(
+                r"
+                UPDATE topology_node_memberships
+                SET active = 0
+                WHERE scope_key = ? AND source = ? AND active = 1 AND last_sync_run_id <> ?
+                ",
+            )
+            .bind(scope_key)
+            .bind(source)
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected(),
+        )?;
+
+        for edge in edges {
+            sqlx::query(
+                r"
+                INSERT INTO topology_edges (
+                    id, external_key, source_node_id, target_node_id, relation_json,
+                    metadata_json, created_at, updated_at, last_observed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(external_key) DO UPDATE SET
+                    source_node_id = excluded.source_node_id,
+                    target_node_id = excluded.target_node_id,
+                    relation_json = excluded.relation_json,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at,
+                    last_observed_at = excluded.last_observed_at
+                ",
+            )
+            .bind(edge.id.to_string())
+            .bind(&edge.external_key)
+            .bind(edge.source_node_id.to_string())
+            .bind(edge.target_node_id.to_string())
+            .bind(to_json(&edge.relation)?)
+            .bind(to_json(&edge.metadata)?)
+            .bind(edge.created_at)
+            .bind(edge.updated_at)
+            .bind(edge.last_observed_at)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                r"
+                INSERT INTO topology_edge_memberships (
+                    scope_key, source, edge_id, last_sync_run_id, active, observed_at
+                )
+                VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT(scope_key, source, edge_id) DO UPDATE SET
+                    last_sync_run_id = excluded.last_sync_run_id,
+                    active = 1,
+                    observed_at = excluded.observed_at
+                ",
+            )
+            .bind(scope_key)
+            .bind(source)
+            .bind(edge.id.to_string())
+            .bind(run_id.to_string())
+            .bind(observed_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let inactive_edge_count = u32::try_from(
+            sqlx::query(
+                r"
+                UPDATE topology_edge_memberships
+                SET active = 0
+                WHERE scope_key = ? AND source = ? AND active = 1 AND last_sync_run_id <> ?
+                ",
+            )
+            .bind(scope_key)
+            .bind(source)
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected(),
+        )?;
+        let active_node_count = u32::try_from(nodes.len())?;
+        let active_edge_count = u32::try_from(edges.len())?;
+        sqlx::query(
+            r"
+            UPDATE topology_sync_runs
+            SET active_node_count = ?, inactive_node_count = ?,
+                active_edge_count = ?, inactive_edge_count = ?
+            WHERE id = ?
+            ",
+        )
+        .bind(u32_to_i64(active_node_count))
+        .bind(u32_to_i64(inactive_node_count))
+        .bind(u32_to_i64(active_edge_count))
+        .bind(u32_to_i64(inactive_edge_count))
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+
+        Ok(TopologySyncRun {
+            id: run_id,
+            scope_key: scope_key.to_owned(),
+            source: source.to_owned(),
+            active_node_count,
+            inactive_node_count,
+            active_edge_count,
+            inactive_edge_count,
+            completed_at: observed_at,
+        })
+    }
+}
+
+impl CredentialBindingRepository {
+    /// Inserts a topology credential binding if it is not already present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database rejects the insert.
+    pub async fn insert(&self, binding: &CredentialBinding) -> Result<(), DbError> {
+        sqlx::query(
+            r"
+            INSERT INTO credential_bindings (
+                id, topology_node_id, credential_id, purpose, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(topology_node_id, credential_id, purpose) DO NOTHING
+            ",
+        )
+        .bind(binding.id.to_string())
+        .bind(binding.topology_node_id.to_string())
+        .bind(binding.credential_id.to_string())
+        .bind(&binding.purpose)
+        .bind(binding.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Lists public credential metadata bound to topology resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_views(&self) -> Result<Vec<CredentialBindingView>, DbError> {
+        let rows = sqlx::query(
+            r"
+            SELECT b.id AS binding_id, b.topology_node_id, b.purpose, b.created_at AS binding_created_at,
+                   c.id AS credential_id, c.name AS credential_name, c.kind_json,
+                   c.username_hint, c.created_at AS credential_created_at,
+                   c.updated_at AS credential_updated_at, c.last_used_at
+            FROM credential_bindings b
+            JOIN credentials c ON c.id = b.credential_id
+            ORDER BY b.topology_node_id, b.purpose, c.name
+            ",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_credential_binding_view).collect()
+    }
+}
+
 impl StateEventRepository {
     /// Inserts a state event.
     ///
@@ -3718,6 +4168,57 @@ fn row_to_knowledge_item(row: &SqliteRow) -> Result<KnowledgeItem, DbError> {
         tags: from_json_col(row, "tags_json")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn row_to_topology_node(row: &SqliteRow) -> Result<TopologyNode, DbError> {
+    Ok(TopologyNode {
+        id: parse_id(row, "id")?,
+        external_key: row.try_get("external_key")?,
+        host_id: parse_optional_id(row, "host_id")?,
+        name: row.try_get("name")?,
+        kind: from_json_col(row, "kind_json")?,
+        status: from_json_col(row, "status_json")?,
+        address: row.try_get("address")?,
+        ports: from_json_col(row, "ports_json")?,
+        metadata: from_json_col(row, "metadata_json")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        last_observed_at: row.try_get("last_observed_at")?,
+        active: i64_to_bool(row.try_get("active")?),
+    })
+}
+
+fn row_to_topology_edge(row: &SqliteRow) -> Result<TopologyEdge, DbError> {
+    Ok(TopologyEdge {
+        id: parse_id(row, "id")?,
+        external_key: row.try_get("external_key")?,
+        source_node_id: parse_id(row, "source_node_id")?,
+        target_node_id: parse_id(row, "target_node_id")?,
+        relation: from_json_col(row, "relation_json")?,
+        metadata: from_json_col(row, "metadata_json")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        last_observed_at: row.try_get("last_observed_at")?,
+        active: i64_to_bool(row.try_get("active")?),
+    })
+}
+
+fn row_to_credential_binding_view(row: &SqliteRow) -> Result<CredentialBindingView, DbError> {
+    Ok(CredentialBindingView {
+        id: parse_id(row, "binding_id")?,
+        topology_node_id: parse_id(row, "topology_node_id")?,
+        purpose: row.try_get("purpose")?,
+        credential: CredentialMetadata {
+            id: parse_id(row, "credential_id")?,
+            name: row.try_get("credential_name")?,
+            kind: from_json_col(row, "kind_json")?,
+            username_hint: row.try_get("username_hint")?,
+            created_at: row.try_get("credential_created_at")?,
+            updated_at: row.try_get("credential_updated_at")?,
+            last_used_at: row.try_get("last_used_at")?,
+        },
+        created_at: row.try_get("binding_created_at")?,
     })
 }
 

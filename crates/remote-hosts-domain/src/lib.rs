@@ -81,6 +81,10 @@ id_type!(StateEventId);
 id_type!(KnowledgeItemId);
 id_type!(SoftwareInstallId);
 id_type!(HostFactId);
+id_type!(TopologyNodeId);
+id_type!(TopologyEdgeId);
+id_type!(TopologySyncRunId);
+id_type!(CredentialBindingId);
 
 /// Returns the current UTC timestamp.
 pub fn now_utc() -> OffsetDateTime {
@@ -238,6 +242,96 @@ pub enum CredentialKind {
     SudoPassword,
     /// Windows account password.
     WindowsPassword,
+    /// Username and password used by an application or web service.
+    BasicAuth,
+    /// API token or bearer token.
+    ApiToken,
+    /// Database username and password.
+    DatabasePassword,
+    /// Middleware or cluster administrative credential.
+    ServiceAccount,
+    /// Arbitrary secret text for an internal system.
+    GenericSecret,
+}
+
+/// Infrastructure resource represented in the topology graph.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyNodeKind {
+    /// A registered physical or logical host.
+    Host,
+    /// A group of cooperating machines or services.
+    Cluster,
+    /// A virtual machine.
+    VirtualMachine,
+    /// A container or workload instance.
+    Container,
+    /// A reverse proxy such as nginx, Caddy, Traefik, or `HAProxy`.
+    ReverseProxy,
+    /// A load balancer.
+    LoadBalancer,
+    /// A shared middleware service.
+    Middleware,
+    /// A database service.
+    Database,
+    /// A cache service.
+    Cache,
+    /// A message queue or streaming service.
+    MessageQueue,
+    /// A business-facing application or API.
+    BusinessService,
+    /// A storage service.
+    Storage,
+    /// A network, subnet, or overlay.
+    Network,
+    /// A generic reachable endpoint.
+    Endpoint,
+    /// A resource outside the predefined categories.
+    Other,
+}
+
+/// Operational status reported for one topology node.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyNodeStatus {
+    /// No health observation is available.
+    Unknown,
+    /// The resource is healthy.
+    Healthy,
+    /// The resource is usable with known degradation.
+    Degraded,
+    /// The resource is offline or unreachable.
+    Offline,
+    /// The resource is intentionally under maintenance.
+    Maintenance,
+}
+
+/// Directed relationship between two topology nodes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyRelation {
+    /// The source logically contains the target.
+    Contains,
+    /// The source is a member of the target.
+    MemberOf,
+    /// The source runs on the target.
+    RunsOn,
+    /// The source reverse-proxies requests to the target.
+    ProxiesTo,
+    /// The source routes traffic to the target.
+    RoutesTo,
+    /// The source depends on the target.
+    DependsOn,
+    /// The source opens a network or protocol connection to the target.
+    ConnectsTo,
+    /// The source replicates data to the target.
+    ReplicatesTo,
+    /// The source exposes the target.
+    Exposes,
+    /// The source is managed by the target.
+    ManagedBy,
+    /// A relationship outside the predefined categories.
+    Other,
 }
 
 /// Source for observed facts and knowledge.
@@ -749,6 +843,113 @@ pub struct SoftwareInstall {
     pub installed_by_operation_id: Option<OperationId>,
     /// Notes.
     pub notes: Option<String>,
+}
+
+/// One resource in the infrastructure topology graph.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TopologyNode {
+    /// Stable node identifier.
+    pub id: TopologyNodeId,
+    /// Caller-controlled stable identity used to merge repeated observations.
+    pub external_key: String,
+    /// Optional link to a host in the primary host registry.
+    pub host_id: Option<HostId>,
+    /// Human-readable resource name.
+    pub name: String,
+    /// Resource category.
+    pub kind: TopologyNodeKind,
+    /// Last reported status.
+    pub status: TopologyNodeStatus,
+    /// Optional address, DNS name, URL, virtual IP, or subnet.
+    pub address: Option<String>,
+    /// Exposed or listened ports.
+    pub ports: Vec<u16>,
+    /// Non-secret extensible inventory attributes.
+    pub metadata: Value,
+    /// Creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Most recent content update.
+    pub updated_at: OffsetDateTime,
+    /// Most recent observation in any snapshot.
+    pub last_observed_at: OffsetDateTime,
+    /// Whether at least one current snapshot still includes the node.
+    pub active: bool,
+}
+
+/// One directed relationship in the infrastructure topology graph.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TopologyEdge {
+    /// Stable edge identifier.
+    pub id: TopologyEdgeId,
+    /// Caller-controlled stable identity used to merge repeated observations.
+    pub external_key: String,
+    /// Relationship source.
+    pub source_node_id: TopologyNodeId,
+    /// Relationship target.
+    pub target_node_id: TopologyNodeId,
+    /// Relationship category.
+    pub relation: TopologyRelation,
+    /// Non-secret extensible relationship attributes.
+    pub metadata: Value,
+    /// Creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Most recent content update.
+    pub updated_at: OffsetDateTime,
+    /// Most recent observation in any snapshot.
+    pub last_observed_at: OffsetDateTime,
+    /// Whether at least one current snapshot still includes the edge.
+    pub active: bool,
+}
+
+/// Durable result of one topology snapshot reconciliation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TopologySyncRun {
+    /// Sync run identifier.
+    pub id: TopologySyncRunId,
+    /// Stable reconciliation scope, such as `host:<uuid>` or `cluster:factory-a`.
+    pub scope_key: String,
+    /// Producer of the snapshot, such as `manual`, `nginx-probe`, or `inventory-agent`.
+    pub source: String,
+    /// Number of active nodes supplied by the snapshot.
+    pub active_node_count: u32,
+    /// Number of formerly active nodes omitted by the snapshot.
+    pub inactive_node_count: u32,
+    /// Number of active edges supplied by the snapshot.
+    pub active_edge_count: u32,
+    /// Number of formerly active edges omitted by the snapshot.
+    pub inactive_edge_count: u32,
+    /// Completion timestamp.
+    pub completed_at: OffsetDateTime,
+}
+
+/// A purpose-specific link from a topology node to encrypted credential metadata.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CredentialBinding {
+    /// Binding identifier.
+    pub id: CredentialBindingId,
+    /// Topology resource that can use the credential.
+    pub topology_node_id: TopologyNodeId,
+    /// Encrypted credential record.
+    pub credential_id: CredentialId,
+    /// Human-readable use, such as `admin`, `readonly`, or `database`.
+    pub purpose: String,
+    /// Binding creation timestamp.
+    pub created_at: OffsetDateTime,
+}
+
+/// Public credential binding view that never contains decrypted secret material.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CredentialBindingView {
+    /// Binding identifier.
+    pub id: CredentialBindingId,
+    /// Topology resource that can use the credential.
+    pub topology_node_id: TopologyNodeId,
+    /// Human-readable use.
+    pub purpose: String,
+    /// Public metadata for the encrypted credential.
+    pub credential: CredentialMetadata,
+    /// Binding creation timestamp.
+    pub created_at: OffsetDateTime,
 }
 
 /// Operation run record.

@@ -92,6 +92,11 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [x] Local launchd deployment running API and connector daemon with release binary, SQLite database, logs, and default connector bootstrap.
 - [x] Verification: `cargo fmt --all`, `cargo test --workspace`, `cargo check --workspace`, strict clippy.
 - [x] Release deployment smoke: migration applied, launchd API/connector healthy, fresh MCP stdio exposes 18 Agent tools and `snapshot_version=6` without opening a remote SSH connection.
+- [x] Generic infrastructure topology graph for hosts, clusters, VMs, reverse proxies, middleware, data services, business services, and arbitrary directed dependencies.
+- [x] Source- and scope-aware topology snapshot reconciliation with idempotent upserts and non-destructive inactive history.
+- [x] Encrypted credential storage and purpose-specific bindings for any topology resource, with metadata-only HTTP responses.
+- [x] Embedded local administration console with server registry, route health, topology SVG, filtering, snapshot import, resource details, and credential capture.
+- [x] Loopback-only safety boundary for an HTTP process with an unlocked credential vault.
 
 ## Next
 
@@ -107,6 +112,7 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [ ] Expand HTTP API endpoints for registry mutation, knowledge search, and operations.
 - [ ] Add Linux systemd packaging and service templates.
 - [ ] Add first-class CLI registry mutation commands for hosts/environments/connectors/access paths.
+- [ ] Add opt-in topology discovery adapters for nginx/Caddy/Traefik, Docker/Podman, systemd, Kubernetes, and common middleware; adapters should emit the existing topology snapshot contract instead of adding product-specific graph tables.
 
 Domain-specific Kubernetes, Harbor, database, middleware, GPU, and deployment behavior is intentionally not a core MCP-tool roadmap. Use arbitrary shell/PowerShell or PTY on the pooled connection; package repeated workflows as optional runbooks.
 

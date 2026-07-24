@@ -46,7 +46,7 @@ Run the CLI:
 ```bash
 cargo run -p remote-hosts-cli -- doctor
 cargo run -p remote-hosts-cli -- migrate --database-url sqlite://remote-hosts.sqlite
-cargo run -p remote-hosts-cli -- serve --bind 127.0.0.1:8787
+cargo run -p remote-hosts-cli -- serve --bind 127.0.0.1:8787 --vault-master-password-file ~/.config/remote-hosts/vault-master-password
 cargo run -p remote-hosts-cli -- mcp-stdio --database-url sqlite://remote-hosts.sqlite --vault-master-password-file ~/.config/remote-hosts/vault-master-password
 cargo run -p remote-hosts-cli -- worker-once --database-url sqlite://remote-hosts.sqlite --connector-id <uuid>
 cargo run -p remote-hosts-cli -- worker-daemon --database-url sqlite://remote-hosts.sqlite --connector-id <uuid> --pty-backend-mode auto
@@ -79,8 +79,15 @@ Queued operation execution can use `--ssh-backend openssh` or `--ssh-backend rus
 
 Current HTTP surfaces:
 
+- `GET /` and `GET /admin` (embedded infrastructure management console)
+- `GET /v1/admin/overview`
 - `GET /v1/hosts`
 - `GET /v1/hosts/{host_id}`
+- `GET /v1/topology`
+- `POST /v1/topology/sync`
+- `GET /v1/topology/credential-bindings`
+- `POST /v1/topology/nodes/{node_id}/credentials`
+- `GET /v1/credentials`
 - `GET /v1/hosts/{host_id}/access-paths`
 - `GET /v1/hosts/{host_id}/resolve-access`
 - `GET /v1/hosts/{host_id}/state`
@@ -107,6 +114,60 @@ Current HTTP surfaces:
 - `GET /v1/pty-sessions/{pty_session_id}/input-events`
 - `POST /v1/pty-sessions/{pty_session_id}/close`
 - `POST /v1/pty-sessions/reap-expired`
+
+## Infrastructure topology and credentials
+
+The management console at `http://127.0.0.1:8787/admin` combines the host registry,
+access-path health, connectors, infrastructure topology, and public credential metadata. The
+topology is a generic directed graph, so hosts, virtual machines, clusters, reverse proxies,
+middleware, databases, caches, queues, storage, and business services can be represented without
+adding one product-specific table for every technology.
+
+`POST /v1/topology/sync` accepts an authoritative snapshot for one `scope_key + source`. Repeating
+the same snapshot is idempotent. Nodes and edges omitted by a later snapshot are marked inactive
+for that source and scope, but are not deleted; another source can keep the same graph object
+active. Use globally stable external keys such as `host:<host-id>`,
+`cluster:<cluster-name>`, or `service:<cluster-name>:<service-name>`.
+
+Topology metadata rejects secret-like keys. Store passwords, API tokens, database credentials,
+service accounts, private keys, and arbitrary internal secrets through the node credential
+endpoint or management form. They are encrypted with the existing local vault, and HTTP responses
+contain metadata and bindings only. An unlocked HTTP vault is restricted to a loopback bind; use
+an SSH tunnel for remote access to the console.
+
+Example snapshot:
+
+```json
+{
+  "scope_key": "cluster:factory-a",
+  "source": "inventory-agent",
+  "nodes": [
+    {
+      "external_key": "proxy:factory-a",
+      "name": "Factory ingress",
+      "kind": "reverse_proxy",
+      "address": "10.20.0.10",
+      "ports": [443],
+      "metadata": {"software": "nginx"}
+    },
+    {
+      "external_key": "service:factory-a:api",
+      "name": "Factory API",
+      "kind": "business_service",
+      "address": "10.20.0.21",
+      "ports": [8080]
+    }
+  ],
+  "edges": [
+    {
+      "external_key": "factory-ingress-api",
+      "from": "proxy:factory-a",
+      "to": "service:factory-a:api",
+      "relation": "proxies_to"
+    }
+  ]
+}
+```
 
 The default `agent` MCP profile exposes 18 task-oriented tools:
 

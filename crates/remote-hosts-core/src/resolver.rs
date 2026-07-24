@@ -66,10 +66,11 @@ impl AccessResolver {
             });
         }
 
+        let now = remote_hosts_domain::now_utc();
         let mut scored = candidates
             .iter()
             .filter(|candidate| candidate.access_path.enabled)
-            .filter_map(score_candidate)
+            .filter_map(|candidate| score_candidate(candidate, now))
             .collect::<Vec<_>>();
 
         scored.sort_by_key(|(score, candidate)| (*score, candidate.access_path.priority));
@@ -83,11 +84,14 @@ impl AccessResolver {
             });
         }
 
-        Err(best_failure(candidates))
+        Err(best_failure(candidates, now))
     }
 }
 
-fn score_candidate(candidate: &AccessCandidate) -> Option<(u32, &AccessCandidate)> {
+fn score_candidate(
+    candidate: &AccessCandidate,
+    now: time::OffsetDateTime,
+) -> Option<(u32, &AccessCandidate)> {
     if matches!(
         candidate
             .connector
@@ -101,7 +105,19 @@ fn score_candidate(candidate: &AccessCandidate) -> Option<(u32, &AccessCandidate
     let health_state = candidate
         .health
         .as_ref()
-        .map_or(EntityState::Unknown, |health| health.state.clone());
+        .map_or(EntityState::Unknown, |health| {
+            if matches!(
+                health.state,
+                EntityState::Throttled | EntityState::TargetOverloaded | EntityState::RateLimited
+            ) && health
+                .next_retry_at
+                .is_some_and(|next_retry_at| next_retry_at <= now)
+            {
+                EntityState::Unknown
+            } else {
+                health.state.clone()
+            }
+        });
 
     match health_state {
         EntityState::Connected | EntityState::Healthy => Some((0, candidate)),
@@ -122,7 +138,10 @@ fn score_candidate(candidate: &AccessCandidate) -> Option<(u32, &AccessCandidate
     }
 }
 
-fn best_failure(candidates: &[AccessCandidate]) -> AccessResolutionError {
+fn best_failure(
+    candidates: &[AccessCandidate],
+    now: time::OffsetDateTime,
+) -> AccessResolutionError {
     if candidates.iter().any(|candidate| {
         matches!(
             candidate.health.as_ref().map(|h| &h.state),
@@ -149,16 +168,18 @@ fn best_failure(candidates: &[AccessCandidate]) -> AccessResolutionError {
             )
         })
         .filter_map(|health| {
-            health.next_retry_at.map(|next_retry| {
-                let now = remote_hosts_domain::now_utc();
-                (
-                    (next_retry - now).whole_seconds().max(0).cast_unsigned(),
-                    health
-                        .last_error_code
-                        .clone()
-                        .unwrap_or(StateReasonCode::TargetSshdRateLimited),
-                )
-            })
+            health
+                .next_retry_at
+                .filter(|next_retry| *next_retry > now)
+                .map(|next_retry| {
+                    (
+                        (next_retry - now).whole_seconds().max(1).cast_unsigned(),
+                        health
+                            .last_error_code
+                            .clone()
+                            .unwrap_or(StateReasonCode::TargetSshdRateLimited),
+                    )
+                })
         })
         .min_by_key(|(retry_after_seconds, _)| *retry_after_seconds)
     {
@@ -309,6 +330,25 @@ mod tests {
         );
         assert!(error.human_message.contains("connector local"));
         assert!(error.retry_after_seconds.is_some_and(|value| value <= 164));
+        Ok(())
+    }
+
+    #[test]
+    fn expired_local_handshake_budget_allows_one_retry() -> Result<(), Box<dyn std::error::Error>> {
+        let p = path(10);
+        let mut local_budget = health(&p, EntityState::Throttled);
+        local_budget.last_error_code = Some(StateReasonCode::LocalHandshakeBudgetExhausted);
+        local_budget.next_retry_at =
+            Some(remote_hosts_domain::now_utc() - time::Duration::seconds(1));
+
+        let resolution = AccessResolver::resolve(&[AccessCandidate {
+            access_path: p.clone(),
+            connector: None,
+            health: Some(local_budget),
+        }])?;
+
+        assert_eq!(resolution.selected.access_path.id, p.id);
+        assert!(resolution.used_cached_state);
         Ok(())
     }
 }

@@ -1105,6 +1105,8 @@ impl RemoteHostsMcpServer {
                     private_key_pem: None,
                     private_key_passphrase: None,
                     sudo_password: None,
+                    token: None,
+                    secret_text: None,
                     use_ssh_agent: true,
                 },
                 Some(value) => {
@@ -1122,6 +1124,8 @@ impl RemoteHostsMcpServer {
                     private_key_pem: None,
                     private_key_passphrase: None,
                     sudo_password: None,
+                    token: None,
+                    secret_text: None,
                     use_ssh_agent: false,
                 },
             };

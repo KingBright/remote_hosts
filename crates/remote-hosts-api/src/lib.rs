@@ -1,12 +1,17 @@
 //! HTTP API surface for operators and future UI.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use remote_hosts_core::{
@@ -20,11 +25,16 @@ use remote_hosts_core::{
 use remote_hosts_db::{DbError, Repositories};
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AgentWorkspace, ConnectionSession, Connector, ConnectorId,
-    EntityState, Host, HostFact, HostId, OperationId, OperationOutputArtifact,
+    CredentialBinding, CredentialBindingId, CredentialBindingView, CredentialKind,
+    CredentialMetadata, EntityState, Host, HostFact, HostId, OperationId, OperationOutputArtifact,
     OperationOutputArtifactId, OperationOutputChunk, OperationRun, PtyInputEvent, PtyOutputChunk,
     PtySession, PtySessionId, SequencedStateEvent, SessionId, StateEvent, StateSnapshot,
-    WorkspaceId, WorkspaceState, now_utc,
+    StoredCredential, TopologyEdge, TopologyEdgeId, TopologyNode, TopologyNodeId, TopologyNodeKind,
+    TopologyNodeStatus, TopologyRelation, TopologySyncRun, TopologySyncRunId, WorkspaceId,
+    WorkspaceState, now_utc,
 };
+use remote_hosts_vault::{CredentialSecret, CredentialVault};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -36,6 +46,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct ApiState {
     repositories: Arc<Repositories>,
+    vault_master_password: Option<Arc<SecretString>>,
 }
 
 impl ApiState {
@@ -43,6 +54,18 @@ impl ApiState {
     pub fn new(repositories: Repositories) -> Self {
         Self {
             repositories: Arc::new(repositories),
+            vault_master_password: None,
+        }
+    }
+
+    /// Creates API state with an unlocked local credential vault for management writes.
+    pub fn with_vault_master_password(
+        repositories: Repositories,
+        vault_master_password: SecretString,
+    ) -> Self {
+        Self {
+            repositories: Arc::new(repositories),
+            vault_master_password: Some(Arc::new(vault_master_password)),
         }
     }
 }
@@ -58,9 +81,23 @@ pub fn router() -> Router {
 /// Builds the full HTTP router.
 pub fn router_with_state(state: ApiState) -> Router {
     Router::new()
+        .route("/", get(admin_dashboard))
+        .route("/admin", get(admin_dashboard))
         .route("/healthz", get(healthz_state))
         .route("/v1/health", get(healthz_state))
         .route("/v1/hosts", get(list_hosts))
+        .route("/v1/topology", get(get_topology))
+        .route("/v1/topology/sync", post(sync_topology))
+        .route(
+            "/v1/topology/credential-bindings",
+            get(list_credential_bindings),
+        )
+        .route(
+            "/v1/topology/nodes/{node_id}/credentials",
+            post(store_topology_credential),
+        )
+        .route("/v1/credentials", get(list_credentials))
+        .route("/v1/admin/overview", get(admin_overview))
         .route("/v1/hosts/{host_id}", get(get_host))
         .route("/v1/hosts/{host_id}/access-paths", get(list_access_paths))
         .route("/v1/hosts/{host_id}/resolve-access", get(resolve_access))
@@ -161,6 +198,345 @@ fn health_response() -> HealthResponse {
         service: "remote-hosts-api",
         checked_at: OffsetDateTime::now_utc().to_string(),
     }
+}
+
+fn no_store_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    headers
+}
+
+async fn admin_dashboard() -> impl IntoResponse {
+    let mut headers = no_store_headers();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; connect-src 'self'; img-src 'self' data:; \
+             style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
+             object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    (headers, Html(include_str!("admin.html")))
+}
+
+async fn get_topology(
+    State(state): State<ApiState>,
+    Query(query): Query<TopologyQuery>,
+) -> Result<Json<TopologyGraphResponse>, ApiError> {
+    let (nodes, edges) = state
+        .repositories
+        .topology
+        .list_graph(query.include_inactive.unwrap_or(false))
+        .await?;
+    Ok(Json(TopologyGraphResponse { nodes, edges }))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn sync_topology(
+    State(state): State<ApiState>,
+    Json(request): Json<TopologySyncRequest>,
+) -> Result<Json<TopologySyncRun>, ApiError> {
+    let scope_key = normalized_topology_text(&request.scope_key, "scope_key", 256)?;
+    let source = normalized_topology_text(&request.source, "source", 128)?;
+    if request.nodes.len() > 2_000 {
+        return Err(ApiError::BadRequest(
+            "nodes must contain at most 2000 items".to_owned(),
+        ));
+    }
+    if request.edges.len() > 5_000 {
+        return Err(ApiError::BadRequest(
+            "edges must contain at most 5000 items".to_owned(),
+        ));
+    }
+
+    let observed_at = now_utc();
+    let mut nodes = Vec::with_capacity(request.nodes.len());
+    let mut node_ids = HashMap::with_capacity(request.nodes.len());
+    let mut node_keys = HashSet::with_capacity(request.nodes.len());
+    for input in request.nodes {
+        let external_key = normalized_topology_text(&input.external_key, "node.external_key", 256)?;
+        if !node_keys.insert(external_key.clone()) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate node external_key: {external_key}"
+            )));
+        }
+        let name = normalized_topology_text(&input.name, "node.name", 256)?;
+        let address =
+            normalized_optional_topology_text(input.address.as_deref(), "node.address", 2_048)?;
+        ensure_safe_topology_metadata(&input.metadata, "node.metadata")?;
+        if let Some(host_id) = input.host_id
+            && state.repositories.hosts.get(host_id).await?.is_none()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "node.host_id does not exist: {host_id}"
+            )));
+        }
+        let existing = state
+            .repositories
+            .topology
+            .get_node_by_external_key(&external_key)
+            .await?;
+        let id = existing
+            .as_ref()
+            .map_or_else(TopologyNodeId::new, |node| node.id);
+        node_ids.insert(external_key.clone(), id);
+        nodes.push(TopologyNode {
+            id,
+            external_key,
+            host_id: input
+                .host_id
+                .or_else(|| existing.as_ref().and_then(|node| node.host_id)),
+            name,
+            kind: input.kind,
+            status: input.status,
+            address,
+            ports: normalized_ports(input.ports)?,
+            metadata: input.metadata,
+            created_at: existing
+                .as_ref()
+                .map_or(observed_at, |node| node.created_at),
+            updated_at: observed_at,
+            last_observed_at: observed_at,
+            active: true,
+        });
+    }
+
+    let mut edges = Vec::with_capacity(request.edges.len());
+    let mut edge_keys = HashSet::with_capacity(request.edges.len());
+    for input in request.edges {
+        let external_key = normalized_topology_text(&input.external_key, "edge.external_key", 256)?;
+        if !edge_keys.insert(external_key.clone()) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate edge external_key: {external_key}"
+            )));
+        }
+        let from = normalized_topology_text(&input.from, "edge.from", 256)?;
+        let to = normalized_topology_text(&input.to, "edge.to", 256)?;
+        if from == to {
+            return Err(ApiError::BadRequest(
+                "topology edges cannot point a node to itself".to_owned(),
+            ));
+        }
+        ensure_safe_topology_metadata(&input.metadata, "edge.metadata")?;
+        let source_node_id = resolve_topology_node_id(&state, &node_ids, &from).await?;
+        let target_node_id = resolve_topology_node_id(&state, &node_ids, &to).await?;
+        let existing = state
+            .repositories
+            .topology
+            .get_edge_by_external_key(&external_key)
+            .await?;
+        edges.push(TopologyEdge {
+            id: existing
+                .as_ref()
+                .map_or_else(TopologyEdgeId::new, |edge| edge.id),
+            external_key,
+            source_node_id,
+            target_node_id,
+            relation: input.relation,
+            metadata: input.metadata,
+            created_at: existing
+                .as_ref()
+                .map_or(observed_at, |edge| edge.created_at),
+            updated_at: observed_at,
+            last_observed_at: observed_at,
+            active: true,
+        });
+    }
+
+    let run = state
+        .repositories
+        .topology
+        .sync_snapshot(
+            &scope_key,
+            &source,
+            &nodes,
+            &edges,
+            TopologySyncRunId::new(),
+            observed_at,
+        )
+        .await?;
+    Ok(Json(run))
+}
+
+async fn resolve_topology_node_id(
+    state: &ApiState,
+    current_snapshot: &HashMap<String, TopologyNodeId>,
+    external_key: &str,
+) -> Result<TopologyNodeId, ApiError> {
+    if let Some(id) = current_snapshot.get(external_key) {
+        return Ok(*id);
+    }
+    state
+        .repositories
+        .topology
+        .get_node_by_external_key(external_key)
+        .await?
+        .filter(|node| node.active)
+        .map(|node| node.id)
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "edge references unknown or inactive topology node: {external_key}"
+            ))
+        })
+}
+
+async fn list_credentials(
+    State(state): State<ApiState>,
+) -> Result<(HeaderMap, Json<Vec<CredentialMetadata>>), ApiError> {
+    Ok((
+        no_store_headers(),
+        Json(state.repositories.credentials.list_metadata().await?),
+    ))
+}
+
+async fn list_credential_bindings(
+    State(state): State<ApiState>,
+) -> Result<(HeaderMap, Json<Vec<CredentialBindingView>>), ApiError> {
+    Ok((
+        no_store_headers(),
+        Json(state.repositories.credential_bindings.list_views().await?),
+    ))
+}
+
+async fn store_topology_credential(
+    State(state): State<ApiState>,
+    Path(node_id): Path<String>,
+    Json(request): Json<StoreTopologyCredentialRequest>,
+) -> Result<(HeaderMap, Json<CredentialBindingView>), ApiError> {
+    let node_id = parse_topology_node_id(&node_id)?;
+    if state
+        .repositories
+        .topology
+        .get_node(node_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    let name = normalized_topology_text(&request.name, "name", 256)?;
+    let username_hint =
+        normalized_optional_topology_text(request.username_hint.as_deref(), "username_hint", 256)?;
+    let purpose = normalized_topology_text(&request.purpose, "purpose", 128)?;
+    validate_credential_secret(&request.secret)?;
+    let master_password = state
+        .vault_master_password
+        .clone()
+        .ok_or(ApiError::VaultUnavailable)?;
+    let secret = request.secret;
+    let encrypted_blob = tokio::task::spawn_blocking(move || {
+        CredentialVault::encrypt(master_password.as_ref(), &secret)
+    })
+    .await
+    .map_err(|_| ApiError::Internal("credential encryption task failed"))?
+    .map_err(|_| ApiError::Internal("credential encryption failed"))?;
+    let observed_at = now_utc();
+    let existing = state.repositories.credentials.get_by_name(&name).await?;
+    let metadata = CredentialMetadata {
+        id: existing
+            .as_ref()
+            .map_or_else(remote_hosts_domain::CredentialId::new, |item| {
+                item.metadata.id
+            }),
+        name,
+        kind: request.kind,
+        username_hint,
+        created_at: existing
+            .as_ref()
+            .map_or(observed_at, |item| item.metadata.created_at),
+        updated_at: observed_at,
+        last_used_at: existing
+            .as_ref()
+            .and_then(|item| item.metadata.last_used_at),
+    };
+    state
+        .repositories
+        .credentials
+        .upsert(&StoredCredential {
+            metadata: metadata.clone(),
+            encrypted_blob_json: serde_json::to_value(encrypted_blob)
+                .map_err(|_| ApiError::Internal("credential serialization failed"))?,
+        })
+        .await?;
+    let binding = CredentialBinding {
+        id: CredentialBindingId::new(),
+        topology_node_id: node_id,
+        credential_id: metadata.id,
+        purpose: purpose.clone(),
+        created_at: observed_at,
+    };
+    state
+        .repositories
+        .credential_bindings
+        .insert(&binding)
+        .await?;
+    let views = state.repositories.credential_bindings.list_views().await?;
+    views
+        .into_iter()
+        .find(|view| {
+            view.topology_node_id == node_id
+                && view.credential.id == metadata.id
+                && view.purpose == purpose
+        })
+        .map(|view| (no_store_headers(), Json(view)))
+        .ok_or(ApiError::Internal(
+            "credential binding was not visible after storage",
+        ))
+}
+
+async fn admin_overview(
+    State(state): State<ApiState>,
+) -> Result<(HeaderMap, Json<AdminOverviewResponse>), ApiError> {
+    let hosts = state.repositories.hosts.list().await?;
+    let mut host_views = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let access_paths = state
+            .repositories
+            .access_paths
+            .list_for_host(host.id)
+            .await?;
+        let mut path_views = Vec::with_capacity(access_paths.len());
+        for access_path in access_paths {
+            let health = state
+                .repositories
+                .access_path_health
+                .get(access_path.id)
+                .await?;
+            path_views.push(AdminAccessPathView {
+                access_path,
+                health,
+            });
+        }
+        host_views.push(AdminHostView {
+            host,
+            access_paths: path_views,
+        });
+    }
+    let (nodes, edges) = state.repositories.topology.list_graph(true).await?;
+    let credentials = state.repositories.credentials.list_metadata().await?;
+    Ok((
+        no_store_headers(),
+        Json(AdminOverviewResponse {
+            hosts: host_views,
+            environments: state.repositories.environments.list().await?,
+            connectors: state.repositories.connectors.list().await?,
+            nodes,
+            edges,
+            credential_bindings: state.repositories.credential_bindings.list_views().await?,
+            credential_count: credentials.len(),
+            vault_unlocked: state.vault_master_password.is_some(),
+        }),
+    ))
 }
 
 async fn list_hosts(State(state): State<ApiState>) -> Result<Json<Vec<Host>>, ApiError> {
@@ -1151,6 +1527,123 @@ fn parse_output_artifact_id(input: &str) -> Result<OperationOutputArtifactId, Ap
     Ok(OperationOutputArtifactId::from(Uuid::parse_str(input)?))
 }
 
+fn parse_topology_node_id(input: &str) -> Result<TopologyNodeId, ApiError> {
+    Ok(TopologyNodeId::from(Uuid::parse_str(input)?))
+}
+
+fn normalized_topology_text(value: &str, field: &str, max_len: usize) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError::BadRequest(format!("{field} must not be empty")));
+    }
+    if value.len() > max_len {
+        return Err(ApiError::BadRequest(format!(
+            "{field} must be at most {max_len} bytes"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(format!(
+            "{field} must not contain control characters"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn normalized_optional_topology_text(
+    value: Option<&str>,
+    field: &str,
+    max_len: usize,
+) -> Result<Option<String>, ApiError> {
+    value
+        .map(|value| normalized_topology_text(value, field, max_len))
+        .transpose()
+}
+
+fn normalized_ports(mut ports: Vec<u16>) -> Result<Vec<u16>, ApiError> {
+    if ports.contains(&0) {
+        return Err(ApiError::BadRequest(
+            "node.ports must contain values between 1 and 65535".to_owned(),
+        ));
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.len() > 256 {
+        return Err(ApiError::BadRequest(
+            "node.ports must contain at most 256 unique ports".to_owned(),
+        ));
+    }
+    Ok(ports)
+}
+
+fn ensure_safe_topology_metadata(value: &serde_json::Value, field: &str) -> Result<(), ApiError> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let normalized_key: String = key
+                    .chars()
+                    .filter(char::is_ascii_alphanumeric)
+                    .flat_map(char::to_lowercase)
+                    .collect();
+                if [
+                    "password",
+                    "passwd",
+                    "token",
+                    "secret",
+                    "apikey",
+                    "privatekey",
+                    "credential",
+                    "connectionstring",
+                ]
+                .iter()
+                .any(|needle| normalized_key.contains(needle))
+                {
+                    return Err(ApiError::BadRequest(format!(
+                        "{field} contains secret-like key '{key}'; use a credential binding"
+                    )));
+                }
+                ensure_safe_topology_metadata(child, field)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                ensure_safe_topology_metadata(item, field)?;
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_credential_secret(secret: &CredentialSecret) -> Result<(), ApiError> {
+    let values = [
+        secret.password.as_deref(),
+        secret.private_key_pem.as_deref(),
+        secret.private_key_passphrase.as_deref(),
+        secret.sudo_password.as_deref(),
+        secret.token.as_deref(),
+        secret.secret_text.as_deref(),
+    ];
+    if !secret.use_ssh_agent
+        && !values
+            .iter()
+            .flatten()
+            .any(|value| !value.trim().is_empty())
+    {
+        return Err(ApiError::BadRequest(
+            "secret must contain password, key, token, secret_text, or SSH-agent access".to_owned(),
+        ));
+    }
+    if values.iter().flatten().any(|value| value.len() > 1_048_576) {
+        return Err(ApiError::BadRequest(
+            "individual secret fields must not exceed 1 MiB".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn normalized_event_filter(value: Option<String>, field: &str) -> Result<Option<String>, ApiError> {
     value
         .map(|value| {
@@ -1181,6 +1674,143 @@ fn default_wait_states() -> Vec<WorkspaceState> {
 
 fn elapsed_ms(started_at: std::time::Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn default_topology_status() -> TopologyNodeStatus {
+    TopologyNodeStatus::Unknown
+}
+
+fn empty_json_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// Query for the infrastructure topology graph.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TopologyQuery {
+    /// Include nodes and edges no longer present in their latest source snapshot.
+    pub include_inactive: Option<bool>,
+}
+
+/// One node supplied by a topology producer.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopologySyncNodeInput {
+    /// Stable source-controlled key.
+    pub external_key: String,
+    /// Optional primary host-registry link.
+    pub host_id: Option<HostId>,
+    /// Human-readable name.
+    pub name: String,
+    /// Resource category.
+    pub kind: TopologyNodeKind,
+    /// Last observed status.
+    #[serde(default = "default_topology_status")]
+    pub status: TopologyNodeStatus,
+    /// Address, DNS name, URL, virtual IP, or subnet.
+    pub address: Option<String>,
+    /// Exposed or listened ports.
+    #[serde(default)]
+    pub ports: Vec<u16>,
+    /// Non-secret extensible metadata.
+    #[serde(default = "empty_json_object")]
+    pub metadata: serde_json::Value,
+}
+
+/// One directed edge supplied by a topology producer.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopologySyncEdgeInput {
+    /// Stable source-controlled key.
+    pub external_key: String,
+    /// Source node external key.
+    pub from: String,
+    /// Target node external key.
+    pub to: String,
+    /// Relationship category.
+    pub relation: TopologyRelation,
+    /// Non-secret extensible metadata.
+    #[serde(default = "empty_json_object")]
+    pub metadata: serde_json::Value,
+}
+
+/// Authoritative snapshot for one producer and topology scope.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopologySyncRequest {
+    /// Reconciliation scope, such as `host:<uuid>` or `cluster:factory-a`.
+    pub scope_key: String,
+    /// Snapshot producer.
+    pub source: String,
+    /// Current nodes owned by this source in this scope.
+    #[serde(default)]
+    pub nodes: Vec<TopologySyncNodeInput>,
+    /// Current edges owned by this source in this scope.
+    #[serde(default)]
+    pub edges: Vec<TopologySyncEdgeInput>,
+}
+
+/// Infrastructure topology graph response.
+#[derive(Clone, Debug, Serialize)]
+pub struct TopologyGraphResponse {
+    /// Topology nodes.
+    pub nodes: Vec<TopologyNode>,
+    /// Directed topology edges.
+    pub edges: Vec<TopologyEdge>,
+}
+
+/// Store or rotate an encrypted credential and bind it to a topology node.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreTopologyCredentialRequest {
+    /// Stable human-readable credential name. Reusing the name rotates the encrypted value.
+    pub name: String,
+    /// Credential category.
+    pub kind: CredentialKind,
+    /// Optional username hint visible in the UI.
+    pub username_hint: Option<String>,
+    /// Purpose of this binding.
+    pub purpose: String,
+    /// Secret material encrypted before database storage.
+    pub secret: CredentialSecret,
+}
+
+/// Access path and current health shown in the management overview.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminAccessPathView {
+    /// Configured SSH access path.
+    pub access_path: AccessPath,
+    /// Latest health snapshot.
+    pub health: Option<AccessPathHealth>,
+}
+
+/// Host registry record with all configured access paths.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminHostView {
+    /// Host registry record.
+    pub host: Host,
+    /// Access routes, including disabled routes.
+    pub access_paths: Vec<AdminAccessPathView>,
+}
+
+/// Management dashboard bootstrap response.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminOverviewResponse {
+    /// All registered hosts and routes.
+    pub hosts: Vec<AdminHostView>,
+    /// Network environments.
+    pub environments: Vec<remote_hosts_domain::Environment>,
+    /// Connector workers.
+    pub connectors: Vec<Connector>,
+    /// Active and inactive topology nodes.
+    pub nodes: Vec<TopologyNode>,
+    /// Active and inactive topology edges.
+    pub edges: Vec<TopologyEdge>,
+    /// Public bindings to encrypted credentials.
+    pub credential_bindings: Vec<CredentialBindingView>,
+    /// Total encrypted credentials, including SSH route credentials.
+    pub credential_count: usize,
+    /// Whether this HTTP process can accept credential writes.
+    pub vault_unlocked: bool,
 }
 
 /// Health response.
@@ -1549,6 +2179,12 @@ pub enum ApiError {
     /// Request is invalid.
     #[error("{0}")]
     BadRequest(String),
+    /// Credential writes require a configured local vault key.
+    #[error("credential vault is locked; configure --vault-master-password-file")]
+    VaultUnavailable,
+    /// Internal operation failed without exposing sensitive implementation details.
+    #[error("{0}")]
+    Internal(&'static str),
     /// Workspace supervisor rejected the request.
     #[error(transparent)]
     WorkspaceSupervisor(#[from] WorkspaceSupervisorError),
@@ -1567,7 +2203,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let error = self.to_string();
         let status = match &self {
-            Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::WorkspaceSupervisor(WorkspaceSupervisorError::PolicyDenied(_))
             | Self::WorkspaceOperation(WorkspaceOperationError::PolicyDenied(_))
@@ -1588,7 +2224,7 @@ impl IntoResponse for ApiError {
             {
                 StatusCode::TOO_MANY_REQUESTS
             }
-            Self::AccessResolution(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::VaultUnavailable | Self::AccessResolution(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         let body = Json(ErrorResponse { error });
         (status, body).into_response()
@@ -1617,6 +2253,7 @@ mod tests {
         RiskLevel, RouteType, SessionId, StoredCredential, TrustLevel, WorkspaceId, WorkspaceState,
         now_utc,
     };
+    use secrecy::SecretString;
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -2337,6 +2974,312 @@ mod tests {
         assert_eq!(close_body["state"], "closed");
         assert_eq!(close_body["input_allowed"], false);
         assert_eq!(close_body["last_exit_code"], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn topology_snapshot_sync_is_idempotent_and_marks_missing_members_inactive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&pool).await?;
+        let repos = Repositories::new(pool);
+        let app = router_with_state(ApiState::new(repos));
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/topology/sync")
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(
+                        json!({
+                            "scope_key": "cluster:factory-a",
+                            "source": "inventory-agent",
+                            "nodes": [
+                                {
+                                    "external_key": "cluster:factory-a",
+                                    "name": "Factory A",
+                                    "kind": "cluster"
+                                },
+                                {
+                                    "external_key": "proxy:factory-a",
+                                    "name": "Factory ingress",
+                                    "kind": "reverse_proxy",
+                                    "address": "10.20.0.10",
+                                    "metadata": {"software": "nginx"}
+                                },
+                                {
+                                    "external_key": "service:factory-a-api",
+                                    "name": "Factory API",
+                                    "kind": "business_service",
+                                    "address": "10.20.0.21",
+                                    "ports": [8080]
+                                }
+                            ],
+                            "edges": [
+                                {
+                                    "external_key": "proxy-to-api",
+                                    "from": "proxy:factory-a",
+                                    "to": "service:factory-a-api",
+                                    "relation": "proxies_to"
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        let bytes = body::to_bytes(first.into_body(), usize::MAX).await?;
+        let first_body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(first_body["active_node_count"], 3);
+        assert_eq!(first_body["active_edge_count"], 1);
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/topology/sync")
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(
+                        json!({
+                            "scope_key": "cluster:factory-a",
+                            "source": "inventory-agent",
+                            "nodes": [
+                                {
+                                    "external_key": "cluster:factory-a",
+                                    "name": "Factory A",
+                                    "kind": "cluster"
+                                },
+                                {
+                                    "external_key": "proxy:factory-a",
+                                    "name": "Factory ingress v2",
+                                    "kind": "reverse_proxy",
+                                    "address": "10.20.0.10",
+                                    "metadata": {"software": "caddy"}
+                                }
+                            ],
+                            "edges": []
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(second.status(), axum::http::StatusCode::OK);
+        let bytes = body::to_bytes(second.into_body(), usize::MAX).await?;
+        let second_body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(second_body["active_node_count"], 2);
+        assert_eq!(second_body["inactive_node_count"], 1);
+        assert_eq!(second_body["inactive_edge_count"], 1);
+
+        let graph = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/topology?include_inactive=true")
+                    .body(body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(graph.status(), axum::http::StatusCode::OK);
+        let bytes = body::to_bytes(graph.into_body(), usize::MAX).await?;
+        let graph_body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(graph_body["nodes"].as_array().map(Vec::len), Some(3));
+        assert_eq!(graph_body["edges"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            graph_body["nodes"]
+                .as_array()
+                .and_then(|nodes| nodes
+                    .iter()
+                    .find(|node| node["external_key"] == "proxy:factory-a"))
+                .map(|node| node["name"].clone()),
+            Some(json!("Factory ingress v2"))
+        );
+        assert_eq!(
+            graph_body["nodes"]
+                .as_array()
+                .and_then(|nodes| nodes
+                    .iter()
+                    .find(|node| node["external_key"] == "service:factory-a-api"))
+                .map(|node| node["active"].clone()),
+            Some(json!(false))
+        );
+
+        let admin = app
+            .oneshot(Request::builder().uri("/admin").body(body::Body::empty())?)
+            .await?;
+        assert_eq!(admin.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            admin
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, max-age=0")
+        );
+        assert!(
+            admin
+                .headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("frame-ancestors 'none'"))
+        );
+        let bytes = body::to_bytes(admin.into_body(), usize::MAX).await?;
+        let html = String::from_utf8(bytes.to_vec())?;
+        assert!(html.contains("Remote Hosts"));
+        assert!(html.contains("/v1/admin/overview"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topology_metadata_rejects_secret_like_fields() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&pool).await?;
+        let repos = Repositories::new(pool);
+        let app = router_with_state(ApiState::new(repos.clone()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/topology/sync")
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(
+                        json!({
+                            "scope_key": "service:unsafe",
+                            "source": "manual",
+                            "nodes": [{
+                                "external_key": "service:unsafe",
+                                "name": "Unsafe service",
+                                "kind": "business_service",
+                                "metadata": {"admin_password": "must-not-be-stored"}
+                            }],
+                            "edges": []
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            repos
+                .topology
+                .get_node_by_external_key("service:unsafe")
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn topology_credentials_are_encrypted_bound_and_never_returned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&pool).await?;
+        let repos = Repositories::new(pool);
+        let app = router_with_state(ApiState::with_vault_master_password(
+            repos.clone(),
+            SecretString::from("local-test-vault-key".to_owned()),
+        ));
+        let sync_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/topology/sync")
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(
+                        json!({
+                            "scope_key": "service:billing",
+                            "source": "manual",
+                            "nodes": [{
+                                "external_key": "service:billing",
+                                "name": "Billing API",
+                                "kind": "business_service"
+                            }],
+                            "edges": []
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(sync_response.status(), axum::http::StatusCode::OK);
+        let node = repos
+            .topology
+            .get_node_by_external_key("service:billing")
+            .await?
+            .ok_or("topology node should exist")?;
+        let plaintext = "internal-billing-password";
+        let credential_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/topology/nodes/{}/credentials", node.id))
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(
+                        json!({
+                            "name": "billing-admin",
+                            "kind": "basic_auth",
+                            "username_hint": "admin",
+                            "purpose": "admin",
+                            "secret": {"password": plaintext}
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(credential_response.status(), axum::http::StatusCode::OK);
+        let bytes = body::to_bytes(credential_response.into_body(), usize::MAX).await?;
+        let credential_body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(credential_body["credential"]["name"], "billing-admin");
+        assert_eq!(credential_body["purpose"], "admin");
+        assert!(!credential_body.to_string().contains(plaintext));
+
+        let stored = repos
+            .credentials
+            .get_by_name("billing-admin")
+            .await?
+            .ok_or("credential should exist")?;
+        assert!(!stored.encrypted_blob_json.to_string().contains(plaintext));
+
+        let overview_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/overview")
+                    .body(body::Body::empty())?,
+            )
+            .await?;
+        let bytes = body::to_bytes(overview_response.into_body(), usize::MAX).await?;
+        let overview_text = String::from_utf8(bytes.to_vec())?;
+        assert!(overview_text.contains("billing-admin"));
+        assert!(!overview_text.contains(plaintext));
+
+        let locked_app = router_with_state(ApiState::new(repos));
+        let locked_response = locked_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/topology/nodes/{}/credentials", node.id))
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(
+                        json!({
+                            "name": "billing-readonly",
+                            "kind": "basic_auth",
+                            "username_hint": "viewer",
+                            "purpose": "readonly",
+                            "secret": {"password": "another-secret"}
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(
+            locked_response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
         Ok(())
     }
 }

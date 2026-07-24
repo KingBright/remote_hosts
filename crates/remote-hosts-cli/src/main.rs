@@ -76,6 +76,9 @@ enum Command {
         /// Bind address.
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
+        /// Local vault master password file required for credential writes in the admin UI.
+        #[arg(long, env = "REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE")]
+        vault_master_password_file: Option<PathBuf>,
     },
     /// Claim and execute one queued operation for a connector.
     WorkerOnce {
@@ -239,10 +242,24 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(anyhow::Error::msg)?;
         }
-        Command::Serve { database_url, bind } => {
+        Command::Serve {
+            database_url,
+            bind,
+            vault_master_password_file,
+        } => {
             let repositories = connect_repositories(&database_url).await?;
+            let vault_master_password =
+                read_optional_vault_master_password(vault_master_password_file.as_ref())?;
+            ensure_safe_api_bind(bind, vault_master_password.is_some())?;
+            let api_state = match vault_master_password {
+                Some(master_password) => remote_hosts_api::ApiState::with_vault_master_password(
+                    repositories,
+                    master_password,
+                ),
+                None => remote_hosts_api::ApiState::new(repositories),
+            };
             tracing::info!(%bind, "starting remote-hosts api");
-            remote_hosts_api::serve(bind, remote_hosts_api::ApiState::new(repositories))
+            remote_hosts_api::serve(bind, api_state)
                 .await
                 .context("serve api")?;
         }
@@ -691,6 +708,16 @@ fn read_optional_vault_master_password(
     path.map(read_vault_master_password).transpose()
 }
 
+fn ensure_safe_api_bind(bind: SocketAddr, vault_unlocked: bool) -> anyhow::Result<()> {
+    if vault_unlocked && !bind.ip().is_loopback() {
+        anyhow::bail!(
+            "refusing to expose an unlocked credential vault on non-loopback bind {bind}; \
+             bind to 127.0.0.1 and use an SSH tunnel"
+        );
+    }
+    Ok(())
+}
+
 fn read_vault_master_password(path: &PathBuf) -> anyhow::Result<SecretString> {
     let value = std::fs::read_to_string(path)
         .with_context(|| format!("read vault master password file {}", path.display()))?;
@@ -707,7 +734,7 @@ mod tests {
 
     use super::{
         Cli, Command, McpToolProfile, OpenSshManagedPtyBackendMode, PtyBackendMode, SshBackend,
-        parse_pty_backend_mode,
+        ensure_safe_api_bind, parse_pty_backend_mode,
     };
 
     #[test]
@@ -735,6 +762,14 @@ mod tests {
             anyhow::bail!("expected mcp-stdio command");
         };
         assert_eq!(tool_profile, McpToolProfile::Full);
+        Ok(())
+    }
+
+    #[test]
+    fn unlocked_http_vault_requires_loopback_bind() -> anyhow::Result<()> {
+        ensure_safe_api_bind("127.0.0.1:8787".parse()?, true)?;
+        ensure_safe_api_bind("0.0.0.0:8787".parse()?, false)?;
+        assert!(ensure_safe_api_bind("0.0.0.0:8787".parse()?, true).is_err());
         Ok(())
     }
 

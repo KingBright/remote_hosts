@@ -372,6 +372,31 @@ Fields:
 - `created_at`
 - `updated_at`
 
+### 6.10 Infrastructure Topology
+
+The topology layer is a generic directed graph rather than a collection of product-specific
+tables.
+
+`TopologyNode` represents registered hosts, virtual machines, clusters, containers, reverse
+proxies, load balancers, middleware, databases, caches, message queues, storage, networks,
+endpoints, and business services. A node has a globally stable `external_key`, optional primary
+`host_id`, status, address, ports, non-secret metadata, observation timestamps, and derived active
+state.
+
+`TopologyEdge` connects two nodes with relationships such as `contains`, `member_of`, `runs_on`,
+`proxies_to`, `routes_to`, `depends_on`, `connects_to`, `replicates_to`, `exposes`, or
+`managed_by`.
+
+Topology synchronization is authoritative within one `scope_key + source`. A repeated snapshot
+upserts stable nodes and edges in a transaction. Memberships omitted by the next snapshot become
+inactive for that source and scope instead of being deleted. This preserves history and allows
+manual inventory, host probes, cluster inventory agents, and imported sources to contribute to the
+same graph safely.
+
+`CredentialBinding` links any topology node to encrypted credential metadata with a purpose such
+as `admin`, `readonly`, `database`, or `automation`. Secret-like keys are forbidden in topology
+metadata; secret material belongs in the credential vault.
+
 ## 7. Credential Vault Design
 
 No Keychain, 1Password, or external Vault dependency in the default product.
@@ -888,6 +913,19 @@ Do not expose:
 - `get_password`
 - `show_private_key`
 - unmanaged shell execution that bypasses workspace reuse, policy, timeout, output bounds, and audit
+
+### 10.4 Operator Management HTTP Surface
+
+- `GET /admin`
+- `GET /v1/admin/overview`
+- `GET /v1/topology`
+- `POST /v1/topology/sync`
+- `GET /v1/topology/credential-bindings`
+- `POST /v1/topology/nodes/{node_id}/credentials`
+
+The embedded console visualizes hosts, access-path health, clusters, services, and topology
+relationships. Credential responses are metadata-only. A service process with an unlocked HTTP
+vault binds only to loopback; operators reach it remotely through their existing SSH tunnel.
 
 ## 11. Execution Safety
 

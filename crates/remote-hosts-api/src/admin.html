@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remote Hosts · 基础设施控制台</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07100f;
+      --panel: rgba(15, 29, 27, .92);
+      --panel-2: #132622;
+      --line: rgba(166, 197, 187, .16);
+      --text: #edf7f3;
+      --muted: #91a9a1;
+      --mint: #7cf7c8;
+      --amber: #f8c56a;
+      --red: #ff7e7e;
+      --blue: #78c7ff;
+      --shadow: 0 22px 70px rgba(0, 0, 0, .34);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 1120px;
+      min-height: 100vh;
+      overflow: hidden;
+      color: var(--text);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at 75% -10%, rgba(55, 184, 138, .18), transparent 32%),
+        radial-gradient(circle at 5% 100%, rgba(54, 129, 151, .13), transparent 28%),
+        var(--bg);
+    }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .shell { height: 100vh; display: grid; grid-template-rows: 70px 1fr; }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 26px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(7, 16, 15, .76);
+      backdrop-filter: blur(22px);
+    }
+    .brand { display: flex; align-items: center; gap: 13px; }
+    .brand-mark {
+      width: 36px; height: 36px; display: grid; place-items: center;
+      border: 1px solid rgba(124, 247, 200, .45);
+      border-radius: 11px;
+      background: linear-gradient(145deg, rgba(124, 247, 200, .2), rgba(124, 247, 200, .03));
+      color: var(--mint); font-weight: 800; letter-spacing: -.04em;
+      box-shadow: inset 0 0 22px rgba(124, 247, 200, .08);
+    }
+    h1 { margin: 0; font-size: 16px; letter-spacing: -.02em; }
+    .eyebrow { margin-top: 2px; color: var(--muted); font-size: 11px; letter-spacing: .11em; text-transform: uppercase; }
+    .header-actions { display: flex; align-items: center; gap: 9px; }
+    .status { display: flex; align-items: center; gap: 8px; margin-right: 10px; color: var(--muted); font-size: 12px; }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 14px var(--mint); }
+    .btn {
+      min-height: 36px; padding: 0 14px; border: 1px solid var(--line); border-radius: 9px;
+      color: var(--text); background: rgba(255, 255, 255, .035);
+    }
+    .btn:hover { border-color: rgba(124, 247, 200, .38); background: rgba(124, 247, 200, .07); }
+    .btn.primary { color: #06110e; border-color: var(--mint); background: var(--mint); font-weight: 750; }
+    .workspace {
+      min-height: 0; display: grid; grid-template-columns: 292px minmax(600px, 1fr) 320px; gap: 1px;
+      background: var(--line);
+    }
+    aside, main { min-height: 0; background: rgba(7, 16, 15, .96); }
+    aside { display: flex; flex-direction: column; }
+    .pane-head { padding: 20px 18px 14px; }
+    .pane-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .pane-title strong { font-size: 13px; letter-spacing: .01em; }
+    .badge {
+      min-width: 23px; padding: 2px 7px; border-radius: 99px; text-align: center;
+      color: var(--mint); background: rgba(124, 247, 200, .08); font-size: 11px;
+    }
+    .search, .field {
+      width: 100%; border: 1px solid var(--line); border-radius: 9px; outline: none;
+      color: var(--text); background: rgba(255, 255, 255, .035);
+    }
+    .search { height: 38px; padding: 0 12px; }
+    .field { min-height: 40px; padding: 9px 11px; }
+    .search:focus, .field:focus { border-color: rgba(124, 247, 200, .55); }
+    .host-list { overflow: auto; padding: 0 10px 18px; }
+    .host-card {
+      width: 100%; margin: 2px 0 7px; padding: 12px; text-align: left; border: 1px solid transparent;
+      border-radius: 11px; color: inherit; background: transparent;
+    }
+    .host-card:hover, .host-card.active { border-color: var(--line); background: rgba(255,255,255,.035); }
+    .host-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .host-name { overflow: hidden; font-weight: 670; text-overflow: ellipsis; white-space: nowrap; }
+    .state-pill { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--muted); }
+    .state-pill.healthy, .state-pill.connected { background: var(--mint); box-shadow: 0 0 9px rgba(124,247,200,.55); }
+    .state-pill.degraded { background: var(--amber); }
+    .host-meta { margin-top: 5px; color: var(--muted); font-size: 11px; }
+    main { display: grid; grid-template-rows: auto 1fr; }
+    .topbar { padding: 17px 20px 12px; border-bottom: 1px solid var(--line); }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 10px; }
+    .metric {
+      min-height: 70px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 11px;
+      background: linear-gradient(145deg, rgba(255,255,255,.035), rgba(255,255,255,.012));
+    }
+    .metric-value { font-size: 22px; font-weight: 760; letter-spacing: -.04em; }
+    .metric-label { color: var(--muted); font-size: 11px; letter-spacing: .035em; }
+    .graph-wrap { position: relative; min-height: 0; overflow: hidden; }
+    .graph-toolbar {
+      position: absolute; z-index: 3; top: 14px; left: 16px; right: 16px;
+      display: flex; align-items: center; justify-content: space-between; pointer-events: none;
+    }
+    .graph-toolbar > * { pointer-events: auto; }
+    .filters { display: flex; gap: 7px; }
+    .chip {
+      padding: 6px 10px; border: 1px solid var(--line); border-radius: 99px;
+      color: var(--muted); background: rgba(7,16,15,.74); font-size: 11px;
+    }
+    .chip.active { color: var(--mint); border-color: rgba(124,247,200,.35); }
+    #topology { width: 100%; height: 100%; min-height: 520px; }
+    .empty {
+      position: absolute; inset: 0; display: none; place-items: center; color: var(--muted); text-align: center;
+    }
+    .empty strong { display: block; margin-bottom: 5px; color: var(--text); font-size: 15px; }
+    .detail { overflow: auto; }
+    .detail-body { padding: 4px 18px 24px; }
+    .detail-hero { padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+    .kind { color: var(--mint); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; }
+    .detail h2 { margin: 7px 0 4px; font-size: 18px; letter-spacing: -.03em; }
+    .detail-key { overflow-wrap: anywhere; color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .section { margin-top: 21px; }
+    .section-title { margin-bottom: 9px; color: var(--muted); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+    .kv { display: grid; grid-template-columns: 88px 1fr; gap: 8px; padding: 8px 0; border-bottom: 1px solid rgba(166,197,187,.09); font-size: 12px; }
+    .kv span:first-child { color: var(--muted); }
+    .credential {
+      padding: 10px 11px; margin-bottom: 7px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.025);
+    }
+    .credential strong { display: block; font-size: 12px; }
+    .credential small { color: var(--muted); }
+    .muted { color: var(--muted); }
+    dialog {
+      width: min(680px, calc(100vw - 40px)); padding: 0; border: 1px solid var(--line); border-radius: 15px;
+      color: var(--text); background: #0d1d1a; box-shadow: var(--shadow);
+    }
+    dialog::backdrop { background: rgba(0, 0, 0, .66); backdrop-filter: blur(4px); }
+    .modal-head { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid var(--line); }
+    .modal-head h3 { margin: 0; font-size: 15px; }
+    .modal-body { padding: 18px 20px 20px; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .form-row { display: grid; gap: 6px; }
+    .form-row.full { grid-column: 1 / -1; }
+    label { color: var(--muted); font-size: 11px; }
+    textarea.field { min-height: 220px; resize: vertical; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+    .notice { margin-bottom: 12px; padding: 9px 11px; border: 1px solid rgba(248,197,106,.25); border-radius: 9px; color: var(--amber); background: rgba(248,197,106,.06); font-size: 12px; }
+    .toast {
+      position: fixed; z-index: 10; right: 22px; bottom: 22px; max-width: 420px; padding: 11px 14px;
+      border: 1px solid var(--line); border-radius: 10px; background: #183029; box-shadow: var(--shadow);
+      opacity: 0; transform: translateY(8px); transition: .2s; pointer-events: none;
+    }
+    .toast.show { opacity: 1; transform: none; }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <div class="brand">
+      <div class="brand-mark">RH</div>
+      <div><h1>Remote Hosts</h1><div class="eyebrow">Infrastructure control plane</div></div>
+    </div>
+    <div class="header-actions">
+      <div class="status"><span class="status-dot"></span><span id="connectionStatus">正在读取本地状态</span></div>
+      <button class="btn" id="refreshButton">刷新</button>
+      <button class="btn" id="syncButton">同步快照</button>
+      <button class="btn primary" id="credentialButton">录入凭据</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <aside>
+      <div class="pane-head">
+        <div class="pane-title"><strong>服务器注册表</strong><span class="badge" id="hostBadge">0</span></div>
+        <input class="search" id="hostSearch" placeholder="搜索服务器、地址或标签">
+      </div>
+      <div class="host-list" id="hostList"></div>
+    </aside>
+
+    <main>
+      <div class="topbar">
+        <div class="metrics">
+          <div class="metric"><div class="metric-value" id="hostMetric">0</div><div class="metric-label">受管服务器</div></div>
+          <div class="metric"><div class="metric-value" id="clusterMetric">0</div><div class="metric-label">内网集群</div></div>
+          <div class="metric"><div class="metric-value" id="serviceMetric">0</div><div class="metric-label">活跃服务 / 中间件</div></div>
+          <div class="metric"><div class="metric-value" id="credentialMetric">0</div><div class="metric-label">加密凭据</div></div>
+        </div>
+      </div>
+      <div class="graph-wrap">
+        <div class="graph-toolbar">
+          <div class="filters">
+            <button class="chip active" data-kind="all">全部</button>
+            <button class="chip" data-kind="cluster">集群</button>
+            <button class="chip" data-kind="reverse_proxy">代理</button>
+            <button class="chip" data-kind="business_service">业务服务</button>
+            <button class="chip" data-kind="middleware">中间件</button>
+          </div>
+          <button class="chip" id="staleToggle">显示历史节点</button>
+        </div>
+        <svg id="topology" role="img" aria-label="基础设施拓扑图"></svg>
+        <div class="empty" id="emptyState"><div><strong>还没有拓扑数据</strong>点击“同步快照”导入服务器或集群拓扑。</div></div>
+      </div>
+    </main>
+
+    <aside class="detail">
+      <div class="pane-head"><div class="pane-title"><strong>资源详情</strong><span class="badge" id="activeBadge">LIVE</span></div></div>
+      <div class="detail-body" id="detailBody"><div class="muted">在拓扑图中选择一个资源。</div></div>
+    </aside>
+  </div>
+</div>
+
+<dialog id="syncDialog">
+  <div class="modal-head"><h3>同步拓扑快照</h3><button class="btn" data-close="syncDialog">关闭</button></div>
+  <form class="modal-body" id="syncForm">
+    <div class="notice">同一 scope_key + source 的快照会幂等合并；本次缺失的成员只会标记为历史，不会删除。</div>
+    <div class="form-row"><label for="snapshotJson">JSON 快照</label><textarea class="field" id="snapshotJson" required spellcheck="false"></textarea></div>
+    <div class="modal-actions"><button type="button" class="btn" data-close="syncDialog">取消</button><button class="btn primary" type="submit">执行同步</button></div>
+  </form>
+</dialog>
+
+<dialog id="credentialDialog">
+  <div class="modal-head"><h3>录入或轮换凭据</h3><button class="btn" data-close="credentialDialog">关闭</button></div>
+  <form class="modal-body" id="credentialForm">
+    <div class="notice" id="vaultNotice">凭据将使用本机 vault 密钥加密；页面和 API 不会回显密文内容。</div>
+    <div class="form-grid">
+      <div class="form-row full"><label for="credentialNode">绑定资源</label><select class="field" id="credentialNode" required></select></div>
+      <div class="form-row"><label for="credentialName">凭据名称</label><input class="field" id="credentialName" required placeholder="factory-api-admin"></div>
+      <div class="form-row"><label for="credentialPurpose">用途</label><input class="field" id="credentialPurpose" required value="admin"></div>
+      <div class="form-row"><label for="credentialKind">类型</label><select class="field" id="credentialKind"><option value="basic_auth">账号密码</option><option value="database_password">数据库密码</option><option value="service_account">服务账号</option><option value="api_token">API Token</option><option value="generic_secret">通用密文</option></select></div>
+      <div class="form-row"><label for="credentialUser">用户名提示</label><input class="field" id="credentialUser" autocomplete="off"></div>
+      <div class="form-row full"><label for="credentialSecret">密码 / Token / Secret</label><input class="field" id="credentialSecret" type="password" required autocomplete="new-password"></div>
+    </div>
+    <div class="modal-actions"><button type="button" class="btn" data-close="credentialDialog">取消</button><button class="btn primary" type="submit">加密保存</button></div>
+  </form>
+</dialog>
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  "use strict";
+  const api = "/v1/admin/overview";
+  const state = { data: null, selectedNodeId: null, kind: "all", showStale: false };
+  const byId = id => document.getElementById(id);
+  const svgNs = "http://www.w3.org/2000/svg";
+  const create = (tag, className, text) => {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text !== undefined) el.textContent = text;
+    return el;
+  };
+  const svg = (tag, attrs = {}) => {
+    const el = document.createElementNS(svgNs, tag);
+    Object.entries(attrs).forEach(([key, value]) => el.setAttribute(key, String(value)));
+    return el;
+  };
+  const label = value => String(value || "unknown").replaceAll("_", " ");
+  const formatTimestamp = value => {
+    let date;
+    if (Array.isArray(value) && value.length >= 6) {
+      date = new Date(Date.UTC(value[0], 0, value[1], value[2], value[3], value[4]));
+    } else {
+      date = new Date(value);
+    }
+    return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+  };
+  const showToast = (message, bad = false) => {
+    const toast = byId("toast");
+    toast.textContent = message;
+    toast.style.borderColor = bad ? "rgba(255,126,126,.5)" : "rgba(124,247,200,.35)";
+    toast.classList.add("show");
+    window.setTimeout(() => toast.classList.remove("show"), 3200);
+  };
+  const jsonRequest = async (url, options = {}) => {
+    const response = await fetch(url, options);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    return body;
+  };
+
+  async function refresh() {
+    byId("connectionStatus").textContent = "正在同步本地状态";
+    try {
+      state.data = await jsonRequest(api);
+      byId("connectionStatus").textContent = "本地控制面在线";
+      render();
+    } catch (error) {
+      byId("connectionStatus").textContent = "控制面不可用";
+      showToast(error.message, true);
+    }
+  }
+
+  function render() {
+    const data = state.data;
+    const activeNodes = data.nodes.filter(node => node.active);
+    byId("hostMetric").textContent = data.hosts.length;
+    byId("hostBadge").textContent = data.hosts.length;
+    byId("clusterMetric").textContent = activeNodes.filter(node => node.kind === "cluster").length;
+    byId("serviceMetric").textContent = activeNodes.filter(node => ["business_service", "middleware", "database", "cache", "message_queue", "reverse_proxy"].includes(node.kind)).length;
+    byId("credentialMetric").textContent = data.credential_count;
+    renderHosts();
+    renderGraph();
+    renderCredentialOptions();
+    renderDetail();
+  }
+
+  function renderHosts() {
+    const list = byId("hostList");
+    list.replaceChildren();
+    const query = byId("hostSearch").value.trim().toLowerCase();
+    state.data.hosts.filter(item => {
+      const haystack = [item.host.display_name, item.host.name, ...(item.host.tags || []), ...item.access_paths.map(path => path.access_path.address)].join(" ").toLowerCase();
+      return haystack.includes(query);
+    }).forEach(item => {
+      const button = create("button", "host-card");
+      const top = create("div", "host-top");
+      top.append(create("span", "host-name", item.host.display_name));
+      const health = item.access_paths.find(path => path.health)?.health?.state || "unknown";
+      top.append(create("span", `state-pill ${health}`));
+      button.append(top, create("div", "host-meta", `${label(item.host.kind)} · ${item.access_paths.length} 条访问路径`));
+      button.addEventListener("click", () => {
+        const node = state.data.nodes.find(candidate => candidate.host_id === item.host.id);
+        if (node) { state.selectedNodeId = node.id; renderGraph(); renderDetail(); }
+      });
+      list.append(button);
+    });
+  }
+
+  function filteredNodes() {
+    return state.data.nodes.filter(node =>
+      (state.showStale || node.active) && (state.kind === "all" || node.kind === state.kind)
+    );
+  }
+
+  function nodeColor(kind) {
+    if (kind === "cluster") return "#f8c56a";
+    if (kind === "reverse_proxy" || kind === "load_balancer") return "#78c7ff";
+    if (["business_service", "middleware"].includes(kind)) return "#7cf7c8";
+    if (["database", "cache", "message_queue", "storage"].includes(kind)) return "#c8a5ff";
+    return "#91a9a1";
+  }
+
+  function renderGraph() {
+    const canvas = byId("topology");
+    canvas.replaceChildren();
+    canvas.setAttribute("viewBox", "0 0 1100 650");
+    const nodes = filteredNodes();
+    const allowed = new Set(nodes.map(node => node.id));
+    const edges = state.data.edges.filter(edge => (state.showStale || edge.active) && allowed.has(edge.source_node_id) && allowed.has(edge.target_node_id));
+    byId("emptyState").style.display = nodes.length ? "none" : "grid";
+    if (!nodes.length) return;
+
+    const defs = svg("defs");
+    const marker = svg("marker", { id: "arrow", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" });
+    marker.append(svg("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "rgba(145,169,161,.46)" }));
+    defs.append(marker);
+    canvas.append(defs);
+
+    const groups = ["network", "host", "virtual_machine", "cluster", "reverse_proxy", "load_balancer", "business_service", "middleware", "database", "cache", "message_queue", "storage", "container", "endpoint", "other"];
+    const columns = new Map();
+    nodes.forEach(node => {
+      const rank = Math.max(0, groups.indexOf(node.kind));
+      const column = rank <= 3 ? 0 : rank <= 5 ? 1 : rank <= 7 ? 2 : 3;
+      const bucket = columns.get(column) || [];
+      bucket.push(node);
+      columns.set(column, bucket);
+    });
+    const positions = new Map();
+    [...columns.entries()].forEach(([column, bucket]) => {
+      bucket.sort((a, b) => a.name.localeCompare(b.name));
+      const gap = Math.min(122, 520 / Math.max(1, bucket.length));
+      const start = 92 + Math.max(0, (520 - gap * (bucket.length - 1)) / 2);
+      bucket.forEach((node, index) => positions.set(node.id, { x: 125 + column * 285, y: start + index * gap }));
+    });
+
+    const edgeLayer = svg("g");
+    edges.forEach(edge => {
+      const from = positions.get(edge.source_node_id);
+      const to = positions.get(edge.target_node_id);
+      if (!from || !to) return;
+      const path = svg("path", {
+        d: `M ${from.x + 76} ${from.y} C ${from.x + 145} ${from.y}, ${to.x - 145} ${to.y}, ${to.x - 76} ${to.y}`,
+        fill: "none", stroke: edge.active ? "rgba(145,169,161,.32)" : "rgba(145,169,161,.13)",
+        "stroke-width": 1.25, "stroke-dasharray": edge.active ? "" : "5 5", "marker-end": "url(#arrow)"
+      });
+      edgeLayer.append(path);
+      const text = svg("text", { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 - 6, fill: "#718a82", "font-size": 10, "text-anchor": "middle" });
+      text.textContent = label(edge.relation);
+      edgeLayer.append(text);
+    });
+    canvas.append(edgeLayer);
+
+    const nodeLayer = svg("g");
+    nodes.forEach(node => {
+      const pos = positions.get(node.id);
+      const group = svg("g", { role: "button", tabindex: 0, style: "cursor:pointer" });
+      const selected = node.id === state.selectedNodeId;
+      group.append(svg("rect", {
+        x: pos.x - 76, y: pos.y - 35, width: 152, height: 70, rx: 12,
+        fill: selected ? "rgba(124,247,200,.13)" : "rgba(19,38,34,.96)",
+        stroke: selected ? "#7cf7c8" : node.active ? "rgba(166,197,187,.24)" : "rgba(166,197,187,.1)",
+        "stroke-width": selected ? 1.6 : 1, "stroke-dasharray": node.active ? "" : "4 4"
+      }));
+      group.append(svg("circle", { cx: pos.x - 56, cy: pos.y - 13, r: 5, fill: nodeColor(node.kind), opacity: node.active ? 1 : .38 }));
+      const name = svg("text", { x: pos.x - 44, y: pos.y - 9, fill: node.active ? "#edf7f3" : "#718a82", "font-size": 12, "font-weight": 650 });
+      name.textContent = node.name.length > 17 ? `${node.name.slice(0, 16)}…` : node.name;
+      group.append(name);
+      const meta = svg("text", { x: pos.x - 56, y: pos.y + 16, fill: "#91a9a1", "font-size": 10 });
+      meta.textContent = `${label(node.kind)}${node.ports.length ? ` · :${node.ports.join(",")}` : ""}`;
+      group.append(meta);
+      group.addEventListener("click", () => { state.selectedNodeId = node.id; renderGraph(); renderDetail(); });
+      group.addEventListener("keydown", event => { if (event.key === "Enter") { state.selectedNodeId = node.id; renderGraph(); renderDetail(); } });
+      nodeLayer.append(group);
+    });
+    canvas.append(nodeLayer);
+  }
+
+  function renderCredentialOptions() {
+    const select = byId("credentialNode");
+    const prior = select.value;
+    select.replaceChildren();
+    state.data.nodes.filter(node => node.active).forEach(node => {
+      const option = document.createElement("option");
+      option.value = node.id;
+      option.textContent = `${node.name} · ${label(node.kind)}`;
+      select.append(option);
+    });
+    if (state.selectedNodeId) select.value = state.selectedNodeId;
+    else if (prior) select.value = prior;
+  }
+
+  function renderDetail() {
+    const body = byId("detailBody");
+    body.replaceChildren();
+    const node = state.data.nodes.find(candidate => candidate.id === state.selectedNodeId);
+    if (!node) { body.append(create("div", "muted", "在拓扑图中选择一个资源。")); return; }
+    byId("activeBadge").textContent = node.active ? "LIVE" : "HISTORY";
+    const hero = create("div", "detail-hero");
+    hero.append(create("div", "kind", label(node.kind)), create("h2", "", node.name), create("div", "detail-key", node.external_key));
+    body.append(hero);
+    const info = create("div", "section");
+    info.append(create("div", "section-title", "Inventory"));
+    [["状态", label(node.status)], ["地址", node.address || "—"], ["端口", node.ports.join(", ") || "—"], ["最近观测", formatTimestamp(node.last_observed_at)]].forEach(([key, value]) => {
+      const row = create("div", "kv"); row.append(create("span", "", key), create("span", "", value)); info.append(row);
+    });
+    body.append(info);
+    const credentials = state.data.credential_bindings.filter(binding => binding.topology_node_id === node.id);
+    const section = create("div", "section");
+    section.append(create("div", "section-title", `Credentials · ${credentials.length}`));
+    credentials.forEach(binding => {
+      const card = create("div", "credential");
+      card.append(create("strong", "", binding.credential.name), create("small", "", `${binding.purpose} · ${label(binding.credential.kind)} · ${binding.credential.username_hint || "无用户名提示"}`));
+      section.append(card);
+    });
+    if (!credentials.length) section.append(create("div", "muted", "暂无绑定凭据。"));
+    body.append(section);
+    const metadataKeys = Object.keys(node.metadata || {});
+    if (metadataKeys.length) {
+      const metadata = create("div", "section");
+      metadata.append(create("div", "section-title", "Metadata"));
+      metadataKeys.slice(0, 12).forEach(key => {
+        const row = create("div", "kv"); row.append(create("span", "", key), create("span", "", String(node.metadata[key]))); metadata.append(row);
+      });
+      body.append(metadata);
+    }
+  }
+
+  byId("refreshButton").addEventListener("click", refresh);
+  byId("hostSearch").addEventListener("input", renderHosts);
+  document.querySelectorAll(".chip[data-kind]").forEach(button => button.addEventListener("click", () => {
+    state.kind = button.dataset.kind;
+    document.querySelectorAll(".chip[data-kind]").forEach(item => item.classList.toggle("active", item === button));
+    renderGraph();
+  }));
+  byId("staleToggle").addEventListener("click", event => {
+    state.showStale = !state.showStale;
+    event.currentTarget.classList.toggle("active", state.showStale);
+    renderGraph();
+  });
+  byId("syncButton").addEventListener("click", () => byId("syncDialog").showModal());
+  byId("credentialButton").addEventListener("click", () => {
+    if (!state.data?.vault_unlocked) { showToast("HTTP 服务未配置 vault 密钥，暂不能写入凭据。", true); return; }
+    byId("credentialDialog").showModal();
+  });
+  document.querySelectorAll("[data-close]").forEach(button => button.addEventListener("click", () => byId(button.dataset.close).close()));
+
+  byId("snapshotJson").value = JSON.stringify({
+    scope_key: "cluster:factory-a",
+    source: "manual",
+    nodes: [
+      { external_key: "cluster:factory-a", name: "Factory A", kind: "cluster" },
+      { external_key: "proxy:factory-a", name: "Factory ingress", kind: "reverse_proxy", address: "10.20.0.10", ports: [443], metadata: { software: "nginx" } },
+      { external_key: "service:factory-api", name: "Factory API", kind: "business_service", address: "10.20.0.21", ports: [8080] }
+    ],
+    edges: [
+      { external_key: "factory-proxy-api", from: "proxy:factory-a", to: "service:factory-api", relation: "proxies_to" },
+      { external_key: "factory-contains-api", from: "cluster:factory-a", to: "service:factory-api", relation: "contains" }
+    ]
+  }, null, 2);
+
+  byId("syncForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    try {
+      const snapshot = JSON.parse(byId("snapshotJson").value);
+      const result = await jsonRequest("/v1/topology/sync", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(snapshot) });
+      byId("syncDialog").close();
+      showToast(`同步完成：${result.active_node_count} 个节点，${result.active_edge_count} 条关系`);
+      await refresh();
+    } catch (error) { showToast(error.message, true); }
+  });
+
+  byId("credentialForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    const nodeId = byId("credentialNode").value;
+    const value = byId("credentialSecret").value;
+    const kind = byId("credentialKind").value;
+    const secret = kind === "api_token" ? { token: value } : kind === "generic_secret" ? { secret_text: value } : { password: value };
+    try {
+      await jsonRequest(`/v1/topology/nodes/${encodeURIComponent(nodeId)}/credentials`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: byId("credentialName").value,
+          kind,
+          username_hint: byId("credentialUser").value || null,
+          purpose: byId("credentialPurpose").value,
+          secret
+        })
+      });
+      byId("credentialSecret").value = "";
+      byId("credentialDialog").close();
+      showToast("凭据已加密保存并绑定到资源");
+      await refresh();
+    } catch (error) { byId("credentialSecret").value = ""; showToast(error.message, true); }
+  });
+
+  refresh();
+})();
+</script>
+</body>
+</html>

@@ -2572,6 +2572,8 @@ dependencies = [
  "remote-hosts-core",
  "remote-hosts-db",
  "remote-hosts-domain",
+ "remote-hosts-vault",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",

@@ -23,6 +23,12 @@ pub struct CredentialSecret {
     pub private_key_passphrase: Option<String>,
     /// sudo password.
     pub sudo_password: Option<String>,
+    /// API, bearer, or service token.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Arbitrary internal secret text.
+    #[serde(default)]
+    pub secret_text: Option<String>,
     /// Authenticate through the connector process's SSH agent.
     #[serde(default)]
     pub use_ssh_agent: bool,
@@ -202,6 +208,8 @@ mod tests {
             private_key_pem: None,
             private_key_passphrase: None,
             sudo_password: Some("sudo-password".to_owned()),
+            token: None,
+            secret_text: None,
             use_ssh_agent: false,
         }
     }
