@@ -85,6 +85,7 @@ const AUTHORIZED_KEY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHORIZED_KEY_BOOTSTRAP_MAX_FAILURES: u32 = 3;
 const EXEC_INLINE_UPLOAD_MAX_BYTES: u64 = 8 * 1024;
 const EXEC_UPLOAD_CHUNK_BYTES: usize = 24 * 1024;
+const EXEC_UPLOAD_CHUNKS_PER_SESSION: u64 = 256;
 const EXEC_TRANSFER_MAX_STAGE_ATTEMPTS: u32 = 3;
 const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -2109,6 +2110,13 @@ where
         }
     }
 
+    async fn invalidate_current_session(&self) {
+        let mut guard = self.session.lock().await;
+        if guard.take().is_some() {
+            self.telemetry.disconnected();
+        }
+    }
+
     async fn schedule_authorized_key_bootstrap(
         &self,
         session: Arc<client::Handle<RusshClientHandler>>,
@@ -2484,8 +2492,14 @@ where
                     local_sha256.to_owned(),
                 ));
             }
-            Err(TransportError::Timeout) => return Err(TransportError::Timeout),
+            Err(TransportError::Timeout) => {
+                transport.invalidate_current_session().await;
+                return Err(TransportError::Timeout);
+            }
             Err(error) if retryable_exec_transfer_error(&error) => {
+                if exec_transfer_error_invalidates_session(&error) {
+                    transport.invalidate_current_session().await;
+                }
                 let consumes_attempt = exec_transfer_retry_consumes_attempt(&error);
                 if consumes_attempt && attempt >= EXEC_TRANSFER_MAX_STAGE_ATTEMPTS {
                     return Err(error);
@@ -3100,6 +3114,9 @@ where
         chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
             TransportError::FileTransfer("upload chunk index overflow".to_owned())
         })?;
+        if should_rotate_exec_upload_session(chunk_index, bytes_transferred, context.total_bytes) {
+            transport.invalidate_current_session().await;
+        }
         if bytes_transferred % (8 * 1024 * 1024) < EXEC_UPLOAD_CHUNK_BYTES as u64 {
             emit_sftp_progress_to(
                 context.progress_tx,
@@ -3355,6 +3372,9 @@ where
         match result {
             Ok(value) => return Ok(value),
             Err(error) if retryable_exec_transfer_error(&error) => {
+                if exec_transfer_error_invalidates_session(&error) {
+                    transport.invalidate_current_session().await;
+                }
                 let consumes_attempt = exec_transfer_retry_consumes_attempt(&error);
                 if consumes_attempt && attempt >= EXEC_TRANSFER_MAX_STAGE_ATTEMPTS {
                     return Err(error);
@@ -3411,6 +3431,9 @@ where
         match result {
             Ok(value) => return Ok(value),
             Err(error) if retryable_exec_transfer_error(&error) => {
+                if exec_transfer_error_invalidates_session(&error) {
+                    transport.invalidate_current_session().await;
+                }
                 let consumes_attempt = exec_transfer_retry_consumes_attempt(&error);
                 if consumes_attempt && attempt >= EXEC_TRANSFER_MAX_STAGE_ATTEMPTS {
                     return Err(error);
@@ -3567,6 +3590,9 @@ where
         match result {
             Ok(()) => return Ok(()),
             Err(error) if retryable_exec_transfer_error(&error) => {
+                if exec_transfer_error_invalidates_session(&error) {
+                    transport.invalidate_current_session().await;
+                }
                 let consumes_attempt = exec_transfer_retry_consumes_attempt(&error);
                 if consumes_attempt && attempt >= EXEC_TRANSFER_MAX_STAGE_ATTEMPTS {
                     return Err(error);
@@ -3607,6 +3633,28 @@ fn retryable_exec_transfer_error(error: &TransportError) -> bool {
         }
         TransportError::PolicyDenied(_) => false,
     }
+}
+
+fn exec_transfer_error_invalidates_session(error: &TransportError) -> bool {
+    match error {
+        TransportError::Backend(_) | TransportError::Timeout => true,
+        TransportError::FileTransfer(message) => {
+            message.contains("did not return the required completion frame")
+        }
+        TransportError::LocalHandshakeBudgetExhausted { .. } | TransportError::PolicyDenied(_) => {
+            false
+        }
+    }
+}
+
+fn should_rotate_exec_upload_session(
+    completed_chunks: u64,
+    bytes_transferred: u64,
+    total_bytes: u64,
+) -> bool {
+    bytes_transferred < total_bytes
+        && completed_chunks > 0
+        && completed_chunks.is_multiple_of(EXEC_UPLOAD_CHUNKS_PER_SESSION)
 }
 
 fn exec_transfer_retry_delay(error: &TransportError, attempt: u32) -> Duration {
@@ -4628,6 +4676,7 @@ where
         let (close_tx, close_rx) = oneshot::channel::<()>();
         let initial_input = shell_change_dir_input(request.cwd.as_deref());
         tokio::spawn(run_russh_pty_channel(
+            Arc::clone(&transport),
             channel,
             input_rx,
             output_tx,
@@ -5208,16 +5257,20 @@ async fn receive_russh_exec_result(
     })
 }
 
-async fn run_russh_pty_channel(
+async fn run_russh_pty_channel<C>(
+    transport: Arc<RusshTransport<C>>,
     mut channel: russh::Channel<client::Msg>,
     mut input_rx: mpsc::Receiver<String>,
     output_tx: mpsc::Sender<PtyBackendOutput>,
     mut close_rx: oneshot::Receiver<()>,
     initial_input: Option<String>,
-) {
+) where
+    C: SshCredentialProvider + 'static,
+{
     if let Some(initial_input) = initial_input
         && let Err(error) = channel.data_bytes(initial_input.into_bytes()).await
     {
+        transport.invalidate_current_session().await;
         let _ = send_pty_backend_output(
             &output_tx,
             OutputStream::System,
@@ -5238,6 +5291,7 @@ async fn run_russh_pty_channel(
             input = input_rx.recv(), if !input_closed => {
                 if let Some(input) = input {
                     if let Err(error) = channel.data_bytes(input.into_bytes()).await {
+                        transport.invalidate_current_session().await;
                         let sent = send_pty_backend_output(
                             &output_tx,
                             OutputStream::System,
@@ -5259,12 +5313,30 @@ async fn run_russh_pty_channel(
                 let Some(message) = message else {
                     break;
                 };
+                if russh_pty_message_invalidates_session(&message) {
+                    transport.invalidate_current_session().await;
+                }
                 if !handle_russh_pty_message(&output_tx, message).await {
                     break;
                 }
             }
         }
     }
+}
+
+fn russh_pty_message_invalidates_session(message: &ChannelMsg) -> bool {
+    match message {
+        ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+            russh_pty_output_invalidates_session(data)
+        }
+        _ => false,
+    }
+}
+
+fn russh_pty_output_invalidates_session(data: &[u8]) -> bool {
+    String::from_utf8_lossy(data)
+        .to_ascii_lowercase()
+        .contains("please re-login")
 }
 
 async fn handle_russh_pty_message(
@@ -8430,6 +8502,59 @@ mod tests {
         ));
         assert!(!super::retryable_exec_transfer_error(
             &TransportError::PolicyDenied("write denied".to_owned())
+        ));
+    }
+
+    #[test]
+    fn exec_transfer_command_failures_invalidate_the_pooled_session() {
+        assert!(super::exec_transfer_error_invalidates_session(
+            &TransportError::Backend("channel send failed".to_owned())
+        ));
+        assert!(super::exec_transfer_error_invalidates_session(
+            &TransportError::Timeout
+        ));
+        assert!(super::exec_transfer_error_invalidates_session(
+            &TransportError::FileTransfer(
+                "append pooled upload chunk did not return the required completion frame"
+                    .to_owned()
+            )
+        ));
+        assert!(!super::exec_transfer_error_invalidates_session(
+            &TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds: 1,
+            }
+        ));
+        assert!(!super::exec_transfer_error_invalidates_session(
+            &TransportError::FileTransfer("remote SHA-256 mismatch".to_owned())
+        ));
+    }
+
+    #[test]
+    fn exec_upload_rotates_long_lived_gateway_sessions_before_channel_exhaustion() {
+        assert!(!super::should_rotate_exec_upload_session(
+            255,
+            255 * super::EXEC_UPLOAD_CHUNK_BYTES as u64,
+            512 * super::EXEC_UPLOAD_CHUNK_BYTES as u64,
+        ));
+        assert!(super::should_rotate_exec_upload_session(
+            256,
+            256 * super::EXEC_UPLOAD_CHUNK_BYTES as u64,
+            512 * super::EXEC_UPLOAD_CHUNK_BYTES as u64,
+        ));
+        assert!(!super::should_rotate_exec_upload_session(
+            512,
+            512 * super::EXEC_UPLOAD_CHUNK_BYTES as u64,
+            512 * super::EXEC_UPLOAD_CHUNK_BYTES as u64,
+        ));
+    }
+
+    #[test]
+    fn bastion_relogin_banner_invalidates_the_pooled_pty_session() {
+        assert!(super::russh_pty_output_invalidates_session(
+            b"Please re-login.\r\n"
+        ));
+        assert!(!super::russh_pty_output_invalidates_session(
+            b"root@target:~# "
         ));
     }
 
