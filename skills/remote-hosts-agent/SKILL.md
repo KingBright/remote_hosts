@@ -1,0 +1,106 @@
+---
+name: remote-hosts-agent
+description: Operate and maintain the user's transport-first Remote Hosts system for managed SSH machines and infrastructure topology. Use for arbitrary POSIX/PowerShell commands over pooled connections, persistent PTYs, host inventory and deduplication, cluster and per-host service topology, encrypted credentials, password fallback and public-key bootstrap, direct/FRP/VPN/proxy/jump/bastion routes, file transfer, output artifacts, runtime health and errors, and MCP setup in Codex or Antigravity. Do not invent domain-specific tools when the remote CLI can run through the generic channel.
+---
+
+# Remote Hosts Agent Skill
+
+Use this skill to interact with the user's Remote Hosts service instead of opening raw SSH sessions directly.
+
+## Core Rules
+
+1. Prefer `remote_hosts_*` MCP tools over shelling out to `ssh`, editing the SQLite database, or inventing host state.
+2. When the user explicitly supplies an SSH password, private key, passphrase, or sudo password, store it immediately through `remote_hosts_ensure_host.access.credential_secret` or `remote_hosts_store_host_credential`. Never repeat it in replies, logs, notes, knowledge, shell commands, or non-credential tools.
+3. Never create or suggest a duplicate host before running the duplicate checks in [host-registry.md](references/host-registry.md).
+4. Reuse only `idle` or `working` workspaces owned by the current Agent Session and healthy PTY/access-path state. Avoid creating repeated SSH sessions.
+5. Treat `blocked`, `exhausted`, `throttled`, `rate_limited`, `connector_offline`, `auth_failed`, `host_key_changed`, and `ssh_route_unsupported` as stop-and-diagnose states.
+6. Use `shell.posix` or `shell.powershell` as the normal path for domain work. Narrow read-only profiles are optional shortcuts, not an extensibility boundary. Prefer one persistent PTY when interaction, shared shell state, or an unreliable gateway makes repeated exec channels unsuitable.
+7. Keep output bounded. Use output artifact tools for large logs and read full content only in bounded chunks.
+8. For normal host registration or route updates, use the idempotent `remote_hosts_ensure_host`; it performs duplicate checks and preserves the canonical host identity.
+9. The default MCP `agent` profile is intentionally compact but supports task-level host and encrypted credential management. Use `admin` only for low-level registry repair or manual entity maintenance; never bypass a missing tool by editing SQLite directly.
+10. Prefer public-key authentication. When a stored password is needed, the connector tries local keys first, uses the password as fallback, and then schedules one bounded, idempotent local-public-key install. A failed install never invalidates the authenticated pooled session or requires the user to type the password again.
+11. Inspect each runtime snapshot access path's `authorized_key_bootstrap` and related `attention` before retrying. `proxy_jump` or a non-empty `proxy_chain` is true multi-hop and must stop on `ssh_route_unsupported`. An empty-chain `bastion` route is a single SSH endpoint and may use an interactive menu or an explicitly documented gateway username. For Smart Mine production, the only SSH entry is `10.36.31.20`; all internal machines must be selected inside its interactive menu, and no direct-login username or internal-IP access path may be inferred.
+12. Never loop on a pending or failed PTY. Only `idle` or `working` workspaces are activatable. If `backend_state=failed`, input is disabled, or system output says automatic retry is disabled, inspect the snapshot and output, recover or replace the workspace connection, and open a new PTY id.
+13. Use `remote_hosts_upload_file` and `remote_hosts_download_file` for deployment files. They reuse the workspace's pooled SSH session, enforce size/timeout/overwrite policy, verify SHA-256 at both ends, and place through a same-directory temporary file. Exec-channel uploads use per-I/O no-progress timeouts, retain and verify partial bytes across reconnects, and emit progress plus 30-second active heartbeats. A successful command or transfer keeps the healthy SSH session pooled; a timeout or missing completion frame invalidates it before reuse. Let the connector perform its bounded idempotent-stage retries; do not create parallel transfer operations or encode file bodies into agent-visible shell arguments.
+14. Handshake protection has independent per-access-path and connector-wide budgets. On `local_handshake_budget_exhausted`, respect the exact `retry_after_seconds`; do not create another workspace or session to bypass either bucket.
+15. For gateway file fallback, require explicit initialization, per-chunk, and final markers plus integrity checks. Missing output or markers is failure even when the channel reports exit status zero. Initialization, chunk append, and final placement may retry internally up to the bounded stage limit because they verify remote state and are idempotent. Once that budget is exhausted, stop until route capability or configuration changes. Never generalize this retry permission to arbitrary shell writes.
+16. Require `snapshot_version=6` when reasoning about reuse or conversation isolation. A logical connection session is not proof of a live SSH transport. Inspect each access path's `transport_runtime` and each recent operation or PTY's `transport_evidence`. `transport_runtime=null` means cold/unobserved, not connected or failed; the next real channel may require a handshake.
+17. Interpret `transport_evidence.connection_use` precisely: `reused` proves an existing authenticated SSH connection served the channel; `first_handshake` means this runtime opened its first connection; `reconnected` means the same runtime replaced a failed connection; `attempt_failed` means a real connection attempt did not authenticate. `runtime_replaced=true` separately means route change or connector restart created a different runtime.
+18. Treat Agent Session boundaries as strict. Never reuse a Workspace or PTY id copied from another Codex/Antigravity task. If ownership is rejected, call `remote_hosts_prepare_workspace` in the current task; do not switch profiles or create raw SSH state to bypass isolation.
+19. Use a stable semantic `idempotency_key` for every mutating shell step, upload/download placement, and PTY input. Keep the same key and exact payload for a retry; use a new key for a changed command, file specification, or input. Never generate a new key merely because a wait timed out.
+20. Snapshot `write_lease.state=held_by_other_session` means another conversation is mutating the same Host. Wait and refresh state; do not create another Workspace, PTY, access path, or SSH connection to bypass the lease. Read-only work may continue when the queue accepts it.
+21. Physical and logical reuse are different: Agent Sessions, Workspaces, PTYs, operations, artifacts, and temporary context are isolated per conversation, while all conversations intentionally share the connector's pooled SSH transport for the selected access path.
+22. Treat topology synchronization as an authoritative inventory write. Read [topology-and-inventory.md](references/topology-and-inventory.md), use one globally stable `external_key` per real resource, and submit a complete snapshot for exactly one `scope_key + source`. Never publish a partial or failed discovery as complete because omitted members become inactive for that producer scope.
+
+## Service Assumptions
+
+The local Remote Hosts service is expected to be installed and running through launchd:
+
+- Binary: `/Users/jinliang/.local/bin/remote-hosts`
+- Database: `sqlite:///Users/jinliang/.local/share/remote-hosts/remote-hosts.sqlite`
+- HTTP API: `http://127.0.0.1:8787`
+- Service helper: `/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service`
+- Output artifacts: `/Users/jinliang/.local/share/remote-hosts/artifacts`
+
+If MCP tools are unavailable, first check whether the service is running:
+
+```bash
+/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service status
+curl -sS http://127.0.0.1:8787/v1/command-profiles
+```
+
+## Workflow Router
+
+- For host inventory, aliases, deduplication, environment/access-path maintenance, or stale facts: read [host-registry.md](references/host-registry.md).
+- For normal remote execution, workspace reuse, PTY sessions, and output polling: read [mcp-workflows.md](references/mcp-workflows.md).
+- For connection health, connector state, throttling, SSH failures, and reuse policy: read [connection-and-errors.md](references/connection-and-errors.md).
+- For cluster topology, host-internal services, dependency edges, inactive history, or topology credential bindings: read [topology-and-inventory.md](references/topology-and-inventory.md).
+- For Codex/Antigravity MCP configuration and local service operations: read [setup-and-runtime.md](references/setup-and-runtime.md).
+
+## Fast Path
+
+For a typical request like "check machine X":
+
+1. `remote_hosts_list_hosts` and identify the intended host.
+2. For state-only work, call `remote_hosts_get_host_runtime_snapshot`; inspect `attention`, each access path's `authorized_key_bootstrap`, and retain `event_cursor` when later changes must be observed.
+3. For execution, call `remote_hosts_prepare_workspace`. It reuses only an `idle` or `working` workspace owned by this Agent Session before creating one and returns the runtime snapshot plus command profiles. Require `snapshot_version=6` for transport-runtime identity, per-channel reuse evidence, conversation ownership, write-lease state, single-hop bastion, managed shell, and proactive PTY behavior.
+4. Call `remote_hosts_run_in_workspace` with `shell.posix` or `shell.powershell`, one script argument, explicit intent, a semantic `idempotency_key`, and realistic timeout/output limits. A narrow profile is a convenience for a matching read-only check.
+5. Wait with `remote_hosts_wait_workspace_state`, then read chunks, operations, and artifacts together with `remote_hosts_get_workspace_result`. Inspect the completed operation's `transport_evidence`; do not infer real reuse only from `session_id` or logical `reused_count`.
+6. Upload or download manifests, kubeconfig, certificates, installers, packages, and collected files with the file tools on that workspace. Supply one stable `idempotency_key` per intended placement, keep `overwrite=deny` unless replacement is intentional, and pass an expected SHA-256 when one is known. Follow `bytes_transferred`, `resumed_bytes`, `retry_count`, and the 30-second active heartbeat instead of starting another channel. Missing transfer markers or suppressed output after the bounded internal retries ends the transfer attempt.
+7. For artifact output larger than the normal result, call `remote_hosts_read_output_artifact_content` from offset zero and continue only with the returned `next_offset` until `eof=true`.
+8. If the task becomes interactive, needs shell context, or repeated exec channels are unreliable, open one PTY without guessing a `session_id`. Follow `recommended_action`: read output first while the connector activates it, respect `poll_after_ms`, inspect real `backend_capabilities`, and only then queue each menu or prompt response with a distinct semantic `idempotency_key`. If pending activation converges to failed, do not retry that PTY id.
+9. For connector state changes after the snapshot, call `remote_hosts_wait_runtime_events` with `start_mode=after_cursor` and the retained cursor. Use `live_only` only when retained history is intentionally irrelevant.
+
+For a typical request like "record/update machine X":
+
+1. Call `remote_hosts_ensure_host` with the proposed slug, display name, kind, risk level, and any known SSH route.
+2. Inspect `duplicate_signals`, the returned canonical `host`, `defaults_applied`, and `attention`. Existing environment classification is canonical, and correcting only the route type for the same endpoint reuses that access path instead of creating another.
+3. If it reports ambiguous canonical hosts, stop and ask the user which identity to keep; do not create another host.
+4. If the user supplied credential material during registration, include it only in `access.credential_secret`. For an existing host, call `remote_hosts_store_host_credential`; omit `access_path_id` only when exactly one route exists.
+5. Reuse the returned host id for knowledge and later workspaces. Add another route by calling `remote_hosts_ensure_host` again with that canonical identity and new access details.
+6. Store durable non-secret observations with `remote_hosts_record_knowledge`. Use the `admin` profile only when low-level facts or registry repair are actually required.
+
+For a typical request like "discover or update the topology":
+
+1. Use the managed shell or PTY on the relevant Host to run existing inventory commands. Do not add a Kubernetes-, Harbor-, Docker-, database-, or middleware-specific MCP tool.
+2. Read the current graph from the loopback `GET /v1/topology?include_inactive=true` endpoint.
+3. Normalize the successful discovery into one complete `scope_key + source` snapshot with stable node and edge keys. Abort without syncing when discovery is partial, timed out, or ambiguous.
+4. POST the snapshot to `/v1/topology/sync`, then read the graph again and verify active/inactive counts and important relationships.
+5. Keep secrets out of topology metadata. Use the encrypted management form or a secret-safe client for node credential binding; never place a topology credential in a shell command, URL, audit note, or knowledge record.
+
+## Reporting
+
+In final answers, include:
+
+- which host/workspace/access path was used;
+- whether the connector and backend were healthy;
+- the command profile or PTY action used;
+- any blocked/throttled/error state and recovery hint;
+- file direction, bytes, verified SHA-256, and overwrite policy for transfers;
+- any runtime snapshot `attention` item, especially `pty_runtime_lost` or `connection_unhealthy`;
+- each relevant access path's public-key bootstrap state when password fallback, key installation, or retry behavior mattered;
+- runtime `snapshot_version` when single-hop bastion, managed shell, or PTY activation behavior mattered;
+- Agent Session ownership and `write_lease` state when multiple tasks touched the same host;
+- transport runtime id/backend/generation and the relevant operation or PTY `transport_evidence` when connection reuse, reconnect, or replacement mattered;
+- topology `scope_key`, `source`, active/inactive counts, and any resource whose status changed when topology was synchronized;
+- any registry data gaps that should be cleaned up.

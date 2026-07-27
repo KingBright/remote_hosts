@@ -29,8 +29,8 @@ use remote_hosts_core::{
     CheckRequest, CheckResult, CommandProfile, CommandValidationError, ConnectorStateTracker,
     ExecRequest, ExecResult, FileTransferSpec, ForwardHandle, ForwardRequest,
     PtySessionOpenCommand, PtySessionSupervisor, PtySessionSupervisorError, RemoteTransport,
-    SecretRedactor, ServerProtectionPolicy, SftpDirection, SftpOverwritePolicy, SftpRequest,
-    SftpResult, transport::TransportError,
+    SecretRedactor, ServerProtectionPolicy, SftpDirection, SftpOverwritePolicy, SftpProgress,
+    SftpRequest, SftpResult, transport::TransportError,
 };
 use remote_hosts_db::{
     AuthorizedKeyBootstrapRepository, ClaimedOperationFinish, DbError, Repositories,
@@ -83,8 +83,11 @@ const DEFAULT_ARTIFACT_ROOT: &str = "remote-hosts-artifacts";
 const MAX_SSH_AGENT_IDENTITIES_PER_HANDSHAKE: usize = 2;
 const AUTHORIZED_KEY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHORIZED_KEY_BOOTSTRAP_MAX_FAILURES: u32 = 3;
+const EXEC_INLINE_UPLOAD_MAX_BYTES: u64 = 8 * 1024;
 const EXEC_UPLOAD_CHUNK_BYTES: usize = 24 * 1024;
+const EXEC_TRANSFER_MAX_STAGE_ATTEMPTS: u32 = 3;
 const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
 const PTY_WRITE_LEASE_SECONDS: i64 = 300;
 
@@ -465,9 +468,15 @@ async fn openssh_upload(
             .await
             .map_err(openssh_file_transfer_error)?;
         let mut remote = Box::pin(OpenSshSftpFile::from(remote));
-        let (bytes_transferred, transfer_sha256) =
-            copy_bounded_and_hash(Pin::new(&mut local), remote.as_mut(), spec.max_size_bytes)
-                .await?;
+        let (bytes_transferred, transfer_sha256) = copy_bounded_and_hash(
+            Pin::new(&mut local),
+            remote.as_mut(),
+            spec.max_size_bytes,
+            request.progress_tx.as_ref(),
+            "uploading",
+            Some(local_size),
+        )
+        .await?;
         remote.as_mut().shutdown().await.map_err(file_transfer_io)?;
         drop(remote);
         if bytes_transferred != local_size || transfer_sha256 != local_sha256 {
@@ -545,9 +554,15 @@ async fn openssh_download(
             .open(&temporary_path)
             .await
             .map_err(file_transfer_io)?;
-        let (bytes_transferred, remote_sha256) =
-            copy_bounded_and_hash(remote.as_mut(), Pin::new(&mut local), spec.max_size_bytes)
-                .await?;
+        let (bytes_transferred, remote_sha256) = copy_bounded_and_hash(
+            remote.as_mut(),
+            Pin::new(&mut local),
+            spec.max_size_bytes,
+            request.progress_tx.as_ref(),
+            "downloading",
+            Some(source_size),
+        )
+        .await?;
         local.shutdown().await.map_err(file_transfer_io)?;
         drop(remote);
         if bytes_transferred != source_size {
@@ -732,6 +747,9 @@ async fn copy_bounded_and_hash<R, W>(
     mut reader: Pin<&mut R>,
     mut writer: Pin<&mut W>,
     max_size_bytes: u64,
+    progress_tx: Option<&mpsc::UnboundedSender<SftpProgress>>,
+    stage: &str,
+    total_bytes: Option<u64>,
 ) -> Result<(u64, String), TransportError>
 where
     R: AsyncRead + ?Sized,
@@ -739,6 +757,7 @@ where
 {
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
+    let mut next_progress_bytes = 8 * 1024 * 1024_u64;
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = reader
@@ -759,8 +778,15 @@ where
             .await
             .map_err(file_transfer_io)?;
         hasher.update(&buffer[..read]);
+        if total >= next_progress_bytes {
+            emit_sftp_progress_to(progress_tx, stage, total, total_bytes, 0, 0);
+            while next_progress_bytes <= total {
+                next_progress_bytes = next_progress_bytes.saturating_add(8 * 1024 * 1024);
+            }
+        }
     }
     writer.as_mut().flush().await.map_err(file_transfer_io)?;
+    emit_sftp_progress_to(progress_tx, stage, total, total_bytes, 0, 0);
     Ok((total, format!("{:x}", hasher.finalize())))
 }
 
@@ -907,6 +933,18 @@ fn remote_temporary_path(
         "{}.{file_name}.remote-hosts-{operation_id}.part",
         &destination[..=separator]
     ))
+}
+
+fn resumable_remote_temporary_path(destination: &str, sha256: &str) -> String {
+    let (parent, file_name) = destination.rsplit_once('/').unwrap_or(("", destination));
+    let digest_prefix = sha256.get(..16).unwrap_or(sha256);
+    format!("{parent}/.{file_name}.remote-hosts-{digest_prefix}.part")
+}
+
+fn streaming_remote_temporary_path(destination: &str, sha256: &str) -> String {
+    let (parent, file_name) = destination.rsplit_once('/').unwrap_or(("", destination));
+    let digest_prefix = sha256.get(..16).unwrap_or(sha256);
+    format!("{parent}/.{file_name}.remote-hosts-stream-{digest_prefix}.part")
 }
 
 fn remote_parent(path: &str) -> Result<&str, TransportError> {
@@ -1971,7 +2009,11 @@ where
     async fn session(&self) -> Result<Arc<client::Handle<RusshClientHandler>>, TransportError> {
         let mut guard = self.session.lock().await;
         if let Some(session) = guard.as_ref() {
-            if session.send_ping().await.is_ok() {
+            let ping_timeout = Duration::from_secs(self.config.connect_timeout_seconds);
+            if matches!(
+                tokio::time::timeout(ping_timeout, session.send_ping()).await,
+                Ok(Ok(()))
+            ) {
                 self.telemetry.session_reused(now_utc());
                 return Ok(Arc::clone(session));
             }
@@ -1983,7 +2025,10 @@ where
         self.telemetry.connection_attempted();
         let connect_timeout = Duration::from_secs(self.config.connect_timeout_seconds);
         let config = Arc::new(client::Config {
-            inactivity_timeout: Some(Duration::from_secs(self.config.inactivity_timeout_seconds)),
+            inactivity_timeout: russh_inactivity_timeout(
+                self.config.inactivity_timeout_seconds,
+                self.config.keepalive_seconds,
+            ),
             keepalive_interval: (self.config.keepalive_seconds > 0)
                 .then(|| Duration::from_secs(self.config.keepalive_seconds)),
             keepalive_max: 4,
@@ -2023,17 +2068,20 @@ where
                 return Err(TransportError::Backend(error.to_string()));
             }
         };
-        let authentication = match authenticate_russh_session(
-            &mut session,
-            &self.config.username,
-            &credential,
+        let authentication = match tokio::time::timeout(
+            connect_timeout,
+            authenticate_russh_session(&mut session, &self.config.username, &credential),
         )
         .await
         {
-            Ok(authentication) => authentication,
-            Err(error) => {
+            Ok(Ok(authentication)) => authentication,
+            Ok(Err(error)) => {
                 self.telemetry.disconnected();
                 return Err(error);
+            }
+            Err(_) => {
+                self.telemetry.disconnected();
+                return Err(TransportError::Timeout);
             }
         };
         let session = Arc::new(session);
@@ -2048,6 +2096,17 @@ where
             .await;
         }
         Ok(session)
+    }
+
+    async fn invalidate_session(&self, expected: &Arc<client::Handle<RusshClientHandler>>) {
+        let mut guard = self.session.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            *guard = None;
+            self.telemetry.disconnected();
+        }
     }
 
     async fn schedule_authorized_key_bootstrap(
@@ -2197,13 +2256,42 @@ where
             .validate()
             .map_err(|error| TransportError::PolicyDenied(error.to_string()))?;
         let session = self.session().await?;
-        let command = ssh_exec_command(&request.profile, self.config.windows);
-        tokio::time::timeout(
+        let completion_marker = (!self.config.windows)
+            .then(|| format!("REMOTE_HOSTS_EXEC_DONE_{}", request.operation_id));
+        let command = match completion_marker.as_deref() {
+            Some(marker) => framed_posix_ssh_exec_command(&request.profile, marker),
+            None => ssh_exec_command(&request.profile, self.config.windows),
+        };
+        let execution = tokio::time::timeout(
             Duration::from_secs(request.profile.timeout_seconds),
-            execute_russh_command(session, command, request.profile.output_limit_bytes),
+            execute_russh_command(
+                Arc::clone(&session),
+                command,
+                request.profile.output_limit_bytes,
+            ),
         )
-        .await
-        .map_err(|_| TransportError::Timeout)?
+        .await;
+        let mut result = match execution {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                self.invalidate_session(&session).await;
+                return Err(error);
+            }
+            Err(_) => {
+                self.invalidate_session(&session).await;
+                return Err(TransportError::Timeout);
+            }
+        };
+        if let Some(marker) = completion_marker.as_deref()
+            && !recover_framed_exec_status(&mut result, marker)
+        {
+            self.invalidate_session(&session).await;
+            return Err(TransportError::Backend(
+                "remote POSIX exec did not return its completion frame; the pooled SSH session was invalidated"
+                    .to_owned(),
+            ));
+        }
+        Ok(result)
     }
 
     async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
@@ -2212,12 +2300,20 @@ where
             .validate()
             .map_err(|error| TransportError::FileTransfer(error.to_string()))?;
         let timeout = Duration::from_secs(request.spec.timeout_seconds);
-        let session = self.session().await?;
         if self.config.use_exec_file_transfer {
-            tokio::time::timeout(timeout, execute_russh_exec_file_transfer(session, request))
-                .await
-                .map_err(|_| TransportError::Timeout)?
+            if let Ok(result) =
+                tokio::time::timeout(timeout, execute_russh_exec_file_transfer(self, request)).await
+            {
+                result
+            } else {
+                let mut guard = self.session.lock().await;
+                if guard.take().is_some() {
+                    self.telemetry.disconnected();
+                }
+                Err(TransportError::Timeout)
+            }
         } else {
+            let session = self.session().await?;
             tokio::time::timeout(timeout, execute_russh_sftp(session, request))
                 .await
                 .map_err(|_| TransportError::Timeout)?
@@ -2234,111 +2330,724 @@ where
     }
 }
 
-async fn execute_russh_exec_file_transfer(
-    session: Arc<client::Handle<RusshClientHandler>>,
+async fn execute_russh_exec_file_transfer<C>(
+    transport: &RusshTransport<C>,
     request: SftpRequest,
-) -> Result<SftpResult, TransportError> {
+) -> Result<SftpResult, TransportError>
+where
+    C: SshCredentialProvider,
+{
     match request.spec.direction {
-        SftpDirection::Upload => execute_russh_exec_upload(session, &request).await,
-        SftpDirection::Download => execute_russh_exec_download(session, &request).await,
+        SftpDirection::Upload => execute_russh_exec_upload(transport, &request).await,
+        SftpDirection::Download => execute_russh_exec_download(transport, &request).await,
     }
 }
 
-async fn execute_russh_exec_upload(
-    session: Arc<client::Handle<RusshClientHandler>>,
+async fn execute_russh_exec_upload<C>(
+    transport: &RusshTransport<C>,
     request: &SftpRequest,
-) -> Result<SftpResult, TransportError> {
+) -> Result<SftpResult, TransportError>
+where
+    C: SshCredentialProvider,
+{
     let spec = &request.spec;
     let (local_size, local_sha256) =
         hash_local_source(Path::new(&spec.local_path), spec.max_size_bytes).await?;
     ensure_expected_sha256(spec, &local_sha256)?;
-    let temporary_path = remote_temporary_path(&spec.remote_path, request.operation_id)?;
-    let transfer = async {
-        let initialize = russh_exec_upload_initialize_command(spec, &temporary_path);
-        let outcome = execute_russh_transfer_command(
-            Arc::clone(&session),
-            initialize,
-            "initialize pooled exec upload",
-        )
-        .await?;
-        require_exec_transfer_marker(
-            &outcome,
-            "REMOTE_HOSTS_UPLOAD_READY",
-            "initialize pooled exec upload",
-            &spec.remote_path,
-            &temporary_path,
-        )?;
 
-        let mut local = tokio::fs::File::open(&spec.local_path)
-            .await
-            .map_err(file_transfer_io)?;
-        let (bytes_transferred, streamed_sha256) = stream_base64_upload_via_exec(
-            Arc::clone(&session),
-            &mut local,
-            &temporary_path,
-            spec.max_size_bytes,
-            &spec.remote_path,
-        )
-        .await?;
+    if local_size <= EXEC_INLINE_UPLOAD_MAX_BYTES {
+        return execute_russh_inline_exec_upload(transport, request, local_size, &local_sha256)
+            .await;
+    }
 
-        let finalize = russh_exec_upload_finalize_command(
-            spec,
-            &temporary_path,
-            local_size,
-            &local_sha256,
-        );
-        let outcome =
-            execute_russh_transfer_command(Arc::clone(&session), finalize, "finalize pooled upload")
-                .await?;
-        require_exec_transfer_success(
-            &outcome,
-            "finalize pooled upload",
-            &spec.remote_path,
-            &temporary_path,
-        )?;
-        let (remote_size, remote_sha256) =
-            parse_transfer_marker(&outcome.stdout, "REMOTE_HOSTS_TRANSFER_OK")?;
-        if bytes_transferred != local_size
-            || streamed_sha256 != local_sha256
-            || remote_size != local_size
-            || remote_sha256 != local_sha256
-        {
-            return Err(TransportError::FileTransfer(format!(
-                "pooled exec upload verification failed: local_bytes={local_size}, streamed_bytes={bytes_transferred}, remote_bytes={remote_size}, local_sha256={local_sha256}, remote_sha256={remote_sha256}"
-            )));
+    match execute_russh_stream_exec_upload(transport, request, local_size, &local_sha256).await {
+        Ok(result) => Ok(result),
+        Err(stream_error) if retryable_exec_transfer_error(&stream_error) => {
+            tracing::warn!(
+                error = %stream_error,
+                "single-channel streaming upload failed; falling back to resumable exec chunks"
+            );
+            execute_russh_resumable_exec_upload(transport, request)
+                .await
+                .map_err(|fallback_error| {
+                    TransportError::FileTransfer(format!(
+                        "streaming upload failed ({stream_error}); resumable fallback failed ({fallback_error})"
+                    ))
+                })
         }
-
-        Ok(SftpResult {
-            direction: spec.direction,
-            bytes_transferred,
-            sha256: local_sha256,
-            local_path: spec.local_path.clone(),
-            remote_path: spec.remote_path.clone(),
-            overwrite: spec.overwrite,
-        })
+        Err(error) => Err(error),
     }
-    .await;
-
-    if transfer.is_err() {
-        let cleanup = russh_exec_upload_cleanup_command(&temporary_path);
-        let _ =
-            execute_russh_transfer_command(session, cleanup, "clean pooled upload temporary file")
-                .await;
-    }
-    transfer
 }
 
-async fn stream_base64_upload_via_exec(
+async fn execute_russh_inline_exec_upload<C>(
+    transport: &RusshTransport<C>,
+    request: &SftpRequest,
+    local_size: u64,
+    local_sha256: &str,
+) -> Result<SftpResult, TransportError>
+where
+    C: SshCredentialProvider,
+{
+    let spec = &request.spec;
+    let payload = tokio::fs::read(&spec.local_path)
+        .await
+        .map_err(file_transfer_io)?;
+    if u64::try_from(payload.len()).map_err(file_transfer_conversion)? != local_size
+        || format!("{:x}", Sha256::digest(&payload)) != local_sha256
+    {
+        return Err(TransportError::FileTransfer(
+            "local file changed while it was being prepared for upload".to_owned(),
+        ));
+    }
+
+    let temporary_path = streaming_remote_temporary_path(&spec.remote_path, local_sha256);
+    let command =
+        russh_exec_inline_upload_command(spec, &temporary_path, local_size, local_sha256, &payload);
+    let mut retry_count = 0_u32;
+    let (remote_size, remote_sha256) = execute_russh_upload_placement_with_retry(
+        transport,
+        command,
+        "single-channel pooled exec upload",
+        &mut retry_count,
+        &ExecUploadDestinationVerification {
+            remote_path: &spec.remote_path,
+            temporary_path: &temporary_path,
+            expected_size: local_size,
+            expected_sha256: local_sha256,
+        },
+    )
+    .await?;
+    if remote_size != local_size || remote_sha256 != local_sha256 {
+        return Err(TransportError::FileTransfer(format!(
+            "pooled exec upload verification failed: local_bytes={local_size}, remote_bytes={remote_size}, local_sha256={local_sha256}, remote_sha256={remote_sha256}"
+        )));
+    }
+    emit_sftp_progress(
+        request,
+        "completed",
+        remote_size,
+        Some(local_size),
+        0,
+        retry_count,
+    );
+    Ok(exec_upload_result(spec, remote_size, remote_sha256))
+}
+
+async fn execute_russh_stream_exec_upload<C>(
+    transport: &RusshTransport<C>,
+    request: &SftpRequest,
+    local_size: u64,
+    local_sha256: &str,
+) -> Result<SftpResult, TransportError>
+where
+    C: SshCredentialProvider,
+{
+    let spec = &request.spec;
+    let temporary_path = streaming_remote_temporary_path(&spec.remote_path, local_sha256);
+    let script = russh_exec_stream_upload_command(spec, &temporary_path, local_size, local_sha256);
+    let frame_marker = russh_transfer_frame_marker(&script);
+    let command = framed_posix_script_ssh_exec_command(&script, &frame_marker);
+    let mut retry_count = 0_u32;
+    let mut attempt = 1_u32;
+    loop {
+        let result = match transport.session().await {
+            Ok(session) => {
+                execute_russh_stream_upload_attempt(
+                    session,
+                    &RusshStreamUploadAttempt {
+                        request,
+                        command: &command,
+                        frame_marker: &frame_marker,
+                        temporary_path: &temporary_path,
+                        local_size,
+                        local_sha256,
+                        retry_count,
+                    },
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                emit_sftp_progress(
+                    request,
+                    "completed",
+                    local_size,
+                    Some(local_size),
+                    0,
+                    retry_count,
+                );
+                return Ok(exec_upload_result(
+                    spec,
+                    local_size,
+                    local_sha256.to_owned(),
+                ));
+            }
+            Err(TransportError::Timeout) => return Err(TransportError::Timeout),
+            Err(error) if retryable_exec_transfer_error(&error) => {
+                let consumes_attempt = exec_transfer_retry_consumes_attempt(&error);
+                if consumes_attempt && attempt >= EXEC_TRANSFER_MAX_STAGE_ATTEMPTS {
+                    return Err(error);
+                }
+                let delay = exec_transfer_retry_delay(&error, attempt);
+                tracing::warn!(
+                    stage = "single-channel streaming pooled exec upload",
+                    attempt,
+                    max_attempts = EXEC_TRANSFER_MAX_STAGE_ATTEMPTS,
+                    consumes_attempt,
+                    retry_after_seconds = delay.as_secs(),
+                    error = %error,
+                    "streaming pooled exec upload will retry"
+                );
+                retry_count = retry_count.saturating_add(1);
+                tokio::time::sleep(delay).await;
+                if consumes_attempt {
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct RusshStreamUploadAttempt<'a> {
+    request: &'a SftpRequest,
+    command: &'a str,
+    frame_marker: &'a str,
+    temporary_path: &'a str,
+    local_size: u64,
+    local_sha256: &'a str,
+    retry_count: u32,
+}
+
+async fn exec_transfer_stage_with_timeout<F, T>(
+    timeout: Duration,
+    future: F,
+) -> Result<T, TransportError>
+where
+    F: Future<Output = Result<T, TransportError>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| TransportError::Timeout)?
+}
+
+async fn execute_russh_stream_upload_attempt(
     session: Arc<client::Handle<RusshClientHandler>>,
-    local: &mut tokio::fs::File,
-    temporary_path: &str,
-    max_size_bytes: u64,
-    remote_path: &str,
+    context: &RusshStreamUploadAttempt<'_>,
+) -> Result<(), TransportError> {
+    let channel = exec_transfer_stage_with_timeout(EXEC_TRANSFER_STAGE_TIMEOUT, async {
+        session.channel_open_session().await.map_err(|error| {
+            TransportError::FileTransfer(format!("open pooled exec upload channel: {error}"))
+        })
+    })
+    .await?;
+    exec_transfer_stage_with_timeout(EXEC_TRANSFER_STAGE_TIMEOUT, async {
+        channel
+            .exec(true, russh_transfer_exec_command(context.command))
+            .await
+            .map_err(|error| {
+                TransportError::FileTransfer(format!("start pooled exec upload: {error}"))
+            })
+    })
+    .await?;
+    let (read_half, write_half) = channel.split();
+    let mut receive_task = tokio::spawn(async move {
+        let mut read_half = read_half;
+        receive_russh_exec_result_from_read_half(&mut read_half, EXEC_TRANSFER_OUTPUT_LIMIT_BYTES)
+            .await
+    });
+
+    let upload = stream_russh_upload_body(&write_half, context).await;
+    if upload.is_err() {
+        let _ = write_half.close().await;
+        receive_task.abort();
+    }
+    let (bytes_transferred, streamed_sha256) = upload?;
+    let outcome = exec_transfer_stage_with_timeout(EXEC_TRANSFER_STAGE_TIMEOUT, async {
+        (&mut receive_task).await.map_err(|error| {
+            TransportError::FileTransfer(format!("join pooled exec upload receiver: {error}"))
+        })?
+    })
+    .await;
+    if outcome.is_err() {
+        receive_task.abort();
+        let _ = receive_task.await;
+    }
+    let mut outcome = outcome?;
+    let _ = write_half.close().await;
+    if !recover_framed_exec_status(&mut outcome, context.frame_marker) {
+        return Err(TransportError::FileTransfer(
+            "single-channel streaming pooled exec upload did not return the required completion frame"
+                .to_owned(),
+        ));
+    }
+
+    if bytes_transferred != context.local_size || streamed_sha256 != context.local_sha256 {
+        return Err(TransportError::FileTransfer(
+            "local file changed while it was being uploaded".to_owned(),
+        ));
+    }
+    let (remote_size, remote_sha256) = verify_russh_upload_outcome_or_destination(
+        session,
+        &outcome,
+        "single-channel streaming pooled exec upload",
+        &ExecUploadDestinationVerification {
+            remote_path: &context.request.spec.remote_path,
+            temporary_path: context.temporary_path,
+            expected_size: context.local_size,
+            expected_sha256: context.local_sha256,
+        },
+    )
+    .await?;
+    if remote_size != context.local_size || remote_sha256 != context.local_sha256 {
+        return Err(TransportError::FileTransfer(format!(
+            "streaming pooled exec upload verification failed: local_bytes={}, remote_bytes={remote_size}, local_sha256={}, remote_sha256={remote_sha256}",
+            context.local_size, context.local_sha256
+        )));
+    }
+    Ok(())
+}
+
+async fn stream_russh_upload_body(
+    write_half: &russh::ChannelWriteHalf<client::Msg>,
+    context: &RusshStreamUploadAttempt<'_>,
 ) -> Result<(u64, String), TransportError> {
-    let mut buffer = vec![0_u8; EXEC_UPLOAD_CHUNK_BYTES];
+    let spec = &context.request.spec;
+    let mut local = tokio::fs::File::open(&spec.local_path)
+        .await
+        .map_err(file_transfer_io)?;
     let mut hasher = Sha256::new();
     let mut bytes_transferred = 0_u64;
-    let mut chunk_index = 0_u64;
+    let mut next_progress_bytes = 1024 * 1024_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = local
+            .read(&mut buffer)
+            .await
+            .map_err(|error| file_transfer_io_context("read local upload source", error))?;
+        if read == 0 {
+            break;
+        }
+        bytes_transferred = bytes_transferred
+            .checked_add(u64::try_from(read).map_err(file_transfer_conversion)?)
+            .ok_or_else(|| TransportError::FileTransfer("file size overflow".to_owned()))?;
+        ensure_size_within_limit(bytes_transferred, spec.max_size_bytes)?;
+        hasher.update(&buffer[..read]);
+        exec_transfer_stage_with_timeout(EXEC_TRANSFER_STAGE_TIMEOUT, async {
+            write_half
+                .data_bytes(buffer[..read].to_vec())
+                .await
+                .map_err(|error| {
+                    TransportError::FileTransfer(format!("stream pooled exec upload: {error}"))
+                })
+        })
+        .await?;
+        if bytes_transferred >= next_progress_bytes {
+            emit_sftp_progress(
+                context.request,
+                "uploading",
+                bytes_transferred,
+                Some(context.local_size),
+                0,
+                context.retry_count,
+            );
+            while next_progress_bytes <= bytes_transferred {
+                next_progress_bytes = next_progress_bytes.saturating_add(1024 * 1024);
+            }
+        }
+    }
+    exec_transfer_stage_with_timeout(EXEC_TRANSFER_STAGE_TIMEOUT, async {
+        write_half.eof().await.map_err(|error| {
+            TransportError::FileTransfer(format!("finish pooled exec upload input: {error}"))
+        })
+    })
+    .await?;
+    Ok((bytes_transferred, format!("{:x}", hasher.finalize())))
+}
+
+async fn receive_russh_exec_result_from_read_half(
+    channel: &mut russh::ChannelReadHalf,
+    output_limit_bytes: usize,
+) -> Result<ExecResult, TransportError> {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = None;
+    let mut truncated = false;
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => {
+                append_limited_utf8(&mut stdout, &data, output_limit_bytes, &mut truncated);
+            }
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                append_limited_utf8(&mut stderr, &data, output_limit_bytes, &mut truncated);
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit_code = i32::try_from(exit_status).ok();
+            }
+            ChannelMsg::ExitSignal { error_message, .. } => {
+                if !error_message.is_empty() {
+                    append_limited_utf8(
+                        &mut stderr,
+                        error_message.as_bytes(),
+                        output_limit_bytes,
+                        &mut truncated,
+                    );
+                }
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    Ok(ExecResult {
+        exit_code,
+        stdout,
+        stderr,
+        truncated,
+    })
+}
+
+async fn execute_russh_resumable_exec_upload<C>(
+    transport: &RusshTransport<C>,
+    request: &SftpRequest,
+) -> Result<SftpResult, TransportError>
+where
+    C: SshCredentialProvider,
+{
+    let spec = &request.spec;
+    match prepare_russh_exec_upload(transport, request).await? {
+        PreparedExecUpload::Complete {
+            local_size,
+            local_sha256,
+            retry_count,
+        } => {
+            emit_sftp_progress(
+                request,
+                "completed",
+                local_size,
+                Some(local_size),
+                local_size,
+                retry_count,
+            );
+            Ok(exec_upload_result(spec, local_size, local_sha256))
+        }
+        PreparedExecUpload::Pending(pending) => {
+            let PendingExecUpload {
+                mut local,
+                hasher,
+                local_size,
+                local_sha256,
+                temporary_path,
+                resume_bytes,
+                mut retry_count,
+            } = *pending;
+            let context = ExecUploadStreamContext {
+                temporary_path: &temporary_path,
+                remote_path: &spec.remote_path,
+                max_size_bytes: spec.max_size_bytes,
+                total_bytes: local_size,
+                initial_resume_bytes: resume_bytes,
+                progress_tx: request.progress_tx.as_ref(),
+            };
+            let (bytes_transferred, streamed_sha256) = stream_base64_upload_via_exec(
+                transport,
+                &mut local,
+                resume_bytes,
+                hasher,
+                &mut retry_count,
+                &context,
+            )
+            .await?;
+            if bytes_transferred != local_size || streamed_sha256 != local_sha256 {
+                return Err(TransportError::FileTransfer(
+                    "local file changed while it was being uploaded".to_owned(),
+                ));
+            }
+
+            let finalize = russh_exec_upload_finalize_command(
+                spec,
+                &temporary_path,
+                local_size,
+                &local_sha256,
+            );
+            let (remote_size, remote_sha256) = execute_russh_upload_placement_with_retry(
+                transport,
+                finalize,
+                "finalize pooled exec upload",
+                &mut retry_count,
+                &ExecUploadDestinationVerification {
+                    remote_path: &spec.remote_path,
+                    temporary_path: &temporary_path,
+                    expected_size: local_size,
+                    expected_sha256: &local_sha256,
+                },
+            )
+            .await?;
+            if remote_size != local_size || remote_sha256 != local_sha256 {
+                return Err(TransportError::FileTransfer(format!(
+                    "pooled exec upload verification failed: local_bytes={local_size}, remote_bytes={remote_size}, local_sha256={local_sha256}, remote_sha256={remote_sha256}"
+                )));
+            }
+            emit_sftp_progress(
+                request,
+                "completed",
+                remote_size,
+                Some(local_size),
+                resume_bytes,
+                retry_count,
+            );
+            Ok(exec_upload_result(spec, remote_size, remote_sha256))
+        }
+    }
+}
+
+fn exec_upload_result(
+    spec: &FileTransferSpec,
+    bytes_transferred: u64,
+    sha256: String,
+) -> SftpResult {
+    SftpResult {
+        direction: spec.direction,
+        bytes_transferred,
+        sha256,
+        local_path: spec.local_path.clone(),
+        remote_path: spec.remote_path.clone(),
+        overwrite: spec.overwrite,
+    }
+}
+
+enum PreparedExecUpload {
+    Complete {
+        local_size: u64,
+        local_sha256: String,
+        retry_count: u32,
+    },
+    Pending(Box<PendingExecUpload>),
+}
+
+struct PendingExecUpload {
+    local: tokio::fs::File,
+    hasher: Sha256,
+    local_size: u64,
+    local_sha256: String,
+    temporary_path: String,
+    resume_bytes: u64,
+    retry_count: u32,
+}
+
+async fn prepare_russh_exec_upload<C>(
+    transport: &RusshTransport<C>,
+    request: &SftpRequest,
+) -> Result<PreparedExecUpload, TransportError>
+where
+    C: SshCredentialProvider,
+{
+    let spec = &request.spec;
+    let (local_size, local_sha256) =
+        hash_local_source(Path::new(&spec.local_path), spec.max_size_bytes).await?;
+    ensure_expected_sha256(spec, &local_sha256)?;
+    let temporary_path = resumable_remote_temporary_path(&spec.remote_path, &local_sha256);
+    let initialize =
+        russh_exec_upload_initialize_command(spec, &temporary_path, local_size, &local_sha256);
+    let mut retry_count = 0_u32;
+    let remote_status = execute_russh_transfer_stage_with_retry(
+        transport,
+        initialize.clone(),
+        "initialize pooled exec upload",
+        &mut retry_count,
+        |outcome| {
+            require_exec_transfer_success(
+                outcome,
+                "initialize pooled exec upload",
+                &spec.remote_path,
+                &temporary_path,
+            )?;
+            parse_exec_upload_status(&outcome.stdout)
+        },
+    )
+    .await?;
+    let ExecUploadRemoteStatus::Ready {
+        bytes: mut resume_bytes,
+        mut prefix_sha256,
+    } = remote_status
+    else {
+        let ExecUploadRemoteStatus::Complete { size, sha256 } = remote_status else {
+            unreachable!();
+        };
+        if size != local_size || sha256 != local_sha256 {
+            return Err(TransportError::FileTransfer(
+                "completed pooled exec upload marker does not match local source".to_owned(),
+            ));
+        }
+        return Ok(PreparedExecUpload::Complete {
+            local_size,
+            local_sha256,
+            retry_count,
+        });
+    };
+
+    let (mut local, mut hasher, local_prefix_sha256) =
+        open_local_upload_at_offset(&spec.local_path, resume_bytes, spec.max_size_bytes).await?;
+    emit_sftp_progress(
+        request,
+        "resume_verified",
+        resume_bytes,
+        Some(local_size),
+        resume_bytes,
+        retry_count,
+    );
+    if prefix_sha256 != local_prefix_sha256 {
+        let (reset_local, reset_hasher, reset_prefix_sha256) = reset_mismatched_russh_exec_upload(
+            transport,
+            spec,
+            &temporary_path,
+            &initialize,
+            &mut retry_count,
+        )
+        .await?;
+        resume_bytes = 0;
+        prefix_sha256 = reset_prefix_sha256;
+        local = reset_local;
+        hasher = reset_hasher;
+        emit_sftp_progress(request, "resume_reset", 0, Some(local_size), 0, retry_count);
+    }
+    tracing::info!(
+        remote_path = %spec.remote_path,
+        local_size,
+        resume_bytes,
+        remote_prefix_sha256 = %prefix_sha256,
+        "starting resumable pooled exec upload"
+    );
+
+    Ok(PreparedExecUpload::Pending(Box::new(PendingExecUpload {
+        local,
+        hasher,
+        local_size,
+        local_sha256,
+        temporary_path,
+        resume_bytes,
+        retry_count,
+    })))
+}
+
+async fn reset_mismatched_russh_exec_upload<C>(
+    transport: &RusshTransport<C>,
+    spec: &FileTransferSpec,
+    temporary_path: &str,
+    initialize: &str,
+    retry_count: &mut u32,
+) -> Result<(tokio::fs::File, Sha256, String), TransportError>
+where
+    C: SshCredentialProvider,
+{
+    let reset = russh_exec_upload_cleanup_command(temporary_path);
+    execute_russh_transfer_stage_with_retry(
+        transport,
+        reset,
+        "reset mismatched pooled upload temporary file",
+        retry_count,
+        |outcome| {
+            require_exec_transfer_marker(
+                outcome,
+                "REMOTE_HOSTS_RESET_OK",
+                "reset mismatched pooled upload temporary file",
+                &spec.remote_path,
+                temporary_path,
+            )
+        },
+    )
+    .await?;
+    let reinitialized = execute_russh_transfer_stage_with_retry(
+        transport,
+        initialize.to_owned(),
+        "reinitialize pooled exec upload",
+        retry_count,
+        |outcome| {
+            require_exec_transfer_success(
+                outcome,
+                "reinitialize pooled exec upload",
+                &spec.remote_path,
+                temporary_path,
+            )?;
+            parse_exec_upload_status(&outcome.stdout)
+        },
+    )
+    .await?;
+    let ExecUploadRemoteStatus::Ready {
+        bytes,
+        prefix_sha256,
+    } = reinitialized
+    else {
+        return Err(TransportError::FileTransfer(
+            "pooled exec upload reset unexpectedly reported a completed destination".to_owned(),
+        ));
+    };
+    if bytes != 0 {
+        return Err(TransportError::FileTransfer(
+            "pooled exec upload reset did not return an empty temporary file".to_owned(),
+        ));
+    }
+    let (local, hasher, _) =
+        open_local_upload_at_offset(&spec.local_path, 0, spec.max_size_bytes).await?;
+    Ok((local, hasher, prefix_sha256))
+}
+
+async fn open_local_upload_at_offset(
+    local_path: &str,
+    offset: u64,
+    max_size_bytes: u64,
+) -> Result<(tokio::fs::File, Sha256, String), TransportError> {
+    ensure_size_within_limit(offset, max_size_bytes)?;
+    let mut local = tokio::fs::File::open(local_path)
+        .await
+        .map_err(file_transfer_io)?;
+    let mut hasher = Sha256::new();
+    let mut remaining = offset;
+    let mut buffer = vec![0_u8; 256 * 1024];
+    while remaining > 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(file_transfer_conversion)?;
+        let read = local
+            .read(&mut buffer[..requested])
+            .await
+            .map_err(|error| file_transfer_io_context("read local upload prefix", error))?;
+        if read == 0 {
+            return Err(TransportError::FileTransfer(format!(
+                "remote upload offset {offset} exceeds the local source size"
+            )));
+        }
+        hasher.update(&buffer[..read]);
+        remaining =
+            remaining.saturating_sub(u64::try_from(read).map_err(file_transfer_conversion)?);
+    }
+    let prefix_sha256 = format!("{:x}", hasher.clone().finalize());
+    Ok((local, hasher, prefix_sha256))
+}
+
+struct ExecUploadStreamContext<'a> {
+    temporary_path: &'a str,
+    remote_path: &'a str,
+    max_size_bytes: u64,
+    total_bytes: u64,
+    initial_resume_bytes: u64,
+    progress_tx: Option<&'a mpsc::UnboundedSender<SftpProgress>>,
+}
+
+async fn stream_base64_upload_via_exec<C>(
+    transport: &RusshTransport<C>,
+    local: &mut tokio::fs::File,
+    resume_bytes: u64,
+    mut hasher: Sha256,
+    retry_count: &mut u32,
+    context: &ExecUploadStreamContext<'_>,
+) -> Result<(u64, String), TransportError>
+where
+    C: SshCredentialProvider,
+{
+    let mut buffer = vec![0_u8; EXEC_UPLOAD_CHUNK_BYTES];
+    let mut bytes_transferred = resume_bytes;
+    let mut chunk_index = resume_bytes / EXEC_UPLOAD_CHUNK_BYTES as u64;
     loop {
         let mut filled = 0;
         while filled < buffer.len() {
@@ -2354,24 +3063,58 @@ async fn stream_base64_upload_via_exec(
         if filled == 0 {
             break;
         }
-        bytes_transferred = bytes_transferred
+        let next_bytes_transferred = bytes_transferred
             .checked_add(u64::try_from(filled).map_err(file_transfer_conversion)?)
             .ok_or_else(|| TransportError::FileTransfer("file size overflow".to_owned()))?;
-        ensure_size_within_limit(bytes_transferred, max_size_bytes)?;
-        hasher.update(&buffer[..filled]);
-        let encoded = BASE64_STANDARD.encode(&buffer[..filled]);
-        let command =
-            russh_exec_upload_chunk_command(temporary_path, chunk_index, encoded.as_str());
-        let outcome = execute_russh_transfer_command(
-            Arc::clone(&session),
+        ensure_size_within_limit(next_bytes_transferred, context.max_size_bytes)?;
+        let command = russh_exec_upload_chunk_command(
+            context.temporary_path,
+            chunk_index,
+            bytes_transferred,
+            &buffer[..filled],
+        );
+        let payload_sha256 = format!("{:x}", Sha256::digest(&buffer[..filled]));
+        let verify_command = russh_exec_upload_chunk_verify_command(
+            context.temporary_path,
+            chunk_index,
+            next_bytes_transferred,
+            filled,
+            &payload_sha256,
+        );
+        execute_russh_upload_chunk_with_retry(
+            transport,
             command,
-            "append pooled upload chunk",
+            verify_command,
+            retry_count,
+            &ExecUploadChunkVerification {
+                chunk_index,
+                expected_size: next_bytes_transferred,
+                expected_sha256: &payload_sha256,
+                remote_path: context.remote_path,
+                temporary_path: context.temporary_path,
+            },
         )
         .await?;
-        require_exec_upload_chunk_success(&outcome, chunk_index, remote_path, temporary_path)?;
+        hasher.update(&buffer[..filled]);
+        bytes_transferred = next_bytes_transferred;
         chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
             TransportError::FileTransfer("upload chunk index overflow".to_owned())
         })?;
+        if bytes_transferred % (8 * 1024 * 1024) < EXEC_UPLOAD_CHUNK_BYTES as u64 {
+            emit_sftp_progress_to(
+                context.progress_tx,
+                "uploading",
+                bytes_transferred,
+                Some(context.total_bytes),
+                context.initial_resume_bytes,
+                *retry_count,
+            );
+            tracing::info!(
+                remote_path = context.remote_path,
+                bytes_transferred,
+                "resumable pooled exec upload progress"
+            );
+        }
         if filled < buffer.len() {
             break;
         }
@@ -2379,16 +3122,62 @@ async fn stream_base64_upload_via_exec(
     Ok((bytes_transferred, format!("{:x}", hasher.finalize())))
 }
 
-async fn execute_russh_exec_download(
-    session: Arc<client::Handle<RusshClientHandler>>,
+async fn execute_russh_exec_download<C>(
+    transport: &RusshTransport<C>,
     request: &SftpRequest,
-) -> Result<SftpResult, TransportError> {
+) -> Result<SftpResult, TransportError>
+where
+    C: SshCredentialProvider,
+{
     let spec = &request.spec;
     let destination = Path::new(&spec.local_path);
     ensure_local_destination(destination, spec.overwrite).await?;
     let temporary_path = local_temporary_path(destination, request.operation_id)?;
-    cleanup_local_temporary_file(&temporary_path).await?;
-    let command = russh_exec_download_command(spec);
+    let mut attempt = 1_u32;
+    loop {
+        cleanup_local_temporary_file(&temporary_path).await?;
+        let session = transport.session().await?;
+        let transfer = execute_russh_exec_download_attempt(
+            Arc::clone(&session),
+            request,
+            destination,
+            &temporary_path,
+        )
+        .await;
+        match transfer {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if retryable_exec_transfer_error(&error)
+                    && attempt < EXEC_TRANSFER_MAX_STAGE_ATTEMPTS =>
+            {
+                transport.invalidate_session(&session).await;
+                let delay = exec_transfer_retry_delay(&error, attempt);
+                tracing::warn!(
+                    attempt,
+                    max_attempts = EXEC_TRANSFER_MAX_STAGE_ATTEMPTS,
+                    retry_after_seconds = delay.as_secs(),
+                    error = %error,
+                    "pooled exec download will retry with a fresh SSH session"
+                );
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temporary_path).await;
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn execute_russh_exec_download_attempt(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    request: &SftpRequest,
+    destination: &Path,
+    temporary_path: &Path,
+) -> Result<SftpResult, TransportError> {
+    let spec = &request.spec;
+    let command = russh_exec_download_request_command(spec);
     let transfer = async {
         let mut channel = session
             .channel_open_session()
@@ -2436,9 +3225,9 @@ async fn execute_russh_exec_download(
         }
         ensure_expected_sha256(spec, &outcome.sha256)?;
         if let Some(mode) = spec.mode {
-            set_local_mode(&temporary_path, mode).await?;
+            set_local_mode(temporary_path, mode).await?;
         }
-        place_local_file(&temporary_path, destination, spec.overwrite).await?;
+        place_local_file(temporary_path, destination, spec.overwrite).await?;
         Ok(SftpResult {
             direction: spec.direction,
             bytes_transferred: outcome.bytes_transferred,
@@ -2515,12 +3304,369 @@ async fn receive_russh_exec_download(
 
 async fn execute_russh_transfer_command(
     session: Arc<client::Handle<RusshClientHandler>>,
-    command: String,
+    script: String,
     stage: &str,
 ) -> Result<ExecResult, TransportError> {
-    execute_russh_command(session, command, EXEC_TRANSFER_OUTPUT_LIMIT_BYTES)
+    let marker = russh_transfer_frame_marker(&script);
+    let command = framed_posix_script_ssh_exec_command(&script, &marker);
+    let mut outcome = tokio::time::timeout(
+        EXEC_TRANSFER_STAGE_TIMEOUT,
+        execute_russh_command(session, command, EXEC_TRANSFER_OUTPUT_LIMIT_BYTES),
+    )
+    .await
+    .map_err(|_| TransportError::Timeout)?
+    .map_err(|error| file_transfer_context(stage, error))?;
+    if !recover_framed_exec_status(&mut outcome, &marker) {
+        return Err(TransportError::FileTransfer(format!(
+            "{stage} did not return the required completion frame"
+        )));
+    }
+    Ok(outcome)
+}
+
+fn russh_transfer_exec_command(script: &str) -> String {
+    [shell_quote("sh"), shell_quote("-lc"), shell_quote(script)].join(" ")
+}
+
+fn russh_transfer_frame_marker(script: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(script.as_bytes()));
+    format!("REMOTE_HOSTS_TRANSFER_FRAME_DONE_{}", &digest[..16])
+}
+
+async fn execute_russh_transfer_stage_with_retry<C, T, F>(
+    transport: &RusshTransport<C>,
+    command: String,
+    stage: &str,
+    retry_count: &mut u32,
+    mut validate: F,
+) -> Result<T, TransportError>
+where
+    C: SshCredentialProvider,
+    F: FnMut(&ExecResult) -> Result<T, TransportError>,
+{
+    let mut attempt = 1_u32;
+    loop {
+        let result = match transport.session().await {
+            Ok(session) => execute_russh_transfer_command(session, command.clone(), stage)
+                .await
+                .and_then(|outcome| validate(&outcome)),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) if retryable_exec_transfer_error(&error) => {
+                let consumes_attempt = exec_transfer_retry_consumes_attempt(&error);
+                if consumes_attempt && attempt >= EXEC_TRANSFER_MAX_STAGE_ATTEMPTS {
+                    return Err(error);
+                }
+                let delay = exec_transfer_retry_delay(&error, attempt);
+                tracing::warn!(
+                    stage,
+                    attempt,
+                    max_attempts = EXEC_TRANSFER_MAX_STAGE_ATTEMPTS,
+                    consumes_attempt,
+                    retry_after_seconds = delay.as_secs(),
+                    error = %error,
+                    "resumable pooled exec transfer stage will retry"
+                );
+                *retry_count = retry_count.saturating_add(1);
+                tokio::time::sleep(delay).await;
+                if consumes_attempt {
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct ExecUploadDestinationVerification<'a> {
+    remote_path: &'a str,
+    temporary_path: &'a str,
+    expected_size: u64,
+    expected_sha256: &'a str,
+}
+
+async fn execute_russh_upload_placement_with_retry<C>(
+    transport: &RusshTransport<C>,
+    command: String,
+    stage: &str,
+    retry_count: &mut u32,
+    verification: &ExecUploadDestinationVerification<'_>,
+) -> Result<(u64, String), TransportError>
+where
+    C: SshCredentialProvider,
+{
+    let mut attempt = 1_u32;
+    loop {
+        let result = async {
+            let session = transport.session().await?;
+            let outcome =
+                execute_russh_transfer_command(Arc::clone(&session), command.clone(), stage)
+                    .await?;
+            verify_russh_upload_outcome_or_destination(session, &outcome, stage, verification).await
+        }
+        .await;
+
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) if retryable_exec_transfer_error(&error) => {
+                let consumes_attempt = exec_transfer_retry_consumes_attempt(&error);
+                if consumes_attempt && attempt >= EXEC_TRANSFER_MAX_STAGE_ATTEMPTS {
+                    return Err(error);
+                }
+                let delay = exec_transfer_retry_delay(&error, attempt);
+                tracing::warn!(
+                    stage,
+                    attempt,
+                    max_attempts = EXEC_TRANSFER_MAX_STAGE_ATTEMPTS,
+                    consumes_attempt,
+                    retry_after_seconds = delay.as_secs(),
+                    error = %error,
+                    "pooled exec upload placement will retry"
+                );
+                *retry_count = retry_count.saturating_add(1);
+                tokio::time::sleep(delay).await;
+                if consumes_attempt {
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn verify_russh_upload_outcome_or_destination(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    outcome: &ExecResult,
+    stage: &str,
+    verification: &ExecUploadDestinationVerification<'_>,
+) -> Result<(u64, String), TransportError> {
+    require_exec_transfer_success(
+        outcome,
+        stage,
+        verification.remote_path,
+        verification.temporary_path,
+    )?;
+    if outcome
+        .stdout
+        .lines()
+        .any(|line| line.starts_with("REMOTE_HOSTS_TRANSFER_OK"))
+    {
+        return parse_transfer_marker(&outcome.stdout, "REMOTE_HOSTS_TRANSFER_OK");
+    }
+
+    verify_russh_upload_destination(
+        session,
+        verification.remote_path,
+        verification.temporary_path,
+        verification.expected_size,
+        verification.expected_sha256,
+    )
+    .await?;
+    Ok((
+        verification.expected_size,
+        verification.expected_sha256.to_owned(),
+    ))
+}
+
+async fn verify_russh_upload_destination(
+    session: Arc<client::Handle<RusshClientHandler>>,
+    remote_path: &str,
+    temporary_path: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), TransportError> {
+    let marker = format!(
+        "REMOTE_HOSTS_UPLOAD_VERIFY_DONE_{}_{}",
+        &expected_sha256[..16],
+        expected_size
+    );
+    let verification =
+        russh_exec_upload_destination_verify_command(remote_path, expected_size, expected_sha256);
+    let command = framed_posix_script_ssh_exec_command(&verification, &marker);
+    let mut outcome = execute_russh_command(session, command, EXEC_TRANSFER_OUTPUT_LIMIT_BYTES)
         .await
-        .map_err(|error| file_transfer_context(stage, error))
+        .map_err(|error| file_transfer_context("verify placed pooled upload", error))?;
+    let marker_seen = recover_framed_exec_status(&mut outcome, &marker);
+    if !marker_seen {
+        return Err(TransportError::FileTransfer(format!(
+            "verify placed pooled upload did not return its completion frame; exit_code={:?}: {}",
+            outcome.exit_code,
+            sanitized_transfer_diagnostics(
+                &format!("{}{}", outcome.stdout, outcome.stderr),
+                remote_path,
+                temporary_path
+            )
+        )));
+    }
+    require_exec_transfer_success(
+        &outcome,
+        "verify placed pooled upload",
+        remote_path,
+        temporary_path,
+    )
+}
+
+struct ExecUploadChunkVerification<'a> {
+    chunk_index: u64,
+    expected_size: u64,
+    expected_sha256: &'a str,
+    remote_path: &'a str,
+    temporary_path: &'a str,
+}
+
+async fn execute_russh_upload_chunk_with_retry<C>(
+    transport: &RusshTransport<C>,
+    append_command: String,
+    verify_command: String,
+    retry_count: &mut u32,
+    verification: &ExecUploadChunkVerification<'_>,
+) -> Result<(), TransportError>
+where
+    C: SshCredentialProvider,
+{
+    let stage = "append and verify pooled upload chunk";
+    let mut attempt = 1_u32;
+    loop {
+        let result = async {
+            let session = transport.session().await?;
+            let append_outcome = execute_russh_transfer_command(
+                session,
+                append_command.clone(),
+                "append pooled upload chunk",
+            )
+            .await?;
+            // Some bastion exec gateways preserve the command and exit status
+            // but suppress stdout when the command carries a large base64 body.
+            require_exec_transfer_success(
+                &append_outcome,
+                "append pooled upload chunk",
+                verification.remote_path,
+                verification.temporary_path,
+            )?;
+
+            let session = transport.session().await?;
+            let verify_outcome = execute_russh_transfer_command(
+                session,
+                verify_command.clone(),
+                "verify pooled upload chunk",
+            )
+            .await?;
+            require_exec_upload_chunk_success(
+                &verify_outcome,
+                verification.chunk_index,
+                verification.expected_size,
+                verification.expected_sha256,
+                verification.remote_path,
+                verification.temporary_path,
+            )
+        }
+        .await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable_exec_transfer_error(&error) => {
+                let consumes_attempt = exec_transfer_retry_consumes_attempt(&error);
+                if consumes_attempt && attempt >= EXEC_TRANSFER_MAX_STAGE_ATTEMPTS {
+                    return Err(error);
+                }
+                let delay = exec_transfer_retry_delay(&error, attempt);
+                tracing::warn!(
+                    stage,
+                    attempt,
+                    max_attempts = EXEC_TRANSFER_MAX_STAGE_ATTEMPTS,
+                    consumes_attempt,
+                    retry_after_seconds = delay.as_secs(),
+                    error = %error,
+                    "resumable pooled exec upload chunk will retry"
+                );
+                *retry_count = retry_count.saturating_add(1);
+                tokio::time::sleep(delay).await;
+                if consumes_attempt {
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn exec_transfer_retry_consumes_attempt(error: &TransportError) -> bool {
+    !matches!(error, TransportError::LocalHandshakeBudgetExhausted { .. })
+}
+
+fn retryable_exec_transfer_error(error: &TransportError) -> bool {
+    match error {
+        TransportError::LocalHandshakeBudgetExhausted { .. }
+        | TransportError::Backend(_)
+        | TransportError::Timeout => true,
+        TransportError::FileTransfer(message) => {
+            message.contains("did not return marker")
+                || message.contains("did not return the required")
+        }
+        TransportError::PolicyDenied(_) => false,
+    }
+}
+
+fn exec_transfer_retry_delay(error: &TransportError, attempt: u32) -> Duration {
+    match error {
+        TransportError::LocalHandshakeBudgetExhausted {
+            retry_after_seconds,
+        } => Duration::from_secs((*retry_after_seconds).max(1)),
+        _ => Duration::from_secs(1_u64 << attempt.saturating_sub(1).min(3)),
+    }
+}
+
+fn format_sftp_progress(progress: &SftpProgress, elapsed_seconds: u64) -> String {
+    let total_bytes = progress
+        .total_bytes
+        .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+    format!(
+        "file transfer progress: stage={}, bytes_transferred={}, total_bytes={}, resumed_bytes={}, retry_count={}, elapsed_seconds={elapsed_seconds}",
+        progress.stage,
+        progress.bytes_transferred,
+        total_bytes,
+        progress.resumed_bytes,
+        progress.retry_count,
+    )
+}
+
+fn emit_sftp_progress(
+    request: &SftpRequest,
+    stage: &str,
+    bytes_transferred: u64,
+    total_bytes: Option<u64>,
+    resumed_bytes: u64,
+    retry_count: u32,
+) {
+    emit_sftp_progress_to(
+        request.progress_tx.as_ref(),
+        stage,
+        bytes_transferred,
+        total_bytes,
+        resumed_bytes,
+        retry_count,
+    );
+}
+
+fn emit_sftp_progress_to(
+    progress_tx: Option<&mpsc::UnboundedSender<SftpProgress>>,
+    stage: &str,
+    bytes_transferred: u64,
+    total_bytes: Option<u64>,
+    resumed_bytes: u64,
+    retry_count: u32,
+) {
+    if let Some(progress_tx) = progress_tx {
+        let _ = progress_tx.send(SftpProgress {
+            stage: stage.to_owned(),
+            bytes_transferred,
+            total_bytes,
+            resumed_bytes,
+            retry_count,
+        });
+    }
 }
 
 fn require_exec_transfer_marker(
@@ -2548,14 +3694,23 @@ fn require_exec_transfer_marker(
 fn require_exec_upload_chunk_success(
     outcome: &ExecResult,
     chunk_index: u64,
+    expected_size: u64,
+    expected_sha256: &str,
     remote_path: &str,
     temporary_path: &str,
 ) -> Result<(), TransportError> {
-    let stage = "append pooled upload chunk";
+    let stage = "verify pooled upload chunk";
     require_exec_transfer_success(outcome, stage, remote_path, temporary_path)?;
-    let marker = format!("REMOTE_HOSTS_CHUNK_OK {chunk_index}");
-    if outcome.stdout.lines().any(|line| line == marker) {
-        return Ok(());
+    let marker = format!("REMOTE_HOSTS_CHUNK_OK {chunk_index} {expected_size} ");
+    if let Some(line) = outcome
+        .stdout
+        .lines()
+        .find(|line| line.starts_with(&marker))
+    {
+        let digest = &line[marker.len()..];
+        if digest.eq_ignore_ascii_case(expected_sha256) {
+            return Ok(());
+        }
     }
     Err(TransportError::FileTransfer(format!(
         "{stage} did not return marker {marker}; exit_code={:?}: {}",
@@ -2593,31 +3748,50 @@ fn require_exec_transfer_success(
     )))
 }
 
-fn russh_exec_upload_initialize_command(spec: &FileTransferSpec, temporary_path: &str) -> String {
+fn russh_exec_upload_initialize_command(
+    spec: &FileTransferSpec,
+    temporary_path: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> String {
     let destination = shell_quote(&spec.remote_path);
     let temporary = shell_quote(temporary_path);
-    let destination_guard = match spec.overwrite {
-        SftpOverwritePolicy::Deny => {
-            "[ ! -e \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73".to_owned()
-        }
-        SftpOverwritePolicy::Replace => {
-            "if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; fi".to_owned()
-        }
+    let mismatched_destination = match spec.overwrite {
+        SftpOverwritePolicy::Deny => "exit 73",
+        SftpOverwritePolicy::Replace => ":",
     };
     format!(
-        "set -eu\ndest={destination}\ntmp={temporary}\nparent=${{dest%/*}}\n[ -n \"$parent\" ] || parent=/\n[ -d \"$parent\" ] && [ ! -L \"$parent\" ] || exit 72\n{destination_guard}\nif [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74; rm -f \"$tmp\"; fi\numask 077\n: > \"$tmp\"\nchmod 600 \"$tmp\"\nprintf 'REMOTE_HOSTS_UPLOAD_READY\\n'\n"
+        "set -eu\ndest={destination}\ntmp={temporary}\nexpected_digest={expected_sha256}\n[ \"${{#expected_digest}}\" -eq 64 ] || exit 76\nparent=${{dest%/*}}\n[ -n \"$parent\" ] || parent=/\n[ -d \"$parent\" ] && [ ! -L \"$parent\" ] || exit 72\nhash_file() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" | awk '{{print $1}}'; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 \"$1\" | awk '{{print $1}}'; else exit 75; fi; }}\nif [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; dest_bytes=$(wc -c < \"$dest\" | tr -d '[:space:]'); dest_digest=$(hash_file \"$dest\"); if [ \"$dest_bytes\" = \"{expected_size}\" ] && [ \"$dest_digest\" = \"$expected_digest\" ]; then if [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74; rm -f \"$tmp\"; fi; printf 'REMOTE_HOSTS_UPLOAD_COMPLETE %s %s\\n' \"$dest_bytes\" \"$dest_digest\"; exit 0; fi; {mismatched_destination}; fi\nif [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74; else umask 077; : > \"$tmp\"; chmod 600 \"$tmp\"; fi\nbytes=$(wc -c < \"$tmp\" | tr -d '[:space:]')\n[ \"$bytes\" -le \"{expected_size}\" ] || exit 77\ndigest=$(hash_file \"$tmp\")\nprintf 'REMOTE_HOSTS_UPLOAD_READY %s %s\\n' \"$bytes\" \"$digest\"\n"
     )
 }
 
 fn russh_exec_upload_chunk_command(
     temporary_path: &str,
     chunk_index: u64,
-    encoded: &str,
+    expected_offset: u64,
+    payload_bytes: &[u8],
 ) -> String {
     let temporary = shell_quote(temporary_path);
-    let payload = shell_quote(encoded);
+    let encoded = BASE64_STANDARD.encode(payload_bytes);
+    let payload = shell_quote(&encoded);
+    let payload_size = payload_bytes.len();
+    let next_offset = expected_offset.saturating_add(payload_size as u64);
+    let payload_sha256 = format!("{:x}", Sha256::digest(payload_bytes));
     format!(
-        "set -eu\ntmp={temporary}\n[ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74\ndecode_payload() {{ if base64 -d </dev/null >/dev/null 2>&1; then base64 -d; else base64 -D; fi; }}\nprintf '%s' {payload} | decode_payload >> \"$tmp\"\nprintf 'REMOTE_HOSTS_CHUNK_OK {chunk_index}\\n'\n"
+        "set -eu\ntmp={temporary}\nn=$(wc -c <\"$tmp\" | tr -d '[:space:]')\nif [ \"$n\" = \"{expected_offset}\" ]; then printf '%s' {payload} | (base64 -d 2>/dev/null || base64 -D) >>\"$tmp\"; elif [ \"$n\" != \"{next_offset}\" ]; then exit 78; fi\n[ \"$(wc -c <\"$tmp\" | tr -d '[:space:]')\" = \"{next_offset}\" ] || exit 78\nprintf 'REMOTE_HOSTS_CHUNK_OK {chunk_index} {next_offset} {payload_sha256}\\n'\n"
+    )
+}
+
+fn russh_exec_upload_chunk_verify_command(
+    temporary_path: &str,
+    chunk_index: u64,
+    expected_size: u64,
+    payload_size: usize,
+    payload_sha256: &str,
+) -> String {
+    let temporary = shell_quote(temporary_path);
+    format!(
+        "set -eu\ntmp={temporary}\n[ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74\nn=$(wc -c <\"$tmp\" | tr -d '[:space:]')\n[ \"$n\" = \"{expected_size}\" ] || exit 78\nif command -v sha256sum >/dev/null 2>&1; then digest=$(tail -c {payload_size} \"$tmp\" | sha256sum | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then digest=$(tail -c {payload_size} \"$tmp\" | shasum -a 256 | awk '{{print $1}}'); else exit 75; fi\n[ \"$digest\" = \"{payload_sha256}\" ] || exit 79\nprintf 'REMOTE_HOSTS_CHUNK_OK {chunk_index} {expected_size} %s\\n' \"$digest\"\n"
     )
 }
 
@@ -2633,22 +3807,87 @@ fn russh_exec_upload_finalize_command(
         .mode
         .map_or_else(String::new, |mode| format!("chmod {mode:o} \"$tmp\"\n"));
     let placement = match spec.overwrite {
-        SftpOverwritePolicy::Deny => {
-            "[ ! -e \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73\nln \"$tmp\" \"$dest\"\nrm -f \"$tmp\"".to_owned()
-        }
+        SftpOverwritePolicy::Deny => format!(
+            "if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; dest_bytes=$(wc -c < \"$dest\" | tr -d '[:space:]'); if command -v sha256sum >/dev/null 2>&1; then dest_digest=$(sha256sum \"$dest\" | awk '{{print $1}}'); else dest_digest=$(shasum -a 256 \"$dest\" | awk '{{print $1}}'); fi; [ \"$dest_bytes\" = \"{expected_size}\" ] && [ \"$dest_digest\" = \"{expected_sha256}\" ] || exit 73; rm -f \"$tmp\"; else ln \"$tmp\" \"$dest\"; rm -f \"$tmp\"; fi"
+        ),
         SftpOverwritePolicy::Replace => {
             "if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; fi\nmv -f \"$tmp\" \"$dest\"".to_owned()
         }
     };
     format!(
-        "set -eu\ndest={destination}\ntmp={temporary}\n[ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74\nbytes=$(wc -c < \"$tmp\" | tr -d '[:space:]')\nif command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum \"$tmp\"); digest=${{digest%% *}}; elif command -v shasum >/dev/null 2>&1; then digest=$(shasum -a 256 \"$tmp\"); digest=${{digest%% *}}; else exit 75; fi\n[ \"$bytes\" = \"{expected_size}\" ] && [ \"$digest\" = \"{expected_sha256}\" ] || exit 76\n{mode}{placement}\nprintf 'REMOTE_HOSTS_TRANSFER_OK %s %s\\n' \"$bytes\" \"$digest\"\n"
+        "set -eu\ndest={destination}\ntmp={temporary}\nhash_file() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" | awk '{{print $1}}'; else shasum -a 256 \"$1\" | awk '{{print $1}}'; fi; }}\nif [ ! -f \"$tmp\" ] || [ -L \"$tmp\" ]; then if [ -f \"$dest\" ] && [ ! -L \"$dest\" ]; then bytes=$(wc -c < \"$dest\" | tr -d '[:space:]'); digest=$(hash_file \"$dest\"); [ \"$bytes\" = \"{expected_size}\" ] && [ \"$digest\" = \"{expected_sha256}\" ] || exit 76; printf 'REMOTE_HOSTS_TRANSFER_OK %s %s\\n' \"$bytes\" \"$digest\"; exit 0; fi; exit 74; fi\nbytes=$(wc -c < \"$tmp\" | tr -d '[:space:]')\ndigest=$(hash_file \"$tmp\")\n[ \"$bytes\" = \"{expected_size}\" ] && [ \"$digest\" = \"{expected_sha256}\" ] || exit 76\n{mode}{placement}\nprintf 'REMOTE_HOSTS_TRANSFER_OK %s %s\\n' \"$bytes\" \"$digest\"\n"
+    )
+}
+
+fn russh_exec_upload_destination_verify_command(
+    remote_path: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> String {
+    let destination = shell_quote(remote_path);
+    format!(
+        "set -u\ndest={destination}\n[ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 71\nbytes=$(wc -c < \"$dest\" | tr -d '[:space:]') || exit 75\n[ \"$bytes\" = \"{expected_size}\" ] || exit 76\nif command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum \"$dest\" | awk '{{print $1}}') || exit 75; elif command -v shasum >/dev/null 2>&1; then digest=$(shasum -a 256 \"$dest\" | awk '{{print $1}}') || exit 75; else exit 75; fi\n[ \"$digest\" = \"{expected_sha256}\" ] || exit 76\n"
+    )
+}
+
+fn russh_exec_inline_upload_command(
+    spec: &FileTransferSpec,
+    temporary_path: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+    payload_bytes: &[u8],
+) -> String {
+    let destination = shell_quote(&spec.remote_path);
+    let temporary = shell_quote(temporary_path);
+    let payload = shell_quote(&BASE64_STANDARD.encode(payload_bytes));
+    let mode = spec
+        .mode
+        .map_or_else(String::new, |mode| format!("chmod {mode:o} \"$tmp\"\n"));
+    let placement = match spec.overwrite {
+        SftpOverwritePolicy::Deny => "ln \"$tmp\" \"$dest\"\nrm -f \"$tmp\"".to_owned(),
+        SftpOverwritePolicy::Replace => {
+            "if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; fi\nmv -f \"$tmp\" \"$dest\"".to_owned()
+        }
+    };
+    let mismatched_destination = match spec.overwrite {
+        SftpOverwritePolicy::Deny => "exit 73",
+        SftpOverwritePolicy::Replace => ":",
+    };
+    format!(
+        "set -eu\ndest={destination}\ntmp={temporary}\nexpected_digest={expected_sha256}\nparent=${{dest%/*}}\n[ -n \"$parent\" ] || parent=/\n[ -d \"$parent\" ] && [ ! -L \"$parent\" ] || exit 72\nhash_file() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" | awk '{{print $1}}'; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 \"$1\" | awk '{{print $1}}'; else exit 75; fi; }}\nif [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; dest_bytes=$(wc -c < \"$dest\" | tr -d '[:space:]'); dest_digest=$(hash_file \"$dest\"); if [ \"$dest_bytes\" = \"{expected_size}\" ] && [ \"$dest_digest\" = \"$expected_digest\" ]; then if [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74; rm -f \"$tmp\"; fi; printf 'REMOTE_HOSTS_TRANSFER_OK %s %s\\n' \"$dest_bytes\" \"$dest_digest\"; exit 0; fi; {mismatched_destination}; fi\nif [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74; fi\numask 077\nprintf '%s' {payload} | (base64 -d 2>/dev/null || base64 -D) > \"$tmp\"\nchmod 600 \"$tmp\"\nbytes=$(wc -c < \"$tmp\" | tr -d '[:space:]')\ndigest=$(hash_file \"$tmp\")\n[ \"$bytes\" = \"{expected_size}\" ] && [ \"$digest\" = \"$expected_digest\" ] || exit 76\n{mode}{placement}\nprintf 'REMOTE_HOSTS_TRANSFER_OK %s %s\\n' \"$bytes\" \"$digest\"\n"
+    )
+}
+
+fn russh_exec_stream_upload_command(
+    spec: &FileTransferSpec,
+    temporary_path: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> String {
+    let destination = shell_quote(&spec.remote_path);
+    let temporary = shell_quote(temporary_path);
+    let mode = spec
+        .mode
+        .map_or_else(String::new, |mode| format!("chmod {mode:o} \"$tmp\"\n"));
+    let placement = match spec.overwrite {
+        SftpOverwritePolicy::Deny => "ln \"$tmp\" \"$dest\"\nrm -f \"$tmp\"".to_owned(),
+        SftpOverwritePolicy::Replace => {
+            "if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; fi\nmv -f \"$tmp\" \"$dest\"".to_owned()
+        }
+    };
+    let mismatched_destination = match spec.overwrite {
+        SftpOverwritePolicy::Deny => "exit 73",
+        SftpOverwritePolicy::Replace => ":",
+    };
+    format!(
+        "set -eu\ndest={destination}\ntmp={temporary}\nexpected_digest={expected_sha256}\nparent=${{dest%/*}}\n[ -n \"$parent\" ] || parent=/\n[ -d \"$parent\" ] && [ ! -L \"$parent\" ] || exit 72\nhash_file() {{ if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" | awk '{{print $1}}'; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 \"$1\" | awk '{{print $1}}'; else exit 75; fi; }}\nif [ -e \"$dest\" ] || [ -L \"$dest\" ]; then [ -f \"$dest\" ] && [ ! -L \"$dest\" ] || exit 73; dest_bytes=$(wc -c < \"$dest\" | tr -d '[:space:]'); dest_digest=$(hash_file \"$dest\"); if [ \"$dest_bytes\" = \"{expected_size}\" ] && [ \"$dest_digest\" = \"$expected_digest\" ]; then cat >/dev/null; if [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74; rm -f \"$tmp\"; fi; printf 'REMOTE_HOSTS_TRANSFER_OK %s %s\\n' \"$dest_bytes\" \"$dest_digest\"; exit 0; fi; {mismatched_destination}; fi\nif [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74; fi\numask 077\ncat > \"$tmp\"\nchmod 600 \"$tmp\"\nbytes=$(wc -c < \"$tmp\" | tr -d '[:space:]')\ndigest=$(hash_file \"$tmp\")\n[ \"$bytes\" = \"{expected_size}\" ] && [ \"$digest\" = \"$expected_digest\" ] || exit 76\n{mode}{placement}\nprintf 'REMOTE_HOSTS_TRANSFER_OK %s %s\\n' \"$bytes\" \"$digest\"\n"
     )
 }
 
 fn russh_exec_upload_cleanup_command(temporary_path: &str) -> String {
     let temporary = shell_quote(temporary_path);
     format!(
-        "tmp={temporary}\nif [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] && rm -f \"$tmp\"; fi\n"
+        "set -eu\ntmp={temporary}\nif [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then [ -f \"$tmp\" ] && [ ! -L \"$tmp\" ] || exit 74; rm -f \"$tmp\"; fi\nprintf 'REMOTE_HOSTS_RESET_OK\\n'\n"
     )
 }
 
@@ -2661,9 +3900,13 @@ fn russh_exec_download_command(spec: &FileTransferSpec) -> String {
             format!("[ \"$digest\" = \"{digest}\" ] || exit 76\n")
         });
     format!(
-        "set -eu\nsrc={source}\n[ -f \"$src\" ] && [ ! -L \"$src\" ] || exit 71\nbytes=$(wc -c < \"$src\" | tr -d '[:space:]')\n[ \"$bytes\" -le \"{}\" ] || exit 77\nif command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum \"$src\"); digest=${{digest%% *}}; elif command -v shasum >/dev/null 2>&1; then digest=$(shasum -a 256 \"$src\"); digest=${{digest%% *}}; else exit 75; fi\n{expected_digest}printf 'REMOTE_HOSTS_TRANSFER_META %s %s\\n' \"$bytes\" \"$digest\" >&2\ncat \"$src\"\n",
+        "set -eu\nsrc={source}\n[ -f \"$src\" ] && [ ! -L \"$src\" ] || exit 71\nbytes=$(wc -c < \"$src\" | tr -d '[:space:]')\n[ \"$bytes\" -le \"{}\" ] || exit 77\nif command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum \"$src\"); digest=${{digest%% *}}; elif command -v shasum >/dev/null 2>&1; then digest=$(shasum -a 256 \"$src\"); digest=${{digest%% *}}; else exit 75; fi\n{expected_digest}cat \"$src\"\nprintf 'REMOTE_HOSTS_TRANSFER_META %s %s\\n' \"$bytes\" \"$digest\" >&2\n",
         spec.max_size_bytes
     )
+}
+
+fn russh_exec_download_request_command(spec: &FileTransferSpec) -> String {
+    russh_transfer_exec_command(&russh_exec_download_command(spec))
 }
 
 fn parse_transfer_marker(output: &str, marker: &str) -> Result<(u64, String), TransportError> {
@@ -2699,6 +3942,26 @@ fn parse_transfer_marker(output: &str, marker: &str) -> Result<(u64, String), Tr
         ));
     }
     Ok((size, sha256))
+}
+
+enum ExecUploadRemoteStatus {
+    Ready { bytes: u64, prefix_sha256: String },
+    Complete { size: u64, sha256: String },
+}
+
+fn parse_exec_upload_status(output: &str) -> Result<ExecUploadRemoteStatus, TransportError> {
+    if output
+        .lines()
+        .any(|line| line.starts_with("REMOTE_HOSTS_UPLOAD_COMPLETE"))
+    {
+        let (size, sha256) = parse_transfer_marker(output, "REMOTE_HOSTS_UPLOAD_COMPLETE")?;
+        return Ok(ExecUploadRemoteStatus::Complete { size, sha256 });
+    }
+    let (bytes, prefix_sha256) = parse_transfer_marker(output, "REMOTE_HOSTS_UPLOAD_READY")?;
+    Ok(ExecUploadRemoteStatus::Ready {
+        bytes,
+        prefix_sha256,
+    })
 }
 
 fn sanitized_transfer_diagnostics(
@@ -2782,10 +4045,16 @@ async fn russh_upload(
                 russh_file_transfer_error("create remote temporary file", error)
             })?;
         let mut remote = Box::pin(remote);
-        let (bytes_transferred, transfer_sha256) =
-            copy_bounded_and_hash(Pin::new(&mut local), remote.as_mut(), spec.max_size_bytes)
-                .await
-                .map_err(|error| {
+        let (bytes_transferred, transfer_sha256) = copy_bounded_and_hash(
+            Pin::new(&mut local),
+            remote.as_mut(),
+            spec.max_size_bytes,
+            request.progress_tx.as_ref(),
+            "uploading",
+            Some(local_size),
+        )
+        .await
+        .map_err(|error| {
                     file_transfer_context("stream upload to remote temporary file", error)
                 })?;
         remote
@@ -2873,10 +4142,16 @@ async fn russh_download(
             .open(&temporary_path)
             .await
             .map_err(file_transfer_io)?;
-        let (bytes_transferred, remote_sha256) =
-            copy_bounded_and_hash(remote.as_mut(), Pin::new(&mut local), spec.max_size_bytes)
-                .await
-                .map_err(|error| {
+        let (bytes_transferred, remote_sha256) = copy_bounded_and_hash(
+            remote.as_mut(),
+            Pin::new(&mut local),
+            spec.max_size_bytes,
+            request.progress_tx.as_ref(),
+            "downloading",
+            Some(source_size),
+        )
+        .await
+        .map_err(|error| {
                     file_transfer_context("stream remote source to local file", error)
                 })?;
         local.shutdown().await.map_err(file_transfer_io)?;
@@ -3011,6 +4286,19 @@ async fn hash_russh_remote_file(
         (Ok(result), Ok(())) => Ok(result),
         (Err(error), _) | (Ok(_), Err(error)) => Err(error),
     }
+}
+
+fn russh_inactivity_timeout(
+    inactivity_timeout_seconds: u64,
+    keepalive_seconds: u64,
+) -> Option<Duration> {
+    if inactivity_timeout_seconds == 0 {
+        return None;
+    }
+    let keepalive_grace_seconds = keepalive_seconds.saturating_mul(5);
+    Some(Duration::from_secs(
+        inactivity_timeout_seconds.max(keepalive_grace_seconds),
+    ))
 }
 
 fn russh_file_transfer_error(context: &str, error: RusshSftpError) -> TransportError {
@@ -3874,7 +5162,15 @@ async fn execute_russh_command(
         .exec(true, command)
         .await
         .map_err(|error| TransportError::Backend(error.to_string()))?;
+    let result = receive_russh_exec_result(&mut channel, output_limit_bytes).await;
+    let _ = channel.close().await;
+    result
+}
 
+async fn receive_russh_exec_result(
+    channel: &mut russh::Channel<client::Msg>,
+    output_limit_bytes: usize,
+) -> Result<ExecResult, TransportError> {
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut exit_code = None;
@@ -3904,7 +5200,6 @@ async fn execute_russh_command(
             _ => {}
         }
     }
-    let _ = channel.close().await;
     Ok(ExecResult {
         exit_code,
         stdout,
@@ -4090,6 +5385,60 @@ fn ssh_exec_command(profile: &CommandProfile, windows: bool) -> String {
         .chain(profile.args.iter().map(|arg| quote(arg)))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn framed_posix_ssh_exec_command(profile: &CommandProfile, marker: &str) -> String {
+    let command = ssh_exec_command(profile, false);
+    framed_posix_command(&command, marker)
+}
+
+fn framed_posix_script_ssh_exec_command(script: &str, marker: &str) -> String {
+    framed_posix_command(&russh_transfer_exec_command(script), marker)
+}
+
+fn framed_posix_command(command: &str, marker: &str) -> String {
+    let script =
+        format!("{command}\nstatus=$?\nprintf '\\n{marker} %s\\n' \"$status\"\nexit \"$status\"");
+    russh_transfer_exec_command(&script)
+}
+
+fn recover_framed_exec_status(result: &mut ExecResult, marker: &str) -> bool {
+    let prefix = format!("{marker} ");
+    let Some(start) = result.stdout.rfind(&prefix) else {
+        return false;
+    };
+    if start > 0 && result.stdout.as_bytes()[start - 1] != b'\n' {
+        return false;
+    }
+    let status_start = start + prefix.len();
+    let status_end = result.stdout[status_start..]
+        .find('\n')
+        .map_or(result.stdout.len(), |offset| status_start + offset);
+    let Ok(exit_code) = result.stdout[status_start..status_end]
+        .trim()
+        .parse::<i32>()
+    else {
+        return false;
+    };
+    if !result.stdout[status_end..].trim().is_empty() {
+        return false;
+    }
+
+    let remove_start = start
+        .checked_sub(1)
+        .filter(|index| result.stdout.as_bytes()[*index] == b'\n')
+        .unwrap_or(start);
+    let remove_end = status_end
+        + usize::from(
+            result
+                .stdout
+                .as_bytes()
+                .get(status_end)
+                .is_some_and(|byte| *byte == b'\n'),
+        );
+    result.stdout.replace_range(remove_start..remove_end, "");
+    result.exit_code = Some(exit_code);
+    true
 }
 
 fn windows_command_quote(value: &str) -> String {
@@ -5504,6 +6853,7 @@ where
             host_id: operation.host_id,
             access_path_id: operation.access_path_id,
             spec,
+            progress_tx: None,
         };
         let result = self
             .sftp_with_lease_renewal(operation, Arc::clone(&transport), request)
@@ -5654,19 +7004,66 @@ where
         &self,
         operation: &OperationRun,
         transport: Arc<dyn RemoteTransport>,
-        request: SftpRequest,
+        mut request: SftpRequest,
     ) -> Result<SftpResult, TransportError> {
         let claim_token = operation.claim_token.clone().ok_or_else(|| {
             TransportError::Backend(ConnectorWorkerError::MissingClaimToken.to_string())
         })?;
         let renew_delay = self.lease_renew_delay();
+        let started_at = Instant::now();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        request.progress_tx = Some(progress_tx);
+        let direction = request.spec.direction;
+        let max_size_bytes = request.spec.max_size_bytes;
+        self.append_system_chunk(
+            operation,
+            &format!(
+                "file transfer started: direction={direction:?}, max_size_bytes={max_size_bytes}"
+            ),
+        )
+        .await
+        .map_err(|error| TransportError::Backend(error.to_string()))?;
         let transfer = transport.sftp(request);
         tokio::pin!(transfer);
+        let mut lease_interval = tokio::time::interval(renew_delay);
+        lease_interval.tick().await;
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
+        heartbeat_interval.tick().await;
+        let mut progress_open = true;
+        let mut latest_progress: Option<SftpProgress> = None;
 
         loop {
             tokio::select! {
                 result = &mut transfer => return result,
-                () = tokio::time::sleep(renew_delay) => {
+                progress = progress_rx.recv(), if progress_open => {
+                    match progress {
+                        Some(progress) => {
+                            let summary = format_sftp_progress(
+                                &progress,
+                                started_at.elapsed().as_secs(),
+                            );
+                            self.append_transfer_status_best_effort(operation, &summary)
+                                .await;
+                            latest_progress = Some(progress);
+                        }
+                        None => progress_open = false,
+                    }
+                }
+                _ = heartbeat_interval.tick() => {
+                    let summary = latest_progress.as_ref().map_or_else(
+                        || format!(
+                            "file transfer active: direction={direction:?}, elapsed_seconds={}",
+                            started_at.elapsed().as_secs()
+                        ),
+                        |progress| format_sftp_progress(
+                            progress,
+                            started_at.elapsed().as_secs(),
+                        ),
+                    );
+                    self.append_transfer_status_best_effort(operation, &summary)
+                        .await;
+                }
+                _ = lease_interval.tick() => {
                     let lease_seconds = i64::try_from(self.config.lease_seconds)
                         .map_err(|error| TransportError::Backend(error.to_string()))?;
                     let renewed = self.repositories.operations
@@ -6180,6 +7577,16 @@ where
             .await
     }
 
+    async fn append_transfer_status_best_effort(&self, operation: &OperationRun, message: &str) {
+        if let Err(error) = self.append_system_chunk(operation, message).await {
+            tracing::warn!(
+                operation_id = %operation.id,
+                %error,
+                "failed to persist file transfer progress without interrupting the data channel"
+            );
+        }
+    }
+
     async fn append_stream_output(
         &self,
         operation: &OperationRun,
@@ -6320,6 +7727,20 @@ pub struct ConnectorDaemonReport {
     pub stop_reason: ConnectorDaemonStopReason,
 }
 
+fn initial_connector_daemon_report() -> ConnectorDaemonReport {
+    ConnectorDaemonReport {
+        reconciled_connection_sessions: 0,
+        reconciled_transport_runtimes: 0,
+        reconciled_pty_sessions: 0,
+        completed_operations: 0,
+        delivered_pty_inputs: 0,
+        failed_pty_inputs: 0,
+        idle_polls: 0,
+        infrastructure_errors: 0,
+        stop_reason: ConnectorDaemonStopReason::ShutdownSignal,
+    }
+}
+
 /// Connector daemon errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectorDaemonError {
@@ -6397,17 +7818,7 @@ where
         &self,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<ConnectorDaemonReport, ConnectorDaemonError> {
-        let mut report = ConnectorDaemonReport {
-            reconciled_connection_sessions: 0,
-            reconciled_transport_runtimes: 0,
-            reconciled_pty_sessions: 0,
-            completed_operations: 0,
-            delivered_pty_inputs: 0,
-            failed_pty_inputs: 0,
-            idle_polls: 0,
-            infrastructure_errors: 0,
-            stop_reason: ConnectorDaemonStopReason::ShutdownSignal,
-        };
+        let mut report = initial_connector_daemon_report();
         let mut idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
         let max_idle_delay = Duration::from_millis(self.config.idle_max_delay_ms);
         let heartbeat_interval = Duration::from_millis(self.config.heartbeat_interval_ms);
@@ -6459,7 +7870,21 @@ where
                 }
             }
 
-            match self.worker.run_once().await {
+            let operation = self.worker.run_once();
+            tokio::pin!(operation);
+            let operation_result = loop {
+                let heartbeat_due = tokio::time::sleep_until(next_heartbeat);
+                tokio::pin!(heartbeat_due);
+                tokio::select! {
+                    result = &mut operation => break result,
+                    () = &mut heartbeat_due => {
+                        self.record_connector_state(EntityState::Healthy).await?;
+                        next_heartbeat = Instant::now() + heartbeat_interval;
+                    }
+                }
+            };
+
+            match operation_result {
                 Ok(Some(_outcome)) => {
                     report.completed_operations += 1;
                     idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
@@ -6882,6 +8307,8 @@ fn classify_connection_failure(message: &str) -> (EntityState, StateReasonCode, 
 #[cfg(test)]
 mod tests {
     use std::{
+        io::Write,
+        process::Stdio,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -6894,9 +8321,9 @@ mod tests {
         CheckRequest, CheckResult, CommandClass, CommandProfile, CommandProfileCatalog,
         DEFAULT_SFTP_MAX_SIZE_BYTES, DEFAULT_SFTP_TIMEOUT_SECONDS, ExecRequest, ExecResult,
         FileTransferSpec, ForwardHandle, ForwardRequest, PtySessionOpenCommand,
-        PtySessionSupervisor, RemoteTransport, SftpDirection, SftpOverwritePolicy, SftpRequest,
-        SftpResult, WorkspaceFileTransfer, WorkspaceOperationSupervisor, WorkspaceRunCommand,
-        transport::TransportError,
+        PtySessionSupervisor, RemoteTransport, SftpDirection, SftpOverwritePolicy, SftpProgress,
+        SftpRequest, SftpResult, WorkspaceFileTransfer, WorkspaceOperationSupervisor,
+        WorkspaceRunCommand, transport::TransportError,
     };
     use remote_hosts_db::{Repositories, connect_sqlite, migrate};
     use remote_hosts_domain::{
@@ -6913,6 +8340,7 @@ mod tests {
         TrustLevel, WorkspaceId, WorkspaceState, now_utc,
     };
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use tokio::sync::{mpsc, oneshot, watch};
 
     use super::{
@@ -6925,11 +8353,123 @@ mod tests {
         QueuedPtyInputPump, RemoteTransportProvider, RusshPtyBackendFactory, RusshTransportPool,
         SshCredentialProvider, StaticTransportProvider, TransportTelemetryTracker,
         authorized_key_bootstrap_failure_state, authorized_key_bootstrap_is_eligible,
-        execute_authorized_key_install_with_timeout,
+        execute_authorized_key_install_with_timeout, russh_inactivity_timeout,
     };
     use remote_hosts_core::ServerProtectionPolicy;
     use remote_hosts_vault::{CredentialSecret, CredentialVault};
     use secrecy::{ExposeSecret, SecretString};
+
+    fn run_test_shell(command: &str) -> std::io::Result<std::process::Output> {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+    }
+
+    fn exec_transfer_test_spec() -> FileTransferSpec {
+        FileTransferSpec {
+            direction: SftpDirection::Upload,
+            local_path: "/tmp/local-payload.bin".to_owned(),
+            remote_path: "/tmp/release's payload.bin".to_owned(),
+            overwrite: SftpOverwritePolicy::Deny,
+            mode: Some(0o600),
+            max_size_bytes: 1024,
+            expected_sha256: Some("a".repeat(64)),
+            timeout_seconds: DEFAULT_SFTP_TIMEOUT_SECONDS,
+        }
+    }
+
+    #[test]
+    fn russh_inactivity_timeout_allows_keepalive_grace() {
+        assert_eq!(
+            russh_inactivity_timeout(30, 30),
+            Some(Duration::from_secs(150))
+        );
+        assert_eq!(
+            russh_inactivity_timeout(600, 30),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            russh_inactivity_timeout(30, 0),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(russh_inactivity_timeout(0, 30), None);
+    }
+
+    #[tokio::test]
+    async fn exec_transfer_stage_timeout_allows_resumable_fallback() {
+        let result = super::exec_transfer_stage_with_timeout(
+            Duration::from_millis(5),
+            std::future::pending::<Result<(), TransportError>>(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(TransportError::Timeout)));
+    }
+
+    #[test]
+    fn exec_transfer_retries_only_transient_or_unproven_outcomes() {
+        assert!(super::retryable_exec_transfer_error(
+            &TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds: 1,
+            }
+        ));
+        assert!(super::retryable_exec_transfer_error(
+            &TransportError::Backend("connection closed".to_owned())
+        ));
+        assert!(super::retryable_exec_transfer_error(
+            &TransportError::Timeout
+        ));
+        assert!(super::retryable_exec_transfer_error(
+            &TransportError::FileTransfer(
+                "verify pooled upload chunk did not return marker".to_owned()
+            )
+        ));
+        assert!(!super::retryable_exec_transfer_error(
+            &TransportError::FileTransfer("remote SHA-256 mismatch".to_owned())
+        ));
+        assert!(!super::retryable_exec_transfer_error(
+            &TransportError::PolicyDenied("write denied".to_owned())
+        ));
+    }
+
+    #[test]
+    fn markerless_gateway_chunk_verification_is_not_success() {
+        let result = super::require_exec_upload_chunk_success(
+            &ExecResult {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+            },
+            7,
+            7,
+            &format!("{:x}", Sha256::digest(b"payload")),
+            "/tmp/release.bin",
+            "/tmp/.release.bin.part",
+        );
+
+        assert!(result.is_err());
+    }
+
+    fn run_test_shell_with_input(
+        command: &str,
+        input: &[u8],
+    ) -> std::io::Result<std::process::Output> {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("child stdin is unavailable"))?
+            .write_all(input)?;
+        child.wait_with_output()
+    }
 
     struct FakeTransport;
 
@@ -7036,6 +8576,16 @@ mod tests {
         }
 
         async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+            if let Some(progress_tx) = &request.progress_tx {
+                let _ = progress_tx.send(SftpProgress {
+                    stage: "uploading".to_owned(),
+                    bytes_transferred: 128,
+                    total_bytes: Some(256),
+                    resumed_bytes: 64,
+                    retry_count: 1,
+                });
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             Ok(SftpResult {
                 direction: request.spec.direction,
                 bytes_transferred: 0,
@@ -7347,6 +8897,52 @@ mod tests {
             requires_tty: false,
         };
         assert_eq!(super::ssh_exec_command(&whoami, true), "whoami");
+    }
+
+    #[test]
+    fn framed_posix_exec_recovers_status_when_gateway_omits_exit_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let marker = "REMOTE_HOSTS_EXEC_DONE_test";
+        let profile = CommandProfile {
+            name: "status-test".to_owned(),
+            program: "sh".to_owned(),
+            args: vec!["-lc".to_owned(), "printf 'before'; exit 17".to_owned()],
+            class: CommandClass::ReadOnly,
+            timeout_seconds: 30,
+            output_limit_bytes: 1024,
+            requires_tty: false,
+        };
+        let output = run_test_shell(&super::framed_posix_ssh_exec_command(&profile, marker))?;
+        assert_eq!(output.status.code(), Some(17));
+
+        let mut result = remote_hosts_core::ExecResult {
+            exit_code: None,
+            stdout: String::from_utf8(output.stdout)?,
+            stderr: String::from_utf8(output.stderr)?,
+            truncated: false,
+        };
+        assert!(super::recover_framed_exec_status(&mut result, marker));
+
+        assert_eq!(result.exit_code, Some(17));
+        assert_eq!(result.stdout, "before");
+        assert!(!result.stdout.contains(marker));
+        Ok(())
+    }
+
+    #[test]
+    fn framed_posix_exec_status_overrides_incorrect_gateway_status() {
+        let marker = "REMOTE_HOSTS_EXEC_DONE_override";
+        let mut result = remote_hosts_core::ExecResult {
+            exit_code: Some(0),
+            stdout: format!("output\n\n{marker} 23\n"),
+            stderr: String::new(),
+            truncated: false,
+        };
+
+        assert!(super::recover_framed_exec_status(&mut result, marker));
+
+        assert_eq!(result.exit_code, Some(23));
+        assert_eq!(result.stdout, "output\n");
     }
 
     #[tokio::test]
@@ -7821,28 +9417,39 @@ mod tests {
     }
 
     #[test]
-    fn exec_channel_file_transfer_commands_are_bounded_and_shell_quoted()
+    fn exec_channel_upload_commands_are_resumable_bounded_and_shell_quoted()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut spec = FileTransferSpec {
-            direction: SftpDirection::Upload,
-            local_path: "/tmp/local-payload.bin".to_owned(),
-            remote_path: "/tmp/release's payload.bin".to_owned(),
-            overwrite: SftpOverwritePolicy::Deny,
-            mode: Some(0o600),
-            max_size_bytes: 1024,
-            expected_sha256: Some("a".repeat(64)),
-            timeout_seconds: DEFAULT_SFTP_TIMEOUT_SECONDS,
-        };
-        let initialize = super::russh_exec_upload_initialize_command(&spec, "/tmp/.release-part");
+        let spec = exec_transfer_test_spec();
+        let initialize = super::russh_exec_upload_initialize_command(
+            &spec,
+            "/tmp/.release-part",
+            17,
+            &"a".repeat(64),
+        );
         assert!(initialize.contains("REMOTE_HOSTS_UPLOAD_READY"));
+        assert!(initialize.contains("REMOTE_HOSTS_UPLOAD_COMPLETE"));
         assert!(initialize.contains("'\\''"));
         assert!(!initialize.contains("local-payload.bin"));
+        assert!(initialize.contains("dest_digest"));
 
-        let chunk = super::russh_exec_upload_chunk_command("/tmp/.release-part", 7, "cGF5bG9hZA==");
+        let chunk = super::russh_exec_upload_chunk_command("/tmp/.release-part", 7, 0, b"payload");
         assert!(chunk.contains("REMOTE_HOSTS_CHUNK_OK 7"));
         assert!(chunk.contains("cGF5bG9hZA=="));
-        assert!(chunk.len() < 64 * 1024);
-        let missing_marker = super::require_exec_upload_chunk_success(
+        assert!(chunk.contains("elif [ \"$n\" != \"7\" ]"));
+        assert!(chunk.contains("wc -c"));
+        let maximum_chunk = super::russh_exec_upload_chunk_command(
+            "/root/datatool-dev-deploy-20260724/.release.tgz.remote-hosts-ae94167e0388e3c4.part",
+            8,
+            0,
+            &vec![0x5a; super::EXEC_UPLOAD_CHUNK_BYTES],
+        );
+        assert!(maximum_chunk.len() < 40 * 1024);
+        let wrapped_chunk = super::russh_transfer_exec_command(&maximum_chunk);
+        assert!(wrapped_chunk.starts_with("'sh' '-lc' '"));
+        assert!(wrapped_chunk.contains("'\\''"));
+        assert!(wrapped_chunk.len() < 40 * 1024);
+        let payload_sha256 = format!("{:x}", Sha256::digest(b"payload"));
+        let markerless = super::require_exec_upload_chunk_success(
             &ExecResult {
                 exit_code: Some(0),
                 stdout: String::new(),
@@ -7850,22 +9457,49 @@ mod tests {
                 truncated: false,
             },
             7,
+            7,
+            &payload_sha256,
             &spec.remote_path,
             "/tmp/.release-part",
         );
-        assert!(missing_marker.is_err());
-        super::require_exec_upload_chunk_success(
+        assert!(markerless.is_err());
+        let missing_marker_and_status = super::require_exec_upload_chunk_success(
             &ExecResult {
                 exit_code: None,
-                stdout: "REMOTE_HOSTS_CHUNK_OK 7\n".to_owned(),
+                stdout: String::new(),
                 stderr: String::new(),
                 truncated: false,
             },
             7,
+            7,
+            &payload_sha256,
+            &spec.remote_path,
+            "/tmp/.release-part",
+        );
+        assert!(missing_marker_and_status.is_err());
+        super::require_exec_upload_chunk_success(
+            &ExecResult {
+                exit_code: None,
+                stdout: format!(
+                    "REMOTE_HOSTS_CHUNK_OK 7 7 {:x}\n",
+                    Sha256::digest(b"payload")
+                ),
+                stderr: String::new(),
+                truncated: false,
+            },
+            7,
+            7,
+            &payload_sha256,
             &spec.remote_path,
             "/tmp/.release-part",
         )?;
+        Ok(())
+    }
 
+    #[test]
+    fn exec_channel_finalize_and_download_commands_are_verified_and_shell_quoted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = exec_transfer_test_spec();
         let finalize = super::russh_exec_upload_finalize_command(
             &spec,
             "/tmp/.release-part",
@@ -7876,12 +9510,20 @@ mod tests {
         assert!(finalize.contains("chmod 600 \"$tmp\""));
         assert!(finalize.contains("'\\''"));
         assert!(!finalize.contains("local-payload.bin"));
+        assert!(finalize.contains("[ -f \"$dest\" ]"));
 
         spec.direction = SftpDirection::Download;
         let download = super::russh_exec_download_command(&spec);
         assert!(download.contains("REMOTE_HOSTS_TRANSFER_META"));
         assert!(download.contains("[ \"$bytes\" -le \"1024\" ]"));
         assert!(download.contains("'\\''"));
+        let payload_position = download.find("cat \"$src\"").unwrap_or(usize::MAX);
+        let metadata_position = download.find("REMOTE_HOSTS_TRANSFER_META").unwrap_or(0);
+        assert!(payload_position < metadata_position);
+        let wrapped_download = super::russh_exec_download_request_command(&spec);
+        assert!(wrapped_download.starts_with("'sh' '-lc' '"));
+        assert!(wrapped_download.contains("REMOTE_HOSTS_TRANSFER_META"));
+        assert!(wrapped_download.contains("'\\''"));
 
         let marker = format!("banner\nREMOTE_HOSTS_TRANSFER_OK 17 {}\n", "a".repeat(64));
         assert_eq!(
@@ -7889,6 +9531,293 @@ mod tests {
             (17, "a".repeat(64))
         );
         Ok(())
+    }
+
+    #[test]
+    fn exec_channel_upload_commands_resume_without_duplicate_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("release.bin");
+        let temporary = directory.path().join(".release.bin.remote-hosts-test.part");
+        let first_chunk = b"deployment-";
+        let second_chunk = b"payload";
+        let payload = [first_chunk.as_slice(), second_chunk.as_slice()].concat();
+        let payload_sha256 = format!("{:x}", Sha256::digest(&payload));
+        let empty_sha256 = format!("{:x}", Sha256::digest([]));
+        let spec = FileTransferSpec {
+            direction: SftpDirection::Upload,
+            local_path: "/tmp/local-release.bin".to_owned(),
+            remote_path: destination.to_string_lossy().into_owned(),
+            overwrite: SftpOverwritePolicy::Replace,
+            mode: Some(0o600),
+            max_size_bytes: 1024,
+            expected_sha256: Some(payload_sha256.clone()),
+            timeout_seconds: DEFAULT_SFTP_TIMEOUT_SECONDS,
+        };
+        let temporary = temporary.to_string_lossy().into_owned();
+
+        let initialize = super::russh_exec_upload_initialize_command(
+            &spec,
+            &temporary,
+            u64::try_from(payload.len())?,
+            &payload_sha256,
+        );
+        let initialized = run_test_shell(&initialize)?;
+        assert!(initialized.status.success());
+        assert!(
+            String::from_utf8(initialized.stdout)?
+                .contains(&format!("REMOTE_HOSTS_UPLOAD_READY 0 {empty_sha256}"))
+        );
+
+        let first_chunk_command =
+            super::russh_exec_upload_chunk_command(&temporary, 0, 0, first_chunk);
+        let first_append = run_test_shell(&first_chunk_command)?;
+        assert!(first_append.status.success());
+        assert_eq!(std::fs::read(&temporary)?, first_chunk);
+
+        // A new stateless exec channel observes and verifies the retained prefix.
+        let resumed = run_test_shell(&initialize)?;
+        assert!(resumed.status.success());
+        assert!(String::from_utf8(resumed.stdout)?.contains(&format!(
+            "REMOTE_HOSTS_UPLOAD_READY {} {:x}",
+            first_chunk.len(),
+            Sha256::digest(first_chunk)
+        )));
+
+        let second_chunk_command = super::russh_exec_upload_chunk_command(
+            &temporary,
+            1,
+            u64::try_from(first_chunk.len())?,
+            second_chunk,
+        );
+        for _ in 0..2 {
+            let appended = run_test_shell(&second_chunk_command)?;
+            assert!(
+                appended.status.success(),
+                "{}",
+                String::from_utf8_lossy(&appended.stderr)
+            );
+            assert!(String::from_utf8(appended.stdout)?.contains(&format!(
+                "REMOTE_HOSTS_CHUNK_OK 1 {} {:x}",
+                payload.len(),
+                Sha256::digest(second_chunk)
+            )));
+        }
+        assert_eq!(std::fs::read(&temporary)?, payload);
+
+        let finalize = super::russh_exec_upload_finalize_command(
+            &spec,
+            &temporary,
+            u64::try_from(payload.len())?,
+            &payload_sha256,
+        );
+        for _ in 0..2 {
+            let finalized = run_test_shell(&finalize)?;
+            assert!(
+                finalized.status.success(),
+                "{}",
+                String::from_utf8_lossy(&finalized.stderr)
+            );
+            assert!(String::from_utf8(finalized.stdout)?.contains("REMOTE_HOSTS_TRANSFER_OK"));
+        }
+        assert_eq!(std::fs::read(destination)?, payload);
+
+        let mut deny_spec = spec.clone();
+        deny_spec.overwrite = SftpOverwritePolicy::Deny;
+        let recover_after_placement = super::russh_exec_upload_initialize_command(
+            &deny_spec,
+            &temporary,
+            u64::try_from(payload.len())?,
+            &payload_sha256,
+        );
+        let recovered = run_test_shell(&recover_after_placement)?;
+        assert!(
+            recovered.status.success(),
+            "{}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert!(String::from_utf8(recovered.stdout)?.contains(&format!(
+            "REMOTE_HOSTS_UPLOAD_COMPLETE {} {payload_sha256}",
+            payload.len()
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn exec_channel_inline_upload_is_atomic_idempotent_and_verifies_final_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("release.bin");
+        let temporary = directory
+            .path()
+            .join(".release.bin.remote-hosts-stream.part");
+        let payload = b"binary\0deployment\npayload";
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload));
+        let spec = FileTransferSpec {
+            direction: SftpDirection::Upload,
+            local_path: "/tmp/local-release.bin".to_owned(),
+            remote_path: destination.to_string_lossy().into_owned(),
+            overwrite: SftpOverwritePolicy::Replace,
+            mode: Some(0o600),
+            max_size_bytes: 1024,
+            expected_sha256: Some(payload_sha256.clone()),
+            timeout_seconds: DEFAULT_SFTP_TIMEOUT_SECONDS,
+        };
+        let command = super::russh_exec_inline_upload_command(
+            &spec,
+            &temporary.to_string_lossy(),
+            u64::try_from(payload.len())?,
+            &payload_sha256,
+            payload,
+        );
+        assert!(command.contains("YmluYXJ5AGRlcGxveW1lbnQKcGF5bG9hZA=="));
+        assert!(command.contains("REMOTE_HOSTS_TRANSFER_OK"));
+        assert!(!command.contains("binary"));
+        assert!(super::russh_transfer_exec_command(&command).len() < 2048);
+
+        for _ in 0..2 {
+            let output = run_test_shell(&command)?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8(output.stdout)?.contains(&format!(
+                "REMOTE_HOSTS_TRANSFER_OK {} {payload_sha256}",
+                payload.len()
+            )));
+        }
+        assert_eq!(std::fs::read(destination)?, payload);
+
+        let verification = super::russh_exec_upload_destination_verify_command(
+            &spec.remote_path,
+            u64::try_from(payload.len())?,
+            &payload_sha256,
+        );
+        let marker = "REMOTE_HOSTS_UPLOAD_VERIFY_DONE_test";
+        let verified = run_test_shell(&super::framed_posix_script_ssh_exec_command(
+            &verification,
+            marker,
+        ))?;
+        let mut verified = ExecResult {
+            exit_code: Some(0),
+            stdout: String::from_utf8(verified.stdout)?,
+            stderr: String::from_utf8(verified.stderr)?,
+            truncated: false,
+        };
+        assert!(super::recover_framed_exec_status(&mut verified, marker));
+        assert_eq!(verified.exit_code, Some(0));
+        assert!(verified.stdout.is_empty());
+
+        let mismatched = super::russh_exec_upload_destination_verify_command(
+            &spec.remote_path,
+            u64::try_from(payload.len())?.saturating_add(1),
+            &payload_sha256,
+        );
+        let mismatched = run_test_shell(&super::framed_posix_script_ssh_exec_command(
+            &mismatched,
+            marker,
+        ))?;
+        let mut mismatched = ExecResult {
+            exit_code: Some(0),
+            stdout: String::from_utf8(mismatched.stdout)?,
+            stderr: String::from_utf8(mismatched.stderr)?,
+            truncated: false,
+        };
+        assert!(super::recover_framed_exec_status(&mut mismatched, marker));
+        assert_eq!(mismatched.exit_code, Some(76));
+        Ok(())
+    }
+
+    #[test]
+    fn exec_channel_stream_upload_keeps_payload_out_of_command_and_verifies_stdin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("stream-release.bin");
+        let temporary = directory
+            .path()
+            .join(".stream-release.bin.remote-hosts-test.part");
+        let payload = vec![0x5a; 600 * 1024];
+        let payload_sha256 = format!("{:x}", Sha256::digest(&payload));
+        let spec = FileTransferSpec {
+            direction: SftpDirection::Upload,
+            local_path: "/tmp/local-stream-release.bin".to_owned(),
+            remote_path: destination.to_string_lossy().into_owned(),
+            overwrite: SftpOverwritePolicy::Replace,
+            mode: Some(0o600),
+            max_size_bytes: 1024 * 1024,
+            expected_sha256: Some(payload_sha256.clone()),
+            timeout_seconds: DEFAULT_SFTP_TIMEOUT_SECONDS,
+        };
+        let command = super::russh_exec_stream_upload_command(
+            &spec,
+            &temporary.to_string_lossy(),
+            u64::try_from(payload.len())?,
+            &payload_sha256,
+        );
+
+        assert!(command.contains("cat > \"$tmp\""));
+        assert!(command.contains("REMOTE_HOSTS_TRANSFER_OK"));
+        assert!(!command.contains("WlpaWlpaWlpaWlpa"));
+        assert!(super::russh_transfer_exec_command(&command).len() < 4096);
+
+        let output = run_test_shell_with_input(&command, &payload)?;
+        assert!(output.status.success());
+        assert!(String::from_utf8(output.stdout)?.contains(&format!(
+            "REMOTE_HOSTS_TRANSFER_OK {} {payload_sha256}",
+            payload.len()
+        )));
+        assert_eq!(std::fs::read(destination)?, payload);
+        Ok(())
+    }
+
+    #[test]
+    fn resumable_upload_temporary_path_is_stable_for_the_same_artifact() {
+        let destination = "/root/release_artifacts/app.tar.gz";
+        let digest = "a".repeat(64);
+        let first = super::resumable_remote_temporary_path(destination, &digest);
+        let second = super::resumable_remote_temporary_path(destination, &digest);
+        let other = super::resumable_remote_temporary_path(destination, &"b".repeat(64));
+
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert!(first.starts_with("/root/release_artifacts/.app.tar.gz.remote-hosts-"));
+        assert!(
+            std::path::Path::new(&first)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
+        );
+    }
+
+    #[test]
+    fn streaming_upload_uses_a_distinct_temporary_path_from_resumable_upload() {
+        let destination = "/root/release_artifacts/app.tar.gz";
+        let digest = "a".repeat(64);
+        let resumable = super::resumable_remote_temporary_path(destination, &digest);
+        let streaming = super::streaming_remote_temporary_path(destination, &digest);
+
+        assert_ne!(streaming, resumable);
+        assert!(streaming.starts_with("/root/release_artifacts/.app.tar.gz.remote-hosts-stream-"));
+        assert!(
+            std::path::Path::new(&streaming)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
+        );
+    }
+
+    #[test]
+    fn local_handshake_cooldown_does_not_consume_a_transfer_stage_attempt() {
+        assert!(!super::exec_transfer_retry_consumes_attempt(
+            &TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds: 17,
+            }
+        ));
+        assert!(super::exec_transfer_retry_consumes_attempt(
+            &TransportError::Timeout
+        ));
+        assert!(super::exec_transfer_retry_consumes_attempt(
+            &TransportError::Backend("connection closed".to_owned())
+        ));
     }
 
     #[tokio::test]
@@ -8297,6 +10226,17 @@ mod tests {
         assert!(chunks.iter().any(|chunk| {
             chunk.redacted_text.contains("pooled_session=true")
                 && chunk.redacted_text.contains("file=manifest.yaml")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.redacted_text.contains("file transfer started")
+                && chunk.redacted_text.contains("direction=Upload")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.redacted_text.contains("stage=uploading")
+                && chunk.redacted_text.contains("bytes_transferred=128")
+                && chunk.redacted_text.contains("total_bytes=256")
+                && chunk.redacted_text.contains("resumed_bytes=64")
+                && chunk.redacted_text.contains("retry_count=1")
         }));
         Ok(())
     }
@@ -9784,6 +11724,71 @@ mod tests {
                 .iter()
                 .any(|event| event.new_state == EntityState::ConnectorOffline)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_daemon_keeps_heartbeating_while_operation_is_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let daemon = ConnectorDaemon::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(SlowTransport(Duration::from_millis(150))),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+            ConnectorDaemonConfig {
+                connector_id: fixture.connector_id,
+                version: "test-daemon".to_owned(),
+                current_network: Some("test-net".to_owned()),
+                heartbeat_interval_ms: 10,
+                idle_min_delay_ms: 5,
+                idle_max_delay_ms: 10,
+                error_backoff_ms: 5,
+            },
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { daemon.run_until_stopped(stop_rx).await });
+
+        wait_for_operation_state(
+            &fixture.repositories,
+            fixture.operation_id,
+            OperationState::Running,
+        )
+        .await?;
+        let first_seen_at = fixture
+            .repositories
+            .connectors
+            .get(fixture.connector_id)
+            .await?
+            .and_then(|connector| connector.last_seen_at)
+            .ok_or("connector heartbeat should exist")?;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let second_seen_at = fixture
+            .repositories
+            .connectors
+            .get(fixture.connector_id)
+            .await?
+            .and_then(|connector| connector.last_seen_at)
+            .ok_or("connector heartbeat should still exist")?;
+
+        assert!(
+            second_seen_at > first_seen_at,
+            "connector heartbeat must advance while a remote operation is still running"
+        );
+
+        wait_for_operation_state(
+            &fixture.repositories,
+            fixture.operation_id,
+            OperationState::Succeeded,
+        )
+        .await?;
+        stop_tx.send(true)?;
+        handle.await??;
         Ok(())
     }
 

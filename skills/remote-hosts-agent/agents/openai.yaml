@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Hosts Agent"
+  short_description: "Reuse SSH channels and maintain topology"
+  default_prompt: "Use $remote-hosts-agent to work through my pooled, observable Remote Hosts channel and keep host or service topology current when relevant."

@@ -73,6 +73,10 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [x] Runtime snapshot filtering so disabled access paths cannot contribute stale connection-health warnings.
 - [x] Managed OpenSSH and native `russh` SFTP upload/download through the existing pooled session, with bounded size/time, SHA-256 verification, same-directory temporary placement, atomic rename, mode, and overwrite policy.
 - [x] Route-compatible POSIX exec-channel file transfer for empty-chain bastion endpoints that cannot carry SFTP writes, with bounded encrypted chunks, no file body in MCP/audit persistence, and mandatory per-stage completion markers.
+- [x] Resumable exec-channel uploads with artifact-stable temporary paths, prefix SHA-256 validation, idempotent chunk replay, connector-restart recovery, and already-placed destination convergence.
+- [x] Single-channel stdin uploads with per-I/O no-progress timeouts, resumable fallback, and healthy pooled-session retention after successful commands and transfers.
+- [x] File-transfer progress events and 30-second active heartbeats with verified bytes, total bytes, resumed bytes, retry count, and elapsed time.
+- [x] Best-effort transfer progress persistence so a diagnostic output-write failure cannot cancel an active data channel.
 - [x] Independent per-access-path and connector-wide shared SSH handshake budgets; local path cooldown is no longer expanded to the ten-minute global window.
 - [x] Route-aware raw and guarded transport cache replacement after endpoint, route, host-kind, keepalive, or connection-policy changes.
 - [x] Bounded MCP reads for complete redacted output artifacts with offset pagination, UTF-8 boundary handling, and artifact-root containment checks.
@@ -97,10 +101,12 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [x] Encrypted credential storage and purpose-specific bindings for any topology resource, with metadata-only HTTP responses.
 - [x] Embedded local administration console with server registry, route health, topology SVG, filtering, snapshot import, resource details, and credential capture.
 - [x] Loopback-only safety boundary for an HTTP process with an unlocked credential vault.
+- [x] launchd API wrapper passes the generated local vault password file so topology credential capture is usable after install/update.
+- [x] Repository-owned Remote Hosts Agent Skill with topology workflow guidance and automatic Codex/Antigravity synchronization during service install/update.
 
 ## Next
 
-- [ ] Add a real gateway/SSHD regression suite for pooled arbitrary commands, session invalidation, one bounded reconnect, cross-workspace reuse, SFTP and exec-channel file transfer, 1 GiB files, complete Artifact reads, and gateways that drop stdin/EOF/stdout/exit-status signals.
+- [ ] Add a real gateway/SSHD regression suite for pooled arbitrary commands, session invalidation, one bounded reconnect, cross-workspace reuse, SFTP and exec-channel file transfer, 1 GiB files, complete Artifact reads, and gateways that drop stdin/EOF/stdout/exit-status signals. The local shell regression already covers disconnect-equivalent stateless chunk continuation, duplicate chunk replies, and already-placed destination recovery.
 - [ ] Add local SSHD integration tests for `control-master-tty` and native `russh` PTY backend.
 - [ ] Add a multi-process MCP integration test that drives two Agent Sessions through one real pooled SSH transport while proving workspace/PTY isolation and write-lease handoff.
 - [ ] Emit authoritative connection, workspace, operation, and PTY lifecycle events into the sequenced runtime event log.

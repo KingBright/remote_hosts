@@ -563,7 +563,7 @@ Default policy:
 Recommended defaults:
 
 ```text
-max_new_ssh_handshakes_per_10_min = 2
+max_new_ssh_handshakes_per_10_min = 10
 max_parallel_exec_channels_per_host = 1
 max_parallel_probe_jobs_per_host = 1
 max_persistent_ptys_per_host = 1

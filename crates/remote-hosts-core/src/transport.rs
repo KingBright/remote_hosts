@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use remote_hosts_domain::{AccessPathId, HostId, OperationId, SessionId, SshTransportTelemetry};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 use crate::CommandProfile;
 
@@ -181,7 +182,7 @@ pub enum FileTransferValidationError {
 }
 
 /// SFTP transfer request.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct SftpRequest {
     /// Operation id.
     pub operation_id: OperationId,
@@ -191,6 +192,23 @@ pub struct SftpRequest {
     pub access_path_id: AccessPathId,
     /// Validated transfer payload.
     pub spec: FileTransferSpec,
+    /// Optional in-process progress stream consumed by the connector worker.
+    pub progress_tx: Option<mpsc::UnboundedSender<SftpProgress>>,
+}
+
+/// Progress emitted while a managed file operation is running.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SftpProgress {
+    /// Current transfer stage.
+    pub stage: String,
+    /// Bytes already verified at the destination or temporary file.
+    pub bytes_transferred: u64,
+    /// Total source size when known.
+    pub total_bytes: Option<u64>,
+    /// Bytes retained from a prior interrupted attempt.
+    pub resumed_bytes: u64,
+    /// Number of safe stage retries after transient transport failure.
+    pub retry_count: u32,
 }
 
 /// Verified SFTP transfer result.

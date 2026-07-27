@@ -28,7 +28,7 @@ pub use transport::{
     CheckRequest, CheckResult, DEFAULT_SFTP_MAX_SIZE_BYTES, DEFAULT_SFTP_TIMEOUT_SECONDS,
     ExecRequest, ExecResult, FileTransferSpec, FileTransferValidationError, ForwardHandle,
     ForwardRequest, MAX_SFTP_MAX_SIZE_BYTES, MAX_SFTP_TIMEOUT_SECONDS, RemoteTransport,
-    SftpDirection, SftpOverwritePolicy, SftpRequest, SftpResult,
+    SftpDirection, SftpOverwritePolicy, SftpProgress, SftpRequest, SftpResult,
 };
 pub use workspace::{WorkspaceCreateCommand, WorkspaceSupervisor, WorkspaceSupervisorError};
 pub use workspace_operation::{

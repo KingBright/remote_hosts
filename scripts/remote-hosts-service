@@ -21,6 +21,9 @@ LAUNCH_AGENT_DIR="${HOME}/Library/LaunchAgents"
 API_PLIST="${LAUNCH_AGENT_DIR}/${API_LABEL}.plist"
 CONNECTOR_PLIST="${LAUNCH_AGENT_DIR}/${CONNECTOR_LABEL}.plist"
 USER_DOMAIN="gui/$(id -u)"
+SKILL_SOURCE_DIR="${ROOT_DIR}/skills/remote-hosts-agent"
+CODEX_SKILL_DIR="${HOME}/.codex/skills/remote-hosts-agent"
+ANTIGRAVITY_SKILL_DIR="${HOME}/.gemini/config/skills/remote-hosts-agent"
 
 usage() {
   cat <<EOF
@@ -32,6 +35,7 @@ Commands:
   start          Start loaded launchd services
   stop           Unload launchd services
   restart        Restart loaded launchd services
+  skills         Install the Remote Hosts skill into Codex and Antigravity
   status         Print launchd status for API and connector
   logs           Tail API and connector logs
   migrate        Run database migrations with the installed binary
@@ -181,6 +185,21 @@ install_binary() {
   install -m 0755 "${release_binary}" "${BIN_PATH}"
 }
 
+install_skills() {
+  if [[ ! -f "${SKILL_SOURCE_DIR}/SKILL.md" ]]; then
+    echo "Remote Hosts skill source is missing at ${SKILL_SOURCE_DIR}" >&2
+    exit 1
+  fi
+  if ! command -v rsync >/dev/null 2>&1; then
+    echo "rsync is required to install Remote Hosts skills" >&2
+    exit 1
+  fi
+
+  mkdir -p "${CODEX_SKILL_DIR}" "${ANTIGRAVITY_SKILL_DIR}"
+  rsync -a --delete "${SKILL_SOURCE_DIR}/" "${CODEX_SKILL_DIR}/"
+  rsync -a --delete "${SKILL_SOURCE_DIR}/" "${ANTIGRAVITY_SKILL_DIR}/"
+}
+
 run_migrate() {
   load_config
   require_installed_binary
@@ -255,9 +274,18 @@ set -a
 . "${CONFIG_FILE}"
 set +a
 export RUST_LOG="\${REMOTE_HOSTS_LOG:-remote_hosts=info,remote_hosts_cli=info}"
-exec "\${REMOTE_HOSTS_BIN}" serve \\
-  --database-url "\${REMOTE_HOSTS_DATABASE_URL}" \\
+if [[ -z "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE:-}" ]]; then
+  unset REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE
+fi
+args=(
+  serve
+  --database-url "\${REMOTE_HOSTS_DATABASE_URL}"
   --bind "\${REMOTE_HOSTS_BIND:-127.0.0.1:8787}"
+)
+if [[ -n "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE:-}" ]]; then
+  args+=(--vault-master-password-file "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}")
+fi
+exec "\${REMOTE_HOSTS_BIN}" "\${args[@]}"
 EOF
 
   cat >"${RUN_DIR}/remote-hosts-connector" <<EOF
@@ -386,6 +414,7 @@ install_services() {
   ensure_default_connector
   write_wrappers
   write_plists
+  install_skills
   bootout_if_loaded "${API_LABEL}" "${API_PLIST}"
   bootout_if_loaded "${CONNECTOR_LABEL}" "${CONNECTOR_PLIST}"
   bootstrap_service "${API_PLIST}"
@@ -403,6 +432,7 @@ update_services() {
   ensure_default_connector
   write_wrappers
   write_plists
+  install_skills
   restart_services
 }
 
@@ -446,6 +476,8 @@ Data:        ${DATA_DIR}
 Logs:        ${LOG_DIR}
 API plist:   ${API_PLIST}
 Worker plist:${CONNECTOR_PLIST}
+Codex skill: ${CODEX_SKILL_DIR}
+AG skill:    ${ANTIGRAVITY_SKILL_DIR}
 EOF
 }
 
@@ -467,6 +499,9 @@ case "${command}" in
     ;;
   restart)
     restart_services
+    ;;
+  skills)
+    install_skills
     ;;
   status)
     status_services
