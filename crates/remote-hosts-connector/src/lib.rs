@@ -7942,19 +7942,13 @@ where
                 }
             }
 
-            let operation = self.worker.run_once();
-            tokio::pin!(operation);
-            let operation_result = loop {
-                let heartbeat_due = tokio::time::sleep_until(next_heartbeat);
-                tokio::pin!(heartbeat_due);
-                tokio::select! {
-                    result = &mut operation => break result,
-                    () = &mut heartbeat_due => {
-                        self.record_connector_state(EntityState::Healthy).await?;
-                        next_heartbeat = Instant::now() + heartbeat_interval;
-                    }
-                }
-            };
+            let operation_result = self
+                .run_operation_with_background_services(
+                    &mut report,
+                    &mut next_heartbeat,
+                    heartbeat_interval,
+                )
+                .await?;
 
             match operation_result {
                 Ok(Some(_outcome)) => {
@@ -7987,6 +7981,75 @@ where
         self.record_connector_state(EntityState::ConnectorOffline)
             .await?;
         Ok(report)
+    }
+
+    async fn run_operation_with_background_services(
+        &self,
+        report: &mut ConnectorDaemonReport,
+        next_heartbeat: &mut Instant,
+        heartbeat_interval: Duration,
+    ) -> Result<Result<Option<ConnectorOperationOutcome>, ConnectorWorkerError>, ConnectorDaemonError>
+    {
+        let operation = self.worker.run_once();
+        tokio::pin!(operation);
+        let mut next_pty_poll =
+            Instant::now() + Duration::from_millis(self.config.idle_min_delay_ms);
+
+        loop {
+            let heartbeat_due = tokio::time::sleep_until(*next_heartbeat);
+            let pty_input_pump = self.pty_input_pump.clone();
+            let pty_poll_at = next_pty_poll;
+            let pty_poll = async move {
+                let Some(pump) = pty_input_pump else {
+                    return std::future::pending().await;
+                };
+                tokio::time::sleep_until(pty_poll_at).await;
+                poll_pty_pump(pump.as_ref()).await
+            };
+            tokio::pin!(heartbeat_due);
+            tokio::pin!(pty_poll);
+
+            tokio::select! {
+                result = &mut operation => return Ok(result),
+                () = &mut heartbeat_due => {
+                    self.record_connector_state(EntityState::Healthy).await?;
+                    *next_heartbeat = Instant::now() + heartbeat_interval;
+                }
+                result = &mut pty_poll => {
+                    let delay = self.handle_background_pty_result(result, report).await?;
+                    next_pty_poll = Instant::now() + delay;
+                }
+            }
+        }
+    }
+
+    async fn handle_background_pty_result(
+        &self,
+        result: Result<Option<PtyPumpOutcome>, ConnectorPtyError>,
+        report: &mut ConnectorDaemonReport,
+    ) -> Result<Duration, ConnectorDaemonError> {
+        match result {
+            Ok(Some(PtyPumpOutcome::Input(outcome))) => {
+                match outcome.state {
+                    PtyInputEventState::Delivered => report.delivered_pty_inputs += 1,
+                    PtyInputEventState::Failed => report.failed_pty_inputs += 1,
+                    PtyInputEventState::Queued | PtyInputEventState::Claimed => {}
+                }
+                Ok(Duration::from_millis(self.config.idle_min_delay_ms))
+            }
+            Ok(Some(PtyPumpOutcome::Activated) | None) => {
+                Ok(Duration::from_millis(self.config.idle_min_delay_ms))
+            }
+            Err(error) => {
+                report.infrastructure_errors += 1;
+                tracing::warn!(
+                    %error,
+                    "connector daemon PTY pump error while operation is running"
+                );
+                self.record_connector_state(EntityState::Degraded).await?;
+                Ok(Duration::from_millis(self.config.error_backoff_ms))
+            }
+        }
     }
 
     async fn reconcile_runtime_startup(
@@ -8669,6 +8732,44 @@ mod tests {
             &self,
         ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, super::ConnectorPtyError> {
             if self.delivered.swap(true, Ordering::SeqCst) {
+                return Ok(None);
+            }
+            Ok(Some(ConnectorPtyInputDeliveryOutcome {
+                input_event_id: PtyInputEventId::new(),
+                pty_session_id: PtySessionId::new(),
+                state: PtyInputEventState::Delivered,
+                byte_len: 1,
+                error: None,
+            }))
+        }
+    }
+
+    struct DeferredOneShotPtyInputPump {
+        ready_at: tokio::time::Instant,
+        delivered: AtomicBool,
+    }
+
+    impl DeferredOneShotPtyInputPump {
+        fn new(delay: Duration) -> Self {
+            Self {
+                ready_at: tokio::time::Instant::now() + delay,
+                delivered: AtomicBool::new(false),
+            }
+        }
+
+        fn was_delivered(&self) -> bool {
+            self.delivered.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl QueuedPtyInputPump for DeferredOneShotPtyInputPump {
+        async fn deliver_next(
+            &self,
+        ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, super::ConnectorPtyError> {
+            if tokio::time::Instant::now() < self.ready_at
+                || self.delivered.swap(true, Ordering::SeqCst)
+            {
                 return Ok(None);
             }
             Ok(Some(ConnectorPtyInputDeliveryOutcome {
@@ -11914,6 +12015,59 @@ mod tests {
         .await?;
         stop_tx.send(true)?;
         handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_daemon_keeps_pumping_pty_input_while_operation_is_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let pump = Arc::new(DeferredOneShotPtyInputPump::new(Duration::from_millis(30)));
+        let daemon = ConnectorDaemon::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(SlowTransport(Duration::from_millis(150))),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+            ConnectorDaemonConfig {
+                connector_id: fixture.connector_id,
+                version: "test-daemon".to_owned(),
+                current_network: Some("test-net".to_owned()),
+                heartbeat_interval_ms: 10,
+                idle_min_delay_ms: 5,
+                idle_max_delay_ms: 10,
+                error_backoff_ms: 5,
+            },
+        )
+        .with_pty_input_pump(pump.clone());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { daemon.run_until_stopped(stop_rx).await });
+
+        wait_for_operation_state(
+            &fixture.repositories,
+            fixture.operation_id,
+            OperationState::Running,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        assert!(
+            pump.was_delivered(),
+            "PTY input must be delivered before the long remote operation completes"
+        );
+
+        wait_for_operation_state(
+            &fixture.repositories,
+            fixture.operation_id,
+            OperationState::Succeeded,
+        )
+        .await?;
+        stop_tx.send(true)?;
+        let report = handle.await??;
+        assert_eq!(report.delivered_pty_inputs, 1);
         Ok(())
     }
 
