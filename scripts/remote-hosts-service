@@ -27,14 +27,15 @@ ANTIGRAVITY_SKILL_DIR="${HOME}/.gemini/config/skills/remote-hosts-agent"
 
 usage() {
   cat <<EOF
-Usage: scripts/remote-hosts-service <command>
+Usage: scripts/remote-hosts-service <command> [--force]
 
 Commands:
   install        Build, install, migrate, register launchd services, and start them
-  update         Rebuild/reinstall binary, migrate database, refresh launchd files, restart
-  start          Start loaded launchd services
+  stage          Rebuild/install/migrate and refresh files without restarting services
+  update         Stage a release and restart only when no conversation work is active
+  start          Start loaded launchd services without restarting running processes
   stop           Unload launchd services
-  restart        Restart loaded launchd services
+  restart        Restart only when no conversation work is active
   skills         Install the Remote Hosts skill into Codex and Antigravity
   status         Print launchd status for API and connector
   logs           Tail API and connector logs
@@ -44,6 +45,9 @@ Commands:
 
 Config:
   ${CONFIG_FILE}
+
+Options:
+  --force        Allow install/update/restart to interrupt active operations or PTYs
 EOF
 }
 
@@ -88,6 +92,7 @@ REMOTE_HOSTS_PTY_BACKEND_MODE=auto
 REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE=${DEFAULT_VAULT_MASTER_PASSWORD_FILE}
 REMOTE_HOSTS_KNOWN_HOSTS_PATH=
 REMOTE_HOSTS_RUSSH_INACTIVITY_TIMEOUT_SECONDS=30
+REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS=4
 REMOTE_HOSTS_LOG=remote_hosts=info,remote_hosts_cli=info
 EOF
 }
@@ -404,7 +409,7 @@ bootstrap_service() {
   launchctl bootstrap "${USER_DOMAIN}" "${plist}"
 }
 
-install_services() {
+stage_services() {
   ensure_dirs
   write_default_config
   ensure_local_vault
@@ -415,6 +420,12 @@ install_services() {
   write_wrappers
   write_plists
   install_skills
+}
+
+install_services() {
+  local force_restart="${1:-0}"
+  stage_services
+  assert_restart_safe "${force_restart}"
   bootout_if_loaded "${API_LABEL}" "${API_PLIST}"
   bootout_if_loaded "${CONNECTOR_LABEL}" "${CONNECTOR_PLIST}"
   bootstrap_service "${API_PLIST}"
@@ -423,22 +434,14 @@ install_services() {
 }
 
 update_services() {
-  ensure_dirs
-  write_default_config
-  ensure_local_vault
-  build_release
-  install_binary
-  run_migrate
-  ensure_default_connector
-  write_wrappers
-  write_plists
-  install_skills
-  restart_services
+  local force_restart="${1:-0}"
+  stage_services
+  restart_services "${force_restart}"
 }
 
 start_services() {
-  launchctl kickstart -k "${USER_DOMAIN}/${API_LABEL}" >/dev/null 2>&1 || bootstrap_service "${API_PLIST}"
-  launchctl kickstart -k "${USER_DOMAIN}/${CONNECTOR_LABEL}" >/dev/null 2>&1 || bootstrap_service "${CONNECTOR_PLIST}"
+  launchctl kickstart "${USER_DOMAIN}/${API_LABEL}" >/dev/null 2>&1 || bootstrap_service "${API_PLIST}"
+  launchctl kickstart "${USER_DOMAIN}/${CONNECTOR_LABEL}" >/dev/null 2>&1 || bootstrap_service "${CONNECTOR_PLIST}"
 }
 
 stop_services() {
@@ -446,7 +449,57 @@ stop_services() {
   bootout_if_loaded "${CONNECTOR_LABEL}" "${CONNECTOR_PLIST}"
 }
 
+assert_restart_safe() {
+  local force_restart="${1:-0}"
+  if [[ "${force_restart}" == "1" ]]; then
+    return
+  fi
+
+  load_config
+  local db_path
+  db_path="$(sqlite_path_from_url "${REMOTE_HOSTS_DATABASE_URL}")"
+  if [[ ! -f "${db_path}" ]]; then
+    return
+  fi
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "refusing to restart without sqlite3 to verify active conversation work; use --force only after manual verification" >&2
+    return 1
+  fi
+
+  local busy_summary
+  busy_summary="$(
+    sqlite3 -readonly -separator ' ' "${db_path}" "
+      SELECT
+        (SELECT COUNT(*) FROM operation_runs
+          WHERE state_json IN ('\"queued\"', '\"running\"')),
+        (SELECT COUNT(*) FROM pty_sessions
+          WHERE backend_state_json IN ('\"pending\"', '\"active\"')
+            AND input_allowed = 1),
+        (SELECT COUNT(*) FROM pty_input_events
+          WHERE state_json IN ('\"queued\"', '\"claimed\"')),
+        (SELECT COUNT(*) FROM host_write_leases
+          WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+    "
+  )"
+  local operation_count pty_count pty_input_count write_lease_count
+  read -r operation_count pty_count pty_input_count write_lease_count <<<"${busy_summary}"
+  if (( operation_count > 0 || pty_count > 0 || pty_input_count > 0 || write_lease_count > 0 )); then
+    cat >&2 <<EOF
+refusing to restart Remote Hosts while conversation work is active:
+  queued_or_running_operations=${operation_count}
+  pending_or_active_ptys=${pty_count}
+  queued_or_claimed_pty_inputs=${pty_input_count}
+  unexpired_write_leases=${write_lease_count}
+The new binary and service files may already be staged. Retry 'restart' when idle,
+or use '--force' only when interrupting those conversations is intentional.
+EOF
+    return 1
+  fi
+}
+
 restart_services() {
+  local force_restart="${1:-0}"
+  assert_restart_safe "${force_restart}"
   stop_services
   bootstrap_service "${API_PLIST}"
   bootstrap_service "${CONNECTOR_PLIST}"
@@ -482,13 +535,27 @@ EOF
 }
 
 command="${1:-}"
+option="${2:-}"
+force_restart=0
+if [[ -n "${option}" ]]; then
+  if [[ "${option}" != "--force" ]]; then
+    echo "unknown option: ${option}" >&2
+    usage >&2
+    exit 2
+  fi
+  force_restart=1
+fi
 case "${command}" in
   install)
-    install_services
+    install_services "${force_restart}"
+    print_config
+    ;;
+  stage)
+    stage_services
     print_config
     ;;
   update)
-    update_services
+    update_services "${force_restart}"
     print_config
     ;;
   start)
@@ -498,7 +565,7 @@ case "${command}" in
     stop_services
     ;;
   restart)
-    restart_services
+    restart_services "${force_restart}"
     ;;
   skills)
     install_skills

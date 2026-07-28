@@ -1289,7 +1289,7 @@ async fn open_workspace_pty_session(
     let active_ptys = state
         .repositories
         .pty_sessions
-        .count_active_for_workspace(workspace_id)
+        .count_active_for_host(workspace.host_id)
         .await?;
     let pty = PtySessionSupervisor::default().open_session(
         &workspace,
@@ -2533,7 +2533,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn workspace_creation_is_visible_and_rate_limited()
+    async fn workspace_creation_supports_bounded_multi_conversation_capacity()
     -> Result<(), Box<dyn std::error::Error>> {
         let pool = connect_sqlite("sqlite::memory:").await?;
         migrate(&pool).await?;
@@ -2680,6 +2680,23 @@ mod tests {
         let output_body: serde_json::Value = serde_json::from_slice(&bytes)?;
         assert_eq!(output_body["chunks"][0]["stream"], "system");
 
+        for _ in 1..32 {
+            let additional_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/hosts/{}/workspaces", host.id))
+                        .header("content-type", "application/json")
+                        .body(body::Body::from(create_body.clone()))?,
+                )
+                .await?;
+            assert_eq!(
+                additional_response.status(),
+                axum::http::StatusCode::CREATED
+            );
+        }
+
         let limited_response = app
             .clone()
             .oneshot(
@@ -2704,7 +2721,7 @@ mod tests {
             .await?;
         let bytes = body::to_bytes(list_response.into_body(), usize::MAX).await?;
         let list_body: serde_json::Value = serde_json::from_slice(&bytes)?;
-        assert_eq!(list_body.as_array().map(Vec::len), Some(1));
+        assert_eq!(list_body.as_array().map(Vec::len), Some(32));
         Ok(())
     }
 

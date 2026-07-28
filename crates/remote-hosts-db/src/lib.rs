@@ -1098,6 +1098,171 @@ impl ConnectionSessionRepository {
         Ok(())
     }
 
+    /// Atomically records a newly opened channel on a logical connection session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the database rejects the update.
+    pub async fn open_channel(
+        &self,
+        session: &ConnectionSession,
+        reused: bool,
+        reset_failures: bool,
+    ) -> Result<ConnectionSession, DbError> {
+        let row = sqlx::query(
+            r"
+            INSERT INTO connection_sessions (
+                session_id, access_path_id, connector_id, state_json, created_at, last_used_at,
+                open_channels, reused_count, failure_count, last_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                state_json = excluded.state_json,
+                last_used_at = excluded.last_used_at,
+                open_channels = connection_sessions.open_channels + 1,
+                reused_count = connection_sessions.reused_count + excluded.reused_count,
+                failure_count = CASE
+                    WHEN ? THEN 0
+                    ELSE connection_sessions.failure_count
+                END,
+                last_error = CASE
+                    WHEN ? THEN NULL
+                    ELSE connection_sessions.last_error
+                END
+            RETURNING *
+            ",
+        )
+        .bind(session.session_id.to_string())
+        .bind(session.access_path_id.to_string())
+        .bind(session.connector_id.to_string())
+        .bind(to_json(&session.state)?)
+        .bind(session.created_at)
+        .bind(session.last_used_at)
+        .bind(i64::from(reused))
+        .bind(if reset_failures {
+            0_i64
+        } else {
+            u32_to_i64(session.failure_count)
+        })
+        .bind(if reset_failures {
+            None
+        } else {
+            session.last_error.as_deref()
+        })
+        .bind(reset_failures)
+        .bind(reset_failures)
+        .fetch_one(&self.pool)
+        .await?;
+        row_to_connection_session(&row)
+    }
+
+    /// Atomically releases one open channel while preserving the session health state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database rejects the update.
+    pub async fn close_channel(
+        &self,
+        session_id: SessionId,
+        observed_at: OffsetDateTime,
+    ) -> Result<Option<ConnectionSession>, DbError> {
+        let row = sqlx::query(
+            r"
+            UPDATE connection_sessions
+            SET last_used_at = ?,
+                open_channels = MAX(open_channels - 1, 0)
+            WHERE session_id = ?
+            RETURNING *
+            ",
+        )
+        .bind(observed_at)
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_connection_session).transpose()
+    }
+
+    /// Atomically releases a successful channel and clears prior connection failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the database rejects the update.
+    pub async fn close_channel_success(
+        &self,
+        session_id: SessionId,
+        observed_at: OffsetDateTime,
+    ) -> Result<Option<ConnectionSession>, DbError> {
+        let row = sqlx::query(
+            r"
+            UPDATE connection_sessions
+            SET state_json = ?,
+                last_used_at = ?,
+                open_channels = MAX(open_channels - 1, 0),
+                failure_count = 0,
+                last_error = NULL
+            WHERE session_id = ?
+            RETURNING *
+            ",
+        )
+        .bind(to_json(&EntityState::Connected)?)
+        .bind(observed_at)
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_connection_session).transpose()
+    }
+
+    /// Atomically records a connection failure and optionally releases its channel reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the database rejects the update.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_failure(
+        &self,
+        session_id: SessionId,
+        observed_at: OffsetDateTime,
+        state: EntityState,
+        last_error: &str,
+        increment_failure: bool,
+        close_channel: bool,
+        circuit_breaker_eligible: bool,
+        circuit_breaker_threshold: u32,
+    ) -> Result<Option<ConnectionSession>, DbError> {
+        let increment = i64::from(increment_failure);
+        let row = sqlx::query(
+            r"
+            UPDATE connection_sessions
+            SET state_json = CASE
+                    WHEN ? AND failure_count + ? >= ? THEN ?
+                    ELSE ?
+                END,
+                last_used_at = ?,
+                open_channels = CASE
+                    WHEN ? THEN MAX(open_channels - 1, 0)
+                    ELSE open_channels
+                END,
+                failure_count = failure_count + ?,
+                last_error = ?
+            WHERE session_id = ?
+            RETURNING *
+            ",
+        )
+        .bind(circuit_breaker_eligible)
+        .bind(increment)
+        .bind(u32_to_i64(circuit_breaker_threshold))
+        .bind(to_json(&EntityState::CircuitOpen)?)
+        .bind(to_json(&state)?)
+        .bind(observed_at)
+        .bind(close_channel)
+        .bind(increment)
+        .bind(last_error)
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_connection_session).transpose()
+    }
+
     /// Gets a connection session by id.
     ///
     /// # Errors
@@ -1875,11 +2040,43 @@ impl PtySessionRepository {
             SELECT COUNT(*)
             FROM pty_sessions
             WHERE workspace_id = ?
-              AND state_json != ?
+              AND state_json IN (?, ?)
+              AND input_allowed = 1
+              AND backend_state_json IN (?, ?)
             ",
         )
         .bind(workspace_id.to_string())
-        .bind(to_json(&WorkspaceState::Closed)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&PtyBackendState::Pending)?)
+        .bind(to_json(&PtyBackendState::Active)?)
+        .fetch_one(&self.pool)
+        .await?;
+        i64_to_u32(count)
+    }
+
+    /// Counts active PTY sessions across all workspaces for a host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or serialization fails.
+    pub async fn count_active_for_host(&self, host_id: HostId) -> Result<u32, DbError> {
+        let count: i64 = sqlx::query_scalar(
+            r"
+            SELECT COUNT(*)
+            FROM pty_sessions ps
+            JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
+            WHERE aw.host_id = ?
+              AND ps.state_json IN (?, ?)
+              AND ps.input_allowed = 1
+              AND ps.backend_state_json IN (?, ?)
+            ",
+        )
+        .bind(host_id.to_string())
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&PtyBackendState::Pending)?)
+        .bind(to_json(&PtyBackendState::Active)?)
         .fetch_one(&self.pool)
         .await?;
         i64_to_u32(count)
@@ -2572,6 +2769,18 @@ impl OperationRunRepository {
                   AND attempt_count < ?
                   AND (
                     requires_write_lease = 0
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM operation_runs running_write
+                        WHERE running_write.host_id = operation_runs.host_id
+                          AND running_write.requires_write_lease = 1
+                          AND running_write.state_json = ?
+                          AND running_write.lease_expires_at IS NOT NULL
+                          AND running_write.lease_expires_at > ?
+                    )
+                  )
+                  AND (
+                    requires_write_lease = 0
                     OR agent_session_id IS NULL
                     OR NOT EXISTS (
                         SELECT 1
@@ -2603,6 +2812,8 @@ impl OperationRunRepository {
         .bind("claimed by connector worker")
         .bind(connector_id.to_string())
         .bind(u32_to_i64(max_attempts))
+        .bind(to_json(&OperationState::Running)?)
+        .bind(claimed_at)
         .bind(claimed_at)
         .bind(to_json(&OperationState::Queued)?)
         .bind(to_json(&OperationState::Running)?)
@@ -4713,6 +4924,100 @@ mod tests {
             last_error: None,
         };
         repos.connection_sessions.upsert(&session).await?;
+        let (first_open, second_open) = tokio::join!(
+            repos
+                .connection_sessions
+                .open_channel(&session, true, false),
+            repos
+                .connection_sessions
+                .open_channel(&session, true, false),
+        );
+        first_open?;
+        second_open?;
+        let concurrently_opened = repos
+            .connection_sessions
+            .get(session.session_id)
+            .await?
+            .ok_or_else(|| io::Error::other("connection session exists"))?;
+        assert_eq!(concurrently_opened.open_channels, 3);
+        assert_eq!(concurrently_opened.reused_count, 5);
+        let (first_close, second_close) = tokio::join!(
+            repos
+                .connection_sessions
+                .close_channel(session.session_id, now),
+            repos
+                .connection_sessions
+                .close_channel(session.session_id, now),
+        );
+        first_close?;
+        second_close?;
+        let concurrently_closed = repos
+            .connection_sessions
+            .get(session.session_id)
+            .await?
+            .ok_or_else(|| io::Error::other("connection session exists"))?;
+        assert_eq!(concurrently_closed.open_channels, 1);
+        repos
+            .connection_sessions
+            .open_channel(&session, true, false)
+            .await?;
+        repos
+            .connection_sessions
+            .open_channel(&session, true, false)
+            .await?;
+        let (first_failure, second_failure) = tokio::join!(
+            repos.connection_sessions.record_failure(
+                session.session_id,
+                now,
+                EntityState::Degraded,
+                "concurrent failure",
+                true,
+                true,
+                true,
+                3,
+            ),
+            repos.connection_sessions.record_failure(
+                session.session_id,
+                now,
+                EntityState::Degraded,
+                "concurrent failure",
+                true,
+                true,
+                true,
+                3,
+            ),
+        );
+        first_failure?;
+        second_failure?;
+        let twice_failed = repos
+            .connection_sessions
+            .get(session.session_id)
+            .await?
+            .ok_or_else(|| io::Error::other("connection session exists"))?;
+        assert_eq!(twice_failed.open_channels, 1);
+        assert_eq!(twice_failed.failure_count, 2);
+        assert_eq!(twice_failed.state, EntityState::Degraded);
+        repos
+            .connection_sessions
+            .open_channel(&session, true, false)
+            .await?;
+        let circuit_open = repos
+            .connection_sessions
+            .record_failure(
+                session.session_id,
+                now,
+                EntityState::Degraded,
+                "threshold failure",
+                true,
+                true,
+                true,
+                3,
+            )
+            .await?
+            .ok_or_else(|| io::Error::other("connection session exists"))?;
+        assert_eq!(circuit_open.open_channels, 1);
+        assert_eq!(circuit_open.failure_count, 3);
+        assert_eq!(circuit_open.state, EntityState::CircuitOpen);
         assert_eq!(
             repos
                 .connection_sessions
@@ -4739,6 +5044,14 @@ mod tests {
             last_activity_at: now,
         };
         repos.pty_sessions.upsert(&pty).await?;
+        let mut second_workspace = workspace.clone();
+        second_workspace.id = WorkspaceId::new();
+        second_workspace.label = "agent-secondary".to_owned();
+        repos.workspaces.insert(&second_workspace).await?;
+        let mut second_pty = pty.clone();
+        second_pty.pty_session_id = PtySessionId::new();
+        second_pty.workspace_id = second_workspace.id;
+        repos.pty_sessions.upsert(&second_pty).await?;
         assert_eq!(
             repos
                 .pty_sessions
@@ -4754,6 +5067,13 @@ mod tests {
                 .await?,
             1
         );
+        assert_eq!(
+            repos
+                .pty_sessions
+                .count_active_for_host(workspace.host_id)
+                .await?,
+            2
+        );
         let closed_pty = repos
             .pty_sessions
             .close(pty.pty_session_id, Some(0), now)
@@ -4767,6 +5087,25 @@ mod tests {
                 .count_active_for_workspace(workspace.id)
                 .await?,
             0
+        );
+        assert_eq!(
+            repos
+                .pty_sessions
+                .count_active_for_host(workspace.host_id)
+                .await?,
+            1
+        );
+        second_pty.state = WorkspaceState::Done;
+        second_pty.input_allowed = false;
+        second_pty.backend_state = PtyBackendState::Closed;
+        repos.pty_sessions.upsert(&second_pty).await?;
+        assert_eq!(
+            repos
+                .pty_sessions
+                .count_active_for_host(workspace.host_id)
+                .await?,
+            0,
+            "terminal PTY history must not consume the host concurrency limit"
         );
         let pty_chunk = PtyOutputChunk {
             id: PtyOutputChunkId::new(),
@@ -5121,6 +5460,54 @@ mod tests {
             .await?
             .ok_or_else(|| io::Error::other("mutation should run after lease expiry"))?;
         assert_eq!(claimed_mutation.id, mutating_b.id);
+        let mut same_session_mutation = mutating_b.clone();
+        same_session_mutation.id = OperationId::new();
+        same_session_mutation.idempotency_key = Some("agent-b-write-2".to_owned());
+        same_session_mutation.state = OperationState::Queued;
+        same_session_mutation.started_at = lock_at + time::Duration::seconds(2);
+        same_session_mutation.claim_token = None;
+        same_session_mutation.claimed_at = None;
+        same_session_mutation.lease_expires_at = None;
+        same_session_mutation.attempt_count = 0;
+        repos.operations.insert(&same_session_mutation).await?;
+        assert!(
+            repos
+                .operations
+                .claim_next_for_connector(
+                    connector.id,
+                    "claim-same-session-write-2",
+                    lock_at,
+                    lock_at + time::Duration::minutes(5),
+                    3,
+                )
+                .await?
+                .is_none(),
+            "same-session host mutations must not overlap"
+        );
+        repos
+            .operations
+            .finish_claimed(ClaimedOperationFinish {
+                id: claimed_mutation.id,
+                claim_token: "claim-mutation-b",
+                state: OperationState::Succeeded,
+                finished_at: lock_at,
+                exit_code: Some(0),
+                redacted_output_summary: Some("ok"),
+                last_error: None,
+            })
+            .await?;
+        let claimed_second_mutation = repos
+            .operations
+            .claim_next_for_connector(
+                connector.id,
+                "claim-same-session-write-2",
+                lock_at,
+                lock_at + time::Duration::minutes(5),
+                3,
+            )
+            .await?
+            .ok_or_else(|| io::Error::other("next mutation should run after prior completion"))?;
+        assert_eq!(claimed_second_mutation.id, same_session_mutation.id);
 
         let chunk = OperationOutputChunk {
             id: OperationOutputChunkId::new(),

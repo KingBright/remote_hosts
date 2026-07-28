@@ -475,7 +475,7 @@ mod tests {
             .open_session(
                 &workspace,
                 &connection,
-                1,
+                8,
                 PtySessionOpenCommand {
                     session_id: connection.session_id,
                     cwd: None,

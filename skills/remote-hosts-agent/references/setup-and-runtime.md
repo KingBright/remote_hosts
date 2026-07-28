@@ -19,6 +19,7 @@ Useful commands:
 
 ```bash
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service status
+/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service stage
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service update
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service restart
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service logs
@@ -42,11 +43,14 @@ Do not run MCP stdio as a launchd daemon. Keep API and connector as daemons; let
 
 ## Updating and Reloading
 
-`remote-hosts-service update` rebuilds the binary, applies migrations, synchronizes the
-repository-owned Skill into Codex and Antigravity, and restarts the launchd-owned API and
-connector. It does not replace MCP stdio children or already-loaded Skill context owned by an
-existing Codex or Antigravity task; those processes keep the old binary, tool schema, and
-instructions until the client reloads them.
+`remote-hosts-service stage` rebuilds the binary, applies migrations, and synchronizes the
+repository-owned Skill into Codex and Antigravity without restarting launchd services.
+`remote-hosts-service update` stages the same files and restarts only after its database drain
+gate confirms there are no queued/running operations, active PTYs, queued PTY inputs, or
+unexpired write leases. `restart` uses the same gate. Use `--force` only when interrupting all
+reported conversations is intentional. Neither command replaces MCP stdio children or
+already-loaded Skill context owned by an existing Codex or Antigravity task; those processes
+keep the old binary, tool schema, and instructions until the client reloads them.
 
 - Complete any required calls on the current MCP transport before reloading it.
 - Reload MCP servers or begin the next agent task after an update, then require runtime `snapshot_version=6`.

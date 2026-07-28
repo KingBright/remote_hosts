@@ -71,7 +71,9 @@ impl WorkspaceSupervisor {
     ) -> Result<AgentWorkspace, WorkspaceSupervisorError> {
         validate_command(&command)?;
 
-        let decision = self.policy.decide(0, 0, 0, active_workspace_count, false);
+        let decision = self
+            .policy
+            .decide_workspace_creation(active_workspace_count);
         if !decision.allowed {
             return Err(WorkspaceSupervisorError::PolicyDenied(decision));
         }
@@ -150,18 +152,20 @@ mod tests {
     }
 
     #[test]
-    fn denies_workspace_when_persistent_pty_limit_is_reached()
+    fn workspace_limit_is_independent_from_persistent_pty_limit()
     -> Result<(), Box<dyn std::error::Error>> {
         let supervisor = WorkspaceSupervisor::default();
+        supervisor.create_workspace(command(), 1)?;
         let error = supervisor
-            .create_workspace(command(), 1)
+            .create_workspace(command(), 32)
             .err()
-            .ok_or("default policy allows one persistent PTY only")?;
+            .ok_or("default policy should cap active logical workspaces")?;
 
         match error {
             WorkspaceSupervisorError::PolicyDenied(decision) => {
                 assert!(!decision.allowed);
                 assert_eq!(decision.state, EntityState::RateLimited);
+                assert_eq!(decision.human_message, "active workspace limit reached");
             }
             other => return Err(format!("unexpected error: {other:?}").into()),
         }

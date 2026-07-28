@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-governor.workspace = true
 regex.workspace = true
 remote-hosts-domain = { path = "../remote-hosts-domain" }
 serde.workspace = true

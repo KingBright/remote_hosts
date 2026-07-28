@@ -48,6 +48,7 @@ pub const SERVER_NAME: &str = "remote-hosts";
 const DEFAULT_ARTIFACT_ROOT: &str = "remote-hosts-artifacts";
 const DEFAULT_ARTIFACT_READ_BYTES: usize = 64 * 1024;
 const MAX_ARTIFACT_READ_BYTES: usize = 256 * 1024;
+const DEFAULT_MAX_CONCURRENT_CHANNELS: u16 = 8;
 const WRITE_LEASE_SECONDS: i64 = 300;
 
 /// Stable MCP tool names.
@@ -376,7 +377,7 @@ pub struct EnsureHostAccessRequest {
     pub idle_ttl_seconds: Option<u64>,
     /// Keepalive interval in seconds. Defaults to 30.
     pub keepalive_seconds: Option<u64>,
-    /// Max concurrent SSH channels. Defaults to 1.
+    /// Max concurrent SSH channels. Defaults to 8.
     pub max_concurrent_channels: Option<u16>,
     /// Max new SSH connections per minute. Defaults to 1.
     pub max_new_connections_per_minute: Option<u16>,
@@ -1217,15 +1218,12 @@ impl RemoteHostsMcpServer {
     }
 
     async fn active_workspace_count(&self, host_id: HostId) -> Result<u32, String> {
-        let workspaces = if self.requires_workspace_ownership() {
-            self.repositories
-                .workspaces
-                .list_for_host_and_agent_session(host_id, self.agent_session.id)
-                .await
-        } else {
-            self.repositories.workspaces.list_for_host(host_id).await
-        }
-        .map_err(|error| tool_error(&error))?;
+        let workspaces = self
+            .repositories
+            .workspaces
+            .list_for_host(host_id)
+            .await
+            .map_err(|error| tool_error(&error))?;
         let count = workspaces
             .into_iter()
             .filter(|workspace| {
@@ -1786,8 +1784,7 @@ impl RemoteHostsMcpServer {
             .map_err(|error| tool_error(&error))?
             .into_iter()
             .find(|path| {
-                path.environment_id == key.environment_id
-                    && path.address.to_lowercase() == address
+                path.address.to_lowercase() == address
                     && path.port == key.port
                     && path.username.to_lowercase() == username
                     && path.proxy_chain == key.proxy_chain
@@ -2080,7 +2077,7 @@ impl RemoteHostsMcpServer {
                     access.environment_name
                 ));
             }
-            let resolved_environment = existing_environment.unwrap_or_else(|| Environment {
+            let mut resolved_environment = existing_environment.unwrap_or_else(|| Environment {
                 id: EnvironmentId::new(),
                 name: access.environment_name.clone(),
                 kind: access.environment_kind.clone(),
@@ -2125,6 +2122,28 @@ impl RemoteHostsMcpServer {
                 if existing_path.is_some() {
                     defaults_applied.push("access_path:reclassified_route".to_owned());
                 }
+            }
+            if let Some(existing_path) = existing_path.as_ref()
+                && existing_path.environment_id != resolved_environment.id
+            {
+                resolved_environment = self
+                    .repositories
+                    .environments
+                    .get(existing_path.environment_id)
+                    .await
+                    .map_err(|error| tool_error(&error))?
+                    .ok_or_else(|| {
+                        format!(
+                            "environment not found for existing access path: {}",
+                            existing_path.environment_id
+                        )
+                    })?;
+                environment_created = false;
+                defaults_applied.push("access_path:preserved_environment".to_owned());
+                attention.push(format!(
+                    "the existing access path already belongs to canonical environment `{}`; the requested environment was ignored",
+                    resolved_environment.name
+                ));
             }
 
             let (mut stored_credential, mut used_default_credential) = if let Some(name) =
@@ -2295,7 +2314,9 @@ impl RemoteHostsMcpServer {
                 max_concurrent_channels: access.max_concurrent_channels.unwrap_or_else(|| {
                     existing_path
                         .as_ref()
-                        .map_or(1, |path| path.max_concurrent_channels)
+                        .map_or(DEFAULT_MAX_CONCURRENT_CHANNELS, |path| {
+                            path.max_concurrent_channels
+                        })
                 }),
                 max_new_connections_per_minute: access
                     .max_new_connections_per_minute
@@ -2888,7 +2909,9 @@ impl RemoteHostsMcpServer {
             max_concurrent_channels: request.max_concurrent_channels.unwrap_or_else(|| {
                 existing
                     .as_ref()
-                    .map_or(1, |path| path.max_concurrent_channels)
+                    .map_or(DEFAULT_MAX_CONCURRENT_CHANNELS, |path| {
+                        path.max_concurrent_channels
+                    })
             }),
             max_new_connections_per_minute: request.max_new_connections_per_minute.unwrap_or_else(
                 || {
@@ -3152,11 +3175,7 @@ impl RemoteHostsMcpServer {
             .list_for_host(host_id)
             .await
             .map_err(|error| tool_error(&error))?;
-        sessions.retain(|session| {
-            access_paths
-                .iter()
-                .any(|path| path.id == session.access_path_id)
-        });
+        retain_runtime_connection_sessions(&mut sessions, &access_paths);
         let connector_snapshots = self.connector_snapshots_for_paths(&access_paths).await?;
         let connector_state = if !connector_snapshots.is_empty()
             && connector_snapshots
@@ -3383,11 +3402,7 @@ impl RemoteHostsMcpServer {
             .list_for_host(host_id)
             .await
             .map_err(|error| tool_error(&error))?;
-        sessions.retain(|session| {
-            access_paths
-                .iter()
-                .any(|path| path.id == session.access_path_id)
-        });
+        retain_runtime_connection_sessions(&mut sessions, &access_paths);
         for session in &mut sessions {
             if local_handshake_budget_ready_paths.contains(&session.access_path_id)
                 && session.state == EntityState::Throttled
@@ -4165,7 +4180,7 @@ impl RemoteHostsMcpServer {
         let active_ptys = self
             .repositories
             .pty_sessions
-            .count_active_for_workspace(workspace_id)
+            .count_active_for_host(workspace.host_id)
             .await
             .map_err(|error| tool_error(&error))?;
         let pty_session = PtySessionSupervisor::default()
@@ -5881,6 +5896,28 @@ fn elapsed_ms(started_at: std::time::Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn retain_runtime_connection_sessions(
+    sessions: &mut Vec<ConnectionSession>,
+    access_paths: &[AccessPath],
+) {
+    let enabled_paths: BTreeSet<_> = access_paths.iter().map(|path| path.id).collect();
+    let mut latest_paths = BTreeSet::new();
+    let mut reusable_paths = BTreeSet::new();
+    sessions.retain(|session| {
+        if !enabled_paths.contains(&session.access_path_id) {
+            return false;
+        }
+        let latest_for_path = latest_paths.insert(session.access_path_id);
+        let reusable_for_path =
+            matches!(session.state, EntityState::Connected | EntityState::Healthy)
+                && reusable_paths.insert(session.access_path_id);
+        latest_for_path
+            || reusable_for_path
+            || session.open_channels > 0
+            || session.state == EntityState::Resolving
+    });
+}
+
 fn values<T: Serialize>(items: &[T]) -> Result<Vec<Value>, String> {
     items.iter().map(to_json_value).collect()
 }
@@ -6379,6 +6416,7 @@ mod tests {
         let access_path_id = initial["access_path"]["id"]
             .as_str()
             .ok_or("access path id should be a string")?;
+        let environment_count = fixture.repositories.environments.list().await?.len();
 
         let corrected = call_tool(
             agent,
@@ -6390,7 +6428,7 @@ mod tests {
                 "access": {
                     "address": "10.36.31.20",
                     "username": "user/10.36.36.100/root",
-                    "environment_name": "inode-vpn-test",
+                    "environment_name": "mistaken-prod-environment",
                     "environment_kind": "company_lan",
                     "trust_level": "external",
                     "route_type": "bastion"
@@ -6402,6 +6440,7 @@ mod tests {
         assert_eq!(corrected["access_path_created"], json!(false));
         assert_eq!(corrected["access_path"]["id"], json!(access_path_id));
         assert_eq!(corrected["access_path"]["route_type"], json!("bastion"));
+        assert_eq!(corrected["environment"]["name"], json!("inode-vpn-test"));
         assert_eq!(corrected["environment"]["kind"], json!("vpn"));
         assert_eq!(corrected["environment"]["trust_level"], json!("trusted"));
         assert!(
@@ -6410,7 +6449,7 @@ mod tests {
                 .is_some_and(|items| {
                     items
                         .iter()
-                        .any(|item| item == "environment:preserved_existing_classification")
+                        .any(|item| item == "access_path:preserved_environment")
                 })
         );
         let host_id = corrected["host"]["id"]
@@ -6422,6 +6461,10 @@ mod tests {
             .list_for_host(HostId::from(uuid::Uuid::parse_str(host_id)?))
             .await?;
         assert_eq!(paths.len(), 1);
+        assert_eq!(
+            fixture.repositories.environments.list().await?.len(),
+            environment_count
+        );
         Ok(())
     }
 
@@ -6576,6 +6619,53 @@ mod tests {
 
         assert_eq!(snapshot["access_paths"], json!([]));
         assert_eq!(snapshot["connection_sessions"], json!([]));
+        assert!(snapshot["attention"].as_array().is_some_and(|attention| {
+            attention
+                .iter()
+                .all(|item| item["code"] != json!("connection_unhealthy"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_snapshot_compacts_historical_connection_sessions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let current = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection session should exist")?;
+        for age_minutes in 1..=20 {
+            let mut historical = current.clone();
+            historical.session_id = SessionId::new();
+            historical.state = EntityState::Unknown;
+            historical.open_channels = 0;
+            historical.created_at -= time::Duration::minutes(age_minutes);
+            historical.last_used_at -= time::Duration::minutes(age_minutes);
+            fixture
+                .repositories
+                .connection_sessions
+                .upsert(&historical)
+                .await?;
+        }
+
+        let snapshot = call_tool(
+            fixture.server(),
+            tools::GET_HOST_RUNTIME_SNAPSHOT,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+
+        assert_eq!(
+            snapshot["connection_sessions"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot["connection_sessions"][0]["session_id"],
+            json!(fixture.session_id.to_string())
+        );
         assert!(snapshot["attention"].as_array().is_some_and(|attention| {
             attention
                 .iter()
@@ -7568,7 +7658,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_create_workspace_is_policy_guarded() -> Result<(), Box<dyn std::error::Error>> {
+    async fn mcp_create_workspace_supports_multiple_logical_workspaces()
+    -> Result<(), Box<dyn std::error::Error>> {
         let fixture = TestFixture::new().await?;
         let arguments = json!({
             "host_id": fixture.host_id.to_string(),
@@ -7585,16 +7676,9 @@ mod tests {
         .await?;
         assert_eq!(created["workspace"]["state"], json!("idle"));
 
-        let second_result =
-            call_tool_raw(fixture.server(), tools::CREATE_WORKSPACE, Some(arguments)).await?;
-        assert_eq!(second_result.is_error, Some(true));
-        let message = second_result
-            .content
-            .first()
-            .and_then(|content| content.as_text())
-            .map(|text| text.text.as_str())
-            .ok_or("expected tool-level error text")?;
-        assert!(message.contains("persistent PTY limit reached"));
+        let second = call_tool(fixture.server(), tools::CREATE_WORKSPACE, Some(arguments)).await?;
+        assert_eq!(second["workspace"]["state"], json!("idle"));
+        assert_ne!(created["workspace"]["id"], second["workspace"]["id"]);
         Ok(())
     }
 

@@ -14,6 +14,9 @@ pub struct ServerProtectionPolicy {
     pub max_parallel_probe_jobs_per_host: u32,
     /// Maximum persistent PTYs per host.
     pub max_persistent_ptys_per_host: u32,
+    /// Maximum active logical workspaces per host.
+    #[serde(default = "default_max_active_workspaces_per_host")]
+    pub max_active_workspaces_per_host: u32,
     /// Maximum queued operations per host.
     pub max_operation_queue_depth_per_host: u32,
     /// Default command timeout in seconds.
@@ -30,10 +33,11 @@ impl ServerProtectionPolicy {
     /// Production baseline designed for agent safety before throughput.
     pub fn production_default() -> Self {
         Self {
-            max_new_ssh_handshakes_per_10_min: 10,
-            max_parallel_exec_channels_per_host: 1,
+            max_new_ssh_handshakes_per_10_min: 60,
+            max_parallel_exec_channels_per_host: 4,
             max_parallel_probe_jobs_per_host: 1,
-            max_persistent_ptys_per_host: 1,
+            max_persistent_ptys_per_host: 8,
+            max_active_workspaces_per_host: default_max_active_workspaces_per_host(),
             max_operation_queue_depth_per_host: 20,
             default_exec_timeout_seconds: 30,
             default_output_limit_bytes: 256 * 1024,
@@ -110,6 +114,35 @@ impl ServerProtectionPolicy {
             human_message: "request allowed".to_owned(),
         }
     }
+
+    /// Returns a policy decision for logical workspace allocation.
+    ///
+    /// Workspaces isolate agent conversations and do not consume an SSH channel until an
+    /// operation or PTY is opened, so they have an independent, higher limit.
+    pub fn decide_workspace_creation(&self, active_workspaces: u32) -> ProtectionDecision {
+        if active_workspaces >= self.max_active_workspaces_per_host {
+            return ProtectionDecision::deny(
+                EntityState::RateLimited,
+                StateReasonCode::PolicyRejected,
+                AgentHint::UseExistingWorkspace,
+                Some(10),
+                "active workspace limit reached",
+            );
+        }
+
+        ProtectionDecision {
+            allowed: true,
+            state: EntityState::Healthy,
+            reason_code: StateReasonCode::None,
+            agent_hint: None,
+            retry_after_seconds: None,
+            human_message: "request allowed".to_owned(),
+        }
+    }
+}
+
+const fn default_max_active_workspaces_per_host() -> u32 {
+    32
 }
 
 impl Default for ServerProtectionPolicy {
@@ -172,5 +205,17 @@ mod tests {
     fn default_policy_allows_quiet_host() {
         let decision = ServerProtectionPolicy::default().decide(0, 0, 0, 0, false);
         assert!(decision.allowed);
+    }
+
+    #[test]
+    fn default_policy_supports_bounded_multi_conversation_concurrency() {
+        let policy = ServerProtectionPolicy::default();
+
+        assert_eq!(policy.max_new_ssh_handshakes_per_10_min, 60);
+        assert_eq!(policy.max_parallel_exec_channels_per_host, 4);
+        assert_eq!(policy.max_persistent_ptys_per_host, 8);
+        assert_eq!(policy.max_active_workspaces_per_host, 32);
+        assert!(policy.decide_workspace_creation(31).allowed);
+        assert!(!policy.decide_workspace_creation(32).allowed);
     }
 }

@@ -1,22 +1,18 @@
 //! Connector-side execution guards and transport backends.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     future::Future,
-    num::{NonZeroU32, NonZeroUsize},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio as ProcessStdio,
     sync::{Arc, Mutex as StdMutex},
+    time::Instant as StdInstant,
 };
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use governor::{
-    Quota, RateLimiter,
-    clock::{Clock, DefaultClock},
-    state::{InMemoryState, direct::NotKeyed},
-};
 use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder, Stdio as OpenSshStdio};
 use openssh_sftp_client::{
     Error as OpenSshSftpError, Sftp as OpenSshSftp, SftpOptions,
@@ -71,7 +67,8 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child as LocalChild, Command as LocalCommand},
-    sync::{Mutex, Semaphore, mpsc, oneshot, watch},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
+    task::JoinSet,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -89,14 +86,21 @@ const EXEC_UPLOAD_CHUNKS_PER_SESSION: u64 = 256;
 const EXEC_TRANSFER_MAX_STAGE_ATTEMPTS: u32 = 3;
 const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
+const PTY_TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
 const PTY_WRITE_LEASE_SECONDS: i64 = 300;
 
-type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+type SharedHandshakeBudget = Arc<StdMutex<SlidingWindowBudget>>;
 
 struct HandshakeLimiter {
-    path: DirectRateLimiter,
-    global: Arc<DirectRateLimiter>,
+    path: StdMutex<SlidingWindowBudget>,
+    global: SharedHandshakeBudget,
+}
+
+struct SlidingWindowBudget {
+    max_events: usize,
+    window: Duration,
+    events: VecDeque<StdInstant>,
 }
 
 struct TransportTelemetryTracker {
@@ -189,46 +193,95 @@ impl HandshakeLimiter {
         Self::with_shared_global(max_per_minute, Self::shared_global(max_per_ten_minutes))
     }
 
-    fn with_shared_global(max_per_minute: u16, global: Arc<DirectRateLimiter>) -> Self {
+    fn with_shared_global(max_per_minute: u16, global: SharedHandshakeBudget) -> Self {
         Self {
-            path: rate_limiter_for_window(u32::from(max_per_minute), Duration::from_secs(60)),
+            path: StdMutex::new(SlidingWindowBudget::new(
+                u32::from(max_per_minute),
+                Duration::from_secs(60),
+            )),
             global,
         }
     }
 
-    fn shared_global(max_per_ten_minutes: u32) -> Arc<DirectRateLimiter> {
-        Arc::new(rate_limiter_for_window(
-            max_per_ten_minutes,
-            Duration::from_secs(600),
-        ))
+    fn shared_global(max_per_ten_minutes: u32) -> SharedHandshakeBudget {
+        Self::shared_global_for_window(max_per_ten_minutes, Duration::from_secs(600))
+    }
+
+    fn shared_global_for_window(max_events: u32, window: Duration) -> SharedHandshakeBudget {
+        Arc::new(StdMutex::new(SlidingWindowBudget::new(max_events, window)))
     }
 
     fn try_acquire(&self) -> Result<(), TransportError> {
-        check_handshake_rate_limiter(&self.path)?;
-        check_handshake_rate_limiter(self.global.as_ref())
+        self.try_acquire_at(StdInstant::now())
+    }
+
+    fn try_acquire_at(&self, now: StdInstant) -> Result<(), TransportError> {
+        // Lock ordering is always global then path so the two budgets are checked and consumed
+        // atomically across every access path.
+        let mut global = self
+            .global
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut path = self
+            .path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let global_wait = global.retry_after(now);
+        let path_wait = path.retry_after(now);
+        let wait = [global_wait, path_wait].into_iter().flatten().max();
+        if let Some(wait) = wait {
+            tracing::warn!(
+                global_retry_after_seconds = global_wait.map(duration_seconds_ceil),
+                path_retry_after_seconds = path_wait.map(duration_seconds_ceil),
+                effective_retry_after_seconds = duration_seconds_ceil(wait),
+                "local SSH handshake budget denied without consuming either budget"
+            );
+            return Err(TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds: duration_seconds_ceil(wait),
+            });
+        }
+        global.consume(now);
+        path.consume(now);
+        Ok(())
     }
 }
 
-fn rate_limiter_for_window(max_events: u32, window: Duration) -> DirectRateLimiter {
-    let max_events = max_events.max(1);
-    let period = window.div_f64(f64::from(max_events));
-    let burst = NonZeroU32::new(max_events).unwrap_or(NonZeroU32::MIN);
-    let quota = Quota::with_period(period)
-        .unwrap_or_else(|| Quota::per_minute(NonZeroU32::MIN))
-        .allow_burst(burst);
-    RateLimiter::direct(quota)
+impl SlidingWindowBudget {
+    fn new(max_events: u32, window: Duration) -> Self {
+        Self {
+            max_events: usize::try_from(max_events.max(1)).unwrap_or(usize::MAX),
+            window,
+            events: VecDeque::new(),
+        }
+    }
+
+    fn retry_after(&mut self, now: StdInstant) -> Option<Duration> {
+        while self
+            .events
+            .front()
+            .is_some_and(|event| now.saturating_duration_since(*event) >= self.window)
+        {
+            self.events.pop_front();
+        }
+        if self.events.len() < self.max_events {
+            return None;
+        }
+        self.events.front().map(|event| {
+            self.window
+                .saturating_sub(now.saturating_duration_since(*event))
+        })
+    }
+
+    fn consume(&mut self, now: StdInstant) {
+        self.events.push_back(now);
+    }
 }
 
-fn check_handshake_rate_limiter(limiter: &DirectRateLimiter) -> Result<(), TransportError> {
-    limiter.check().map_err(|not_until| {
-        let retry_after_seconds = not_until
-            .wait_time_from(DefaultClock::default().now())
-            .as_secs()
-            .max(1);
-        TransportError::LocalHandshakeBudgetExhausted {
-            retry_after_seconds,
-        }
-    })
+fn duration_seconds_ceil(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
+        .max(1)
 }
 
 /// Host key policy for OpenSSH sessions.
@@ -266,6 +319,8 @@ pub struct OpenSshTransportConfig {
     pub idle_ttl_seconds: u64,
     /// OpenSSH server-alive interval.
     pub keepalive_seconds: u64,
+    /// Maximum channels sharing this access-path transport.
+    pub max_concurrent_channels: u16,
     /// Access-path handshake budget per minute.
     pub max_new_connections_per_minute: u16,
     /// Global handshake budget per ten minutes.
@@ -277,6 +332,7 @@ pub struct OpenSshTransport {
     config: OpenSshTransportConfig,
     session: Mutex<Option<Arc<Session>>>,
     handshake_limiter: HandshakeLimiter,
+    channel_semaphore: Arc<Semaphore>,
     telemetry: TransportTelemetryTracker,
 }
 
@@ -289,14 +345,16 @@ impl OpenSshTransport {
 
     fn with_shared_handshake_budget(
         config: OpenSshTransportConfig,
-        global: Arc<DirectRateLimiter>,
+        global: SharedHandshakeBudget,
     ) -> Self {
         let handshake_limiter =
             HandshakeLimiter::with_shared_global(config.max_new_connections_per_minute, global);
+        let channel_limit = usize::from(config.max_concurrent_channels.max(1));
         Self {
             config,
             session: Mutex::new(None),
             handshake_limiter,
+            channel_semaphore: Arc::new(Semaphore::new(channel_limit)),
             telemetry: TransportTelemetryTracker::new(
                 SshTransportBackend::OpenSshControlMaster,
                 SshTransportCapabilities::pooled(SshFileTransferMode::Sftp),
@@ -357,6 +415,14 @@ impl OpenSshTransport {
         self.telemetry.handshake_succeeded(now_utc());
         Ok(session)
     }
+
+    async fn acquire_channel(&self) -> Result<OwnedSemaphorePermit, TransportError> {
+        self.channel_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| TransportError::Backend("SSH channel pool is closed".to_owned()))
+    }
 }
 
 #[async_trait]
@@ -379,6 +445,7 @@ impl RemoteTransport for OpenSshTransport {
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult, TransportError> {
+        let _channel_permit = self.acquire_channel().await?;
         let session = self.session().await?;
         let mut command = session.command(&request.profile.program);
         command.args(&request.profile.args);
@@ -404,6 +471,7 @@ impl RemoteTransport for OpenSshTransport {
             .validate()
             .map_err(|error| TransportError::FileTransfer(error.to_string()))?;
         let timeout = Duration::from_secs(request.spec.timeout_seconds);
+        let _channel_permit = self.acquire_channel().await?;
         let session = self.session().await?;
         tokio::time::timeout(timeout, execute_openssh_sftp(session, request))
             .await
@@ -1011,6 +1079,7 @@ pub struct ManagedPtyProcess {
     close_tx: oneshot::Sender<()>,
     transport_telemetry: Option<SshTransportTelemetry>,
     transport_evidence: Option<SshChannelTransportEvidence>,
+    channel_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ManagedPtyProcess {
@@ -1026,6 +1095,7 @@ impl ManagedPtyProcess {
             close_tx,
             transport_telemetry: None,
             transport_evidence: None,
+            channel_permit: None,
         }
     }
 
@@ -1045,6 +1115,11 @@ impl ManagedPtyProcess {
             ));
             self.transport_telemetry = Some(after);
         }
+        self
+    }
+
+    fn with_channel_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
+        self.channel_permit = Some(permit);
         self
     }
 }
@@ -1084,6 +1159,7 @@ impl ManagedPtyBackend for OpenSshShellBackend {
         &self,
         request: PtyBackendSpawnRequest,
     ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
+        let channel_permit = self.transport.acquire_channel().await?;
         let before = self.transport.transport_telemetry();
         let session = self.transport.session().await?;
         let mut command = session.arc_command("sh");
@@ -1145,6 +1221,7 @@ impl ManagedPtyBackend for OpenSshShellBackend {
         });
 
         Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx)
+            .with_channel_permit(channel_permit)
             .with_transport_observation(before.as_ref(), self.transport.transport_telemetry()))
     }
 }
@@ -1208,6 +1285,7 @@ impl ManagedPtyBackend for OpenSshControlMasterTtyBackend {
         &self,
         request: PtyBackendSpawnRequest,
     ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
+        let channel_permit = self.transport.acquire_channel().await?;
         let before = self.transport.transport_telemetry();
         let session = self.transport.session().await?;
         let control_socket = session.control_socket().to_path_buf();
@@ -1263,6 +1341,7 @@ impl ManagedPtyBackend for OpenSshControlMasterTtyBackend {
         spawn_local_child_wait_task(child, close_rx, writer_input_tx, output_tx);
 
         Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx)
+            .with_channel_permit(channel_permit)
             .with_transport_observation(before.as_ref(), self.transport.transport_telemetry()))
     }
 }
@@ -1645,7 +1724,7 @@ pub struct OpenSshTransportPool {
     host_key_policy: HostKeyPolicy,
     connect_timeout_seconds: u64,
     max_new_ssh_handshakes_per_10_min: u32,
-    global_handshake_limiter: Arc<DirectRateLimiter>,
+    global_handshake_limiter: SharedHandshakeBudget,
     cache: Mutex<BTreeMap<AccessPathId, Arc<OpenSshTransport>>>,
 }
 
@@ -1702,6 +1781,7 @@ impl OpenSshTransportPool {
             connect_timeout_seconds: self.connect_timeout_seconds,
             idle_ttl_seconds: access_path.idle_ttl_seconds,
             keepalive_seconds: access_path.keepalive_seconds,
+            max_concurrent_channels: access_path.max_concurrent_channels,
             max_new_connections_per_minute: access_path.max_new_connections_per_minute,
             max_new_ssh_handshakes_per_10_min: self.max_new_ssh_handshakes_per_10_min,
         };
@@ -1949,10 +2029,42 @@ pub struct RusshTransportConfig {
     pub inactivity_timeout_seconds: u64,
     /// SSH keepalive interval in seconds.
     pub keepalive_seconds: u64,
+    /// Maximum channels sharing this access-path transport.
+    pub max_concurrent_channels: u16,
     /// Access-path handshake budget per minute.
     pub max_new_connections_per_minute: u16,
     /// Global handshake budget per ten minutes.
     pub max_new_ssh_handshakes_per_10_min: u32,
+}
+
+#[derive(Default)]
+struct RusshPtyChannelLifecycle {
+    active_channels: usize,
+}
+
+impl RusshPtyChannelLifecycle {
+    fn reserve(&mut self) {
+        assert_ne!(
+            self.active_channels,
+            usize::MAX,
+            "active russh PTY channel count overflowed"
+        );
+        self.active_channels += 1;
+    }
+
+    fn release(&mut self) -> bool {
+        assert!(
+            self.active_channels > 0,
+            "russh PTY channel released without a matching reservation"
+        );
+        self.active_channels -= 1;
+        self.active_channels == 0
+    }
+
+    #[cfg(test)]
+    fn active_channels(&self) -> usize {
+        self.active_channels
+    }
 }
 
 /// Native async SSH transport backed by `russh`.
@@ -1961,7 +2073,9 @@ pub struct RusshTransport<C> {
     credentials: Arc<C>,
     authorized_key_bootstrap: AuthorizedKeyBootstrapRepository,
     session: Mutex<Option<Arc<client::Handle<RusshClientHandler>>>>,
+    pty_channel_lifecycle: Mutex<RusshPtyChannelLifecycle>,
     handshake_limiter: HandshakeLimiter,
+    channel_semaphore: Arc<Semaphore>,
     telemetry: TransportTelemetryTracker,
 }
 
@@ -1980,10 +2094,11 @@ impl<C> RusshTransport<C> {
         config: RusshTransportConfig,
         credentials: Arc<C>,
         authorized_key_bootstrap: AuthorizedKeyBootstrapRepository,
-        global: Arc<DirectRateLimiter>,
+        global: SharedHandshakeBudget,
     ) -> Self {
         let handshake_limiter =
             HandshakeLimiter::with_shared_global(config.max_new_connections_per_minute, global);
+        let channel_limit = usize::from(config.max_concurrent_channels.max(1));
         let file_transfer_mode = if config.use_exec_file_transfer {
             SshFileTransferMode::ExecFramed
         } else {
@@ -1994,7 +2109,9 @@ impl<C> RusshTransport<C> {
             credentials,
             authorized_key_bootstrap,
             session: Mutex::new(None),
+            pty_channel_lifecycle: Mutex::new(RusshPtyChannelLifecycle::default()),
             handshake_limiter,
+            channel_semaphore: Arc::new(Semaphore::new(channel_limit)),
             telemetry: TransportTelemetryTracker::new(
                 SshTransportBackend::Russh,
                 SshTransportCapabilities::pooled(file_transfer_mode),
@@ -2097,6 +2214,33 @@ where
             .await;
         }
         Ok(session)
+    }
+
+    async fn acquire_channel(&self) -> Result<OwnedSemaphorePermit, TransportError> {
+        self.channel_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| TransportError::Backend("SSH channel pool is closed".to_owned()))
+    }
+
+    async fn reserve_pty_channel(
+        &self,
+    ) -> Result<Arc<client::Handle<RusshClientHandler>>, TransportError> {
+        let mut lifecycle = self.pty_channel_lifecycle.lock().await;
+        let session = self.session().await?;
+        lifecycle.reserve();
+        Ok(session)
+    }
+
+    async fn release_pty_channel(
+        &self,
+        expected_session: &Arc<client::Handle<RusshClientHandler>>,
+    ) {
+        let mut lifecycle = self.pty_channel_lifecycle.lock().await;
+        if lifecycle.release() && self.config.use_exec_file_transfer {
+            self.invalidate_session(expected_session).await;
+        }
     }
 
     async fn invalidate_session(&self, expected: &Arc<client::Handle<RusshClientHandler>>) {
@@ -2263,6 +2407,7 @@ where
             .profile
             .validate()
             .map_err(|error| TransportError::PolicyDenied(error.to_string()))?;
+        let _channel_permit = self.acquire_channel().await?;
         let session = self.session().await?;
         let completion_marker = (!self.config.windows)
             .then(|| format!("REMOTE_HOSTS_EXEC_DONE_{}", request.operation_id));
@@ -2308,6 +2453,7 @@ where
             .validate()
             .map_err(|error| TransportError::FileTransfer(error.to_string()))?;
         let timeout = Duration::from_secs(request.spec.timeout_seconds);
+        let _channel_permit = self.acquire_channel().await?;
         if self.config.use_exec_file_transfer {
             if let Ok(result) =
                 tokio::time::timeout(timeout, execute_russh_exec_file_transfer(self, request)).await
@@ -4364,7 +4510,7 @@ pub struct RusshTransportPool<C> {
     connect_timeout_seconds: u64,
     inactivity_timeout_seconds: u64,
     max_new_ssh_handshakes_per_10_min: u32,
-    global_handshake_limiter: Arc<DirectRateLimiter>,
+    global_handshake_limiter: SharedHandshakeBudget,
     cache: Mutex<BTreeMap<AccessPathId, Arc<RusshTransport<C>>>>,
 }
 
@@ -4445,6 +4591,7 @@ where
             connect_timeout_seconds: self.connect_timeout_seconds,
             inactivity_timeout_seconds: self.inactivity_timeout_seconds,
             keepalive_seconds: access_path.keepalive_seconds,
+            max_concurrent_channels: access_path.max_concurrent_channels,
             max_new_connections_per_minute: access_path.max_new_connections_per_minute,
             max_new_ssh_handshakes_per_10_min: self.max_new_ssh_handshakes_per_10_min,
         };
@@ -4656,20 +4803,32 @@ where
         request: PtyBackendSpawnRequest,
     ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
         let transport = self.transport_for_session(request.session_id).await?;
+        let channel_permit = transport.acquire_channel().await?;
         let before = transport.transport_telemetry();
-        let session = transport.session().await?;
-        let channel = session
-            .channel_open_session()
-            .await
-            .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
-        channel
-            .request_pty(false, &self.term, self.columns, self.rows, 0, 0, &[])
-            .await
-            .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
-        channel
-            .request_shell(true)
-            .await
-            .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
+        let session = transport.reserve_pty_channel().await?;
+        let channel_result = async {
+            let channel = session
+                .channel_open_session()
+                .await
+                .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
+            channel
+                .request_pty(false, &self.term, self.columns, self.rows, 0, 0, &[])
+                .await
+                .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
+            channel
+                .request_shell(true)
+                .await
+                .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
+            Ok(channel)
+        }
+        .await;
+        let channel = match channel_result {
+            Ok(channel) => channel,
+            Err(error) => {
+                transport.release_pty_channel(&session).await;
+                return Err(error);
+            }
+        };
 
         let (input_tx, input_rx) = mpsc::channel::<String>(64);
         let (output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(128);
@@ -4677,6 +4836,7 @@ where
         let initial_input = shell_change_dir_input(request.cwd.as_deref());
         tokio::spawn(run_russh_pty_channel(
             Arc::clone(&transport),
+            session,
             channel,
             input_rx,
             output_tx,
@@ -4685,6 +4845,7 @@ where
         ));
 
         Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx)
+            .with_channel_permit(channel_permit)
             .with_transport_observation(before.as_ref(), transport.transport_telemetry()))
     }
 }
@@ -5259,6 +5420,31 @@ async fn receive_russh_exec_result(
 
 async fn run_russh_pty_channel<C>(
     transport: Arc<RusshTransport<C>>,
+    session: Arc<client::Handle<RusshClientHandler>>,
+    channel: russh::Channel<client::Msg>,
+    input_rx: mpsc::Receiver<String>,
+    output_tx: mpsc::Sender<PtyBackendOutput>,
+    close_rx: oneshot::Receiver<()>,
+    initial_input: Option<String>,
+) where
+    C: SshCredentialProvider + 'static,
+{
+    drive_russh_pty_channel(
+        &transport,
+        &session,
+        channel,
+        input_rx,
+        output_tx,
+        close_rx,
+        initial_input,
+    )
+    .await;
+    transport.release_pty_channel(&session).await;
+}
+
+async fn drive_russh_pty_channel<C>(
+    transport: &RusshTransport<C>,
+    session: &Arc<client::Handle<RusshClientHandler>>,
     mut channel: russh::Channel<client::Msg>,
     mut input_rx: mpsc::Receiver<String>,
     output_tx: mpsc::Sender<PtyBackendOutput>,
@@ -5270,7 +5456,7 @@ async fn run_russh_pty_channel<C>(
     if let Some(initial_input) = initial_input
         && let Err(error) = channel.data_bytes(initial_input.into_bytes()).await
     {
-        transport.invalidate_current_session().await;
+        transport.invalidate_session(session).await;
         let _ = send_pty_backend_output(
             &output_tx,
             OutputStream::System,
@@ -5291,7 +5477,7 @@ async fn run_russh_pty_channel<C>(
             input = input_rx.recv(), if !input_closed => {
                 if let Some(input) = input {
                     if let Err(error) = channel.data_bytes(input.into_bytes()).await {
-                        transport.invalidate_current_session().await;
+                        transport.invalidate_session(session).await;
                         let sent = send_pty_backend_output(
                             &output_tx,
                             OutputStream::System,
@@ -5314,7 +5500,7 @@ async fn run_russh_pty_channel<C>(
                     break;
                 };
                 if russh_pty_message_invalidates_session(&message) {
-                    transport.invalidate_current_session().await;
+                    transport.invalidate_session(session).await;
                 }
                 if !handle_russh_pty_message(&output_tx, message).await {
                     break;
@@ -5682,6 +5868,11 @@ pub trait QueuedPtyInputPump: Send + Sync {
         Ok(0)
     }
 
+    /// Closes connector-local PTY handles whose persisted session is no longer active.
+    async fn reconcile_runtime_state(&self) -> Result<u64, ConnectorPtyError> {
+        Ok(0)
+    }
+
     /// Activates one pending PTY before its first input is queued.
     async fn activate_next(&self) -> Result<Option<PtySessionId>, ConnectorPtyError> {
         Ok(None)
@@ -5693,14 +5884,31 @@ pub trait QueuedPtyInputPump: Send + Sync {
     ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, ConnectorPtyError>;
 }
 
+/// Connector-local file transfer path that can reuse a workspace's selected interactive PTY.
+#[async_trait]
+pub trait InteractiveFileTransferBackend: Send + Sync {
+    /// Handles a transfer when the workspace route requires an interactive target selection.
+    ///
+    /// Returning `None` delegates to the access path's normal SFTP or exec transport.
+    async fn transfer_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        request: SftpRequest,
+    ) -> Result<Option<SftpResult>, TransportError>;
+}
+
 enum PtyPumpOutcome {
     Activated,
+    Reconciled,
     Input(ConnectorPtyInputDeliveryOutcome),
 }
 
 async fn poll_pty_pump(
     pump: &dyn QueuedPtyInputPump,
 ) -> Result<Option<PtyPumpOutcome>, ConnectorPtyError> {
+    if pump.reconcile_runtime_state().await? > 0 {
+        return Ok(Some(PtyPumpOutcome::Reconciled));
+    }
     if pump.activate_next().await?.is_some() {
         return Ok(Some(PtyPumpOutcome::Activated));
     }
@@ -5748,6 +5956,8 @@ pub enum ConnectorPtyError {
 struct ActivePtyHandle {
     input_tx: mpsc::Sender<String>,
     close_tx: Option<oneshot::Sender<()>>,
+    _channel_permit: Option<OwnedSemaphorePermit>,
+    transfer_lock: Arc<Mutex<()>>,
 }
 
 /// Connector-local manager for persistent PTY backend processes.
@@ -5851,7 +6061,7 @@ where
         let active_ptys = self
             .repositories
             .pty_sessions
-            .count_active_for_workspace(workspace_id)
+            .count_active_for_host(workspace.host_id)
             .await?;
         let mut pty_session = PtySessionSupervisor::default().open_session(
             &workspace,
@@ -5865,6 +6075,8 @@ where
                 pty_session.backend_state = PtyBackendState::Failed;
                 pty_session.last_activity_at = now_utc();
                 self.repositories.pty_sessions.upsert(&pty_session).await?;
+                self.record_activation_connection_failure(&connection, &error)
+                    .await?;
                 return Err(error);
             }
         };
@@ -5929,13 +6141,14 @@ where
         input: String,
     ) -> Result<ConnectorPtyInputOutcome, ConnectorPtyError> {
         validate_pty_input(&input, self.config.max_input_bytes)?;
-        let input_tx = {
+        let (input_tx, transfer_lock) = {
             let active = self.active.lock().await;
             active
                 .get(&pty_session_id)
-                .map(|handle| handle.input_tx.clone())
+                .map(|handle| (handle.input_tx.clone(), Arc::clone(&handle.transfer_lock)))
                 .ok_or(ConnectorPtyError::NotActive)?
         };
+        let _input_guard = transfer_lock.lock().await;
         input_tx
             .send(input.clone())
             .await
@@ -6144,6 +6357,56 @@ where
         Ok(closed)
     }
 
+    async fn reconcile_runtime_state(&self) -> Result<u64, ConnectorPtyError> {
+        let pty_session_ids: Vec<_> = self.active.lock().await.keys().copied().collect();
+        let mut reconciled = 0_u64;
+        for pty_session_id in pty_session_ids {
+            let Some(session) = self.repositories.pty_sessions.get(pty_session_id).await? else {
+                if let Some(mut handle) = self.active.lock().await.remove(&pty_session_id)
+                    && let Some(close_tx) = handle.close_tx.take()
+                {
+                    let _ = close_tx.send(());
+                }
+                reconciled = reconciled.saturating_add(1);
+                continue;
+            };
+            let persisted_active = session.backend_state == PtyBackendState::Active
+                && session.input_allowed
+                && matches!(
+                    session.state,
+                    WorkspaceState::Idle | WorkspaceState::Working
+                );
+            if persisted_active {
+                continue;
+            }
+            let Some(mut handle) = self.active.lock().await.remove(&pty_session_id) else {
+                continue;
+            };
+            if let Some(close_tx) = handle.close_tx.take() {
+                let _ = close_tx.send(());
+            }
+            self.mark_connection_channel_closed(session.session_id)
+                .await?;
+            if let Some(workspace) = self
+                .repositories
+                .workspaces
+                .get(session.workspace_id)
+                .await?
+                && let Some(agent_session_id) = workspace.agent_session_id
+            {
+                shorten_host_write_lease(
+                    &self.repositories,
+                    workspace.host_id,
+                    agent_session_id,
+                    now_utc(),
+                )
+                .await?;
+            }
+            reconciled = reconciled.saturating_add(1);
+        }
+        Ok(reconciled)
+    }
+
     async fn deliver_input_text(
         &self,
         pty_session_id: PtySessionId,
@@ -6246,6 +6509,8 @@ where
             Err(error) => {
                 self.mark_activation_failed(active_session, &error.to_string(), true)
                     .await?;
+                self.record_activation_connection_failure(&connection, &error)
+                    .await?;
                 return Err(error);
             }
         };
@@ -6303,12 +6568,46 @@ where
         &self,
         pty_session: &PtySession,
     ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
+        let workspace = self
+            .repositories
+            .workspaces
+            .get(pty_session.workspace_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!(
+                    "workspace not found: {}",
+                    pty_session.workspace_id
+                ))
+            })?;
+        let access_path = self
+            .repositories
+            .access_paths
+            .get(workspace.access_path_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!(
+                    "access path not found: {}",
+                    workspace.access_path_id
+                ))
+            })?;
+        let host = self
+            .repositories
+            .hosts
+            .get(workspace.host_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!("host not found: {}", workspace.host_id))
+            })?;
         self.backend
             .spawn(PtyBackendSpawnRequest {
                 pty_session_id: pty_session.pty_session_id,
                 workspace_id: pty_session.workspace_id,
                 session_id: pty_session.session_id,
-                cwd: pty_session.cwd.clone(),
+                cwd: initial_pty_cwd(
+                    pty_session.cwd.clone(),
+                    &host.kind,
+                    access_path.requires_tty,
+                ),
             })
             .await
     }
@@ -6320,12 +6619,15 @@ where
             close_tx,
             transport_telemetry: _,
             transport_evidence: _,
+            channel_permit,
         } = process;
         self.active.lock().await.insert(
             pty_session.pty_session_id,
             ActivePtyHandle {
                 input_tx,
                 close_tx: Some(close_tx),
+                _channel_permit: channel_permit,
+                transfer_lock: Arc::new(Mutex::new(())),
             },
         );
         self.spawn_output_writer(pty_session, output_rx);
@@ -6379,41 +6681,38 @@ where
                 }
                 sequence = sequence.saturating_add(1);
             }
-            active.lock().await.remove(&pty_session_id);
+            let owns_channel_cleanup = active.lock().await.remove(&pty_session_id).is_some();
+            if !owns_channel_cleanup {
+                return;
+            }
             let Ok(Some(mut session)) = repositories.pty_sessions.get(pty_session_id).await else {
                 return;
             };
-            if session.backend_state != PtyBackendState::Active {
-                return;
+            if session.backend_state == PtyBackendState::Active {
+                session.state = WorkspaceState::Done;
+                session.input_allowed = false;
+                session.foreground_process = None;
+                session.backend_state = PtyBackendState::Closed;
+                session.last_activity_at = now_utc();
+                if repositories.pty_sessions.upsert(&session).await.is_err() {
+                    return;
+                }
+                if let Ok(Some(workspace)) = repositories.workspaces.get(workspace_id).await
+                    && !matches!(
+                        workspace.state,
+                        WorkspaceState::Closed | WorkspaceState::Failed | WorkspaceState::Throttled
+                    )
+                {
+                    let _ = repositories
+                        .workspaces
+                        .update_state(workspace_id, WorkspaceState::Done, session.last_activity_at)
+                        .await;
+                }
             }
-            session.state = WorkspaceState::Done;
-            session.input_allowed = false;
-            session.foreground_process = None;
-            session.backend_state = PtyBackendState::Closed;
-            session.last_activity_at = now_utc();
-            if repositories.pty_sessions.upsert(&session).await.is_err() {
-                return;
-            }
-            if let Ok(Some(mut connection)) = repositories
+            let _ = repositories
                 .connection_sessions
-                .get(session.session_id)
-                .await
-            {
-                connection.open_channels = connection.open_channels.saturating_sub(1);
-                connection.last_used_at = session.last_activity_at;
-                let _ = repositories.connection_sessions.upsert(&connection).await;
-            }
-            if let Ok(Some(workspace)) = repositories.workspaces.get(workspace_id).await
-                && !matches!(
-                    workspace.state,
-                    WorkspaceState::Closed | WorkspaceState::Failed | WorkspaceState::Throttled
-                )
-            {
-                let _ = repositories
-                    .workspaces
-                    .update_state(workspace_id, WorkspaceState::Done, session.last_activity_at)
-                    .await;
-            }
+                .close_channel(session.session_id, session.last_activity_at)
+                .await;
             if let Some((host_id, agent_session_id)) = lease_owner
                 && let Err(error) = shorten_host_write_lease(
                     &repositories,
@@ -6508,6 +6807,94 @@ where
         .await
     }
 
+    async fn record_activation_connection_failure(
+        &self,
+        connection: &ConnectionSession,
+        error: &ConnectorPtyError,
+    ) -> Result<(), ConnectorPtyError> {
+        let observed_at = now_utc();
+        let message = SecretRedactor::default().redact(&error.to_string());
+        let local_handshake_budget = matches!(
+            error,
+            ConnectorPtyError::Transport(TransportError::LocalHandshakeBudgetExhausted { .. })
+        );
+        let (mut state, mut reason_code, mut retry_after_seconds) = match error {
+            ConnectorPtyError::Transport(TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds,
+            }) => (
+                EntityState::Throttled,
+                StateReasonCode::LocalHandshakeBudgetExhausted,
+                Some(*retry_after_seconds),
+            ),
+            ConnectorPtyError::Transport(TransportError::PolicyDenied(_)) => (
+                EntityState::RateLimited,
+                StateReasonCode::TargetSshdRateLimited,
+                Some(60),
+            ),
+            ConnectorPtyError::Transport(
+                TransportError::Backend(_) | TransportError::FileTransfer(_),
+            )
+            | ConnectorPtyError::Backend(_) => classify_connection_failure(&message),
+            ConnectorPtyError::Transport(TransportError::Timeout)
+            | ConnectorPtyError::Database(_)
+            | ConnectorPtyError::Supervisor(_)
+            | ConnectorPtyError::ConnectorMismatch
+            | ConnectorPtyError::NotActive
+            | ConnectorPtyError::RuntimeContinuityLost
+            | ConnectorPtyError::InputNotAllowed
+            | ConnectorPtyError::InvalidInput(_)
+            | ConnectorPtyError::InputClosed
+            | ConnectorPtyError::Int(_) => (
+                EntityState::Degraded,
+                StateReasonCode::SshHandshakeFailed,
+                Some(30),
+            ),
+        };
+        let circuit_breaker_eligible = !local_handshake_budget
+            && !matches!(state, EntityState::AuthFailed | EntityState::HostKeyChanged);
+        let connection = self
+            .repositories
+            .connection_sessions
+            .record_failure(
+                connection.session_id,
+                observed_at,
+                state.clone(),
+                &message,
+                !local_handshake_budget,
+                false,
+                circuit_breaker_eligible,
+                3,
+            )
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!(
+                    "connection session not found: {}",
+                    connection.session_id
+                ))
+            })?;
+        state = connection.state.clone();
+        if state == EntityState::CircuitOpen {
+            reason_code = StateReasonCode::CircuitOpen;
+            retry_after_seconds = Some(300);
+        }
+        self.repositories
+            .access_path_health
+            .upsert(&AccessPathHealth {
+                access_path_id: connection.access_path_id,
+                state,
+                last_checked_at: Some(observed_at),
+                latency_ms: None,
+                failure_count: connection.failure_count,
+                last_error_code: Some(reason_code),
+                next_retry_at: retry_after_seconds.map(|seconds| {
+                    observed_at
+                        + time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX))
+                }),
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn mark_connection_channel_open(
         &self,
         mut connection: ConnectionSession,
@@ -6520,15 +6907,9 @@ where
         );
         connection.state = EntityState::Connected;
         connection.last_used_at = observed_at;
-        connection.open_channels = connection.open_channels.saturating_add(1);
-        if reused {
-            connection.reused_count = connection.reused_count.saturating_add(1);
-        }
-        connection.failure_count = 0;
-        connection.last_error = None;
         self.repositories
             .connection_sessions
-            .upsert(&connection)
+            .open_channel(&connection, reused, true)
             .await?;
         self.repositories
             .access_path_health
@@ -6549,19 +6930,10 @@ where
         &self,
         session_id: SessionId,
     ) -> Result<(), ConnectorPtyError> {
-        if let Some(mut connection) = self
-            .repositories
+        self.repositories
             .connection_sessions
-            .get(session_id)
-            .await?
-        {
-            connection.open_channels = connection.open_channels.saturating_sub(1);
-            connection.last_used_at = now_utc();
-            self.repositories
-                .connection_sessions
-                .upsert(&connection)
-                .await?;
-        }
+            .close_channel(session_id, now_utc())
+            .await?;
         Ok(())
     }
 
@@ -6602,6 +6974,10 @@ where
         ConnectorPtyManager::reconcile_startup(self).await
     }
 
+    async fn reconcile_runtime_state(&self) -> Result<u64, ConnectorPtyError> {
+        ConnectorPtyManager::reconcile_runtime_state(self).await
+    }
+
     async fn activate_next(&self) -> Result<Option<PtySessionId>, ConnectorPtyError> {
         self.activate_next_pending().await
     }
@@ -6617,6 +6993,573 @@ where
     }
 }
 
+#[derive(Clone)]
+struct InteractivePtyTransferHandle {
+    pty_session_id: PtySessionId,
+    input_tx: mpsc::Sender<String>,
+    transfer_lock: Arc<Mutex<()>>,
+}
+
+enum InteractivePtyUploadPreparation {
+    Complete(SftpResult),
+    Pending {
+        local: tokio::fs::File,
+        hasher: Sha256,
+        resume_bytes: u64,
+    },
+}
+
+impl<B> ConnectorPtyManager<B>
+where
+    B: ManagedPtyBackend + 'static,
+{
+    async fn interactive_transfer_handle(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<InteractivePtyTransferHandle, TransportError> {
+        let sessions = self
+            .repositories
+            .pty_sessions
+            .list_for_workspace(workspace_id)
+            .await
+            .map_err(|error| TransportError::Backend(error.to_string()))?;
+        let active = self.active.lock().await;
+        sessions
+            .into_iter()
+            .filter(|session| {
+                session.backend_state == PtyBackendState::Active && session.input_allowed
+            })
+            .find_map(|session| {
+                active
+                    .get(&session.pty_session_id)
+                    .map(|handle| InteractivePtyTransferHandle {
+                        pty_session_id: session.pty_session_id,
+                        input_tx: handle.input_tx.clone(),
+                        transfer_lock: Arc::clone(&handle.transfer_lock),
+                    })
+            })
+            .ok_or_else(|| {
+                TransportError::FileTransfer(
+                    "interactive bastion transfer requires an active PTY in the same workspace"
+                        .to_owned(),
+                )
+            })
+    }
+
+    async fn upload_through_interactive_pty(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        request: &SftpRequest,
+    ) -> Result<SftpResult, TransportError> {
+        let spec = &request.spec;
+        let (local_size, local_sha256) =
+            hash_local_source(Path::new(&spec.local_path), spec.max_size_bytes).await?;
+        ensure_expected_sha256(spec, &local_sha256)?;
+        let temporary_path = resumable_remote_temporary_path(&spec.remote_path, &local_sha256);
+        let _transfer_guard = handle.transfer_lock.lock().await;
+        self.enter_pty_transfer_mode(handle, request.operation_id)
+            .await?;
+        let transfer = tokio::time::timeout(
+            Duration::from_secs(spec.timeout_seconds),
+            self.run_interactive_pty_upload(
+                handle,
+                request,
+                local_size,
+                &local_sha256,
+                &temporary_path,
+            ),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)
+        .and_then(std::convert::identity);
+        let restore = self
+            .leave_pty_transfer_mode(handle, request.operation_id)
+            .await;
+        match (transfer, restore) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    async fn run_interactive_pty_upload(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        request: &SftpRequest,
+        local_size: u64,
+        local_sha256: &str,
+        temporary_path: &str,
+    ) -> Result<SftpResult, TransportError> {
+        let preparation = self
+            .prepare_interactive_pty_upload(
+                handle,
+                request,
+                local_size,
+                local_sha256,
+                temporary_path,
+            )
+            .await?;
+        let InteractivePtyUploadPreparation::Pending {
+            local,
+            hasher,
+            resume_bytes,
+        } = preparation
+        else {
+            let InteractivePtyUploadPreparation::Complete(result) = preparation else {
+                unreachable!();
+            };
+            return Ok(result);
+        };
+        let (bytes_transferred, streamed_sha256) = self
+            .stream_interactive_pty_upload(
+                handle,
+                request,
+                temporary_path,
+                local_size,
+                local,
+                hasher,
+                resume_bytes,
+            )
+            .await?;
+        if bytes_transferred != local_size || streamed_sha256 != local_sha256 {
+            return Err(TransportError::FileTransfer(
+                "interactive PTY upload local stream verification failed".to_owned(),
+            ));
+        }
+        self.finalize_interactive_pty_upload(
+            handle,
+            request,
+            temporary_path,
+            local_size,
+            local_sha256,
+            resume_bytes,
+        )
+        .await
+    }
+
+    async fn prepare_interactive_pty_upload(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        request: &SftpRequest,
+        local_size: u64,
+        local_sha256: &str,
+        temporary_path: &str,
+    ) -> Result<InteractivePtyUploadPreparation, TransportError> {
+        let spec = &request.spec;
+        let initialize =
+            russh_exec_upload_initialize_command(spec, temporary_path, local_size, local_sha256);
+        let initialized = self
+            .execute_pty_transfer_stage(handle, request.operation_id, "initialize", &initialize)
+            .await?;
+        require_exec_transfer_success(
+            &initialized,
+            "initialize interactive PTY upload",
+            &spec.remote_path,
+            temporary_path,
+        )?;
+        let status = parse_exec_upload_status(&initialized.stdout)?;
+        let ExecUploadRemoteStatus::Ready {
+            bytes: mut resume_bytes,
+            prefix_sha256,
+        } = status
+        else {
+            let ExecUploadRemoteStatus::Complete { size, sha256 } = status else {
+                unreachable!();
+            };
+            if size != local_size || sha256 != local_sha256 {
+                return Err(TransportError::FileTransfer(
+                    "completed interactive PTY upload marker does not match local source"
+                        .to_owned(),
+                ));
+            }
+            return Ok(InteractivePtyUploadPreparation::Complete(SftpResult {
+                direction: spec.direction,
+                bytes_transferred: size,
+                sha256,
+                local_path: spec.local_path.clone(),
+                remote_path: spec.remote_path.clone(),
+                overwrite: spec.overwrite,
+            }));
+        };
+
+        let (mut local, mut hasher, local_prefix_sha256) =
+            open_local_upload_at_offset(&spec.local_path, resume_bytes, spec.max_size_bytes)
+                .await?;
+        if prefix_sha256 != local_prefix_sha256 {
+            let reset = russh_exec_upload_cleanup_command(temporary_path);
+            let reset_outcome = self
+                .execute_pty_transfer_stage(handle, request.operation_id, "reset", &reset)
+                .await?;
+            require_exec_transfer_marker(
+                &reset_outcome,
+                "REMOTE_HOSTS_RESET_OK",
+                "reset interactive PTY upload",
+                &spec.remote_path,
+                temporary_path,
+            )?;
+            let reinitialized = self
+                .execute_pty_transfer_stage(
+                    handle,
+                    request.operation_id,
+                    "reinitialize",
+                    &initialize,
+                )
+                .await?;
+            require_exec_transfer_success(
+                &reinitialized,
+                "reinitialize interactive PTY upload",
+                &spec.remote_path,
+                temporary_path,
+            )?;
+            let ExecUploadRemoteStatus::Ready {
+                bytes,
+                prefix_sha256: _,
+            } = parse_exec_upload_status(&reinitialized.stdout)?
+            else {
+                return Err(TransportError::FileTransfer(
+                    "interactive PTY upload reset unexpectedly completed".to_owned(),
+                ));
+            };
+            if bytes != 0 {
+                return Err(TransportError::FileTransfer(
+                    "interactive PTY upload reset did not produce an empty temporary file"
+                        .to_owned(),
+                ));
+            }
+            (local, hasher, _) =
+                open_local_upload_at_offset(&spec.local_path, 0, spec.max_size_bytes).await?;
+            resume_bytes = 0;
+        }
+
+        emit_sftp_progress(
+            request,
+            "resume_verified",
+            resume_bytes,
+            Some(local_size),
+            resume_bytes,
+            0,
+        );
+        Ok(InteractivePtyUploadPreparation::Pending {
+            local,
+            hasher,
+            resume_bytes,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_interactive_pty_upload(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        request: &SftpRequest,
+        temporary_path: &str,
+        local_size: u64,
+        mut local: tokio::fs::File,
+        mut hasher: Sha256,
+        resume_bytes: u64,
+    ) -> Result<(u64, String), TransportError> {
+        let spec = &request.spec;
+        let initial_resume_bytes = resume_bytes;
+        let mut bytes_transferred = resume_bytes;
+        let mut chunk_index = resume_bytes / EXEC_UPLOAD_CHUNK_BYTES as u64;
+        let mut buffer = vec![0_u8; EXEC_UPLOAD_CHUNK_BYTES];
+        loop {
+            let mut filled = 0;
+            while filled < buffer.len() {
+                let read = local.read(&mut buffer[filled..]).await.map_err(|error| {
+                    file_transfer_io_context("read interactive PTY upload source", error)
+                })?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            if filled == 0 {
+                break;
+            }
+            let next_offset = bytes_transferred
+                .checked_add(u64::try_from(filled).map_err(file_transfer_conversion)?)
+                .ok_or_else(|| TransportError::FileTransfer("file size overflow".to_owned()))?;
+            ensure_size_within_limit(next_offset, spec.max_size_bytes)?;
+            let payload = &buffer[..filled];
+            let payload_sha256 = format!("{:x}", Sha256::digest(payload));
+            let append = russh_exec_upload_chunk_command(
+                temporary_path,
+                chunk_index,
+                bytes_transferred,
+                payload,
+            );
+            let verify = russh_exec_upload_chunk_verify_command(
+                temporary_path,
+                chunk_index,
+                next_offset,
+                filled,
+                &payload_sha256,
+            );
+            let stage = format!("{append}\n{verify}");
+            let outcome = self
+                .execute_pty_transfer_stage(
+                    handle,
+                    request.operation_id,
+                    &format!("chunk-{chunk_index}"),
+                    &stage,
+                )
+                .await?;
+            require_exec_upload_chunk_success(
+                &outcome,
+                chunk_index,
+                next_offset,
+                &payload_sha256,
+                &spec.remote_path,
+                temporary_path,
+            )?;
+            hasher.update(payload);
+            bytes_transferred = next_offset;
+            chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                TransportError::FileTransfer("upload chunk index overflow".to_owned())
+            })?;
+            emit_sftp_progress(
+                request,
+                "uploading",
+                bytes_transferred,
+                Some(local_size),
+                initial_resume_bytes,
+                0,
+            );
+        }
+        Ok((bytes_transferred, format!("{:x}", hasher.finalize())))
+    }
+
+    async fn finalize_interactive_pty_upload(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        request: &SftpRequest,
+        temporary_path: &str,
+        local_size: u64,
+        local_sha256: &str,
+        initial_resume_bytes: u64,
+    ) -> Result<SftpResult, TransportError> {
+        let spec = &request.spec;
+        let finalize =
+            russh_exec_upload_finalize_command(spec, temporary_path, local_size, local_sha256);
+        let finalized = self
+            .execute_pty_transfer_stage(handle, request.operation_id, "finalize", &finalize)
+            .await?;
+        require_exec_transfer_success(
+            &finalized,
+            "finalize interactive PTY upload",
+            &spec.remote_path,
+            temporary_path,
+        )?;
+        let (remote_size, remote_sha256) =
+            parse_transfer_marker(&finalized.stdout, "REMOTE_HOSTS_TRANSFER_OK")?;
+        if remote_size != local_size || remote_sha256 != local_sha256 {
+            return Err(TransportError::FileTransfer(
+                "interactive PTY upload destination verification failed".to_owned(),
+            ));
+        }
+        emit_sftp_progress(
+            request,
+            "completed",
+            remote_size,
+            Some(local_size),
+            initial_resume_bytes,
+            0,
+        );
+        Ok(SftpResult {
+            direction: spec.direction,
+            bytes_transferred: remote_size,
+            sha256: remote_sha256,
+            local_path: spec.local_path.clone(),
+            remote_path: spec.remote_path.clone(),
+            overwrite: spec.overwrite,
+        })
+    }
+
+    async fn enter_pty_transfer_mode(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        operation_id: OperationId,
+    ) -> Result<(), TransportError> {
+        let (command, marker) = pty_transfer_enter_command(operation_id);
+        self.send_pty_command_and_wait(handle, command, &marker, EXEC_TRANSFER_STAGE_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    async fn leave_pty_transfer_mode(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        operation_id: OperationId,
+    ) -> Result<(), TransportError> {
+        let (command, marker) = pty_transfer_leave_command(operation_id);
+        self.send_pty_command_and_wait(handle, command, &marker, EXEC_TRANSFER_STAGE_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    async fn execute_pty_transfer_stage(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        operation_id: OperationId,
+        stage: &str,
+        script: &str,
+    ) -> Result<ExecResult, TransportError> {
+        let stage_digest = format!("{:x}", Sha256::digest(stage.as_bytes()));
+        let marker = format!(
+            "REMOTE_HOSTS_PTY_TRANSFER_FRAME_{operation_id}_{}",
+            &stage_digest[..12]
+        );
+        let command = format!(
+            "printf '\\n'; sh -lc {}; rc=$?; printf '\\n{marker} %s\\n' \"$rc\"\n",
+            shell_quote(script)
+        );
+        let output = self
+            .send_pty_command_and_wait(handle, command, &marker, EXEC_TRANSFER_STAGE_TIMEOUT)
+            .await?;
+        let marker_prefix = format!("{marker} ");
+        let exit_code = output.lines().find_map(|line| {
+            line.trim_matches('\r')
+                .strip_prefix(&marker_prefix)
+                .and_then(|value| value.trim().parse::<i32>().ok())
+        });
+        let Some(exit_code) = exit_code else {
+            return Err(TransportError::FileTransfer(format!(
+                "interactive PTY transfer stage `{stage}` returned a malformed completion marker"
+            )));
+        };
+        Ok(ExecResult {
+            exit_code: Some(exit_code),
+            stdout: output,
+            stderr: String::new(),
+            truncated: false,
+        })
+    }
+
+    async fn send_pty_command_and_wait(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        command: String,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<String, TransportError> {
+        let next_sequence = self
+            .repositories
+            .pty_output_chunks
+            .next_sequence(handle.pty_session_id)
+            .await
+            .map_err(|error| TransportError::Backend(error.to_string()))?;
+        handle.input_tx.send(command).await.map_err(|_| {
+            TransportError::FileTransfer(
+                "interactive PTY input channel closed during file transfer".to_owned(),
+            )
+        })?;
+        let deadline = Instant::now() + timeout;
+        let mut after_sequence = next_sequence.checked_sub(1);
+        let mut output = String::new();
+        loop {
+            let chunks = self
+                .repositories
+                .pty_output_chunks
+                .list_for_session(handle.pty_session_id, after_sequence, 100)
+                .await
+                .map_err(|error| TransportError::Backend(error.to_string()))?;
+            for chunk in chunks {
+                after_sequence = Some(chunk.sequence);
+                output.push_str(&chunk.redacted_text);
+                if output.contains(marker) {
+                    return Ok(output);
+                }
+                if output.len() > EXEC_TRANSFER_OUTPUT_LIMIT_BYTES {
+                    let mut keep_from = output
+                        .len()
+                        .saturating_sub(EXEC_TRANSFER_OUTPUT_LIMIT_BYTES);
+                    while !output.is_char_boundary(keep_from) {
+                        keep_from = keep_from.saturating_add(1);
+                    }
+                    output = String::from_utf8_lossy(&output.as_bytes()[keep_from..]).into_owned();
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(TransportError::FileTransfer(format!(
+                    "interactive PTY transfer did not return marker {marker}"
+                )));
+            }
+            tokio::time::sleep(PTY_TRANSFER_POLL_INTERVAL).await;
+        }
+    }
+}
+
+fn pty_transfer_enter_command(operation_id: OperationId) -> (String, String) {
+    let marker = format!("REMOTE_HOSTS_PTY_TRANSFER_READY_{operation_id}");
+    let operation_id_text = operation_id.to_string();
+    let command = format!(
+        "stty -echo -icanon min 1 time 0 && printf '\\nREMOTE_HOSTS_PTY_TRANSFER_READY_%s\\n' '{operation_id_text}'\n"
+    );
+    (command, marker)
+}
+
+fn pty_transfer_leave_command(operation_id: OperationId) -> (String, String) {
+    let marker = format!("REMOTE_HOSTS_PTY_TRANSFER_RESTORED_{operation_id}");
+    let operation_id_text = operation_id.to_string();
+    let command = format!(
+        "stty echo icanon && printf '\\nREMOTE_HOSTS_PTY_TRANSFER_RESTORED_%s\\n' '{operation_id_text}'\n"
+    );
+    (command, marker)
+}
+
+#[async_trait]
+impl<B> InteractiveFileTransferBackend for ConnectorPtyManager<B>
+where
+    B: ManagedPtyBackend + 'static,
+{
+    async fn transfer_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        request: SftpRequest,
+    ) -> Result<Option<SftpResult>, TransportError> {
+        let workspace = self
+            .repositories
+            .workspaces
+            .get(workspace_id)
+            .await
+            .map_err(|error| TransportError::Backend(error.to_string()))?
+            .ok_or_else(|| {
+                TransportError::Backend(format!("workspace not found: {workspace_id}"))
+            })?;
+        if workspace.host_id != request.host_id
+            || workspace.access_path_id != request.access_path_id
+        {
+            return Err(TransportError::PolicyDenied(
+                "interactive file transfer request does not match its workspace route".to_owned(),
+            ));
+        }
+        let access_path = self
+            .repositories
+            .access_paths
+            .get(workspace.access_path_id)
+            .await
+            .map_err(|error| TransportError::Backend(error.to_string()))?
+            .ok_or_else(|| {
+                TransportError::Backend(format!(
+                    "access path not found: {}",
+                    workspace.access_path_id
+                ))
+            })?;
+        if access_path.route_type != RouteType::Bastion || !access_path.proxy_chain.is_empty() {
+            return Ok(None);
+        }
+        if request.spec.direction != SftpDirection::Upload {
+            return Err(TransportError::FileTransfer(
+                "interactive bastion PTY transfer currently supports uploads only".to_owned(),
+            ));
+        }
+        let handle = self.interactive_transfer_handle(workspace_id).await?;
+        let result = self
+            .upload_through_interactive_pty(&handle, &request)
+            .await?;
+        Ok(Some(result))
+    }
+}
+
 /// Worker that claims queued operations and executes them through a reusable transport.
 pub struct ConnectorOperationWorker<P> {
     repositories: Repositories,
@@ -6624,6 +7567,7 @@ pub struct ConnectorOperationWorker<P> {
     config: ConnectorOperationWorkerConfig,
     redactor: SecretRedactor,
     artifact_store: Arc<dyn OutputArtifactStore>,
+    interactive_file_transfer: StdMutex<Option<Arc<dyn InteractiveFileTransferBackend>>>,
 }
 
 enum ClaimedOperationExecution {
@@ -6662,7 +7606,16 @@ where
             config,
             redactor: SecretRedactor::default(),
             artifact_store,
+            interactive_file_transfer: StdMutex::new(None),
         }
+    }
+
+    /// Attaches a connector-local transfer backend for interactive bastion workspaces.
+    pub fn set_interactive_file_transfer(&self, backend: Arc<dyn InteractiveFileTransferBackend>) {
+        *self
+            .interactive_file_transfer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(backend);
     }
 
     /// Claims and executes at most one operation.
@@ -6927,8 +7880,18 @@ where
             spec,
             progress_tx: None,
         };
+        let interactive_backend = self
+            .interactive_file_transfer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let result = self
-            .sftp_with_lease_renewal(operation, Arc::clone(&transport), request)
+            .sftp_with_lease_renewal(
+                operation,
+                Arc::clone(&transport),
+                request,
+                interactive_backend,
+            )
             .await;
         self.record_transport_observation(
             operation,
@@ -7077,6 +8040,7 @@ where
         operation: &OperationRun,
         transport: Arc<dyn RemoteTransport>,
         mut request: SftpRequest,
+        interactive_backend: Option<Arc<dyn InteractiveFileTransferBackend>>,
     ) -> Result<SftpResult, TransportError> {
         let claim_token = operation.claim_token.clone().ok_or_else(|| {
             TransportError::Backend(ConnectorWorkerError::MissingClaimToken.to_string())
@@ -7095,7 +8059,20 @@ where
         )
         .await
         .map_err(|error| TransportError::Backend(error.to_string()))?;
-        let transfer = transport.sftp(request);
+        let workspace_id = operation
+            .workspace_id
+            .ok_or_else(|| TransportError::Backend("file transfer has no workspace".to_owned()))?;
+        let fallback_request = request.clone();
+        let transfer = async move {
+            if let Some(backend) = interactive_backend
+                && let Some(result) = backend
+                    .transfer_for_workspace(workspace_id, request)
+                    .await?
+            {
+                return Ok(result);
+            }
+            transport.sftp(fallback_request).await
+        };
         tokio::pin!(transfer);
         let mut lease_interval = tokio::time::interval(renew_delay);
         lease_interval.tick().await;
@@ -7334,7 +8311,7 @@ where
         operation: &mut OperationRun,
     ) -> Result<(), ConnectorWorkerError> {
         let now = now_utc();
-        let mut session = match operation.session_id {
+        let existing_session = match operation.session_id {
             Some(session_id) => {
                 self.repositories
                     .connection_sessions
@@ -7347,22 +8324,32 @@ where
                     .find_reusable(operation.access_path_id, operation.connector_id)
                     .await?
             }
-        }
-        .unwrap_or_else(|| ConnectionSession {
-            session_id: SessionId::new(),
-            access_path_id: operation.access_path_id,
-            connector_id: operation.connector_id,
-            state: EntityState::Resolving,
-            created_at: now,
-            last_used_at: now,
-            open_channels: 0,
-            reused_count: 0,
-            failure_count: 0,
-            last_error: None,
-        });
-        let reused = matches!(
-            session.state,
-            EntityState::Connected | EntityState::Healthy | EntityState::Resolving
+        };
+        let (mut session, reused) = existing_session.map_or_else(
+            || {
+                (
+                    ConnectionSession {
+                        session_id: SessionId::new(),
+                        access_path_id: operation.access_path_id,
+                        connector_id: operation.connector_id,
+                        state: EntityState::Resolving,
+                        created_at: now,
+                        last_used_at: now,
+                        open_channels: 0,
+                        reused_count: 0,
+                        failure_count: 0,
+                        last_error: None,
+                    },
+                    false,
+                )
+            },
+            |session| {
+                let reused = matches!(
+                    session.state,
+                    EntityState::Connected | EntityState::Healthy | EntityState::Resolving
+                );
+                (session, reused)
+            },
         );
         session.state = if matches!(session.state, EntityState::Connected | EntityState::Healthy) {
             EntityState::Connected
@@ -7370,25 +8357,37 @@ where
             EntityState::Resolving
         };
         session.last_used_at = now;
-        session.open_channels = session.open_channels.saturating_add(1);
-        if reused {
-            session.reused_count = session.reused_count.saturating_add(1);
-        }
-        self.repositories
+        let session = self
+            .repositories
             .connection_sessions
-            .upsert(&session)
+            .open_channel(&session, reused, false)
             .await?;
         let claim_token = operation
             .claim_token
             .as_deref()
             .ok_or(ConnectorWorkerError::MissingClaimToken)?;
-        if !self
+        let attached = self
             .repositories
             .operations
             .attach_session(operation.id, claim_token, session.session_id)
-            .await?
-        {
-            return Err(ConnectorWorkerError::LeaseLost);
+            .await;
+        match attached {
+            Ok(true) => {}
+            Ok(false) => {
+                self.repositories
+                    .connection_sessions
+                    .close_channel(session.session_id, now_utc())
+                    .await?;
+                return Err(ConnectorWorkerError::LeaseLost);
+            }
+            Err(error) => {
+                let _ = self
+                    .repositories
+                    .connection_sessions
+                    .close_channel(session.session_id, now_utc())
+                    .await;
+                return Err(error.into());
+            }
         }
         operation.session_id = Some(session.session_id);
         Ok(())
@@ -7447,21 +8446,13 @@ where
             return Ok(());
         };
         let now = now_utc();
-        if let Some(mut session) = self
+        if let Some(session) = self
             .repositories
             .connection_sessions
-            .get(session_id)
+            .close_channel_success(session_id, now)
             .await?
         {
-            session.state = EntityState::Connected;
-            session.last_used_at = now;
-            session.open_channels = session.open_channels.saturating_sub(1);
-            session.failure_count = 0;
-            session.last_error = None;
-            self.repositories
-                .connection_sessions
-                .upsert(&session)
-                .await?;
+            debug_assert_eq!(session.state, EntityState::Connected);
         }
         self.repositories
             .access_path_health
@@ -7515,33 +8506,30 @@ where
             }
             Some(TransportError::Backend(_)) | None => classify_connection_failure(message),
         };
-        let mut failure_count = 1;
-        if let Some(mut session) = self
+        let circuit_breaker_eligible = !local_handshake_budget
+            && !matches!(state, EntityState::AuthFailed | EntityState::HostKeyChanged);
+        let Some(session) = self
             .repositories
             .connection_sessions
-            .get(session_id)
+            .record_failure(
+                session_id,
+                now,
+                state.clone(),
+                message,
+                !local_handshake_budget,
+                true,
+                circuit_breaker_eligible,
+                3,
+            )
             .await?
-        {
-            session.last_used_at = now;
-            session.open_channels = session.open_channels.saturating_sub(1);
-            if !local_handshake_budget {
-                session.failure_count = session.failure_count.saturating_add(1);
-            }
-            failure_count = session.failure_count;
-            if !local_handshake_budget
-                && failure_count >= 3
-                && !matches!(state, EntityState::AuthFailed | EntityState::HostKeyChanged)
-            {
-                state = EntityState::CircuitOpen;
-                reason_code = StateReasonCode::CircuitOpen;
-                retry_after_seconds = Some(300);
-            }
-            session.state = state.clone();
-            session.last_error = Some(message.to_owned());
-            self.repositories
-                .connection_sessions
-                .upsert(&session)
-                .await?;
+        else {
+            return Ok(());
+        };
+        state = session.state.clone();
+        let failure_count = session.failure_count;
+        if state == EntityState::CircuitOpen {
+            reason_code = StateReasonCode::CircuitOpen;
+            retry_after_seconds = Some(300);
         }
         let next_retry_at = retry_after_seconds.map(|seconds| {
             now + time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX))
@@ -7743,6 +8731,9 @@ pub struct ConnectorDaemonConfig {
     pub version: String,
     /// Optional current network label.
     pub current_network: Option<String>,
+    /// Maximum queued operations executed concurrently by this connector.
+    #[serde(default = "default_max_concurrent_operations")]
+    pub max_concurrent_operations: usize,
     /// Heartbeat interval in milliseconds.
     pub heartbeat_interval_ms: u64,
     /// Minimum idle poll delay in milliseconds.
@@ -7760,12 +8751,17 @@ impl ConnectorDaemonConfig {
         if self.version.trim().is_empty() {
             "unknown".clone_into(&mut self.version);
         }
+        self.max_concurrent_operations = self.max_concurrent_operations.max(1);
         self.heartbeat_interval_ms = self.heartbeat_interval_ms.max(1);
         self.idle_min_delay_ms = self.idle_min_delay_ms.max(1);
         self.idle_max_delay_ms = self.idle_max_delay_ms.max(self.idle_min_delay_ms);
         self.error_backoff_ms = self.error_backoff_ms.max(1);
         self
     }
+}
+
+const fn default_max_concurrent_operations() -> usize {
+    4
 }
 
 /// Daemon stop reason.
@@ -7827,14 +8823,14 @@ pub enum ConnectorDaemonError {
 /// Long-running connector daemon with heartbeat, backoff, and graceful shutdown.
 pub struct ConnectorDaemon<P> {
     repositories: Repositories,
-    worker: ConnectorOperationWorker<P>,
+    worker: Arc<ConnectorOperationWorker<P>>,
     config: ConnectorDaemonConfig,
     pty_input_pump: Option<Arc<dyn QueuedPtyInputPump>>,
 }
 
 impl<P> ConnectorDaemon<P>
 where
-    P: RemoteTransportProvider,
+    P: RemoteTransportProvider + 'static,
 {
     /// Creates a daemon from repositories, provider, worker config, and daemon config.
     pub fn new(
@@ -7843,7 +8839,11 @@ where
         worker_config: ConnectorOperationWorkerConfig,
         config: ConnectorDaemonConfig,
     ) -> Self {
-        let worker = ConnectorOperationWorker::new(repositories.clone(), provider, worker_config);
+        let worker = Arc::new(ConnectorOperationWorker::new(
+            repositories.clone(),
+            provider,
+            worker_config,
+        ));
         Self {
             repositories,
             worker,
@@ -7860,12 +8860,12 @@ where
         config: ConnectorDaemonConfig,
         artifact_store: Arc<dyn OutputArtifactStore>,
     ) -> Self {
-        let worker = ConnectorOperationWorker::with_artifact_store(
+        let worker = Arc::new(ConnectorOperationWorker::with_artifact_store(
             repositories.clone(),
             provider,
             worker_config,
             artifact_store,
-        );
+        ));
         Self {
             repositories,
             worker,
@@ -7878,6 +8878,16 @@ where
     #[must_use]
     pub fn with_pty_input_pump(mut self, pump: Arc<dyn QueuedPtyInputPump>) -> Self {
         self.pty_input_pump = Some(pump);
+        self
+    }
+
+    /// Attaches the PTY-aware file transfer path used by interactive bastion routes.
+    #[must_use]
+    pub fn with_interactive_file_transfer(
+        self,
+        backend: Arc<dyn InteractiveFileTransferBackend>,
+    ) -> Self {
+        self.worker.set_interactive_file_transfer(backend);
         self
     }
 
@@ -7895,84 +8905,94 @@ where
         let max_idle_delay = Duration::from_millis(self.config.idle_max_delay_ms);
         let heartbeat_interval = Duration::from_millis(self.config.heartbeat_interval_ms);
         let mut next_heartbeat = Instant::now();
+        let mut next_claim = Instant::now();
+        let mut next_pty_poll = Instant::now();
+        let mut accepting_operations = !*shutdown.borrow();
+        let mut operations = JoinSet::new();
+        let mut pty_polls = JoinSet::new();
 
         self.reconcile_runtime_startup(&mut report).await?;
 
         loop {
-            if *shutdown.borrow() {
+            if !accepting_operations && operations.is_empty() && pty_polls.is_empty() {
                 break;
             }
 
-            let now = Instant::now();
-            if now >= next_heartbeat {
-                self.record_connector_state(EntityState::Healthy).await?;
-                next_heartbeat = now + heartbeat_interval;
-            }
+            let heartbeat_due = tokio::time::sleep_until(next_heartbeat);
+            let claim_due = tokio::time::sleep_until(next_claim);
+            let pty_poll_due = tokio::time::sleep_until(next_pty_poll);
+            tokio::pin!(heartbeat_due);
+            tokio::pin!(claim_due);
+            tokio::pin!(pty_poll_due);
 
-            if let Some(pump) = &self.pty_input_pump {
-                match poll_pty_pump(pump.as_ref()).await {
-                    Ok(Some(PtyPumpOutcome::Activated)) => {
-                        idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
-                        continue;
+            tokio::select! {
+                changed = shutdown.changed(), if accepting_operations => {
+                    accepting_operations = changed.is_ok() && !*shutdown.borrow();
+                }
+                () = &mut heartbeat_due => {
+                    self.record_connector_state(EntityState::Healthy).await?;
+                    next_heartbeat = Instant::now() + heartbeat_interval;
+                }
+                () = &mut claim_due,
+                    if accepting_operations
+                        && operations.len() < self.config.max_concurrent_operations =>
+                {
+                    let available = self
+                        .config
+                        .max_concurrent_operations
+                        .saturating_sub(operations.len());
+                    for _ in 0..available {
+                        let worker = Arc::clone(&self.worker);
+                        operations.spawn(async move { worker.run_once().await });
                     }
-                    Ok(Some(PtyPumpOutcome::Input(outcome))) => {
-                        match outcome.state {
-                            PtyInputEventState::Delivered => report.delivered_pty_inputs += 1,
-                            PtyInputEventState::Failed => report.failed_pty_inputs += 1,
-                            PtyInputEventState::Queued | PtyInputEventState::Claimed => {}
+                    next_claim = Instant::now() + idle_delay;
+                }
+                joined = operations.join_next(), if !operations.is_empty() => {
+                    match joined {
+                        Some(Ok(Ok(Some(_outcome)))) => {
+                            report.completed_operations += 1;
+                            idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
+                            next_claim = Instant::now();
                         }
-                        idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        report.infrastructure_errors += 1;
-                        tracing::warn!(%error, "connector daemon PTY pump error");
-                        self.record_connector_state(EntityState::Degraded).await?;
-                        if sleep_or_stop(
-                            Duration::from_millis(self.config.error_backoff_ms),
-                            &mut shutdown,
-                        )
-                        .await
-                        {
-                            break;
+                        Some(Ok(Ok(None))) => {
+                            report.idle_polls += 1;
+                            if operations.is_empty() {
+                                idle_delay = doubled_duration(idle_delay, max_idle_delay);
+                                next_claim = Instant::now() + idle_delay;
+                            }
                         }
-                        continue;
+                        Some(Ok(Err(error))) => {
+                            report.infrastructure_errors += 1;
+                            tracing::warn!(%error, "connector daemon infrastructure error");
+                            self.record_connector_state(EntityState::Degraded).await?;
+                            next_claim = Instant::now()
+                                + Duration::from_millis(self.config.error_backoff_ms);
+                        }
+                        Some(Err(error)) => {
+                            report.infrastructure_errors += 1;
+                            tracing::error!(%error, "connector operation task failed");
+                            self.record_connector_state(EntityState::Degraded).await?;
+                            next_claim = Instant::now()
+                                + Duration::from_millis(self.config.error_backoff_ms);
+                        }
+                        None => {}
                     }
                 }
-            }
-
-            let operation_result = self
-                .run_operation_with_background_services(
-                    &mut report,
-                    &mut next_heartbeat,
-                    heartbeat_interval,
-                )
-                .await?;
-
-            match operation_result {
-                Ok(Some(_outcome)) => {
-                    report.completed_operations += 1;
-                    idle_delay = Duration::from_millis(self.config.idle_min_delay_ms);
-                }
-                Ok(None) => {
-                    report.idle_polls += 1;
-                    if sleep_or_stop(idle_delay, &mut shutdown).await {
-                        break;
+                () = &mut pty_poll_due,
+                    if accepting_operations
+                        && self.pty_input_pump.is_some()
+                        && pty_polls.is_empty() =>
+                {
+                    if let Some(pump) = self.pty_input_pump.clone() {
+                        pty_polls.spawn(async move { poll_pty_pump(pump.as_ref()).await });
                     }
-                    idle_delay = doubled_duration(idle_delay, max_idle_delay);
                 }
-                Err(error) => {
-                    report.infrastructure_errors += 1;
-                    tracing::warn!(%error, "connector daemon infrastructure error");
-                    self.record_connector_state(EntityState::Degraded).await?;
-                    if sleep_or_stop(
-                        Duration::from_millis(self.config.error_backoff_ms),
-                        &mut shutdown,
-                    )
-                    .await
+                joined = pty_polls.join_next(), if !pty_polls.is_empty() => {
+                    if let Some(delay) = self
+                        .handle_background_pty_join(joined, &mut report)
+                        .await?
                     {
-                        break;
+                        next_pty_poll = Instant::now() + delay;
                     }
                 }
             }
@@ -7983,43 +9003,24 @@ where
         Ok(report)
     }
 
-    async fn run_operation_with_background_services(
+    async fn handle_background_pty_join(
         &self,
+        joined: Option<
+            Result<Result<Option<PtyPumpOutcome>, ConnectorPtyError>, tokio::task::JoinError>,
+        >,
         report: &mut ConnectorDaemonReport,
-        next_heartbeat: &mut Instant,
-        heartbeat_interval: Duration,
-    ) -> Result<Result<Option<ConnectorOperationOutcome>, ConnectorWorkerError>, ConnectorDaemonError>
-    {
-        let operation = self.worker.run_once();
-        tokio::pin!(operation);
-        let mut next_pty_poll =
-            Instant::now() + Duration::from_millis(self.config.idle_min_delay_ms);
-
-        loop {
-            let heartbeat_due = tokio::time::sleep_until(*next_heartbeat);
-            let pty_input_pump = self.pty_input_pump.clone();
-            let pty_poll_at = next_pty_poll;
-            let pty_poll = async move {
-                let Some(pump) = pty_input_pump else {
-                    return std::future::pending().await;
-                };
-                tokio::time::sleep_until(pty_poll_at).await;
-                poll_pty_pump(pump.as_ref()).await
-            };
-            tokio::pin!(heartbeat_due);
-            tokio::pin!(pty_poll);
-
-            tokio::select! {
-                result = &mut operation => return Ok(result),
-                () = &mut heartbeat_due => {
-                    self.record_connector_state(EntityState::Healthy).await?;
-                    *next_heartbeat = Instant::now() + heartbeat_interval;
-                }
-                result = &mut pty_poll => {
-                    let delay = self.handle_background_pty_result(result, report).await?;
-                    next_pty_poll = Instant::now() + delay;
-                }
+    ) -> Result<Option<Duration>, ConnectorDaemonError> {
+        match joined {
+            Some(Ok(result)) => Ok(Some(
+                self.handle_background_pty_result(result, report).await?,
+            )),
+            Some(Err(error)) => {
+                report.infrastructure_errors += 1;
+                tracing::error!(%error, "connector PTY pump task failed");
+                self.record_connector_state(EntityState::Degraded).await?;
+                Ok(Some(Duration::from_millis(self.config.error_backoff_ms)))
             }
+            None => Ok(None),
         }
     }
 
@@ -8037,7 +9038,7 @@ where
                 }
                 Ok(Duration::from_millis(self.config.idle_min_delay_ms))
             }
-            Ok(Some(PtyPumpOutcome::Activated) | None) => {
+            Ok(Some(PtyPumpOutcome::Activated | PtyPumpOutcome::Reconciled) | None) => {
                 Ok(Duration::from_millis(self.config.idle_min_delay_ms))
             }
             Err(error) => {
@@ -8107,17 +9108,6 @@ where
             self.repositories.state_events.insert(&event).await?;
         }
         Ok(())
-    }
-}
-
-async fn sleep_or_stop(delay: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
-    if *shutdown.borrow() {
-        return true;
-    }
-
-    tokio::select! {
-        () = tokio::time::sleep(delay) => *shutdown.borrow(),
-        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
     }
 }
 
@@ -8381,6 +9371,17 @@ fn shell_change_dir_input(cwd: Option<&str>) -> Option<String> {
     cwd.map(|cwd| format!("cd -- {}\n", shell_quote(cwd)))
 }
 
+fn initial_pty_cwd(
+    cwd: Option<String>,
+    host_kind: &HostKind,
+    access_path_requires_tty: bool,
+) -> Option<String> {
+    if *host_kind == HostKind::JumpHost && access_path_requires_tty {
+        return None;
+    }
+    cwd
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -8446,7 +9447,7 @@ mod tests {
         process::Stdio,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -8488,7 +9489,7 @@ mod tests {
         QueuedPtyInputPump, RemoteTransportProvider, RusshPtyBackendFactory, RusshTransportPool,
         SshCredentialProvider, StaticTransportProvider, TransportTelemetryTracker,
         authorized_key_bootstrap_failure_state, authorized_key_bootstrap_is_eligible,
-        execute_authorized_key_install_with_timeout, russh_inactivity_timeout,
+        execute_authorized_key_install_with_timeout, initial_pty_cwd, russh_inactivity_timeout,
     };
     use remote_hosts_core::ServerProtectionPolicy;
     use remote_hosts_vault::{CredentialSecret, CredentialVault};
@@ -8499,6 +9500,18 @@ mod tests {
             .arg("-c")
             .arg(command)
             .output()
+    }
+
+    #[test]
+    fn pty_cwd_is_deferred_for_interactive_jump_host_menu() {
+        assert_eq!(
+            initial_pty_cwd(Some("/".to_owned()), &HostKind::JumpHost, true,),
+            None,
+        );
+        assert_eq!(
+            initial_pty_cwd(Some("/srv/app".to_owned()), &HostKind::Linux, false,),
+            Some("/srv/app".to_owned()),
+        );
     }
 
     fn exec_transfer_test_spec() -> FileTransferSpec {
@@ -8622,6 +9635,28 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_pty_channels_share_one_lifecycle_without_early_invalidation() {
+        let mut lifecycle = super::RusshPtyChannelLifecycle::default();
+
+        lifecycle.reserve();
+        lifecycle.reserve();
+
+        assert_eq!(lifecycle.active_channels(), 2);
+        assert!(!lifecycle.release());
+        assert_eq!(lifecycle.active_channels(), 1);
+        assert!(lifecycle.release());
+        assert_eq!(lifecycle.active_channels(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "released without a matching reservation")]
+    fn pty_channel_lifecycle_rejects_unbalanced_release() {
+        let mut lifecycle = super::RusshPtyChannelLifecycle::default();
+
+        lifecycle.release();
+    }
+
+    #[test]
     fn markerless_gateway_chunk_verification_is_not_success() {
         let result = super::require_exec_upload_chunk_success(
             &ExecResult {
@@ -8638,6 +9673,26 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn interactive_pty_ready_marker_cannot_be_satisfied_by_terminal_echo() {
+        let operation_id = OperationId::new();
+        let (command, marker) = super::pty_transfer_enter_command(operation_id);
+
+        assert!(!command.contains(&marker));
+        assert!(command.contains("stty -echo -icanon"));
+        assert!(command.contains("&& printf"));
+    }
+
+    #[test]
+    fn interactive_pty_restore_marker_requires_success_and_cannot_be_echoed() {
+        let operation_id = OperationId::new();
+        let (command, marker) = super::pty_transfer_leave_command(operation_id);
+
+        assert!(!command.contains(&marker));
+        assert!(command.contains("stty echo icanon"));
+        assert!(command.contains("&& printf"));
     }
 
     fn run_test_shell_with_input(
@@ -8749,6 +9804,20 @@ mod tests {
         delivered: AtomicBool,
     }
 
+    struct SlowOneShotPtyActivationPump {
+        started: AtomicBool,
+        completed: AtomicBool,
+    }
+
+    impl SlowOneShotPtyActivationPump {
+        fn new() -> Self {
+            Self {
+                started: AtomicBool::new(false),
+                completed: AtomicBool::new(false),
+            }
+        }
+    }
+
     impl DeferredOneShotPtyInputPump {
         fn new(delay: Duration) -> Self {
             Self {
@@ -8779,6 +9848,24 @@ mod tests {
                 byte_len: 1,
                 error: None,
             }))
+        }
+    }
+
+    #[async_trait]
+    impl QueuedPtyInputPump for SlowOneShotPtyActivationPump {
+        async fn activate_next(&self) -> Result<Option<PtySessionId>, super::ConnectorPtyError> {
+            if self.started.swap(true, Ordering::SeqCst) {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(Some(PtySessionId::new()))
+        }
+
+        async fn deliver_next(
+            &self,
+        ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, super::ConnectorPtyError> {
+            Ok(None)
         }
     }
 
@@ -8919,6 +10006,124 @@ mod tests {
         }
     }
 
+    struct ConcurrencyTrackingTransport {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    struct InteractiveRoutingTransport {
+        fallback_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl RemoteTransport for InteractiveRoutingTransport {
+        async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
+            Ok(CheckResult {
+                ok: true,
+                latency_ms: Some(1),
+                message: "ok".to_owned(),
+            })
+        }
+
+        async fn exec(&self, _request: ExecRequest) -> Result<ExecResult, TransportError> {
+            Ok(ExecResult {
+                exit_code: Some(0),
+                stdout: "ok".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            })
+        }
+
+        async fn sftp(&self, _request: SftpRequest) -> Result<SftpResult, TransportError> {
+            self.fallback_called.store(true, Ordering::SeqCst);
+            Err(TransportError::FileTransfer(
+                "ordinary transport must not handle interactive transfer".to_owned(),
+            ))
+        }
+
+        async fn open_forward(
+            &self,
+            _request: ForwardRequest,
+        ) -> Result<ForwardHandle, TransportError> {
+            Err(TransportError::Backend("not implemented".to_owned()))
+        }
+    }
+
+    struct RecordingInteractiveFileTransfer {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl super::InteractiveFileTransferBackend for RecordingInteractiveFileTransfer {
+        async fn transfer_for_workspace(
+            &self,
+            _workspace_id: WorkspaceId,
+            request: SftpRequest,
+        ) -> Result<Option<SftpResult>, TransportError> {
+            self.called.store(true, Ordering::SeqCst);
+            let bytes_transferred = tokio::fs::metadata(&request.spec.local_path)
+                .await
+                .map_err(|error| TransportError::FileTransfer(error.to_string()))?
+                .len();
+            Ok(Some(SftpResult {
+                direction: request.spec.direction,
+                bytes_transferred,
+                sha256: request
+                    .spec
+                    .expected_sha256
+                    .clone()
+                    .unwrap_or_else(|| "0".repeat(64)),
+                local_path: request.spec.local_path,
+                remote_path: request.spec.remote_path,
+                overwrite: request.spec.overwrite,
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteTransport for ConcurrencyTrackingTransport {
+        async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
+            Ok(CheckResult {
+                ok: true,
+                latency_ms: Some(1),
+                message: "ok".to_owned(),
+            })
+        }
+
+        async fn exec(&self, _request: ExecRequest) -> Result<ExecResult, TransportError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ExecResult {
+                exit_code: Some(0),
+                stdout: "concurrent ok".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            })
+        }
+
+        async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+            Ok(SftpResult {
+                direction: request.spec.direction,
+                bytes_transferred: 0,
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_owned(),
+                local_path: request.spec.local_path,
+                remote_path: request.spec.remote_path,
+                overwrite: request.spec.overwrite,
+            })
+        }
+
+        async fn open_forward(
+            &self,
+            _request: ForwardRequest,
+        ) -> Result<ForwardHandle, TransportError> {
+            Err(TransportError::Backend("not implemented".to_owned()))
+        }
+    }
+
     struct LargeOutputTransport;
 
     #[async_trait]
@@ -8981,6 +10186,10 @@ mod tests {
 
     struct EndingPtyBackend;
 
+    struct HandshakeBudgetPtyBackend {
+        retry_after_seconds: u64,
+    }
+
     struct TelemetryPtyBackend {
         tracker: Arc<TransportTelemetryTracker>,
     }
@@ -9035,6 +10244,23 @@ mod tests {
             let (_output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(1);
             let (close_tx, _close_rx) = oneshot::channel();
             Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx))
+        }
+    }
+
+    #[async_trait]
+    impl ManagedPtyBackend for HandshakeBudgetPtyBackend {
+        fn capabilities(&self) -> PtyBackendCapabilities {
+            PtyBackendCapabilities::russh_native_pty()
+        }
+
+        async fn spawn(
+            &self,
+            _request: PtyBackendSpawnRequest,
+        ) -> Result<ManagedPtyProcess, super::ConnectorPtyError> {
+            Err(TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds: self.retry_after_seconds,
+            }
+            .into())
         }
     }
 
@@ -9489,6 +10715,37 @@ mod tests {
             Err(TransportError::LocalHandshakeBudgetExhausted {
                 retry_after_seconds
             }) if retry_after_seconds > 0
+        ));
+    }
+
+    #[test]
+    fn rejected_global_handshake_budget_does_not_consume_the_path_budget() {
+        let global = super::HandshakeLimiter::shared_global_for_window(1, Duration::from_secs(1));
+        let first = super::HandshakeLimiter::with_shared_global(60, Arc::clone(&global));
+        let second = super::HandshakeLimiter::with_shared_global(1, global);
+        let now = std::time::Instant::now();
+
+        assert!(first.try_acquire_at(now).is_ok());
+        assert!(matches!(
+            second.try_acquire_at(now),
+            Err(TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds: 1
+            })
+        ));
+        assert!(second.try_acquire_at(now + Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn handshake_retry_delay_rounds_up_to_avoid_an_immediate_second_throttle() {
+        let limiter = super::HandshakeLimiter::new(1, 100);
+        let now = std::time::Instant::now();
+
+        assert!(limiter.try_acquire_at(now).is_ok());
+        assert!(matches!(
+            limiter.try_acquire_at(now + Duration::from_millis(4_100)),
+            Err(TransportError::LocalHandshakeBudgetExhausted {
+                retry_after_seconds: 56
+            })
         ));
     }
 
@@ -10845,6 +12102,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interactive_pty_transfer_fails_closed_without_completion_marker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let backend = CapturingPtyBackend::new();
+        let inputs = Arc::clone(&backend.inputs);
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let handle = manager
+            .interactive_transfer_handle(fixture.workspace_id)
+            .await?;
+        let error = manager
+            .send_pty_command_and_wait(
+                &handle,
+                "printf payload-without-marker\n".to_owned(),
+                "REMOTE_HOSTS_REQUIRED_MARKER",
+                Duration::from_millis(30),
+            )
+            .await
+            .err()
+            .ok_or("markerless PTY stage must fail")?;
+
+        assert!(error.to_string().contains("did not return marker"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            inputs.lock().await.as_slice(),
+            ["printf payload-without-marker\n"]
+        );
+        let chunks = fixture
+            .repositories
+            .pty_output_chunks
+            .list_for_session(opened.pty_session.pty_session_id, None, 10)
+            .await?;
+        assert!(chunks.is_empty());
+        manager
+            .close(opened.pty_session.pty_session_id, Some(1))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn regular_pty_input_waits_for_an_active_interactive_transfer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let backend = CapturingPtyBackend::new();
+        let inputs = Arc::clone(&backend.inputs);
+        let manager = Arc::new(ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        ));
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let handle = manager
+            .interactive_transfer_handle(fixture.workspace_id)
+            .await?;
+        let transfer_guard = handle.transfer_lock.lock().await;
+        let manager_for_input = Arc::clone(&manager);
+        let input_task = tokio::spawn(async move {
+            manager_for_input
+                .write_input(
+                    opened.pty_session.pty_session_id,
+                    "ordinary command\n".to_owned(),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            inputs.lock().await.is_empty(),
+            "ordinary PTY input must not interleave with transfer frames"
+        );
+        drop(transfer_guard);
+        input_task.await??;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(inputs.lock().await.as_slice(), ["ordinary command\n"]);
+        manager
+            .close(opened.pty_session.pty_session_id, Some(0))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_releases_runtime_handle_after_external_pty_close()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            CapturingPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let pty_session_id = opened.pty_session.pty_session_id;
+        let closed = PtySessionSupervisor::default().close(opened.pty_session, Some(0));
+        fixture.repositories.pty_sessions.upsert(&closed).await?;
+
+        assert_eq!(manager.reconcile_runtime_state().await?, 1);
+        assert!(!manager.active.lock().await.contains_key(&pty_session_id));
+        assert!(
+            manager
+                .write_input(pty_session_id, "after close\n".to_owned())
+                .await
+                .is_err()
+        );
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        assert_eq!(
+            connection.open_channels, 1,
+            "external PTY close must release the connector channel count"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connector_pty_manager_activates_pending_session_before_first_input()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
@@ -10953,6 +12336,85 @@ mod tests {
         assert_eq!(health.failure_count, 0);
         assert_eq!(health.last_error_code, None);
         assert_eq!(health.next_retry_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_activation_failure_updates_its_logical_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let mut connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        connection.state = EntityState::Resolving;
+        fixture
+            .repositories
+            .connection_sessions
+            .upsert(&connection)
+            .await?;
+        let pending = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: Some("/tmp".to_owned()),
+            },
+        )?;
+        fixture.repositories.pty_sessions.upsert(&pending).await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            HandshakeBudgetPtyBackend {
+                retry_after_seconds: 17,
+            },
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let before = now_utc();
+
+        assert_eq!(
+            manager.activate_next_pending().await?,
+            Some(pending.pty_session_id)
+        );
+        let failed_connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        assert_eq!(failed_connection.state, EntityState::Throttled);
+        assert_eq!(failed_connection.failure_count, 0);
+        assert!(
+            failed_connection
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains("retry_after_seconds=17"))
+        );
+        let health = fixture
+            .repositories
+            .access_path_health
+            .get(connection.access_path_id)
+            .await?
+            .ok_or("access path health should exist")?;
+        assert_eq!(health.state, EntityState::Throttled);
+        assert_eq!(
+            health.last_error_code,
+            Some(StateReasonCode::LocalHandshakeBudgetExhausted)
+        );
+        assert_eq!(health.failure_count, 0);
+        let retry_after = health
+            .next_retry_at
+            .ok_or("local cooldown should have a retry time")?
+            - before;
+        assert!((17..=18).contains(&retry_after.whole_seconds()));
         Ok(())
     }
 
@@ -11882,6 +13344,7 @@ mod tests {
                 connector_id: fixture.connector_id,
                 version: "test-daemon".to_owned(),
                 current_network: Some("test-net".to_owned()),
+                max_concurrent_operations: 4,
                 heartbeat_interval_ms: 5,
                 idle_min_delay_ms: 5,
                 idle_max_delay_ms: 10,
@@ -11954,6 +13417,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_routes_file_bytes_to_connector_local_interactive_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let fallback_called = Arc::new(AtomicBool::new(false));
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(InteractiveRoutingTransport {
+                fallback_called: Arc::clone(&fallback_called),
+            }),
+            ConnectorOperationWorkerConfig::production_default(fixture.connector_id),
+        );
+        worker
+            .run_once()
+            .await?
+            .ok_or("fixture operation should finish first")?;
+
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("interactive-upload.bin");
+        let payload = b"connector-local-file-bytes-must-not-enter-audit";
+        tokio::fs::write(&source, payload).await?;
+        let digest = format!("{:x}", Sha256::digest(payload));
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let plan = WorkspaceOperationSupervisor::default().queue_file_transfer(
+            &WorkspaceFileTransfer {
+                workspace,
+                spec: FileTransferSpec {
+                    direction: SftpDirection::Upload,
+                    local_path: source.to_string_lossy().into_owned(),
+                    remote_path: "/tmp/interactive-upload.bin".to_owned(),
+                    overwrite: SftpOverwritePolicy::Replace,
+                    mode: Some(0o600),
+                    max_size_bytes: 1024,
+                    expected_sha256: Some(digest),
+                    timeout_seconds: 30,
+                },
+                intent: Some("verify connector-local interactive routing".to_owned()),
+                idempotency_key: None,
+                queued_operations: 0,
+                active_exec_channels: 0,
+                overload_cooldown_active: false,
+            },
+        )?;
+        fixture
+            .repositories
+            .operations
+            .insert(&plan.operation)
+            .await?;
+        fixture
+            .repositories
+            .operation_output_chunks
+            .insert(&plan.initial_output_chunk)
+            .await?;
+        fixture
+            .repositories
+            .workspaces
+            .update_state(fixture.workspace_id, plan.workspace_state, now_utc())
+            .await?;
+
+        let interactive_called = Arc::new(AtomicBool::new(false));
+        worker.set_interactive_file_transfer(Arc::new(RecordingInteractiveFileTransfer {
+            called: Arc::clone(&interactive_called),
+        }));
+        let outcome = worker
+            .run_once()
+            .await?
+            .ok_or("interactive transfer should be claimed")?;
+        assert_eq!(outcome.state, OperationState::Succeeded);
+        assert!(interactive_called.load(Ordering::SeqCst));
+        assert!(!fallback_called.load(Ordering::SeqCst));
+
+        let chunks = fixture
+            .repositories
+            .operation_output_chunks
+            .list_for_workspace(fixture.workspace_id, Some(plan.operation.id), None, 100)
+            .await?;
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !chunk.redacted_text.contains("connector-local-file-bytes"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_daemon_overlaps_readonly_operations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let policy = ServerProtectionPolicy::default();
+        let profile = CommandProfileCatalog::resolve_builtin("host.identity", Vec::new(), &policy)?;
+        let second =
+            WorkspaceOperationSupervisor::new(policy).queue_operation(&WorkspaceRunCommand {
+                workspace,
+                command_profile: profile,
+                intent: Some("parallel readonly smoke".to_owned()),
+                idempotency_key: None,
+                queued_operations: 1,
+                active_exec_channels: 0,
+                active_probe_jobs: 0,
+                overload_cooldown_active: false,
+            })?;
+        fixture
+            .repositories
+            .operations
+            .insert(&second.operation)
+            .await?;
+        fixture
+            .repositories
+            .operation_output_chunks
+            .insert(&second.initial_output_chunk)
+            .await?;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let transport = ConcurrencyTrackingTransport {
+            active,
+            max_active: Arc::clone(&max_active),
+            delay: Duration::from_millis(250),
+        };
+        let daemon = ConnectorDaemon::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(transport),
+            ConnectorOperationWorkerConfig::production_default(fixture.connector_id),
+            ConnectorDaemonConfig {
+                connector_id: fixture.connector_id,
+                version: "parallel-test".to_owned(),
+                current_network: None,
+                max_concurrent_operations: 2,
+                heartbeat_interval_ms: 10,
+                idle_min_delay_ms: 5,
+                idle_max_delay_ms: 10,
+                error_backoff_ms: 5,
+            },
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { daemon.run_until_stopped(stop_rx).await });
+
+        for _ in 0..50 {
+            if max_active.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        let concurrent_channels: u32 = fixture
+            .repositories
+            .connection_sessions
+            .list_for_host(fixture.host_id)
+            .await?
+            .into_iter()
+            .map(|session| session.open_channels)
+            .sum();
+        assert_eq!(concurrent_channels, 2);
+
+        wait_for_operation_state(
+            &fixture.repositories,
+            fixture.operation_id,
+            OperationState::Succeeded,
+        )
+        .await?;
+        wait_for_operation_state(
+            &fixture.repositories,
+            second.operation.id,
+            OperationState::Succeeded,
+        )
+        .await?;
+        stop_tx.send(true)?;
+        handle.await??;
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        let completed_channels: u32 = fixture
+            .repositories
+            .connection_sessions
+            .list_for_host(fixture.host_id)
+            .await?
+            .into_iter()
+            .map(|session| session.open_channels)
+            .sum();
+        assert_eq!(completed_channels, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connector_daemon_keeps_heartbeating_while_operation_is_running()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
@@ -11971,6 +13627,7 @@ mod tests {
                 connector_id: fixture.connector_id,
                 version: "test-daemon".to_owned(),
                 current_network: Some("test-net".to_owned()),
+                max_concurrent_operations: 4,
                 heartbeat_interval_ms: 10,
                 idle_min_delay_ms: 5,
                 idle_max_delay_ms: 10,
@@ -12037,6 +13694,7 @@ mod tests {
                 connector_id: fixture.connector_id,
                 version: "test-daemon".to_owned(),
                 current_network: Some("test-net".to_owned()),
+                max_concurrent_operations: 4,
                 heartbeat_interval_ms: 10,
                 idle_min_delay_ms: 5,
                 idle_max_delay_ms: 10,
@@ -12068,6 +13726,46 @@ mod tests {
         stop_tx.send(true)?;
         let report = handle.await??;
         assert_eq!(report.delivered_pty_inputs, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_daemon_does_not_cancel_slow_pty_activation_for_heartbeats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let pump = Arc::new(SlowOneShotPtyActivationPump::new());
+        let daemon = ConnectorDaemon::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(SlowTransport(Duration::from_millis(100))),
+            ConnectorOperationWorkerConfig::production_default(fixture.connector_id),
+            ConnectorDaemonConfig {
+                connector_id: fixture.connector_id,
+                version: "pty-cancellation-test".to_owned(),
+                current_network: None,
+                max_concurrent_operations: 4,
+                heartbeat_interval_ms: 5,
+                idle_min_delay_ms: 5,
+                idle_max_delay_ms: 10,
+                error_backoff_ms: 5,
+            },
+        )
+        .with_pty_input_pump(pump.clone());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { daemon.run_until_stopped(stop_rx).await });
+
+        for _ in 0..40 {
+            if pump.completed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        stop_tx.send(true)?;
+        handle.await??;
+
+        assert!(
+            pump.completed.load(Ordering::SeqCst),
+            "heartbeat and operation polling must not cancel an in-flight PTY activation"
+        );
         Ok(())
     }
 

@@ -7,9 +7,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use remote_hosts_connector::{
     ConnectorDaemon, ConnectorDaemonConfig, ConnectorOperationWorker,
     ConnectorOperationWorkerConfig, ConnectorPtyManager, ConnectorPtyManagerConfig,
-    FileOutputArtifactStore, HostKeyPolicy, OpenSshManagedPtyBackendMode, OpenSshPtyBackendFactory,
-    OpenSshTransportPool, OpenSshTransportProvider, QueuedPtyInputPump, RusshPtyBackendFactory,
-    RusshTransportPool, RusshTransportProvider, VaultSshCredentialProvider,
+    FileOutputArtifactStore, HostKeyPolicy, InteractiveFileTransferBackend,
+    OpenSshManagedPtyBackendMode, OpenSshPtyBackendFactory, OpenSshTransportPool,
+    OpenSshTransportProvider, QueuedPtyInputPump, RusshPtyBackendFactory, RusshTransportPool,
+    RusshTransportProvider, VaultSshCredentialProvider,
 };
 use remote_hosts_core::ServerProtectionPolicy;
 use remote_hosts_domain::ConnectorId;
@@ -160,6 +161,13 @@ enum Command {
         /// Maximum attempts per operation.
         #[arg(long, default_value_t = 3)]
         max_attempts: u32,
+        /// Maximum queued operations executed concurrently.
+        #[arg(
+            long,
+            env = "REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS",
+            default_value_t = 4
+        )]
+        max_concurrent_operations: usize,
         /// Claim lease in seconds for queued PTY input events.
         #[arg(long, default_value_t = 30)]
         pty_input_lease_seconds: u64,
@@ -308,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
             russh_inactivity_timeout_seconds,
             lease_seconds,
             max_attempts,
+            max_concurrent_operations,
             pty_input_lease_seconds,
             pty_input_max_attempts,
             pty_backend_mode,
@@ -332,6 +341,7 @@ async fn main() -> anyhow::Result<()> {
                 russh_inactivity_timeout_seconds,
                 lease_seconds,
                 max_attempts,
+                max_concurrent_operations,
                 pty_input_lease_seconds,
                 pty_input_max_attempts,
                 pty_backend_mode,
@@ -466,7 +476,7 @@ async fn run_worker_once(args: WorkerOnceArgs) -> anyhow::Result<()> {
 async fn run_worker_daemon_with_provider<P>(
     repositories: remote_hosts_db::Repositories,
     provider: P,
-    pty_input_pump: Arc<dyn QueuedPtyInputPump>,
+    pty_services: ConnectorPtyServices,
     args: WorkerDaemonArgs,
     connector_id: ConnectorId,
 ) -> anyhow::Result<()>
@@ -487,6 +497,7 @@ where
             connector_id,
             version: args.version,
             current_network: args.current_network,
+            max_concurrent_operations: args.max_concurrent_operations,
             heartbeat_interval_ms: args.heartbeat_interval_ms,
             idle_min_delay_ms: args.idle_min_delay_ms,
             idle_max_delay_ms: args.idle_max_delay_ms,
@@ -494,7 +505,9 @@ where
         },
         Arc::new(FileOutputArtifactStore::new(args.artifact_root)),
     );
-    let daemon = daemon.with_pty_input_pump(pty_input_pump);
+    let daemon = daemon
+        .with_pty_input_pump(pty_services.input_pump)
+        .with_interactive_file_transfer(pty_services.interactive_file_transfer);
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -523,6 +536,7 @@ struct WorkerDaemonArgs {
     russh_inactivity_timeout_seconds: u64,
     lease_seconds: u64,
     max_attempts: u32,
+    max_concurrent_operations: usize,
     pty_input_lease_seconds: u64,
     pty_input_max_attempts: u32,
     pty_backend_mode: String,
@@ -610,6 +624,11 @@ enum SharedPtyTransportPool {
     Russh(Arc<RusshTransportPool<VaultSshCredentialProvider>>),
 }
 
+struct ConnectorPtyServices {
+    input_pump: Arc<dyn QueuedPtyInputPump>,
+    interactive_file_transfer: Arc<dyn InteractiveFileTransferBackend>,
+}
+
 fn build_pty_input_pump(
     repositories: remote_hosts_db::Repositories,
     connector_id: ConnectorId,
@@ -617,7 +636,7 @@ fn build_pty_input_pump(
     args: &WorkerDaemonArgs,
     mode: PtyBackendMode,
     shared_pool: SharedPtyTransportPool,
-) -> anyhow::Result<Arc<dyn QueuedPtyInputPump>> {
+) -> anyhow::Result<ConnectorPtyServices> {
     let config = ConnectorPtyManagerConfig {
         connector_id,
         max_input_bytes: policy.max_pty_input_bytes,
@@ -629,19 +648,19 @@ fn build_pty_input_pump(
         (PtyBackendMode::OpenSsh(mode), SharedPtyTransportPool::OpenSsh(pool)) => {
             let backend =
                 OpenSshPtyBackendFactory::with_pool(repositories.clone(), pool).with_mode(mode);
-            Ok(Arc::new(ConnectorPtyManager::new(
-                repositories,
-                backend,
-                config,
-            )))
+            let manager = Arc::new(ConnectorPtyManager::new(repositories, backend, config));
+            Ok(ConnectorPtyServices {
+                input_pump: manager.clone(),
+                interactive_file_transfer: manager,
+            })
         }
         (PtyBackendMode::RusshNativePty, SharedPtyTransportPool::Russh(pool)) => {
             let backend = RusshPtyBackendFactory::with_pool(repositories.clone(), pool);
-            Ok(Arc::new(ConnectorPtyManager::new(
-                repositories,
-                backend,
-                config,
-            )))
+            let manager = Arc::new(ConnectorPtyManager::new(repositories, backend, config));
+            Ok(ConnectorPtyServices {
+                input_pump: manager.clone(),
+                interactive_file_transfer: manager,
+            })
         }
         _ => anyhow::bail!("PTY backend mode does not match the shared SSH transport pool"),
     }

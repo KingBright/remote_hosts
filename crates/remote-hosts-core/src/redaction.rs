@@ -5,7 +5,7 @@ use regex::Regex;
 /// Secret redactor for logs and agent-visible summaries.
 #[derive(Debug)]
 pub struct SecretRedactor {
-    patterns: Vec<Regex>,
+    patterns: Vec<(Regex, &'static str)>,
 }
 
 impl SecretRedactor {
@@ -15,13 +15,24 @@ impl SecretRedactor {
     ///
     /// Returns a regex compilation error if one of the built-in patterns is invalid.
     pub fn new() -> Result<Self, regex::Error> {
-        let patterns = [
-            r#"(?i)(password|passwd|pwd|token|secret|api[_-]?key|private[_-]?key)\s*[:=]\s*("[^"]+"|'[^']+'|\S+)"#,
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
-        ]
-        .into_iter()
-        .map(Regex::new)
-        .collect::<Result<Vec<_>, _>>()?;
+        let patterns = vec![
+            (
+                Regex::new(
+                    r#"(?i)(password|passwd|pwd|token|secret|api[_-]?key|private[_-]?key)\s*[:=]\s*("[^"]+"|'[^']+'|\S+)"#,
+                )?,
+                "$1=<redacted>",
+            ),
+            (
+                Regex::new(r#"(?i)(\bsshpass\s+-p\s+)("[^"]+"|'[^']+'|\S+)"#)?,
+                "$1<redacted>",
+            ),
+            (
+                Regex::new(
+                    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+                )?,
+                "<redacted>",
+            ),
+        ];
 
         Ok(Self { patterns })
     }
@@ -30,8 +41,8 @@ impl SecretRedactor {
     pub fn redact(&self, input: &str) -> String {
         self.patterns
             .iter()
-            .fold(input.to_owned(), |current, regex| {
-                regex.replace_all(&current, "$1=<redacted>").to_string()
+            .fold(input.to_owned(), |current, (regex, replacement)| {
+                regex.replace_all(&current, *replacement).to_string()
             })
     }
 }
@@ -56,6 +67,30 @@ mod tests {
         let redactor = SecretRedactor::new()?;
         let output = redactor.redact("SSH_PASSWORD=hunter2");
         assert_eq!(output, "SSH_PASSWORD=<redacted>");
+        Ok(())
+    }
+
+    #[test]
+    fn redacts_sshpass_inline_password() -> Result<(), regex::Error> {
+        let redactor = SecretRedactor::new()?;
+        let output = redactor.redact(
+            "sshpass -p super-secret-value ssh -o StrictHostKeyChecking=no user@example.test",
+        );
+        assert_eq!(
+            output,
+            "sshpass -p <redacted> ssh -o StrictHostKeyChecking=no user@example.test"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn redacts_sshpass_long_inline_password() -> Result<(), regex::Error> {
+        let redactor = SecretRedactor::new()?;
+        let output = redactor.redact("sshpass --password='quoted secret' ssh user@example.test");
+        assert_eq!(
+            output,
+            "sshpass --password=<redacted> ssh user@example.test"
+        );
         Ok(())
     }
 
