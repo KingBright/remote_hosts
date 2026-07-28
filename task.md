@@ -103,6 +103,7 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [x] Loopback-only safety boundary for an HTTP process with an unlocked credential vault.
 - [x] launchd API wrapper passes the generated local vault password file so topology credential capture is usable after install/update.
 - [x] Repository-owned Remote Hosts Agent Skill with topology workflow guidance and automatic Codex/Antigravity synchronization during service install/update.
+- [x] Grouped and collapsible topology console with dynamic swimlane layout, bounded relationship rendering, topology search, focus mode, and an atomically hot-swappable external admin HTML file.
 
 ## Next
 

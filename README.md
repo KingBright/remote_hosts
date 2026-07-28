@@ -90,6 +90,7 @@ scripts/remote-hosts-service stage
 scripts/remote-hosts-service update
 scripts/remote-hosts-service restart
 scripts/remote-hosts-service skills
+scripts/remote-hosts-service ui
 scripts/remote-hosts-service stop
 ```
 
@@ -98,7 +99,13 @@ scripts/remote-hosts-service stop
 - `com.remote-hosts.api`: HTTP API on `127.0.0.1:8787`.
 - `com.remote-hosts.connector`: long-running worker daemon for queued operations and PTY input.
 
-The services start automatically when the user logs in. `stage` rebuilds the release binary, reruns migrations, and refreshes launchd and Skill files without interrupting active conversations. `update` performs the same staging work and restarts only when there are no queued/running operations, active PTYs, queued PTY inputs, or write leases; `restart` applies the same drain gate. `--force` is reserved for an intentional interruption. MCP stdio is not kept as a daemon; normal agent clients launch it with the database and the generated `--vault-master-password-file`. The task-level `remote_hosts_ensure_host` tool handles normal host registration, route updates, and optional encrypted credential capture; `remote_hosts_store_host_credential` rotates credentials for existing hosts. Use `admin` for low-level registry repair and `full` only for development/debugging.
+The services start automatically when the user logs in. `stage` rebuilds the release binary, reruns migrations, and refreshes launchd, Skill, and external admin UI files without interrupting active conversations. `update` performs the same staging work and restarts only when there are no queued/running operations, active PTYs, queued PTY inputs, or write leases; `restart` applies the same drain gate. `--force` is reserved for an intentional interruption. MCP stdio is not kept as a daemon; normal agent clients launch it with the database and the generated `--vault-master-password-file`. The task-level `remote_hosts_ensure_host` tool handles normal host registration, route updates, and optional encrypted credential capture; `remote_hosts_store_host_credential` rotates credentials for existing hosts. Use `admin` for low-level registry repair and `full` only for development/debugging.
+
+The API uses the embedded admin page as a fallback and, after one release restart has enabled this
+loader, reads `REMOTE_HOSTS_ADMIN_HTML_PATH` on every `/admin` request. The service script installs
+that file at `~/.local/share/remote-hosts/ui/admin.html`. Later UI-only releases can therefore run
+`scripts/remote-hosts-service ui` and reload the browser without restarting either the API or the
+connector. The copy is atomic, so concurrent page loads never observe a partially written file.
 
 Connector workers store large redacted stdout/stderr streams as file-backed artifacts instead of flooding agent context. The defaults can be tuned with `--artifact-root`, `--artifact-threshold-bytes`, and `--artifact-preview-bytes` on `worker-once` and `worker-daemon`. The daemon runs up to four queued operations concurrently by default; tune that bounded pool with `--max-concurrent-operations` or `REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS`. It also attaches a PTY backend factory and input pump by default; tune queued PTY input delivery with `--pty-input-lease-seconds` and `--pty-input-max-attempts`. The daemon defaults to `--pty-backend-mode auto`: `openssh` operations use `control-master-tty`, while `russh` operations use `russh-native-pty`. `control-master-tty` starts a persistent `ssh -tt` child through the existing OpenSSH ControlMaster socket, `russh-native-pty` opens a native SSH channel with `request-pty` on the pooled `russh` session, and `pipe-shell` remains the lower-overhead compatibility fallback.
 

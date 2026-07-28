@@ -22,6 +22,7 @@ Useful commands:
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service stage
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service update
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service restart
+/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service ui
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service logs
 curl -sS http://127.0.0.1:8787/v1/command-profiles
 curl -sS http://127.0.0.1:8787/v1/admin/overview
@@ -51,6 +52,11 @@ unexpired write leases. `restart` uses the same gate. Use `--force` only when in
 reported conversations is intentional. Neither command replaces MCP stdio children or
 already-loaded Skill context owned by an existing Codex or Antigravity task; those processes
 keep the old binary, tool schema, and instructions until the client reloads them.
+
+After the installed API has been restarted once with external admin UI support,
+`remote-hosts-service ui` atomically updates only
+`~/.local/share/remote-hosts/ui/admin.html`. Reloading `/admin` picks up that file without
+restarting the API, connector, MCP children, PTYs, or active operations.
 
 - Complete any required calls on the current MCP transport before reloading it.
 - Reload MCP servers or begin the next agent task after an update, then require runtime `snapshot_version=6`.

@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -209,6 +210,18 @@ fn no_store_headers() -> HeaderMap {
     headers
 }
 
+const EMBEDDED_ADMIN_DASHBOARD: &str = include_str!("admin.html");
+
+fn load_admin_dashboard(configured_path: Option<&OsStr>) -> (String, &'static str) {
+    if let Some(path) = configured_path
+        && let Ok(html) = std::fs::read_to_string(path)
+        && !html.trim().is_empty()
+    {
+        return (html, "external");
+    }
+    (EMBEDDED_ADMIN_DASHBOARD.to_owned(), "embedded")
+}
+
 async fn admin_dashboard() -> impl IntoResponse {
     let mut headers = no_store_headers();
     headers.insert(
@@ -227,7 +240,10 @@ async fn admin_dashboard() -> impl IntoResponse {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    (headers, Html(include_str!("admin.html")))
+    let (html, source) =
+        load_admin_dashboard(std::env::var_os("REMOTE_HOSTS_ADMIN_HTML_PATH").as_deref());
+    headers.insert("x-remote-hosts-admin-ui", HeaderValue::from_static(source));
+    (headers, Html(html))
 }
 
 async fn get_topology(
@@ -3146,6 +3162,24 @@ mod tests {
         let html = String::from_utf8(bytes.to_vec())?;
         assert!(html.contains("Remote Hosts"));
         assert!(html.contains("/v1/admin/overview"));
+        Ok(())
+    }
+
+    #[test]
+    fn admin_dashboard_can_be_updated_from_an_external_file_without_rebuilding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path =
+            std::env::temp_dir().join(format!("remote-hosts-admin-{}.html", uuid::Uuid::now_v7()));
+        std::fs::write(&path, "<!doctype html><title>External admin UI</title>")?;
+
+        let (external, source) = super::load_admin_dashboard(Some(path.as_os_str()));
+        assert_eq!(source, "external");
+        assert!(external.contains("External admin UI"));
+
+        std::fs::remove_file(&path)?;
+        let (fallback, source) = super::load_admin_dashboard(Some(path.as_os_str()));
+        assert_eq!(source, "embedded");
+        assert!(fallback.contains("Remote Hosts"));
         Ok(())
     }
 

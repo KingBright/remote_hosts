@@ -24,6 +24,9 @@ USER_DOMAIN="gui/$(id -u)"
 SKILL_SOURCE_DIR="${ROOT_DIR}/skills/remote-hosts-agent"
 CODEX_SKILL_DIR="${HOME}/.codex/skills/remote-hosts-agent"
 ANTIGRAVITY_SKILL_DIR="${HOME}/.gemini/config/skills/remote-hosts-agent"
+ADMIN_UI_SOURCE="${ROOT_DIR}/crates/remote-hosts-api/src/admin.html"
+ADMIN_UI_DIR="${DATA_DIR}/ui"
+ADMIN_UI_PATH="${ADMIN_UI_DIR}/admin.html"
 
 usage() {
   cat <<EOF
@@ -37,6 +40,7 @@ Commands:
   stop           Unload launchd services
   restart        Restart only when no conversation work is active
   skills         Install the Remote Hosts skill into Codex and Antigravity
+  ui             Atomically update only the external admin UI without restarting services
   status         Print launchd status for API and connector
   logs           Tail API and connector logs
   migrate        Run database migrations with the installed binary
@@ -90,6 +94,7 @@ REMOTE_HOSTS_CONNECT_TIMEOUT_SECONDS=10
 REMOTE_HOSTS_SSH_BACKEND=russh
 REMOTE_HOSTS_PTY_BACKEND_MODE=auto
 REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE=${DEFAULT_VAULT_MASTER_PASSWORD_FILE}
+REMOTE_HOSTS_ADMIN_HTML_PATH=${ADMIN_UI_PATH}
 REMOTE_HOSTS_KNOWN_HOSTS_PATH=
 REMOTE_HOSTS_RUSSH_INACTIVITY_TIMEOUT_SECONDS=30
 REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS=4
@@ -203,6 +208,22 @@ install_skills() {
   mkdir -p "${CODEX_SKILL_DIR}" "${ANTIGRAVITY_SKILL_DIR}"
   rsync -a --delete "${SKILL_SOURCE_DIR}/" "${CODEX_SKILL_DIR}/"
   rsync -a --delete "${SKILL_SOURCE_DIR}/" "${ANTIGRAVITY_SKILL_DIR}/"
+}
+
+install_admin_ui() {
+  if [[ ! -f "${ADMIN_UI_SOURCE}" ]]; then
+    echo "Remote Hosts admin UI source is missing at ${ADMIN_UI_SOURCE}" >&2
+    exit 1
+  fi
+
+  ensure_dirs
+  write_default_config
+  mkdir -p "${ADMIN_UI_DIR}"
+  local tmp
+  tmp="$(mktemp "${ADMIN_UI_PATH}.tmp.XXXXXX")"
+  install -m 0644 "${ADMIN_UI_SOURCE}" "${tmp}"
+  mv "${tmp}" "${ADMIN_UI_PATH}"
+  update_config_key "REMOTE_HOSTS_ADMIN_HTML_PATH" "${ADMIN_UI_PATH}"
 }
 
 run_migrate() {
@@ -420,6 +441,7 @@ stage_services() {
   write_wrappers
   write_plists
   install_skills
+  install_admin_ui
 }
 
 install_services() {
@@ -531,6 +553,7 @@ API plist:   ${API_PLIST}
 Worker plist:${CONNECTOR_PLIST}
 Codex skill: ${CODEX_SKILL_DIR}
 AG skill:    ${ANTIGRAVITY_SKILL_DIR}
+Admin UI:    ${ADMIN_UI_PATH}
 EOF
 }
 
@@ -569,6 +592,10 @@ case "${command}" in
     ;;
   skills)
     install_skills
+    ;;
+  ui)
+    install_admin_ui
+    echo "Admin UI updated at ${ADMIN_UI_PATH}; reload /admin to use it"
     ;;
   status)
     status_services
