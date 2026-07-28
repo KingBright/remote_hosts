@@ -8224,11 +8224,9 @@ where
         } else {
             OperationState::Failed
         };
-        let workspace_state = if state == OperationState::Succeeded {
-            WorkspaceState::Done
-        } else {
-            WorkspaceState::Failed
-        };
+        // A remote command exit status is an operation result, not evidence that
+        // the pooled transport or another active PTY became unusable.
+        let workspace_state = WorkspaceState::Done;
         let summary = format!(
             "operation finished: state={state:?}, exit_code={:?}, stdout_bytes={}, stderr_bytes={}, truncated={output_truncated}",
             result.exit_code,
@@ -8289,9 +8287,10 @@ where
                 (OperationState::Rejected, WorkspaceState::Throttled)
             }
             TransportError::Timeout => (OperationState::TimedOut, WorkspaceState::Failed),
-            TransportError::Backend(_) | TransportError::FileTransfer(_) => {
-                (OperationState::Failed, WorkspaceState::Failed)
-            }
+            TransportError::Backend(_) => (OperationState::Failed, WorkspaceState::Failed),
+            // FileTransfer explicitly means the operation failed without proving
+            // that the underlying SSH connection is unhealthy.
+            TransportError::FileTransfer(_) => (OperationState::Failed, WorkspaceState::Done),
         };
         self.append_system_chunk(operation, &format!("operation failed: {redacted}"))
             .await?;
@@ -10760,6 +10759,101 @@ mod tests {
                 retry_after_seconds
             }) if (1..=60).contains(&retry_after_seconds)
         ));
+    }
+
+    #[tokio::test]
+    async fn nonzero_exec_result_keeps_the_workspace_reusable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(FakeTransport),
+            ConnectorOperationWorkerConfig::production_default(fixture.connector_id),
+        );
+        let now = now_utc();
+        let operation = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "nonzero-exec-test",
+                now,
+                now + time::Duration::minutes(1),
+                3,
+            )
+            .await?
+            .ok_or("operation should exist")?;
+        let profile = CommandProfileCatalog::resolve_builtin(
+            "host.uptime",
+            Vec::new(),
+            &ServerProtectionPolicy::default(),
+        )?;
+
+        let outcome = worker
+            .persist_exec_result(
+                &operation,
+                &profile,
+                ExecResult {
+                    exit_code: Some(72),
+                    stdout: String::new(),
+                    stderr: "remote command failed".to_owned(),
+                    truncated: false,
+                },
+            )
+            .await?;
+
+        assert_eq!(outcome.state, OperationState::Failed);
+        assert_eq!(outcome.workspace_state, WorkspaceState::Done);
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Done);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_transfer_error_keeps_the_workspace_and_active_pty_reusable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(FakeTransport),
+            ConnectorOperationWorkerConfig::production_default(fixture.connector_id),
+        );
+        let now = now_utc();
+        let operation = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "file-transfer-error-test",
+                now,
+                now + time::Duration::minutes(1),
+                3,
+            )
+            .await?
+            .ok_or("operation should exist")?;
+
+        let outcome = worker
+            .persist_transport_error(
+                &operation,
+                TransportError::FileTransfer("remote parent directory is missing".to_owned()),
+            )
+            .await?;
+
+        assert_eq!(outcome.state, OperationState::Failed);
+        assert_eq!(outcome.workspace_state, WorkspaceState::Done);
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Done);
+        Ok(())
     }
 
     #[tokio::test]
