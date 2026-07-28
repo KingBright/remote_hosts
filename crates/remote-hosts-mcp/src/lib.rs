@@ -18,13 +18,14 @@ use remote_hosts_core::{
 };
 use remote_hosts_db::{DbError, Repositories};
 use remote_hosts_domain::{
-    AccessPath, AccessPathId, AgentSession, AgentSessionId, AgentSessionState, AgentWorkspace,
-    ConnectionMode, ConnectionSession, Connector, ConnectorId, CredentialId, CredentialKind,
-    CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind, FactSource, Host,
-    HostFact, HostFactId, HostId, HostKind, HostWriteLease, KnowledgeItem, KnowledgeItemId,
-    OperationId, OperationOutputArtifactId, OperationRun, Protocol, PtyBackendState, PtyInputEvent,
-    PtySession, PtySessionId, RiskLevel, RouteType, SessionId, SoftwareInstallId, StateReasonCode,
-    StateSnapshot, StoredCredential, TrustLevel, WorkspaceId, WorkspaceState, now_utc,
+    AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentSessionState,
+    AgentWorkspace, ConnectionMode, ConnectionSession, Connector, ConnectorId, CredentialId,
+    CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind,
+    FactSource, Host, HostFact, HostFactId, HostId, HostKind, HostWriteLease, KnowledgeItem,
+    KnowledgeItemId, OperationId, OperationOutputArtifactId, OperationRun, Protocol,
+    PtyBackendState, PtyInputEvent, PtySession, PtySessionId, RiskLevel, RouteType, SessionId,
+    SoftwareInstallId, StateReasonCode, StateSnapshot, StoredCredential, TrustLevel, WorkspaceId,
+    WorkspaceState, now_utc,
 };
 use rmcp::{
     Json, ServerHandler, ServiceExt,
@@ -2500,15 +2501,43 @@ impl RemoteHostsMcpServer {
             .await
             .map_err(|error| tool_error(&error))?;
 
+        let mut attention = vec![
+            "SSH-agent identities will be tried before the stored password; after password authentication the connector will attempt an idempotent public-key install"
+                .to_owned(),
+        ];
+        let stale_auth_failure_cleared = self
+            .repositories
+            .access_path_health
+            .get(access_path.id)
+            .await
+            .map_err(|error| tool_error(&error))?
+            .is_some_and(|health| health.state == EntityState::AuthFailed);
+        if stale_auth_failure_cleared {
+            self.repositories
+                .access_path_health
+                .upsert(&AccessPathHealth {
+                    access_path_id: access_path.id,
+                    state: EntityState::Unknown,
+                    last_checked_at: None,
+                    latency_ms: None,
+                    failure_count: 0,
+                    last_error_code: None,
+                    next_retry_at: None,
+                })
+                .await
+                .map_err(|error| tool_error(&error))?;
+            attention.push(
+                "the previous authentication failure was cleared so the updated credential can be tried once"
+                    .to_owned(),
+            );
+        }
+
         Ok(Json(StoreHostCredentialOutput {
             credential_status: write.status,
             stored_fields: write.stored_fields,
             credential: to_json_value(&write.credential.metadata)?,
             access_path: to_json_value(&access_path)?,
-            attention: vec![
-                "SSH-agent identities will be tried before the stored password; after password authentication the connector will attempt an idempotent public-key install"
-                    .to_owned(),
-            ],
+            attention,
         }))
     }
 
@@ -6301,6 +6330,25 @@ mod tests {
             Some("initial-admin-password")
         );
 
+        let access_path_id = AccessPathId::from(uuid::Uuid::parse_str(
+            created["access_path"]["id"]
+                .as_str()
+                .ok_or("access path id should be a string")?,
+        )?);
+        fixture
+            .repositories
+            .access_path_health
+            .upsert(&AccessPathHealth {
+                access_path_id,
+                state: EntityState::AuthFailed,
+                last_checked_at: Some(now_utc()),
+                latency_ms: None,
+                failure_count: 1,
+                last_error_code: Some(StateReasonCode::SshAuthFailed),
+                next_retry_at: None,
+            })
+            .await?;
+
         let updated = call_tool(
             agent,
             "remote_hosts_store_host_credential",
@@ -6329,6 +6377,16 @@ mod tests {
             Some("initial-admin-password")
         );
         assert_ne!(decrypted.password.as_deref(), Some(master.expose_secret()));
+        let health = fixture
+            .repositories
+            .access_path_health
+            .get(access_path_id)
+            .await?
+            .ok_or("access path health should exist")?;
+        assert_eq!(health.state, EntityState::Unknown);
+        assert_eq!(health.failure_count, 0);
+        assert!(health.last_error_code.is_none());
+        assert!(health.next_retry_at.is_none());
         Ok(())
     }
 
