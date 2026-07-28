@@ -82,6 +82,7 @@ const AUTHORIZED_KEY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHORIZED_KEY_BOOTSTRAP_MAX_FAILURES: u32 = 3;
 const EXEC_INLINE_UPLOAD_MAX_BYTES: u64 = 8 * 1024;
 const EXEC_UPLOAD_CHUNK_BYTES: usize = 24 * 1024;
+const PTY_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 const EXEC_UPLOAD_CHUNKS_PER_SESSION: u64 = 256;
 const EXEC_TRANSFER_MAX_STAGE_ATTEMPTS: u32 = 3;
 const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
@@ -7259,8 +7260,8 @@ where
         let spec = &request.spec;
         let initial_resume_bytes = resume_bytes;
         let mut bytes_transferred = resume_bytes;
-        let mut chunk_index = resume_bytes / EXEC_UPLOAD_CHUNK_BYTES as u64;
-        let mut buffer = vec![0_u8; EXEC_UPLOAD_CHUNK_BYTES];
+        let mut chunk_index = resume_bytes / PTY_UPLOAD_CHUNK_BYTES as u64;
+        let mut buffer = vec![0_u8; PTY_UPLOAD_CHUNK_BYTES];
         loop {
             let mut filled = 0;
             while filled < buffer.len() {
@@ -9630,6 +9631,17 @@ mod tests {
             512 * super::EXEC_UPLOAD_CHUNK_BYTES as u64,
             512 * super::EXEC_UPLOAD_CHUNK_BYTES as u64,
         ));
+    }
+
+    #[test]
+    fn interactive_pty_upload_uses_fewer_sha_verified_frames_than_exec_upload() {
+        assert_eq!(super::PTY_UPLOAD_CHUNK_BYTES, 256 * 1024);
+        assert!(super::PTY_UPLOAD_CHUNK_BYTES > super::EXEC_UPLOAD_CHUNK_BYTES);
+
+        let artifact_bytes: usize = 11 * 1024 * 1024;
+        let exec_frames = artifact_bytes.div_ceil(super::EXEC_UPLOAD_CHUNK_BYTES);
+        let pty_frames = artifact_bytes.div_ceil(super::PTY_UPLOAD_CHUNK_BYTES);
+        assert!(pty_frames * 10 < exec_frames);
     }
 
     #[test]
