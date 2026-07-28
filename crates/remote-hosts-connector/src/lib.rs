@@ -7403,15 +7403,7 @@ where
         stage: &str,
         script: &str,
     ) -> Result<ExecResult, TransportError> {
-        let stage_digest = format!("{:x}", Sha256::digest(stage.as_bytes()));
-        let marker = format!(
-            "REMOTE_HOSTS_PTY_TRANSFER_FRAME_{operation_id}_{}",
-            &stage_digest[..12]
-        );
-        let command = format!(
-            "printf '\\n'; sh -lc {}; rc=$?; printf '\\n{marker} %s\\n' \"$rc\"\n",
-            shell_quote(script)
-        );
+        let (command, marker) = pty_transfer_stage_command(operation_id, stage, script);
         let output = self
             .send_pty_command_and_wait(handle, command, &marker, EXEC_TRANSFER_STAGE_TIMEOUT)
             .await?;
@@ -7486,6 +7478,23 @@ where
             tokio::time::sleep(PTY_TRANSFER_POLL_INTERVAL).await;
         }
     }
+}
+
+fn pty_transfer_stage_command(
+    operation_id: OperationId,
+    stage: &str,
+    script: &str,
+) -> (String, String) {
+    let stage_digest = format!("{:x}", Sha256::digest(stage.as_bytes()));
+    let marker = format!(
+        "REMOTE_HOSTS_PTY_TRANSFER_FRAME_{operation_id}_{}",
+        &stage_digest[..12]
+    );
+    let encoded_script = shell_quote(&BASE64_STANDARD.encode(script.as_bytes()));
+    let command = format!(
+        "printf '\\n'; printf '%s' {encoded_script} | (base64 -d 2>/dev/null || base64 -D) | sh; rc=$?; printf '\\n{marker} %s\\n' \"$rc\"\n"
+    );
+    (command, marker)
 }
 
 fn pty_transfer_enter_command(operation_id: OperationId) -> (String, String) {
@@ -9692,6 +9701,30 @@ mod tests {
         assert!(!command.contains(&marker));
         assert!(command.contains("stty echo icanon"));
         assert!(command.contains("&& printf"));
+    }
+
+    #[test]
+    fn interactive_pty_transfer_stage_uses_one_terminal_input_line()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let operation_id = OperationId::new();
+        let script = "set -eu\nvalue='payload'\nprintf '%s\\n' \"$value\"";
+        let (command, marker) = super::pty_transfer_stage_command(operation_id, "chunk-7", script);
+
+        assert!(command.ends_with('\n'));
+        assert_eq!(
+            command[..command.len() - 1].matches('\n').count(),
+            0,
+            "bastion PTYs throttle multiline terminal input"
+        );
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()?;
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(stdout.contains("payload"));
+        assert!(stdout.contains(&format!("{marker} 0")));
+        Ok(())
     }
 
     fn run_test_shell_with_input(
