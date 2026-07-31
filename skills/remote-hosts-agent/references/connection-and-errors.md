@@ -24,6 +24,7 @@ Before remote execution, inspect:
 
 - the host runtime snapshot and its `attention` list;
 - each selected access path's `transport_runtime`;
+- each selected access path's `channel_capacity`;
 - host state;
 - resolved access path;
 - connector state and recent events;
@@ -50,6 +51,7 @@ Stop and diagnose instead of retrying when you see:
 - PTY system output containing `automatic retry disabled`: activation reached a terminal failure such as a missing or unusable backing connection. Do not poll or queue input again for that PTY id; inspect the workspace/connection state and open a replacement only after recovery.
 - `circuit_open`: do not create another session id to bypass cooldown; wait until `next_retry_at` or change the route.
 - `host_write_lease_wait` or `write_lease.state=held_by_other_session`: another Agent Session is mutating this physical host. Wait and refresh state; do not create another workspace, PTY, route, or SSH connection. This does not mark the connector or target unhealthy.
+- `ssh_channel_capacity_saturated`: the selected path has no unreserved SSH channels. Follow `recommended_action=wait_for_channel_or_raise_limit`, keep the same logical task ids, and wait for an operation or PTY reservation to clear. Do not create another route or SSH connection. Increase the path limit only after verifying the target and bastion support it.
 - `tcp_unreachable` or `ssh_handshake_failed`: check network, VPN, route, port, and connector environment.
 - `ssh_route_unsupported`: stop immediately. The configured route needs one or more jump hosts and was rejected before handshake; do not retry or substitute a direct connection.
 - `authorized_key_bootstrap_deferred`: keep using the stored-password pooled session and wait until `next_retry_at`; do not force another install.
@@ -84,7 +86,18 @@ track output sequence; do not probe by opening a new SSH transport for every com
 
 ## Transport Runtime Evidence
 
-Snapshot version 6 separates the real connector-local SSH runtime from logical sessions and workspaces, and also exposes privacy-aware Agent Session ownership and host write-lease state.
+Snapshot version 7 separates the real connector-local SSH runtime from logical sessions and workspaces, exposes privacy-aware Agent Session ownership and host write-lease state, and reports scheduler-visible channel pressure.
+
+Interpret access-path `channel_capacity`:
+
+- `configured_limit`: bounded channel pool size for this access path.
+- `running_operations`: non-expired operation claims reserving channels.
+- `active_ptys`: PTY backends currently holding channels.
+- `pending_ptys`: activatable PTYs reserving the next available channels.
+- `reserved_channels`: total scheduler reservations; `available_channels` is the remaining capacity.
+- `state=available`: another operation or PTY may be scheduled.
+- `state=saturated`: reservations equal the limit; wait without creating another SSH session.
+- `state=oversubscribed`: old or concurrent reservations exceed the configured limit; allow them to drain before changing configuration.
 
 Interpret `transport_runtime.telemetry`:
 
@@ -146,6 +159,8 @@ A changed local key fingerprint resets eligibility. Raw stderr, key content, and
 True multi-hop means `route_type=proxy_jump` or a non-empty `proxy_chain`. Those routes are currently rejected before TCP/SSH handshake by both connector backends until the proxy chain has a typed format and a verified proxy-aware implementation.
 
 `route_type=bastion` with an empty `proxy_chain` is one physical SSH connection. Use it for a bastion's own interactive asset menu or for gateway login names such as `username/server/account`. Set `requires_tty=true` only when the endpoint actually presents an interactive menu.
+
+For an interactive asset menu, ordinary exec channels are invalid even when a previous attempt happened to return output. The MCP layer rejects `remote_hosts_run_in_workspace` for `requires_tty=true`; open one PTY, read the menu, select the target, and reuse that PTY.
 
 Smart Mine production is a fixed exception to any gateway-username inference: `10.36.31.20` is the only SSH endpoint, `requires_tty=true`, and every internal asset must be selected inside that persistent interactive session.
 

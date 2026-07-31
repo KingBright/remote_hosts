@@ -165,7 +165,7 @@ enum Command {
         #[arg(
             long,
             env = "REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS",
-            default_value_t = 4
+            default_value_t = 16
         )]
         max_concurrent_operations: usize,
         /// Claim lease in seconds for queued PTY input events.

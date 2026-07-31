@@ -34,6 +34,7 @@ The `admin` profile adds host deduplication/upsert, environments, credential ref
 3. For execution, call `remote_hosts_prepare_workspace`. It reuses only an `idle` or `working` workspace owned by the current Agent Session before creating one and returns a fresh runtime snapshot plus command profiles.
 4. Do not execute if snapshot attention reports `auth_failed`, `host_key_changed`, `connector_offline`, `rate_limited`, `throttled`, `circuit_open`, `ssh_route_unsupported`, overload, `pty_runtime_lost`, or `connection_unhealthy` without a recovery action. `local_handshake_budget_ready` allows exactly one normal connection attempt after cooldown. Bootstrap deferred/skipped state does not block password-backed execution unless route attention also blocks it.
 5. For normal remote work, use `shell.posix` or `shell.powershell` with exactly one arbitrary script argument. Include explicit `intent` and a stable semantic `idempotency_key`; set `timeout_seconds` up to 7200 and `output_limit_bytes` up to 8 MiB when defaults are insufficient. Do not put passwords, tokens, or private keys in the script.
+   `remote_hosts_run_in_workspace` intentionally rejects access paths marked `requires_tty=true`; use the Interactive Session workflow for those routes.
 6. Use a narrow profile only as a shortcut when it exactly matches a read-only check. Do not request or implement a Kubernetes, Harbor, database, GPU, package-manager, or deployment-specific MCP tool when the existing remote CLI can run through the generic shell or PTY.
 7. Wait for `done`, `failed`, `blocked`, `throttled`, or timeout with `remote_hosts_wait_workspace_state`.
 8. Read bounded chunks, recent operations, and artifact metadata together with `remote_hosts_get_workspace_result`. Inspect the operation's `transport_evidence` to prove whether the channel reused an authenticated transport or opened a new handshake.
@@ -52,7 +53,7 @@ Use file tools for deployment manifests, kubeconfig, CA material, installers, pa
 
 Direct routes open an SFTP subsystem channel on the pooled SSH transport. Uploads and downloads use a same-directory temporary file, verify both endpoints, and rename only after verification. Empty-chain POSIX bastions may use one stdin stream with a per-I/O no-progress timeout, then fall back to bounded Base64 exec-channel chunks without putting file bodies in MCP input or audit records. Exec uploads use an artifact-stable temporary path, verify the retained prefix SHA-256, make duplicate chunk replay harmless, and recognize a matching already-placed destination after connector restart. Every initialization, chunk, and final placement requires an explicit marker; never accept exit status alone. The connector may retry those idempotent stages up to three times after transient transport failure and publishes `bytes_transferred`, `resumed_bytes`, `retry_count`, elapsed time, and a 30-second active heartbeat. A progress-record write failure does not cancel the active data channel. Successful commands and transfers retain the healthy pooled session; timeouts or missing completion frames invalidate it before reuse. Missing markers or suppressed output after the bounded retry budget ends the transfer. Stop transfer attempts on that route until capability or configuration changes. Multi-hop routes still stop at `ssh_route_unsupported`; do not work around them with recursive shell or raw SSH loops.
 
-The current runtime snapshot schema is version 6. Older snapshots do not provide the complete Agent Session ownership, host write-lease, connector-local transport runtime, connection generation, handshake/reuse counters, or per-channel transport evidence contract. Reload the MCP child before relying on isolation or reuse claims.
+The current runtime snapshot schema is version 7. Older snapshots do not provide the complete Agent Session ownership, host write-lease, connector-local transport runtime, channel-capacity reservations, connection generation, handshake/reuse counters, or per-channel transport evidence contract. Reload the MCP child before relying on isolation, pressure, or reuse claims.
 
 ## Conversation Isolation and Idempotency
 
@@ -61,6 +62,7 @@ The current runtime snapshot schema is version 6. Older snapshots do not provide
 - The SSH transport is deliberately shared per access path. Do not interpret a new Workspace as a new SSH connection or create another route to escape logical isolation.
 - Use one semantic idempotency key per intended side effect, such as `release-1.4-upload-linux-amd64` or `db-migration-20260724-step-2`. An exact retry keeps the same key and payload. Any changed payload requires a new key.
 - `write_lease.state=held_by_other_session` is a queue signal, not a connection failure. Wait and refresh the snapshot or operation state. Do not create another Workspace, PTY, or SSH session. Read-only commands remain eligible.
+- `channel_capacity.state=saturated|oversubscribed` is path-local queue pressure. Keep the current Workspace and operation/PTY ids, respect `wait_for_channel_or_raise_limit`, and let reservations drain. Existing active PTY input remains eligible while a new PTY waits.
 - PTY input holds the host write lease for about 300 seconds; output activity renews it. Close the PTY when finished so the connector can shorten the handoff period.
 
 ## Runtime Event Waits
@@ -118,6 +120,7 @@ Process:
 3. Inspect `transport_evidence` after activation. It records the runtime id/generation and whether opening the PTY reused the authenticated SSH connection or performed a handshake.
 4. Prefer `russh_native_pty` or `openssh_control_master_tty` for true terminal behavior. Omit `session_id` when opening unless you have an explicit compatible session; the service owns session reuse/creation.
 5. Opening is proactive: the connector activates the pending backend without requiring dummy input. Follow `recommended_action=read_pty_output`, wait `poll_after_ms` when returned, and inspect the banner/menu before responding.
+   The connector does not send an initial `cd` command on any `requires_tty=true` route, including when the logical target is recorded as a Linux host rather than a jump host.
 6. Queue input in small chunks with one semantic `idempotency_key` per intentional input; include trailing newline only when the user intended Enter.
 7. Poll output incrementally and remember the last seen sequence.
 8. Close the PTY when the task is complete, unless the user asked to keep it alive.

@@ -47,6 +47,17 @@ pub enum DbError {
     Int(#[from] std::num::TryFromIntError),
 }
 
+/// Scheduler-visible channel reservations for one SSH access path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AccessPathChannelUsage {
+    /// Non-expired operation claims currently reserving a channel.
+    pub running_operations: u32,
+    /// Persistent PTY backends currently holding a channel.
+    pub active_ptys: u32,
+    /// Activatable PTYs waiting to reserve a channel.
+    pub pending_ptys: u32,
+}
+
 /// Creates a `SQLite` pool.
 ///
 /// # Errors
@@ -854,6 +865,120 @@ impl AccessPathRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_access_path).collect()
+    }
+
+    /// Returns scheduler-visible channel usage for one access path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying, serialization, or integer conversion fails.
+    pub async fn channel_usage(
+        &self,
+        access_path_id: AccessPathId,
+        observed_at: OffsetDateTime,
+    ) -> Result<AccessPathChannelUsage, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM operation_runs op
+                    WHERE op.access_path_id = ?
+                      AND op.state_json = ?
+                      AND op.lease_expires_at IS NOT NULL
+                      AND op.lease_expires_at > ?
+                ) AS running_operations,
+                (
+                    SELECT COUNT(*)
+                    FROM pty_sessions ps
+                    JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
+                    WHERE aw.access_path_id = ?
+                      AND ps.backend_state_json = ?
+                      AND ps.input_allowed = 1
+                      AND ps.state_json IN (?, ?)
+                      AND aw.state_json IN (?, ?)
+                ) AS active_ptys,
+                (
+                    SELECT COUNT(*)
+                    FROM pty_sessions ps
+                    JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
+                    WHERE aw.access_path_id = ?
+                      AND ps.backend_state_json = ?
+                      AND ps.input_allowed = 1
+                      AND ps.state_json IN (?, ?)
+                      AND aw.state_json IN (?, ?)
+                ) AS pending_ptys
+            ",
+        )
+        .bind(access_path_id.to_string())
+        .bind(to_json(&OperationState::Running)?)
+        .bind(observed_at)
+        .bind(access_path_id.to_string())
+        .bind(to_json(&PtyBackendState::Active)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(access_path_id.to_string())
+        .bind(to_json(&PtyBackendState::Pending)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(AccessPathChannelUsage {
+            running_operations: i64_to_u32(row.try_get("running_operations")?)?,
+            active_ptys: i64_to_u32(row.try_get("active_ptys")?)?,
+            pending_ptys: i64_to_u32(row.try_get("pending_ptys")?)?,
+        })
+    }
+
+    /// Upgrades the historical one-channel default after a new connector process starts.
+    ///
+    /// The migration records whether legacy rows existed but deliberately leaves them unchanged
+    /// while an old connector may still be running with one-channel in-memory semaphores.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be completed.
+    pub async fn upgrade_legacy_channel_default(&self) -> Result<u64, DbError> {
+        let mut transaction = self.pool.begin().await?;
+        let state: Option<String> = sqlx::query_scalar(
+            r"
+            SELECT value
+            FROM system_settings
+            WHERE setting_key = 'legacy_channel_default_v1'
+            ",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if state.as_deref() != Some("pending") {
+            transaction.commit().await?;
+            return Ok(0);
+        }
+        let updated = sqlx::query(
+            r"
+            UPDATE access_paths
+            SET max_concurrent_channels = 8
+            WHERE max_concurrent_channels = 1
+            ",
+        )
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            r"
+            UPDATE system_settings
+            SET value = 'done'
+            WHERE setting_key = 'legacy_channel_default_v1'
+              AND value = 'pending'
+            ",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(updated)
     }
 }
 
@@ -1998,6 +2123,7 @@ impl PtySessionRepository {
         &self,
         connector_id: ConnectorId,
     ) -> Result<Option<PtySession>, DbError> {
+        let observed_at = OffsetDateTime::now_utc();
         let row = sqlx::query(
             r"
             SELECT ps.pty_session_id, ps.workspace_id, ps.session_id, ps.state_json,
@@ -2006,11 +2132,38 @@ impl PtySessionRepository {
                    ps.transport_evidence_json, ps.created_at, ps.last_activity_at
             FROM pty_sessions ps
             JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
+            JOIN access_paths ap ON ap.id = aw.access_path_id
             WHERE aw.connector_id = ?
               AND ps.backend_state_json = ?
               AND ps.input_allowed = 1
               AND aw.state_json IN (?, ?)
               AND ps.state_json IN (?, ?)
+              AND (
+                (
+                    SELECT COUNT(*)
+                    FROM pty_sessions active_ps
+                    JOIN agent_workspaces active_aw
+                      ON active_aw.workspace_id = active_ps.workspace_id
+                    WHERE active_aw.access_path_id = aw.access_path_id
+                      AND active_ps.backend_state_json = ?
+                      AND active_ps.input_allowed = 1
+                      AND active_ps.state_json IN (?, ?)
+                      AND active_aw.state_json IN (?, ?)
+                )
+                +
+                (
+                    SELECT COUNT(*)
+                    FROM operation_runs running_op
+                    WHERE running_op.access_path_id = aw.access_path_id
+                      AND running_op.state_json = ?
+                      AND running_op.lease_expires_at IS NOT NULL
+                      AND running_op.lease_expires_at > ?
+                )
+              ) < CASE
+                    WHEN ap.max_concurrent_channels > 0
+                    THEN ap.max_concurrent_channels
+                    ELSE 1
+                  END
             ORDER BY ps.created_at ASC, ps.pty_session_id ASC
             LIMIT 1
             ",
@@ -2021,6 +2174,13 @@ impl PtySessionRepository {
         .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&PtyBackendState::Active)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&OperationState::Running)?)
+        .bind(observed_at)
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(row_to_pty_session).transpose()
@@ -2485,31 +2645,39 @@ impl PtyInputEventRepository {
                 attempt_count = attempt_count + 1,
                 last_error = NULL
             WHERE id = (
-                SELECT id
-                FROM pty_input_events
-                WHERE connector_id = ?
-                  AND input_text IS NOT NULL
-                  AND attempt_count < ?
+                SELECT queued_input.id
+                FROM pty_input_events queued_input
+                JOIN pty_sessions target_pty
+                  ON target_pty.pty_session_id = queued_input.pty_session_id
+                JOIN agent_workspaces target_workspace
+                  ON target_workspace.workspace_id = target_pty.workspace_id
+                WHERE queued_input.connector_id = ?
+                  AND queued_input.input_text IS NOT NULL
+                  AND target_pty.backend_state_json = ?
+                  AND target_pty.input_allowed = 1
+                  AND target_pty.state_json IN (?, ?)
+                  AND target_workspace.state_json IN (?, ?)
+                  AND queued_input.attempt_count < ?
                   AND (
-                    agent_session_id IS NULL
+                    queued_input.agent_session_id IS NULL
                     OR NOT EXISTS (
                         SELECT 1
                         FROM host_write_leases
-                        WHERE host_write_leases.host_id = pty_input_events.host_id
+                        WHERE host_write_leases.host_id = queued_input.host_id
                           AND host_write_leases.expires_at > ?
                           AND host_write_leases.holder_agent_session_id
-                              != pty_input_events.agent_session_id
+                              != queued_input.agent_session_id
                     )
                   )
                   AND (
-                    state_json = ?
+                    queued_input.state_json = ?
                     OR (
-                        state_json = ?
-                        AND lease_expires_at IS NOT NULL
-                        AND lease_expires_at <= ?
+                        queued_input.state_json = ?
+                        AND queued_input.lease_expires_at IS NOT NULL
+                        AND queued_input.lease_expires_at <= ?
                     )
                   )
-                ORDER BY created_at ASC, sequence ASC, id ASC
+                ORDER BY queued_input.created_at ASC, queued_input.sequence ASC, queued_input.id ASC
                 LIMIT 1
             )
             RETURNING *
@@ -2520,6 +2688,11 @@ impl PtyInputEventRepository {
         .bind(claimed_at)
         .bind(lease_expires_at)
         .bind(connector_id.to_string())
+        .bind(to_json(&PtyBackendState::Active)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
         .bind(u32_to_i64(max_attempts))
         .bind(claimed_at)
         .bind(to_json(&PtyInputEventState::Queued)?)
@@ -2740,6 +2913,7 @@ impl OperationRunRepository {
     /// # Errors
     ///
     /// Returns an error if querying or deserialization fails.
+    #[allow(clippy::too_many_lines)]
     pub async fn claim_next_for_connector(
         &self,
         connector_id: ConnectorId,
@@ -2761,18 +2935,47 @@ impl OperationRunRepository {
                 last_error = NULL,
                 redacted_output_summary = ?
             WHERE id = (
-                SELECT id
-                FROM operation_runs
-                WHERE connector_id = ?
-                  AND workspace_id IS NOT NULL
-                  AND command_profile_json IS NOT NULL
-                  AND attempt_count < ?
+                SELECT candidate.id
+                FROM operation_runs candidate
+                JOIN access_paths candidate_path
+                  ON candidate_path.id = candidate.access_path_id
+                WHERE candidate.connector_id = ?
+                  AND candidate.workspace_id IS NOT NULL
+                  AND candidate.command_profile_json IS NOT NULL
+                  AND candidate.attempt_count < ?
                   AND (
-                    requires_write_lease = 0
+                    (
+                        SELECT COUNT(*)
+                        FROM operation_runs running_capacity
+                        WHERE running_capacity.access_path_id = candidate.access_path_id
+                          AND running_capacity.id != candidate.id
+                          AND running_capacity.state_json = ?
+                          AND running_capacity.lease_expires_at IS NOT NULL
+                          AND running_capacity.lease_expires_at > ?
+                    )
+                    +
+                    (
+                        SELECT COUNT(*)
+                        FROM pty_sessions reserved_pty
+                        JOIN agent_workspaces reserved_workspace
+                          ON reserved_workspace.workspace_id = reserved_pty.workspace_id
+                        WHERE reserved_workspace.access_path_id = candidate.access_path_id
+                          AND reserved_pty.backend_state_json IN (?, ?)
+                          AND reserved_pty.input_allowed = 1
+                          AND reserved_pty.state_json IN (?, ?)
+                          AND reserved_workspace.state_json IN (?, ?)
+                    )
+                  ) < CASE
+                        WHEN candidate_path.max_concurrent_channels > 0
+                        THEN candidate_path.max_concurrent_channels
+                        ELSE 1
+                      END
+                  AND (
+                    candidate.requires_write_lease = 0
                     OR NOT EXISTS (
                         SELECT 1
                         FROM operation_runs running_write
-                        WHERE running_write.host_id = operation_runs.host_id
+                        WHERE running_write.host_id = candidate.host_id
                           AND running_write.requires_write_lease = 1
                           AND running_write.state_json = ?
                           AND running_write.lease_expires_at IS NOT NULL
@@ -2780,26 +2983,26 @@ impl OperationRunRepository {
                     )
                   )
                   AND (
-                    requires_write_lease = 0
-                    OR agent_session_id IS NULL
+                    candidate.requires_write_lease = 0
+                    OR candidate.agent_session_id IS NULL
                     OR NOT EXISTS (
                         SELECT 1
                         FROM host_write_leases
-                        WHERE host_write_leases.host_id = operation_runs.host_id
+                        WHERE host_write_leases.host_id = candidate.host_id
                           AND host_write_leases.expires_at > ?
                           AND host_write_leases.holder_agent_session_id
-                              != operation_runs.agent_session_id
+                              != candidate.agent_session_id
                     )
                   )
                   AND (
-                    state_json = ?
+                    candidate.state_json = ?
                     OR (
-                        state_json = ?
-                        AND lease_expires_at IS NOT NULL
-                        AND lease_expires_at <= ?
+                        candidate.state_json = ?
+                        AND candidate.lease_expires_at IS NOT NULL
+                        AND candidate.lease_expires_at <= ?
                     )
                   )
-                ORDER BY started_at ASC, id ASC
+                ORDER BY candidate.started_at ASC, candidate.id ASC
                 LIMIT 1
             )
             RETURNING *
@@ -2812,6 +3015,14 @@ impl OperationRunRepository {
         .bind("claimed by connector worker")
         .bind(connector_id.to_string())
         .bind(u32_to_i64(max_attempts))
+        .bind(to_json(&OperationState::Running)?)
+        .bind(claimed_at)
+        .bind(to_json(&PtyBackendState::Pending)?)
+        .bind(to_json(&PtyBackendState::Active)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&OperationState::Running)?)
         .bind(claimed_at)
         .bind(claimed_at)
@@ -4724,6 +4935,33 @@ mod tests {
             notes: None,
         };
         repos.access_paths.insert(&path).await?;
+        sqlx::query(
+            r"
+            UPDATE system_settings
+            SET value = 'pending'
+            WHERE setting_key = 'legacy_channel_default_v1'
+            ",
+        )
+        .execute(&repos.access_paths.pool)
+        .await?;
+        assert_eq!(
+            repos.access_paths.upgrade_legacy_channel_default().await?,
+            1
+        );
+        assert_eq!(
+            repos
+                .access_paths
+                .get(path.id)
+                .await?
+                .ok_or_else(|| io::Error::other("upgraded path exists"))?
+                .max_concurrent_channels,
+            8
+        );
+        assert_eq!(
+            repos.access_paths.upgrade_legacy_channel_default().await?,
+            0,
+            "the guarded legacy upgrade must run only once"
+        );
 
         let loaded_host = repos
             .hosts
@@ -5132,6 +5370,11 @@ mod tests {
             .await?;
         assert_eq!(pty_chunks.len(), 1);
         assert_eq!(pty_chunks[0].redacted_text, "pty hello");
+        let mut input_pty = pty.clone();
+        input_pty.state = WorkspaceState::Working;
+        input_pty.input_allowed = true;
+        input_pty.backend_state = PtyBackendState::Active;
+        repos.pty_sessions.upsert(&input_pty).await?;
         let pty_input = PtyInputEvent {
             id: PtyInputEventId::new(),
             pty_session_id: pty.pty_session_id,
@@ -5225,6 +5468,10 @@ mod tests {
                 .await?
                 .is_none()
         );
+        repos
+            .pty_sessions
+            .close(input_pty.pty_session_id, Some(0), now)
+            .await?;
 
         let operation = OperationRun {
             id: OperationId::new(),

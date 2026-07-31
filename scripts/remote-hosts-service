@@ -80,6 +80,7 @@ write_default_config() {
   cat >"${CONFIG_FILE}" <<EOF
 # Remote Hosts local service config.
 # This file is sourced by local launchd wrapper scripts. Keep values shell-safe.
+REMOTE_HOSTS_CONFIG_VERSION=2
 REMOTE_HOSTS_BIN=${BIN_PATH}
 REMOTE_HOSTS_DATABASE_URL=sqlite://${DATA_DIR}/remote-hosts.sqlite
 REMOTE_HOSTS_BIND=127.0.0.1:8787
@@ -97,7 +98,7 @@ REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE=${DEFAULT_VAULT_MASTER_PASSWORD_FILE}
 REMOTE_HOSTS_ADMIN_HTML_PATH=${ADMIN_UI_PATH}
 REMOTE_HOSTS_KNOWN_HOSTS_PATH=
 REMOTE_HOSTS_RUSSH_INACTIVITY_TIMEOUT_SECONDS=30
-REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS=4
+REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS=16
 REMOTE_HOSTS_LOG=remote_hosts=info,remote_hosts_cli=info
 EOF
 }
@@ -150,6 +151,18 @@ update_config_key() {
     END { if (found == 0) print key "=" value }
   ' "${CONFIG_FILE}" >"${tmp}"
   mv "${tmp}" "${CONFIG_FILE}"
+}
+
+migrate_config_defaults() {
+  load_config
+  if (( ${REMOTE_HOSTS_CONFIG_VERSION:-1} >= 2 )); then
+    return
+  fi
+  if [[ "${REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS:-4}" == "4" ]]; then
+    update_config_key "REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS" "16"
+  fi
+  update_config_key "REMOTE_HOSTS_CONFIG_VERSION" "2"
+  load_config
 }
 
 sqlite_path_from_url() {
@@ -433,6 +446,7 @@ bootstrap_service() {
 stage_services() {
   ensure_dirs
   write_default_config
+  migrate_config_defaults
   ensure_local_vault
   build_release
   install_binary

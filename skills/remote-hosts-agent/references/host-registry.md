@@ -48,9 +48,10 @@ Use this loop for requests such as "record this server", "update host X", "clean
 3. Separate machine identity from access paths. New network routes, ports, users, VPN/proxy paths, or connector scopes belong under the same host when the machine is the same.
 4. Treat an existing environment's kind and trust level as canonical when a caller supplies different guesses. Inspect `defaults_applied` and continue; do not create a second environment name to bypass the mismatch.
 5. Correcting `route_type` for the same environment/address/port/username/proxy chain updates the existing access path. A bastion gateway username remains one path and should not be duplicated as both `bastion` and `vpn`.
-6. Record observations as facts or knowledge with source and time. Do not overwrite useful history with a single latest value unless the schema explicitly models current state.
-7. Link software installs, operations, command outputs, and notes to the canonical host and relevant access path when possible.
-8. When stale or duplicate data is found, produce a merge/update plan before mutating anything.
+6. Multiple logical target hosts may share one interactive bastion endpoint. When `route_type=bastion` and `requires_tty=true`, supply the exact existing canonical host name; that strong identity selects the target while the endpoint remains the physical SSH entry. This exception does not apply to ordinary direct, VPN, public, or non-interactive bastion routes.
+7. Record observations as facts or knowledge with source and time. Do not overwrite useful history with a single latest value unless the schema explicitly models current state.
+8. Link software installs, operations, command outputs, and notes to the canonical host and relevant access path when possible.
+9. When stale or duplicate data is found, produce a merge/update plan before mutating anything.
 
 For observed facts, prefer stable identifiers over transient network data:
 

@@ -1391,6 +1391,19 @@ impl RemoteHostsMcpServer {
     ) -> Result<QueuedOperationOutput, String> {
         let workspace_id = parse_workspace_id(&request.workspace_id)?;
         let workspace = self.workspace_for_tool(workspace_id).await?;
+        let access_path = self
+            .repositories
+            .access_paths
+            .get(workspace.access_path_id)
+            .await
+            .map_err(|error| tool_error(&error))?
+            .ok_or_else(|| format!("access path not found: {}", workspace.access_path_id))?;
+        if access_path.requires_tty {
+            return Err(
+                "this access path requires a persistent PTY; open the workspace PTY, read the interactive menu, select the intended asset, and send commands through that PTY instead of remote_hosts_run_in_workspace"
+                    .to_owned(),
+            );
+        }
         let idempotency_key = normalize_idempotency_key(request.idempotency_key)?;
         let policy = ServerProtectionPolicy::default();
         let mut profile =
@@ -1997,6 +2010,18 @@ impl RemoteHostsMcpServer {
             username: access.as_ref().map(|access| access.username.clone()),
         };
         let mut matches = self.duplicate_host_matches(&duplicate_request).await?;
+        let interactive_bastion = access.as_ref().is_some_and(|access| {
+            access.route_type == RouteType::Bastion && access.requires_tty == Some(true)
+        });
+        if matches.len() > 1 && interactive_bastion {
+            let exact_name_matches = matches
+                .iter()
+                .filter(|candidate| candidate.signals.iter().any(|signal| signal == "name"))
+                .count();
+            if exact_name_matches == 1 {
+                matches.retain(|candidate| candidate.signals.iter().any(|signal| signal == "name"));
+            }
+        }
         if matches.len() > 1 {
             let conflicts = matches
                 .iter()
@@ -3347,6 +3372,32 @@ impl RemoteHostsMcpServer {
             } else {
                 None
             };
+            let channel_usage = self
+                .repositories
+                .access_paths
+                .channel_usage(access_path.id, generated_at)
+                .await
+                .map_err(|error| tool_error(&error))?;
+            let channel_capacity = RuntimeChannelCapacityOutput::new(
+                access_path.max_concurrent_channels,
+                channel_usage,
+            );
+            if channel_capacity.state != "available" {
+                attention.push(RuntimeAttentionOutput {
+                    code: "ssh_channel_capacity_saturated".to_owned(),
+                    entity_type: "access_path".to_owned(),
+                    entity_id: access_path.id.to_string(),
+                    message: format!(
+                        "SSH channel capacity is {}; configured_limit={}, running_operations={}, active_ptys={}, pending_ptys={}",
+                        channel_capacity.state,
+                        channel_capacity.configured_limit,
+                        channel_capacity.running_operations,
+                        channel_capacity.active_ptys,
+                        channel_capacity.pending_ptys
+                    ),
+                    recommended_action: "wait_for_channel_or_raise_limit".to_owned(),
+                });
+            }
             let multi_hop = access_path.requires_multi_hop_transport();
             if multi_hop {
                 attention.push(RuntimeAttentionOutput {
@@ -3423,6 +3474,7 @@ impl RemoteHostsMcpServer {
                 health: optional_value(health.as_ref())?,
                 authorized_key_bootstrap: optional_value(authorized_key_bootstrap.as_ref())?,
                 transport_runtime: optional_value(transport_runtime.as_ref())?,
+                channel_capacity,
             });
         }
         let mut sessions = self
@@ -3562,7 +3614,7 @@ impl RemoteHostsMcpServer {
         }
 
         Ok(Json(HostRuntimeSnapshotOutput {
-            snapshot_version: 6,
+            snapshot_version: 7,
             event_cursor,
             generated_at: generated_at.to_string(),
             agent_session: to_json_value(self.agent_session.as_ref())?,
@@ -5009,6 +5061,52 @@ pub struct RuntimeAccessPathSnapshotOutput {
     pub authorized_key_bootstrap: Option<Value>,
     /// Latest persisted connector-local SSH transport runtime as JSON.
     pub transport_runtime: Option<Value>,
+    /// Scheduler-visible SSH channel capacity and reservations.
+    pub channel_capacity: RuntimeChannelCapacityOutput,
+}
+
+/// Scheduler-visible SSH channel capacity for one access path.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct RuntimeChannelCapacityOutput {
+    /// Configured maximum channels for the pooled SSH transport.
+    pub configured_limit: u32,
+    /// Non-expired operation claims currently reserving channels.
+    pub running_operations: u32,
+    /// Persistent PTY backends currently holding channels.
+    pub active_ptys: u32,
+    /// Activatable PTYs waiting to reserve channels.
+    pub pending_ptys: u32,
+    /// Total active and pending scheduler reservations.
+    pub reserved_channels: u32,
+    /// Channels currently available to the scheduler.
+    pub available_channels: u32,
+    /// Capacity state: `available`, `saturated`, or `oversubscribed`.
+    pub state: String,
+}
+
+impl RuntimeChannelCapacityOutput {
+    fn new(configured_limit: u16, usage: remote_hosts_db::AccessPathChannelUsage) -> Self {
+        let configured_limit = u32::from(configured_limit.max(1));
+        let reserved_channels = usage
+            .running_operations
+            .saturating_add(usage.active_ptys)
+            .saturating_add(usage.pending_ptys);
+        let available_channels = configured_limit.saturating_sub(reserved_channels);
+        let state = match reserved_channels.cmp(&configured_limit) {
+            std::cmp::Ordering::Greater => "oversubscribed",
+            std::cmp::Ordering::Equal => "saturated",
+            std::cmp::Ordering::Less => "available",
+        };
+        Self {
+            configured_limit,
+            running_operations: usage.running_operations,
+            active_ptys: usage.active_ptys,
+            pending_ptys: usage.pending_ptys,
+            reserved_channels,
+            available_channels,
+            state: state.to_owned(),
+        }
+    }
 }
 
 /// Workspace snapshot with bounded child runtime state.
@@ -6272,6 +6370,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_agent_ensure_host_prefers_exact_identity_for_shared_bastion_endpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let agent =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent);
+        call_tool(
+            agent.clone(),
+            tools::ENSURE_HOST,
+            Some(json!({
+                "name": "shared-bastion",
+                "display_name": "Shared Bastion",
+                "kind": "jump_host",
+                "risk_level": "customer_site",
+                "access": {
+                    "address": "10.36.31.20",
+                    "username": "operator",
+                    "environment_name": "customer-vpn",
+                    "environment_kind": "vpn",
+                    "trust_level": "trusted",
+                    "route_type": "bastion",
+                    "requires_tty": true
+                }
+            })),
+        )
+        .await?;
+        let target = call_tool(
+            agent.clone(),
+            tools::ENSURE_HOST,
+            Some(json!({
+                "name": "shared-target",
+                "display_name": "Shared Target",
+                "kind": "linux",
+                "risk_level": "customer_site"
+            })),
+        )
+        .await?;
+        let target_id = target["host"]["id"]
+            .as_str()
+            .ok_or("target host id should be a string")?;
+
+        let routed_target = call_tool(
+            agent,
+            tools::ENSURE_HOST,
+            Some(json!({
+                "name": "shared-target",
+                "display_name": "Shared Target",
+                "kind": "linux",
+                "risk_level": "customer_site",
+                "access": {
+                    "address": "10.36.31.20",
+                    "username": "operator",
+                    "environment_name": "customer-vpn",
+                    "environment_kind": "vpn",
+                    "trust_level": "trusted",
+                    "route_type": "bastion",
+                    "requires_tty": true
+                }
+            })),
+        )
+        .await?;
+
+        assert_eq!(routed_target["host"]["id"], json!(target_id));
+        assert_eq!(routed_target["access_path_created"], json!(true));
+        assert_eq!(
+            routed_target["duplicate_signals"],
+            json!(["name", "display_name"])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn mcp_agent_stores_and_updates_host_password_without_returning_plaintext()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = TestFixture::new().await?;
@@ -6598,7 +6768,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(snapshot["snapshot_version"], json!(6));
+        assert_eq!(snapshot["snapshot_version"], json!(7));
         assert_eq!(snapshot["event_cursor"], json!(0));
         assert_eq!(snapshot["host"]["id"], json!(fixture.host_id.to_string()));
         assert_eq!(snapshot["aggregate"]["overall"], json!("healthy"));
@@ -6636,6 +6806,60 @@ mod tests {
             })
         }));
         assert!(snapshot["generated_at"].as_str().is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_snapshot_exposes_saturated_ssh_channel_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let server = fixture.server();
+        let created = call_tool(
+            server.clone(),
+            tools::CREATE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "access_path_id": fixture.access_path_id.to_string(),
+                "label": "capacity-snapshot"
+            })),
+        )
+        .await?;
+        let workspace_id = created["workspace"]["id"]
+            .as_str()
+            .ok_or("workspace id should be a string")?;
+        call_tool(
+            server.clone(),
+            tools::OPEN_WORKSPACE_PTY_SESSION,
+            Some(json!({"workspace_id": workspace_id})),
+        )
+        .await?;
+
+        let snapshot = call_tool(
+            server,
+            tools::GET_HOST_RUNTIME_SNAPSHOT,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+
+        assert_eq!(snapshot["snapshot_version"], json!(7));
+        assert_eq!(
+            snapshot["access_paths"][0]["channel_capacity"],
+            json!({
+                "configured_limit": 1,
+                "running_operations": 0,
+                "active_ptys": 0,
+                "pending_ptys": 1,
+                "reserved_channels": 1,
+                "available_channels": 0,
+                "state": "saturated"
+            })
+        );
+        assert!(snapshot["attention"].as_array().is_some_and(|attention| {
+            attention.iter().any(|item| {
+                item["code"] == json!("ssh_channel_capacity_saturated")
+                    && item["recommended_action"] == json!("wait_for_channel_or_raise_limit")
+            })
+        }));
         Ok(())
     }
 
@@ -7176,7 +7400,7 @@ mod tests {
             snapshot["write_lease"]["state"],
             json!("held_by_other_session")
         );
-        assert_eq!(snapshot["snapshot_version"], json!(6));
+        assert_eq!(snapshot["snapshot_version"], json!(7));
         assert!(snapshot["attention"].as_array().is_some_and(|attention| {
             attention
                 .iter()
@@ -7796,6 +8020,54 @@ mod tests {
                 .contains("queued")
         );
         assert!(!output.to_string().contains("hunter2"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_run_in_workspace_rejects_exec_for_tty_only_access_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let mut access_path = fixture
+            .repositories
+            .access_paths
+            .get(fixture.access_path_id)
+            .await?
+            .ok_or("fixture access path should exist")?;
+        access_path.requires_tty = true;
+        access_path.route_type = RouteType::Bastion;
+        fixture
+            .repositories
+            .access_paths
+            .upsert(&access_path)
+            .await?;
+        let created = call_tool(
+            fixture.server(),
+            tools::CREATE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "access_path_id": fixture.access_path_id.to_string(),
+                "label": "tty-only"
+            })),
+        )
+        .await?;
+        let workspace_id = created["workspace"]["id"]
+            .as_str()
+            .ok_or("created workspace id should be a string")?;
+
+        let result = call_tool_raw(
+            fixture.server(),
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": workspace_id,
+                "command_profile": "host.uptime",
+                "args": [],
+                "intent": "verify tty-only route guard"
+            })),
+        )
+        .await?;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(format!("{result:?}").contains("requires a persistent PTY"));
         Ok(())
     }
 

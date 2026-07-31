@@ -87,6 +87,7 @@ const EXEC_UPLOAD_CHUNKS_PER_SESSION: u64 = 256;
 const EXEC_TRANSFER_MAX_STAGE_ATTEMPTS: u32 = 3;
 const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
+const PTY_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(180);
 const PTY_TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
 const PTY_WRITE_LEASE_SECONDS: i64 = 300;
@@ -423,6 +424,18 @@ impl OpenSshTransport {
             .acquire_owned()
             .await
             .map_err(|_| TransportError::Backend("SSH channel pool is closed".to_owned()))
+    }
+
+    fn try_acquire_pty_channel(&self) -> Result<OwnedSemaphorePermit, ConnectorPtyError> {
+        match self.channel_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                Err(ConnectorPtyError::ChannelCapacityUnavailable)
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => Err(ConnectorPtyError::Transport(
+                TransportError::Backend("SSH channel pool is closed".to_owned()),
+            )),
+        }
     }
 }
 
@@ -1160,7 +1173,7 @@ impl ManagedPtyBackend for OpenSshShellBackend {
         &self,
         request: PtyBackendSpawnRequest,
     ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
-        let channel_permit = self.transport.acquire_channel().await?;
+        let channel_permit = self.transport.try_acquire_pty_channel()?;
         let before = self.transport.transport_telemetry();
         let session = self.transport.session().await?;
         let mut command = session.arc_command("sh");
@@ -1286,7 +1299,7 @@ impl ManagedPtyBackend for OpenSshControlMasterTtyBackend {
         &self,
         request: PtyBackendSpawnRequest,
     ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
-        let channel_permit = self.transport.acquire_channel().await?;
+        let channel_permit = self.transport.try_acquire_pty_channel()?;
         let before = self.transport.transport_telemetry();
         let session = self.transport.session().await?;
         let control_socket = session.control_socket().to_path_buf();
@@ -2223,6 +2236,18 @@ where
             .acquire_owned()
             .await
             .map_err(|_| TransportError::Backend("SSH channel pool is closed".to_owned()))
+    }
+
+    fn try_acquire_pty_channel(&self) -> Result<OwnedSemaphorePermit, ConnectorPtyError> {
+        match self.channel_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                Err(ConnectorPtyError::ChannelCapacityUnavailable)
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => Err(ConnectorPtyError::Transport(
+                TransportError::Backend("SSH channel pool is closed".to_owned()),
+            )),
+        }
     }
 
     async fn reserve_pty_channel(
@@ -4804,7 +4829,7 @@ where
         request: PtyBackendSpawnRequest,
     ) -> Result<ManagedPtyProcess, ConnectorPtyError> {
         let transport = self.transport_for_session(request.session_id).await?;
-        let channel_permit = transport.acquire_channel().await?;
+        let channel_permit = transport.try_acquire_pty_channel()?;
         let before = transport.transport_telemetry();
         let session = transport.reserve_pty_channel().await?;
         let channel_result = async {
@@ -5931,6 +5956,9 @@ pub enum ConnectorPtyError {
     /// Backend failed.
     #[error("pty backend failed: {0}")]
     Backend(String),
+    /// The access path has no immediately available SSH channel.
+    #[error("SSH channel capacity is currently unavailable")]
+    ChannelCapacityUnavailable,
     /// PTY session does not belong to this connector.
     #[error("pty session does not belong to this connector")]
     ConnectorMismatch,
@@ -6072,6 +6100,10 @@ where
         )?;
         let process = match self.spawn_backend_process(&pty_session).await {
             Ok(process) => process,
+            Err(ConnectorPtyError::ChannelCapacityUnavailable) => {
+                self.repositories.pty_sessions.upsert(&pty_session).await?;
+                return Ok(ConnectorPtyOpenOutcome { pty_session });
+            }
             Err(error) => {
                 pty_session.backend_state = PtyBackendState::Failed;
                 pty_session.last_activity_at = now_utc();
@@ -6108,6 +6140,13 @@ where
         };
         match self.activate_existing(session.pty_session_id).await {
             Ok(()) => Ok(Some(session.pty_session_id)),
+            Err(ConnectorPtyError::ChannelCapacityUnavailable) => {
+                tracing::debug!(
+                    pty_session_id = %session.pty_session_id,
+                    "pending PTY is waiting for access-path channel capacity"
+                );
+                Ok(None)
+            }
             Err(error) => {
                 let terminalized = self
                     .repositories
@@ -6422,6 +6461,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn activate_existing(
         &self,
         pty_session_id: PtySessionId,
@@ -6507,6 +6547,9 @@ where
         let mut active_session = pty_session;
         let process = match self.spawn_backend_process(&active_session).await {
             Ok(process) => process,
+            Err(ConnectorPtyError::ChannelCapacityUnavailable) => {
+                return Err(ConnectorPtyError::ChannelCapacityUnavailable);
+            }
             Err(error) => {
                 self.mark_activation_failed(active_session, &error.to_string(), true)
                     .await?;
@@ -6839,6 +6882,7 @@ where
             ConnectorPtyError::Transport(TransportError::Timeout)
             | ConnectorPtyError::Database(_)
             | ConnectorPtyError::Supervisor(_)
+            | ConnectorPtyError::ChannelCapacityUnavailable
             | ConnectorPtyError::ConnectorMismatch
             | ConnectorPtyError::NotActive
             | ConnectorPtyError::RuntimeContinuityLost
@@ -7381,7 +7425,7 @@ where
         operation_id: OperationId,
     ) -> Result<(), TransportError> {
         let (command, marker) = pty_transfer_enter_command(operation_id);
-        self.send_pty_command_and_wait(handle, command, &marker, EXEC_TRANSFER_STAGE_TIMEOUT)
+        self.send_pty_command_and_wait(handle, command, &marker, PTY_TRANSFER_STAGE_TIMEOUT)
             .await
             .map(|_| ())
     }
@@ -7392,7 +7436,7 @@ where
         operation_id: OperationId,
     ) -> Result<(), TransportError> {
         let (command, marker) = pty_transfer_leave_command(operation_id);
-        self.send_pty_command_and_wait(handle, command, &marker, EXEC_TRANSFER_STAGE_TIMEOUT)
+        self.send_pty_command_and_wait(handle, command, &marker, PTY_TRANSFER_STAGE_TIMEOUT)
             .await
             .map(|_| ())
     }
@@ -7406,7 +7450,7 @@ where
     ) -> Result<ExecResult, TransportError> {
         let (command, marker) = pty_transfer_stage_command(operation_id, stage, script);
         let output = self
-            .send_pty_command_and_wait(handle, command, &marker, EXEC_TRANSFER_STAGE_TIMEOUT)
+            .send_pty_command_and_wait(handle, command, &marker, PTY_TRANSFER_STAGE_TIMEOUT)
             .await?;
         let marker_prefix = format!("{marker} ");
         let exit_code = output.lines().find_map(|line| {
@@ -8770,7 +8814,7 @@ impl ConnectorDaemonConfig {
 }
 
 const fn default_max_concurrent_operations() -> usize {
-    4
+    16
 }
 
 /// Daemon stop reason.
@@ -8784,6 +8828,8 @@ pub enum ConnectorDaemonStopReason {
 /// Connector daemon execution summary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConnectorDaemonReport {
+    /// Number of access paths upgraded from the historical one-channel default.
+    pub upgraded_legacy_access_paths: u64,
     /// Number of connector-local SSH sessions invalidated at connector startup.
     pub reconciled_connection_sessions: u64,
     /// Number of connector-local transport runtimes marked lost at startup.
@@ -8806,6 +8852,7 @@ pub struct ConnectorDaemonReport {
 
 fn initial_connector_daemon_report() -> ConnectorDaemonReport {
     ConnectorDaemonReport {
+        upgraded_legacy_access_paths: 0,
         reconciled_connection_sessions: 0,
         reconciled_transport_runtimes: 0,
         reconciled_pty_sessions: 0,
@@ -9067,6 +9114,17 @@ where
         report: &mut ConnectorDaemonReport,
     ) -> Result<(), ConnectorDaemonError> {
         let observed_at = now_utc();
+        report.upgraded_legacy_access_paths = self
+            .repositories
+            .access_paths
+            .upgrade_legacy_channel_default()
+            .await?;
+        if report.upgraded_legacy_access_paths > 0 {
+            tracing::info!(
+                upgraded_access_paths = report.upgraded_legacy_access_paths,
+                "upgraded historical SSH channel limits before creating connector transports"
+            );
+        }
         report.reconciled_connection_sessions = self
             .repositories
             .connection_sessions
@@ -9382,10 +9440,10 @@ fn shell_change_dir_input(cwd: Option<&str>) -> Option<String> {
 
 fn initial_pty_cwd(
     cwd: Option<String>,
-    host_kind: &HostKind,
+    _host_kind: &HostKind,
     access_path_requires_tty: bool,
 ) -> Option<String> {
-    if *host_kind == HostKind::JumpHost && access_path_requires_tty {
+    if access_path_requires_tty {
         return None;
     }
     cwd
@@ -9518,6 +9576,10 @@ mod tests {
             None,
         );
         assert_eq!(
+            initial_pty_cwd(Some("/root".to_owned()), &HostKind::Linux, true,),
+            None,
+        );
+        assert_eq!(
             initial_pty_cwd(Some("/srv/app".to_owned()), &HostKind::Linux, false,),
             Some("/srv/app".to_owned()),
         );
@@ -9634,14 +9696,21 @@ mod tests {
     }
 
     #[test]
-    fn interactive_pty_upload_uses_fewer_sha_verified_frames_than_exec_upload() {
+    fn interactive_pty_upload_uses_latency_bounded_sha_verified_frames() {
         assert_eq!(super::PTY_UPLOAD_CHUNK_BYTES, 256 * 1024);
-        assert!(super::PTY_UPLOAD_CHUNK_BYTES > super::EXEC_UPLOAD_CHUNK_BYTES);
+        const {
+            assert!(super::PTY_UPLOAD_CHUNK_BYTES > super::EXEC_UPLOAD_CHUNK_BYTES);
+        }
+        assert_eq!(
+            super::PTY_TRANSFER_STAGE_TIMEOUT,
+            std::time::Duration::from_secs(180)
+        );
+        assert!(super::PTY_TRANSFER_STAGE_TIMEOUT > super::EXEC_TRANSFER_STAGE_TIMEOUT);
 
         let artifact_bytes: usize = 11 * 1024 * 1024;
         let exec_frames = artifact_bytes.div_ceil(super::EXEC_UPLOAD_CHUNK_BYTES);
         let pty_frames = artifact_bytes.div_ceil(super::PTY_UPLOAD_CHUNK_BYTES);
-        assert!(pty_frames * 10 < exec_frames);
+        assert!(pty_frames < exec_frames);
     }
 
     #[test]
@@ -10234,6 +10303,20 @@ mod tests {
         retry_after_seconds: u64,
     }
 
+    struct OneChannelPtyBackend {
+        spawn_count: AtomicUsize,
+        inputs: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    impl OneChannelPtyBackend {
+        fn new() -> Self {
+            Self {
+                spawn_count: AtomicUsize::new(0),
+                inputs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
     struct TelemetryPtyBackend {
         tracker: Arc<TransportTelemetryTracker>,
     }
@@ -10305,6 +10388,36 @@ mod tests {
                 retry_after_seconds: self.retry_after_seconds,
             }
             .into())
+        }
+    }
+
+    #[async_trait]
+    impl ManagedPtyBackend for OneChannelPtyBackend {
+        fn capabilities(&self) -> PtyBackendCapabilities {
+            PtyBackendCapabilities::russh_native_pty()
+        }
+
+        async fn spawn(
+            &self,
+            _request: PtyBackendSpawnRequest,
+        ) -> Result<ManagedPtyProcess, super::ConnectorPtyError> {
+            if self.spawn_count.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Err(super::ConnectorPtyError::ChannelCapacityUnavailable);
+            }
+            let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+            let inputs = Arc::clone(&self.inputs);
+            tokio::spawn(async move {
+                while let Some(input) = input_rx.recv().await {
+                    inputs.lock().await.push(input);
+                }
+            });
+            let (output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(1);
+            let (close_tx, close_rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let _ = close_rx.await;
+                drop(output_tx);
+            });
+            Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx))
         }
     }
 
@@ -12417,6 +12530,417 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn operation_claim_skips_a_saturated_access_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let first_path = fixture
+            .repositories
+            .access_paths
+            .get(
+                fixture
+                    .repositories
+                    .workspaces
+                    .get(fixture.workspace_id)
+                    .await?
+                    .ok_or("workspace should exist")?
+                    .access_path_id,
+            )
+            .await?
+            .ok_or("first access path should exist")?;
+        let first_workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("first workspace should exist")?;
+        let first_connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("first connection should exist")?;
+        let mut active_pty = PtySessionSupervisor::default().open_session(
+            &first_workspace,
+            &first_connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: None,
+            },
+        )?;
+        active_pty.backend_state = PtyBackendState::Active;
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&active_pty)
+            .await?;
+
+        let mut second_path = first_path;
+        second_path.id = AccessPathId::new();
+        second_path.address = "10.0.0.41".to_owned();
+        second_path.priority = 2;
+        fixture
+            .repositories
+            .access_paths
+            .insert(&second_path)
+            .await?;
+        let mut second_workspace = first_workspace;
+        second_workspace.id = WorkspaceId::new();
+        second_workspace.access_path_id = second_path.id;
+        second_workspace.label = "available-path".to_owned();
+        fixture
+            .repositories
+            .workspaces
+            .insert(&second_workspace)
+            .await?;
+        let first_operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("first operation should exist")?;
+        let mut second_operation = first_operation;
+        second_operation.id = OperationId::new();
+        second_operation.access_path_id = second_path.id;
+        second_operation.workspace_id = Some(second_workspace.id);
+        second_operation.started_at += time::Duration::seconds(1);
+        fixture
+            .repositories
+            .operations
+            .insert(&second_operation)
+            .await?;
+
+        let claimed = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "capacity-aware-claim",
+                now_utc(),
+                now_utc() + time::Duration::minutes(5),
+                3,
+            )
+            .await?
+            .ok_or("an operation should be claimable")?;
+
+        assert_eq!(
+            claimed.id, second_operation.id,
+            "a full path must not occupy a connector worker while another path has capacity"
+        );
+        assert_eq!(
+            fixture
+                .repositories
+                .operations
+                .get(fixture.operation_id)
+                .await?
+                .ok_or("first operation should remain queued")?
+                .state,
+            OperationState::Queued
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_pty_selection_skips_a_saturated_access_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let first_workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("first workspace should exist")?;
+        let first_path = fixture
+            .repositories
+            .access_paths
+            .get(first_workspace.access_path_id)
+            .await?
+            .ok_or("first access path should exist")?;
+        let first_connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("first connection should exist")?;
+        let mut active_pty = PtySessionSupervisor::default().open_session(
+            &first_workspace,
+            &first_connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: first_connection.session_id,
+                cwd: None,
+            },
+        )?;
+        active_pty.backend_state = PtyBackendState::Active;
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&active_pty)
+            .await?;
+        let mut blocked_pending = active_pty.clone();
+        blocked_pending.pty_session_id = PtySessionId::new();
+        blocked_pending.backend_state = PtyBackendState::Pending;
+        blocked_pending.created_at -= time::Duration::seconds(1);
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&blocked_pending)
+            .await?;
+
+        let mut second_path = first_path;
+        second_path.id = AccessPathId::new();
+        second_path.address = "10.0.0.42".to_owned();
+        second_path.priority = 2;
+        fixture
+            .repositories
+            .access_paths
+            .insert(&second_path)
+            .await?;
+        let mut second_workspace = first_workspace;
+        second_workspace.id = WorkspaceId::new();
+        second_workspace.access_path_id = second_path.id;
+        second_workspace.label = "available-pty-path".to_owned();
+        fixture
+            .repositories
+            .workspaces
+            .insert(&second_workspace)
+            .await?;
+        let mut second_connection = first_connection;
+        second_connection.session_id = SessionId::new();
+        second_connection.access_path_id = second_path.id;
+        fixture
+            .repositories
+            .connection_sessions
+            .upsert(&second_connection)
+            .await?;
+        let available_pending = PtySessionSupervisor::default().open_session(
+            &second_workspace,
+            &second_connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: second_connection.session_id,
+                cwd: None,
+            },
+        )?;
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&available_pending)
+            .await?;
+
+        let selected = fixture
+            .repositories
+            .pty_sessions
+            .next_pending_for_connector(fixture.connector_id)
+            .await?
+            .ok_or("a pending PTY should be activatable")?;
+
+        assert_eq!(
+            selected.pty_session_id, available_pending.pty_session_id,
+            "a pending PTY on a full path must not block activation on another path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn pty_capacity_wait_preserves_pending_state_and_delivers_active_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let mut access_path = fixture
+            .repositories
+            .access_paths
+            .get(
+                fixture
+                    .repositories
+                    .workspaces
+                    .get(fixture.workspace_id)
+                    .await?
+                    .ok_or("workspace should exist")?
+                    .access_path_id,
+            )
+            .await?
+            .ok_or("access path should exist")?;
+        access_path.max_concurrent_channels = 2;
+        fixture
+            .repositories
+            .access_paths
+            .upsert(&access_path)
+            .await?;
+        let backend = OneChannelPtyBackend::new();
+        let inputs = Arc::clone(&backend.inputs);
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let active = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?
+            .pty_session;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        let mut pending = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: None,
+            },
+        )?;
+        pending.created_at -= time::Duration::seconds(1);
+        fixture.repositories.pty_sessions.upsert(&pending).await?;
+
+        let pending_input = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: pending.pty_session_id,
+            workspace_id: workspace.id,
+            connector_id: fixture.connector_id,
+            host_id: fixture.host_id,
+            agent_session_id: Some(fixture.agent_session_id),
+            idempotency_key: Some("pending-input".to_owned()),
+            input_fingerprint: None,
+            state: PtyInputEventState::Queued,
+            sequence: 0,
+            redacted_input_summary: "pending input".to_owned(),
+            byte_len: 8,
+            requested_by: Some("agent".to_owned()),
+            created_at: now_utc() - time::Duration::seconds(1),
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&pending_input, "pending\n")
+            .await?;
+        let active_input = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: active.pty_session_id,
+            idempotency_key: Some("active-input".to_owned()),
+            created_at: now_utc(),
+            redacted_input_summary: "active input".to_owned(),
+            byte_len: 11,
+            ..pending_input.clone()
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&active_input, "echo alive\n")
+            .await?;
+
+        let outcome = super::poll_pty_pump(&manager)
+            .await?
+            .ok_or("active PTY input should be delivered")?;
+
+        assert!(matches!(
+            outcome,
+            super::PtyPumpOutcome::Input(ConnectorPtyInputDeliveryOutcome {
+                input_event_id,
+                state: PtyInputEventState::Delivered,
+                ..
+            }) if input_event_id == active_input.id
+        ));
+        assert_eq!(
+            fixture
+                .repositories
+                .pty_sessions
+                .get(pending.pty_session_id)
+                .await?
+                .ok_or("pending PTY should exist")?
+                .backend_state,
+            PtyBackendState::Pending
+        );
+        assert_eq!(
+            fixture
+                .repositories
+                .connection_sessions
+                .get(fixture.session_id)
+                .await?
+                .ok_or("connection should exist")?
+                .state,
+            EntityState::Connected
+        );
+        assert_eq!(
+            fixture
+                .repositories
+                .workspaces
+                .get(fixture.workspace_id)
+                .await?
+                .ok_or("workspace should exist")?
+                .state,
+            WorkspaceState::Working
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(inputs.lock().await.as_slice(), ["echo alive\n"]);
+        assert_eq!(
+            fixture
+                .repositories
+                .pty_input_events
+                .get(pending_input.id)
+                .await?
+                .ok_or("pending input should remain queued")?
+                .state,
+            PtyInputEventState::Queued
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_running_operation_can_reclaim_its_own_channel_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let now = now_utc();
+        let first = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "first-expiring-claim",
+                now,
+                now + time::Duration::seconds(1),
+                3,
+            )
+            .await?
+            .ok_or("first claim should succeed")?;
+        assert_eq!(first.id, fixture.operation_id);
+
+        let reclaimed = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "reclaimed-capacity",
+                now + time::Duration::seconds(2),
+                now + time::Duration::minutes(5),
+                3,
+            )
+            .await?
+            .ok_or("expired operation should be reclaimable")?;
+
+        assert_eq!(reclaimed.id, fixture.operation_id);
+        assert_eq!(reclaimed.attempt_count, 2);
+        assert_eq!(reclaimed.claim_token.as_deref(), Some("reclaimed-capacity"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connector_pty_manager_activation_clears_expired_handshake_throttle()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
@@ -13104,6 +13628,10 @@ mod tests {
             .insert(&event, "attach input\n")
             .await?;
 
+        assert_eq!(
+            manager.activate_next_pending().await?,
+            Some(pty_session.pty_session_id)
+        );
         let outcome = manager
             .deliver_next_queued_input(30, 3)
             .await?
@@ -13645,6 +14173,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn connector_daemon_overlaps_readonly_operations()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
@@ -13654,6 +14183,18 @@ mod tests {
             .get(fixture.workspace_id)
             .await?
             .ok_or("workspace should exist")?;
+        let mut access_path = fixture
+            .repositories
+            .access_paths
+            .get(workspace.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        access_path.max_concurrent_channels = 2;
+        fixture
+            .repositories
+            .access_paths
+            .upsert(&access_path)
+            .await?;
         let policy = ServerProtectionPolicy::default();
         let profile = CommandProfileCatalog::resolve_builtin("host.identity", Vec::new(), &policy)?;
         let second =
@@ -13821,7 +14362,7 @@ mod tests {
         let pump = Arc::new(DeferredOneShotPtyInputPump::new(Duration::from_millis(30)));
         let daemon = ConnectorDaemon::new(
             fixture.repositories.clone(),
-            StaticTransportProvider::new(SlowTransport(Duration::from_millis(150))),
+            StaticTransportProvider::new(SlowTransport(Duration::from_millis(500))),
             ConnectorOperationWorkerConfig {
                 connector_id: fixture.connector_id,
                 lease_seconds: 300,
@@ -13850,7 +14391,12 @@ mod tests {
             OperationState::Running,
         )
         .await?;
-        tokio::time::sleep(Duration::from_millis(70)).await;
+        for _ in 0..40 {
+            if pump.was_delivered() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(
             pump.was_delivered(),
             "PTY input must be delivered before the long remote operation completes"
