@@ -110,8 +110,8 @@ as `admin`, `readonly`, `database`, `automation`, or `registry`.
 - Use the loopback management form or another client path that keeps the secret body out of command
   history and audit summaries.
 
-If `vault_unlocked=false`, check the launchd API wrapper and service update before asking the user
-to re-enter credentials.
+If `vault_unlocked=false`, check that the macOS LaunchAgent or Windows Scheduled Task passes the
+configured vault key to the API before asking the user to re-enter credentials.
 
 ## Discovery Patterns
 

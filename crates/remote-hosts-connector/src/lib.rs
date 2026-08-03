@@ -3,17 +3,20 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     pin::Pin,
-    process::Stdio as ProcessStdio,
     sync::{Arc, Mutex as StdMutex},
     time::Instant as StdInstant,
 };
 
+#[cfg(unix)]
+use std::{num::NonZeroUsize, process::Stdio as ProcessStdio};
+
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+#[cfg(unix)]
 use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder, Stdio as OpenSshStdio};
+#[cfg(unix)]
 use openssh_sftp_client::{
     Error as OpenSshSftpError, Sftp as OpenSshSftp, SftpOptions,
     error::SftpErrorKind as OpenSshSftpErrorKind,
@@ -64,9 +67,10 @@ use russh_sftp::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use tokio::process::{Child as LocalChild, Command as LocalCommand};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    process::{Child as LocalChild, Command as LocalCommand},
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time::{Duration, Instant},
@@ -299,6 +303,7 @@ pub enum HostKeyPolicy {
     Accept,
 }
 
+#[cfg(unix)]
 impl From<HostKeyPolicy> for KnownHosts {
     fn from(value: HostKeyPolicy) -> Self {
         match value {
@@ -310,6 +315,7 @@ impl From<HostKeyPolicy> for KnownHosts {
 }
 
 /// OpenSSH `ControlMaster` transport configuration.
+#[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OpenSshTransportConfig {
     /// Destination accepted by OpenSSH, for example `ssh://user@example.com:22`.
@@ -331,6 +337,7 @@ pub struct OpenSshTransportConfig {
 }
 
 /// OpenSSH `ControlMaster` transport backed by the `openssh` crate's native mux.
+#[cfg(unix)]
 pub struct OpenSshTransport {
     config: OpenSshTransportConfig,
     session: Mutex<Option<Arc<Session>>>,
@@ -339,6 +346,7 @@ pub struct OpenSshTransport {
     telemetry: TransportTelemetryTracker,
 }
 
+#[cfg(unix)]
 impl OpenSshTransport {
     /// Creates a transport.
     pub fn new(config: OpenSshTransportConfig) -> Self {
@@ -440,6 +448,7 @@ impl OpenSshTransport {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl RemoteTransport for OpenSshTransport {
     fn transport_telemetry(&self) -> Option<SshTransportTelemetry> {
@@ -503,6 +512,7 @@ impl RemoteTransport for OpenSshTransport {
     }
 }
 
+#[cfg(unix)]
 async fn execute_openssh_sftp(
     session: Arc<Session>,
     request: SftpRequest,
@@ -526,6 +536,7 @@ async fn execute_openssh_sftp(
     }
 }
 
+#[cfg(unix)]
 async fn openssh_upload(
     sftp: &OpenSshSftp,
     request: &SftpRequest,
@@ -607,6 +618,7 @@ async fn openssh_upload(
     transfer
 }
 
+#[cfg(unix)]
 async fn openssh_download(
     sftp: &OpenSshSftp,
     request: &SftpRequest,
@@ -683,6 +695,7 @@ async fn openssh_download(
     transfer
 }
 
+#[cfg(unix)]
 async fn openssh_lstat(
     fs: &mut OpenSshSftpFs,
     path: &str,
@@ -694,6 +707,7 @@ async fn openssh_lstat(
     }
 }
 
+#[cfg(unix)]
 async fn ensure_openssh_remote_parent(
     fs: &mut OpenSshSftpFs,
     path: &str,
@@ -713,6 +727,7 @@ async fn ensure_openssh_remote_parent(
     Ok(())
 }
 
+#[cfg(unix)]
 async fn ensure_openssh_remote_destination(
     fs: &mut OpenSshSftpFs,
     path: &str,
@@ -730,6 +745,7 @@ async fn ensure_openssh_remote_destination(
     Ok(())
 }
 
+#[cfg(unix)]
 fn ensure_openssh_regular_file(
     metadata: &OpenSshSftpMetadata,
     label: &str,
@@ -745,6 +761,7 @@ fn ensure_openssh_regular_file(
     Ok(())
 }
 
+#[cfg(unix)]
 async fn cleanup_openssh_temporary_file(
     fs: &mut OpenSshSftpFs,
     path: &str,
@@ -758,6 +775,7 @@ async fn cleanup_openssh_temporary_file(
         .map_err(openssh_file_transfer_error)
 }
 
+#[cfg(unix)]
 async fn hash_openssh_remote_file(
     sftp: &OpenSshSftp,
     path: &str,
@@ -768,6 +786,7 @@ async fn hash_openssh_remote_file(
     hash_reader(remote.as_mut(), max_size_bytes).await
 }
 
+#[cfg(unix)]
 fn openssh_file_transfer_error(error: OpenSshSftpError) -> TransportError {
     let message = error.to_string();
     drop(error);
@@ -988,10 +1007,10 @@ async fn set_local_mode(path: &Path, mode: u32) -> Result<(), TransportError> {
 }
 
 #[cfg(not(unix))]
-async fn set_local_mode(_path: &Path, _mode: u32) -> Result<(), TransportError> {
-    Err(TransportError::FileTransfer(
+fn set_local_mode(_path: &Path, _mode: u32) -> std::future::Ready<Result<(), TransportError>> {
+    std::future::ready(Err(TransportError::FileTransfer(
         "local permission modes are unsupported on this connector platform".to_owned(),
-    ))
+    )))
 }
 
 fn local_temporary_path(
@@ -1153,10 +1172,12 @@ pub trait ManagedPtyBackend: Send + Sync {
 }
 
 /// OpenSSH-backed persistent shell backend.
+#[cfg(unix)]
 pub struct OpenSshShellBackend {
     transport: Arc<OpenSshTransport>,
 }
 
+#[cfg(unix)]
 impl OpenSshShellBackend {
     /// Creates a backend from an OpenSSH transport.
     pub fn new(transport: Arc<OpenSshTransport>) -> Self {
@@ -1164,6 +1185,7 @@ impl OpenSshShellBackend {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl ManagedPtyBackend for OpenSshShellBackend {
     fn capabilities(&self) -> PtyBackendCapabilities {
@@ -1242,6 +1264,7 @@ impl ManagedPtyBackend for OpenSshShellBackend {
 }
 
 /// OpenSSH `ControlMaster` backend mode for persistent shell sessions.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenSshManagedPtyBackendMode {
@@ -1253,6 +1276,7 @@ pub enum OpenSshManagedPtyBackendMode {
 }
 
 /// OpenSSH-backed true terminal backend using an existing `ControlMaster` socket.
+#[cfg(unix)]
 pub struct OpenSshControlMasterTtyBackend {
     transport: Arc<OpenSshTransport>,
     ssh_binary: PathBuf,
@@ -1261,6 +1285,7 @@ pub struct OpenSshControlMasterTtyBackend {
     rows: u32,
 }
 
+#[cfg(unix)]
 impl OpenSshControlMasterTtyBackend {
     /// Creates a backend that invokes the local `ssh` binary.
     pub fn new(transport: Arc<OpenSshTransport>) -> Self {
@@ -1290,6 +1315,7 @@ impl OpenSshControlMasterTtyBackend {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl ManagedPtyBackend for OpenSshControlMasterTtyBackend {
     fn capabilities(&self) -> PtyBackendCapabilities {
@@ -1362,12 +1388,14 @@ impl ManagedPtyBackend for OpenSshControlMasterTtyBackend {
 }
 
 /// OpenSSH-backed PTY backend factory keyed by access path.
+#[cfg(unix)]
 pub struct OpenSshPtyBackendFactory {
     repositories: Repositories,
     pool: Arc<OpenSshTransportPool>,
     mode: OpenSshManagedPtyBackendMode,
 }
 
+#[cfg(unix)]
 impl OpenSshPtyBackendFactory {
     /// Creates an OpenSSH PTY backend factory.
     pub fn new(
@@ -1419,6 +1447,7 @@ impl OpenSshPtyBackendFactory {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl ManagedPtyBackend for OpenSshPtyBackendFactory {
     fn capabilities(&self) -> PtyBackendCapabilities {
@@ -1448,6 +1477,7 @@ impl ManagedPtyBackend for OpenSshPtyBackendFactory {
     }
 }
 
+#[cfg(unix)]
 fn spawn_reader_task<R>(
     mut reader: R,
     stream: OutputStream,
@@ -1488,6 +1518,7 @@ fn spawn_reader_task<R>(
     });
 }
 
+#[cfg(unix)]
 fn spawn_local_child_wait_task(
     mut child: LocalChild,
     close_rx: oneshot::Receiver<()>,
@@ -1734,6 +1765,7 @@ async fn reject_unsupported_multi_hop_route<T>(
 }
 
 /// Shared OpenSSH transport pool with one raw ControlMaster-backed transport per access path.
+#[cfg(unix)]
 pub struct OpenSshTransportPool {
     repositories: Repositories,
     host_key_policy: HostKeyPolicy,
@@ -1743,6 +1775,7 @@ pub struct OpenSshTransportPool {
     cache: Mutex<BTreeMap<AccessPathId, Arc<OpenSshTransport>>>,
 }
 
+#[cfg(unix)]
 impl OpenSshTransportPool {
     /// Creates a raw OpenSSH transport pool.
     pub fn new(
@@ -1823,17 +1856,20 @@ impl OpenSshTransportPool {
 }
 
 /// OpenSSH transport provider with one cached guarded transport per access path.
+#[cfg(unix)]
 pub struct OpenSshTransportProvider {
     pool: Arc<OpenSshTransportPool>,
     policy: ServerProtectionPolicy,
     cache: Mutex<BTreeMap<AccessPathId, OpenSshGuardedTransportCacheEntry>>,
 }
 
+#[cfg(unix)]
 struct OpenSshGuardedTransportCacheEntry {
     pooled: Arc<OpenSshTransport>,
     transport: Arc<dyn RemoteTransport>,
 }
 
+#[cfg(unix)]
 impl OpenSshTransportProvider {
     /// Creates an OpenSSH provider.
     pub fn new(
@@ -1890,6 +1926,7 @@ impl OpenSshTransportProvider {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl RemoteTransportProvider for OpenSshTransportProvider {
     async fn transport_for(
@@ -9820,6 +9857,7 @@ async fn pty_lease_owner(
         })
 }
 
+#[cfg(unix)]
 fn shell_start_script(cwd: Option<&str>) -> String {
     cwd.map_or_else(
         || "exec ${SHELL:-sh} -i".to_owned(),
@@ -9945,12 +9983,15 @@ mod tests {
         ConnectorOperationWorkerConfig, ConnectorPtyInputDeliveryOutcome, ConnectorPtyManager,
         ConnectorPtyManagerConfig, DEFAULT_ARTIFACT_PREVIEW_BYTES,
         DEFAULT_ARTIFACT_THRESHOLD_BYTES, FileOutputArtifactStore, GuardedTransport, HostKeyPolicy,
-        ManagedPtyBackend, ManagedPtyProcess, OpenSshTransport, OpenSshTransportPool,
-        OpenSshTransportProvider, OutputArtifactStore, PtyBackendOutput, PtyBackendSpawnRequest,
-        QueuedPtyInputPump, RemoteTransportProvider, RusshPtyBackendFactory, RusshTransportPool,
+        ManagedPtyBackend, ManagedPtyProcess, OutputArtifactStore, PtyBackendOutput,
+        PtyBackendSpawnRequest, QueuedPtyInputPump, RusshPtyBackendFactory, RusshTransportPool,
         SshCredentialProvider, StaticTransportProvider, TransportTelemetryTracker,
         authorized_key_bootstrap_failure_state, authorized_key_bootstrap_is_eligible,
         execute_authorized_key_install_with_timeout, initial_pty_cwd, russh_inactivity_timeout,
+    };
+    #[cfg(unix)]
+    use super::{
+        OpenSshTransport, OpenSshTransportPool, OpenSshTransportProvider, RemoteTransportProvider,
     };
     use remote_hosts_core::ServerProtectionPolicy;
     use remote_hosts_vault::{CredentialSecret, CredentialVault};
@@ -11306,6 +11347,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn openssh_destination_uses_uri_with_port() {
         let destination = OpenSshTransport::destination("ops", "10.0.0.10", 2222);
@@ -14259,6 +14301,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn openssh_provider_reuses_cached_transport_per_access_path()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -14282,6 +14325,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn openssh_operation_and_pty_backends_share_one_raw_transport()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -14349,6 +14393,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn ssh_transport_pools_replace_cached_transports_when_route_metadata_changes()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -14403,6 +14448,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn guarded_transport_providers_follow_replaced_raw_transports()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -14492,6 +14538,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn ssh_transport_pools_fail_fast_for_multi_hop_routes_without_caching()
     -> Result<(), Box<dyn std::error::Error>> {

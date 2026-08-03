@@ -2551,6 +2551,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "remote-hosts-launcher"
+version = "0.1.0"
+
+[[package]]
 name = "remote-hosts-mcp"
 version = "0.1.0"
 dependencies = [

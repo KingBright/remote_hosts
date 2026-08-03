@@ -2,7 +2,7 @@
 
 Use this when configuring MCP or checking whether the local Remote Hosts service is usable.
 
-## Local Service
+## macOS Local Service
 
 Expected paths:
 
@@ -32,6 +32,24 @@ The launchd API wrapper passes the same local vault password file used by MCP an
 `GET /v1/admin/overview` should therefore report `vault_unlocked=true`. The HTTP API remains bound
 to loopback; do not expose the unlocked vault on a public or LAN bind.
 
+## Windows Local Service
+
+The native Windows package installs under `%LOCALAPPDATA%\RemoteHosts` and registers `Remote Hosts
+API` plus `Remote Hosts Connector` as current-user Task Scheduler jobs. Use:
+
+```powershell
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Status
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Update
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Restart
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Ui
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Skills
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Logs
+```
+
+The Windows connector supports only the native `russh` backend. It retains pooled commands,
+PowerShell, PTYs, upload/download, Windows SSH Agent named-pipe and Pageant authentication, password
+fallback, and key bootstrap. The OpenSSH native-mux compatibility backend is Unix-only.
+
 ## MCP Server Command
 
 Agents should launch the stdio MCP server on demand:
@@ -40,18 +58,28 @@ Agents should launch the stdio MCP server on demand:
 /Users/jinliang/.local/bin/remote-hosts mcp-stdio --database-url sqlite:///Users/jinliang/.local/share/remote-hosts/remote-hosts.sqlite --tool-profile agent --vault-master-password-file /Users/jinliang/.config/remote-hosts/vault-master-password --artifact-root /Users/jinliang/.local/share/remote-hosts/artifacts --agent-client-kind codex
 ```
 
-Do not run MCP stdio as a launchd daemon. Keep API and connector as daemons; let the agent client own the stdio MCP child process.
+Do not run MCP stdio as a launchd daemon or Scheduled Task. Keep API and connector in the platform
+service manager; let the agent client own the stdio MCP child process.
+
+On Windows, use the stable native launcher shown by `remote-hosts-service.ps1 PrintConfig`. It reads
+`%LOCALAPPDATA%\RemoteHosts\config\current-binary.txt`, starts the current versioned binary, and
+inherits MCP stdio directly. New tasks therefore pick up staged releases without changing the MCP
+configuration; already-running MCP children remain on their original binary until reloaded.
 
 ## Updating and Reloading
 
-`remote-hosts-service stage` rebuilds the binary, applies migrations, and synchronizes the
-repository-owned Skill into Codex and Antigravity without restarting launchd services.
+`remote-hosts-service stage` rebuilds or stages the binary, applies migrations, and synchronizes the
+repository-owned Skill into Codex and Antigravity without restarting local services.
 `remote-hosts-service update` stages the same files and restarts only after its database drain
 gate confirms there are no queued/running operations, active PTYs, queued PTY inputs, or
 unexpired write leases. `restart` uses the same gate. Use `--force` only when interrupting all
 reported conversations is intentional. Neither command replaces MCP stdio children or
 already-loaded Skill context owned by an existing Codex or Antigravity task; those processes
 keep the old binary, tool schema, and instructions until the client reloads them.
+
+Windows uses the same Rust `restart-readiness` query and `-Force` spelling. Its versioned release
+directories avoid overwriting an executable that is still in use. Neither macOS nor Windows service
+management depends on an external SQLite CLI.
 
 After the installed API has been restarted once with external admin UI support,
 `remote-hosts-service ui` atomically updates only
@@ -73,6 +101,17 @@ command = "/Users/jinliang/.local/bin/remote-hosts"
 args = ["mcp-stdio", "--database-url", "sqlite:///Users/jinliang/.local/share/remote-hosts/remote-hosts.sqlite", "--tool-profile", "agent", "--vault-master-password-file", "/Users/jinliang/.config/remote-hosts/vault-master-password", "--artifact-root", "/Users/jinliang/.local/share/remote-hosts/artifacts", "--agent-client-kind", "codex"]
 startup_timeout_sec = 30
 ```
+
+On Windows, keep the MCP path stable across versioned updates:
+
+```toml
+[mcp_servers.remote-hosts]
+command = "C:/Users/<user>/AppData/Local/RemoteHosts/bin/remote-hosts-launcher.exe"
+args = ["--", "mcp-stdio", "--database-url", "sqlite://C:/Users/<user>/AppData/Local/RemoteHosts/data/remote-hosts.sqlite", "--tool-profile", "agent", "--vault-master-password-file", "C:/Users/<user>/AppData/Local/RemoteHosts/config/vault-master-password", "--artifact-root", "C:/Users/<user>/AppData/Local/RemoteHosts/data/artifacts", "--agent-client-kind", "codex"]
+startup_timeout_sec = 30
+```
+
+Use `PrintConfig` rather than guessing `<user>` or the configured root.
 
 ## Antigravity MCP Config
 

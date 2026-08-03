@@ -36,7 +36,8 @@ Use this skill to interact with the user's Remote Hosts service instead of openi
 
 ## Service Assumptions
 
-The local Remote Hosts service is expected to be installed and running through launchd:
+The local Remote Hosts service is expected to be installed through the platform service manager.
+On the owner's current macOS workstation:
 
 - Binary: `/Users/jinliang/.local/bin/remote-hosts`
 - Database: `sqlite:///Users/jinliang/.local/share/remote-hosts/remote-hosts.sqlite`
@@ -44,11 +45,32 @@ The local Remote Hosts service is expected to be installed and running through l
 - Service helper: `/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service`
 - Output artifacts: `/Users/jinliang/.local/share/remote-hosts/artifacts`
 
+On Windows, the release defaults to:
+
+- Stable MCP launcher: `%LOCALAPPDATA%\RemoteHosts\bin\remote-hosts-launcher.exe`
+- Service manager: `%LOCALAPPDATA%\RemoteHosts\bin\remote-hosts-service.ps1`
+- Configuration: `%LOCALAPPDATA%\RemoteHosts\config\service.json`
+- Database: `%LOCALAPPDATA%\RemoteHosts\data\remote-hosts.sqlite`
+- HTTP API: `http://127.0.0.1:8787`
+- Output artifacts: `%LOCALAPPDATA%\RemoteHosts\data\artifacts`
+
+macOS uses user LaunchAgents. Windows uses current-user Task Scheduler jobs so native `russh` can
+use that user's OpenSSH Agent named pipe, Pageant, private keys, and configuration. Windows MCP
+clients should call the stable Rust launcher; it reads the current version pointer and forwards
+stdio without a persistent PowerShell proxy.
+
 If MCP tools are unavailable, first check whether the service is running:
 
 ```bash
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service status
 curl -sS http://127.0.0.1:8787/v1/command-profiles
+```
+
+On Windows PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Status
+Invoke-RestMethod http://127.0.0.1:8787/v1/command-profiles
 ```
 
 ## Workflow Router

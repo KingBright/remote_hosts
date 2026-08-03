@@ -1,0 +1,15 @@
+[package]
+name = "remote-hosts-launcher"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "remote-hosts-launcher"
+path = "src/main.rs"

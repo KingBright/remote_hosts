@@ -6,6 +6,7 @@ members = [
     "crates/remote-hosts-core",
     "crates/remote-hosts-db",
     "crates/remote-hosts-domain",
+    "crates/remote-hosts-launcher",
     "crates/remote-hosts-mcp",
     "crates/remote-hosts-vault",
 ]

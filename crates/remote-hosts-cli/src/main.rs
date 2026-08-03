@@ -7,13 +7,18 @@ use clap::{Parser, Subcommand, ValueEnum};
 use remote_hosts_connector::{
     ConnectorDaemon, ConnectorDaemonConfig, ConnectorOperationWorker,
     ConnectorOperationWorkerConfig, ConnectorPtyManager, ConnectorPtyManagerConfig,
-    FileOutputArtifactStore, HostKeyPolicy, InteractiveFileTransferBackend,
+    FileOutputArtifactStore, HostKeyPolicy, InteractiveFileTransferBackend, QueuedPtyInputPump,
+    RusshPtyBackendFactory, RusshTransportPool, RusshTransportProvider, VaultSshCredentialProvider,
+};
+#[cfg(unix)]
+use remote_hosts_connector::{
     OpenSshManagedPtyBackendMode, OpenSshPtyBackendFactory, OpenSshTransportPool,
-    OpenSshTransportProvider, QueuedPtyInputPump, RusshPtyBackendFactory, RusshTransportPool,
-    RusshTransportProvider, VaultSshCredentialProvider,
+    OpenSshTransportProvider,
 };
 use remote_hosts_core::ServerProtectionPolicy;
-use remote_hosts_domain::ConnectorId;
+use remote_hosts_domain::{
+    Connector, ConnectorId, EntityState, Environment, EnvironmentId, EnvironmentKind, TrustLevel,
+};
 use secrecy::SecretString;
 use tokio::sync::watch;
 
@@ -37,6 +42,48 @@ enum Command {
         /// Database URL, for example `<sqlite://remote-hosts.db>`.
         #[arg(long, env = "REMOTE_HOSTS_DATABASE_URL")]
         database_url: String,
+    },
+    /// Check whether local services can restart without interrupting active work.
+    RestartReadiness {
+        /// Database URL, for example `<sqlite://remote-hosts.db>`.
+        #[arg(long, env = "REMOTE_HOSTS_DATABASE_URL")]
+        database_url: String,
+    },
+    /// Idempotently register the local environment and connector.
+    BootstrapConnector {
+        /// Database URL, for example `<sqlite://remote-hosts.db>`.
+        #[arg(long, env = "REMOTE_HOSTS_DATABASE_URL")]
+        database_url: String,
+        /// Stable connector id as UUID.
+        #[arg(long)]
+        connector_id: String,
+        /// Human-facing connector name.
+        #[arg(long)]
+        connector_name: String,
+        /// Stable environment id as UUID.
+        #[arg(long)]
+        environment_id: String,
+        /// Human-facing environment name.
+        #[arg(long)]
+        environment_name: String,
+        /// Environment category.
+        #[arg(long, value_enum, default_value_t = EnvironmentKindArg::HomeLan)]
+        environment_kind: EnvironmentKindArg,
+        /// Environment trust level.
+        #[arg(long, value_enum, default_value_t = TrustLevelArg::Owned)]
+        trust_level: TrustLevelArg,
+        /// Optional environment description.
+        #[arg(long)]
+        environment_description: Option<String>,
+        /// Optional environment notes.
+        #[arg(long)]
+        environment_notes: Option<String>,
+        /// Current network label reported by the connector.
+        #[arg(long, default_value = "local")]
+        current_network: String,
+        /// Connector version stored before the first heartbeat.
+        #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
+        version: String,
     },
     /// Serve the MCP server over stdio for local agents.
     McpStdio {
@@ -96,7 +143,7 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         connect_timeout_seconds: u64,
         /// SSH transport backend for queued operations: openssh or russh.
-        #[arg(long, default_value = "openssh")]
+        #[arg(long, default_value = "russh")]
         ssh_backend: String,
         /// Vault master password file required by the russh backend.
         #[arg(long, env = "REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE")]
@@ -144,7 +191,7 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         connect_timeout_seconds: u64,
         /// SSH transport backend for queued operations: openssh or russh.
-        #[arg(long, default_value = "openssh")]
+        #[arg(long, default_value = "russh")]
         ssh_backend: String,
         /// Vault master password file required by the russh backend.
         #[arg(long, env = "REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE")]
@@ -201,6 +248,48 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum EnvironmentKindArg {
+    HomeLan,
+    CompanyLan,
+    CustomerSite,
+    PublicInternet,
+    Vpn,
+    Frp,
+}
+
+impl From<EnvironmentKindArg> for EnvironmentKind {
+    fn from(value: EnvironmentKindArg) -> Self {
+        match value {
+            EnvironmentKindArg::HomeLan => Self::HomeLan,
+            EnvironmentKindArg::CompanyLan => Self::CompanyLan,
+            EnvironmentKindArg::CustomerSite => Self::CustomerSite,
+            EnvironmentKindArg::PublicInternet => Self::PublicInternet,
+            EnvironmentKindArg::Vpn => Self::Vpn,
+            EnvironmentKindArg::Frp => Self::Frp,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TrustLevelArg {
+    Owned,
+    Trusted,
+    External,
+    Untrusted,
+}
+
+impl From<TrustLevelArg> for TrustLevel {
+    fn from(value: TrustLevelArg) -> Self {
+        match value {
+            TrustLevelArg::Owned => Self::Owned,
+            TrustLevelArg::Trusted => Self::Trusted,
+            TrustLevelArg::External => Self::External,
+            TrustLevelArg::Untrusted => Self::Untrusted,
+        }
+    }
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -221,6 +310,46 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate { database_url } => {
             migrate_database(&database_url).await?;
             println!("migrations applied");
+        }
+        Command::RestartReadiness { database_url } => {
+            let repositories = connect_repositories(&database_url).await?;
+            let summary = repositories
+                .active_work_summary()
+                .await
+                .context("check active work before restart")?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if !summary.is_idle() {
+                anyhow::bail!("active conversation work must drain before restart");
+            }
+        }
+        Command::BootstrapConnector {
+            database_url,
+            connector_id,
+            connector_name,
+            environment_id,
+            environment_name,
+            environment_kind,
+            trust_level,
+            environment_description,
+            environment_notes,
+            current_network,
+            version,
+        } => {
+            let result = bootstrap_connector(BootstrapConnectorArgs {
+                database_url,
+                connector_id,
+                connector_name,
+                environment_id,
+                environment_name,
+                environment_kind,
+                trust_level,
+                environment_description,
+                environment_notes,
+                current_network,
+                version,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::McpStdio {
             database_url,
@@ -396,6 +525,77 @@ async fn connect_repositories(database_url: &str) -> anyhow::Result<remote_hosts
     Ok(remote_hosts_db::Repositories::new(pool))
 }
 
+#[derive(Clone)]
+struct BootstrapConnectorArgs {
+    database_url: String,
+    connector_id: String,
+    connector_name: String,
+    environment_id: String,
+    environment_name: String,
+    environment_kind: EnvironmentKindArg,
+    trust_level: TrustLevelArg,
+    environment_description: Option<String>,
+    environment_notes: Option<String>,
+    current_network: String,
+    version: String,
+}
+
+async fn bootstrap_connector(args: BootstrapConnectorArgs) -> anyhow::Result<serde_json::Value> {
+    let repositories = connect_repositories(&args.database_url).await?;
+    upsert_bootstrap_connector(&repositories, args).await
+}
+
+async fn upsert_bootstrap_connector(
+    repositories: &remote_hosts_db::Repositories,
+    args: BootstrapConnectorArgs,
+) -> anyhow::Result<serde_json::Value> {
+    let environment_id =
+        EnvironmentId::from_str(&args.environment_id).context("parse local environment id")?;
+    let connector_id =
+        ConnectorId::from_str(&args.connector_id).context("parse local connector id")?;
+    let environment = Environment {
+        id: environment_id,
+        name: args.environment_name,
+        kind: args.environment_kind.into(),
+        description: args.environment_description,
+        trust_level: args.trust_level.into(),
+        notes: args.environment_notes,
+    };
+    repositories
+        .environments
+        .upsert(&environment)
+        .await
+        .context("upsert local environment")?;
+
+    let existing = repositories
+        .connectors
+        .get(connector_id)
+        .await
+        .context("load existing local connector")?;
+    let connector = Connector {
+        id: connector_id,
+        name: args.connector_name,
+        environment_id,
+        host_id: existing.as_ref().and_then(|value| value.host_id),
+        version: args.version,
+        state: existing
+            .as_ref()
+            .map_or(EntityState::NotConfigured, |value| value.state.clone()),
+        last_seen_at: existing.as_ref().and_then(|value| value.last_seen_at),
+        current_network: Some(args.current_network),
+    };
+    repositories
+        .connectors
+        .upsert(&connector)
+        .await
+        .context("upsert local connector")?;
+
+    Ok(serde_json::json!({
+        "environment": environment,
+        "connector": connector,
+    }))
+}
+
 struct WorkerOnceArgs {
     database_url: String,
     connector_id: String,
@@ -425,6 +625,7 @@ async fn run_worker_once(args: WorkerOnceArgs) -> anyhow::Result<()> {
     };
     let artifact_store = Arc::new(FileOutputArtifactStore::new(args.artifact_root));
     let outcome = match parse_ssh_backend(&args.ssh_backend)? {
+        #[cfg(unix)]
         SshBackend::OpenSsh => {
             let provider = OpenSshTransportProvider::new(
                 repositories.clone(),
@@ -557,6 +758,7 @@ async fn run_worker_daemon(args: WorkerDaemonArgs) -> anyhow::Result<()> {
     let ssh_backend = parse_ssh_backend(&args.ssh_backend)?;
     let pty_backend_mode = parse_pty_backend_mode(&args.pty_backend_mode, ssh_backend)?;
     match ssh_backend {
+        #[cfg(unix)]
         SshBackend::OpenSsh => {
             let openssh_pool = Arc::new(OpenSshTransportPool::new(
                 repositories.clone(),
@@ -620,6 +822,7 @@ async fn run_worker_daemon(args: WorkerDaemonArgs) -> anyhow::Result<()> {
 }
 
 enum SharedPtyTransportPool {
+    #[cfg(unix)]
     OpenSsh(Arc<OpenSshTransportPool>),
     Russh(Arc<RusshTransportPool<VaultSshCredentialProvider>>),
 }
@@ -629,6 +832,7 @@ struct ConnectorPtyServices {
     interactive_file_transfer: Arc<dyn InteractiveFileTransferBackend>,
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn build_pty_input_pump(
     repositories: remote_hosts_db::Repositories,
     connector_id: ConnectorId,
@@ -645,6 +849,7 @@ fn build_pty_input_pump(
         input_max_attempts: args.pty_input_max_attempts,
     };
     match (mode, shared_pool) {
+        #[cfg(unix)]
         (PtyBackendMode::OpenSsh(mode), SharedPtyTransportPool::OpenSsh(pool)) => {
             let backend =
                 OpenSshPtyBackendFactory::with_pool(repositories.clone(), pool).with_mode(mode);
@@ -662,6 +867,7 @@ fn build_pty_input_pump(
                 interactive_file_transfer: manager,
             })
         }
+        #[cfg(unix)]
         _ => anyhow::bail!("PTY backend mode does not match the shared SSH transport pool"),
     }
 }
@@ -678,41 +884,63 @@ fn parse_host_key_policy(input: &str) -> anyhow::Result<HostKeyPolicy> {
 fn parse_pty_backend_mode(input: &str, ssh_backend: SshBackend) -> anyhow::Result<PtyBackendMode> {
     match input {
         "auto" => match ssh_backend {
+            #[cfg(unix)]
             SshBackend::OpenSsh => Ok(PtyBackendMode::OpenSsh(
                 OpenSshManagedPtyBackendMode::ControlMasterTty,
             )),
             SshBackend::Russh => Ok(PtyBackendMode::RusshNativePty),
         },
+        #[cfg(unix)]
         "pipe-shell" => Ok(PtyBackendMode::OpenSsh(
             OpenSshManagedPtyBackendMode::PipeShell,
         )),
+        #[cfg(unix)]
         "control-master-tty" => Ok(PtyBackendMode::OpenSsh(
             OpenSshManagedPtyBackendMode::ControlMasterTty,
         )),
+        #[cfg(not(unix))]
+        "pipe-shell" | "control-master-tty" => anyhow::bail!(
+            "OpenSSH PTY modes are unavailable on {}; use auto or russh-native-pty",
+            std::env::consts::OS
+        ),
         "russh-native-pty" => Ok(PtyBackendMode::RusshNativePty),
+        #[cfg(unix)]
         other => anyhow::bail!(
             "invalid pty backend mode `{other}`; use auto, control-master-tty, pipe-shell, or russh-native-pty"
         ),
+        #[cfg(not(unix))]
+        other => anyhow::bail!("invalid pty backend mode `{other}`; use auto or russh-native-pty"),
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PtyBackendMode {
+    #[cfg(unix)]
     OpenSsh(OpenSshManagedPtyBackendMode),
     RusshNativePty,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SshBackend {
+    #[cfg(unix)]
     OpenSsh,
     Russh,
 }
 
 fn parse_ssh_backend(input: &str) -> anyhow::Result<SshBackend> {
     match input {
+        #[cfg(unix)]
         "openssh" => Ok(SshBackend::OpenSsh),
+        #[cfg(not(unix))]
+        "openssh" => anyhow::bail!(
+            "the openssh native-mux backend is unavailable on {}; use russh",
+            std::env::consts::OS
+        ),
         "russh" => Ok(SshBackend::Russh),
+        #[cfg(unix)]
         other => anyhow::bail!("invalid ssh backend `{other}`; use openssh or russh"),
+        #[cfg(not(unix))]
+        other => anyhow::bail!("invalid ssh backend `{other}`; use russh"),
     }
 }
 
@@ -751,10 +979,15 @@ fn read_vault_master_password(path: &PathBuf) -> anyhow::Result<SecretString> {
 mod tests {
     use clap::Parser;
 
+    #[cfg(unix)]
+    use super::OpenSshManagedPtyBackendMode;
     use super::{
-        Cli, Command, McpToolProfile, OpenSshManagedPtyBackendMode, PtyBackendMode, SshBackend,
-        ensure_safe_api_bind, parse_pty_backend_mode,
+        BootstrapConnectorArgs, Cli, Command, EnvironmentKindArg, McpToolProfile, PtyBackendMode,
+        SshBackend, TrustLevelArg, connect_repositories, ensure_safe_api_bind,
+        parse_pty_backend_mode, upsert_bootstrap_connector,
     };
+    use remote_hosts_domain::{ConnectorId, EntityState, EnvironmentId};
+    use std::str::FromStr;
 
     #[test]
     fn mcp_stdio_defaults_to_agent_profile_and_accepts_full() -> anyhow::Result<()> {
@@ -829,6 +1062,80 @@ mod tests {
     }
 
     #[test]
+    fn worker_defaults_to_native_russh_backend() -> anyhow::Result<()> {
+        let parsed = Cli::try_parse_from([
+            "remote-hosts",
+            "worker-once",
+            "--database-url",
+            "sqlite::memory:",
+            "--connector-id",
+            "019f0000-0000-7000-8000-000000000001",
+        ])?;
+        let Command::WorkerOnce { ssh_backend, .. } = parsed.command else {
+            anyhow::bail!("expected worker-once command");
+        };
+        assert_eq!(ssh_backend, "russh");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_bootstrap_is_idempotent_and_preserves_runtime_state() -> anyhow::Result<()> {
+        let repositories = connect_repositories("sqlite::memory:").await?;
+        let environment_id = EnvironmentId::new();
+        let connector_id = ConnectorId::new();
+        let mut args = BootstrapConnectorArgs {
+            database_url: "sqlite::memory:".to_owned(),
+            connector_id: connector_id.to_string(),
+            connector_name: "local-windows-connector".to_owned(),
+            environment_id: environment_id.to_string(),
+            environment_name: "local-windows".to_owned(),
+            environment_kind: EnvironmentKindArg::HomeLan,
+            trust_level: TrustLevelArg::Owned,
+            environment_description: Some("Windows user service".to_owned()),
+            environment_notes: Some("test bootstrap".to_owned()),
+            current_network: "local".to_owned(),
+            version: "0.1.0".to_owned(),
+        };
+
+        upsert_bootstrap_connector(&repositories, args.clone()).await?;
+        let mut active = repositories
+            .connectors
+            .get(ConnectorId::from_str(&args.connector_id)?)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("bootstrapped connector is missing"))?;
+        active.state = EntityState::Healthy;
+        repositories.connectors.upsert(&active).await?;
+
+        args.connector_name = "renamed-windows-connector".to_owned();
+        args.current_network = "office".to_owned();
+        upsert_bootstrap_connector(&repositories, args).await?;
+
+        let updated = repositories
+            .connectors
+            .get(connector_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("updated connector is missing"))?;
+        assert_eq!(updated.name, "renamed-windows-connector");
+        assert_eq!(updated.current_network.as_deref(), Some("office"));
+        assert_eq!(updated.state, EntityState::Healthy);
+        assert_eq!(updated.environment_id, environment_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_database_is_ready_for_service_restart() -> anyhow::Result<()> {
+        let repositories = connect_repositories("sqlite::memory:").await?;
+        let summary = repositories.active_work_summary().await?;
+        assert!(summary.is_idle());
+        assert_eq!(summary.queued_or_running_operations, 0);
+        assert_eq!(summary.pending_or_active_ptys, 0);
+        assert_eq!(summary.queued_or_claimed_pty_inputs, 0);
+        assert_eq!(summary.unexpired_write_leases, 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn auto_pty_backend_tracks_operation_ssh_backend() -> anyhow::Result<()> {
         assert_eq!(
             parse_pty_backend_mode("auto", SshBackend::OpenSsh)?,
@@ -844,7 +1151,7 @@ mod tests {
     #[test]
     fn explicit_russh_native_pty_mode_is_supported() -> anyhow::Result<()> {
         assert_eq!(
-            parse_pty_backend_mode("russh-native-pty", SshBackend::OpenSsh)?,
+            parse_pty_backend_mode("russh-native-pty", SshBackend::Russh)?,
             PtyBackendMode::RusshNativePty
         );
         Ok(())

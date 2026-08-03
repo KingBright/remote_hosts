@@ -105,6 +105,12 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [x] launchd API wrapper passes the generated local vault password file so topology credential capture is usable after install/update.
 - [x] Repository-owned Remote Hosts Agent Skill with topology workflow guidance and automatic Codex/Antigravity synchronization during service install/update.
 - [x] Grouped and collapsible topology console with dynamic swimlane layout, bounded relationship rendering, topology search, focus mode, and an atomically hot-swappable external admin HTML file.
+- [x] Native Windows runtime through the cross-platform `russh` connector, with Unix-only OpenSSH mux dependencies excluded from MSVC builds.
+- [x] Rust-native Windows MSVC cross-compilation and ZIP packaging through `cargo-xwin`, including SHA-256 release output, admin UI, and Agent Skill.
+- [x] Windows per-user Task Scheduler installation, login startup, failure restart, versioned staging, drain-gated updates, logs, status, UI refresh, Skill installation, and uninstall.
+- [x] Stable low-overhead Rust MCP launcher for Windows so new Agent Sessions follow the current version pointer without a PowerShell proxy or client-config rewrite.
+- [x] Rust-owned local connector bootstrap and restart-readiness commands, removing the service scripts' dependency on an external SQLite CLI.
+- [x] Documented real macOS resource sample for a history-heavy daily-use installation.
 
 ## Next
 

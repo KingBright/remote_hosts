@@ -1,9 +1,10 @@
 # Deployment and Operations
 
-This guide covers the local macOS service installation and production route practices. Architecture
-and protocol details live in [Architecture and Runtime](architecture-and-runtime.md).
+This guide covers local service installation and production route practices. Architecture and
+protocol details live in [Architecture and Runtime](architecture-and-runtime.md); native Windows
+packaging and Task Scheduler operations live in [Windows Installation and Operations](windows.md).
 
-## Local Paths
+## macOS Local Paths
 
 The service manager uses these defaults:
 
@@ -34,6 +35,14 @@ LaunchAgents, installs the admin UI, synchronizes the Agent Skill, and starts:
 Both services start automatically at user login. MCP stdio is not a daemon; Codex or Antigravity
 starts a child process with the shared database and vault-key path.
 
+## Windows Services
+
+The Windows package runs the same API, connector, SQLite database, encrypted vault, admin UI, and
+Agent Skill. It uses current-user Task Scheduler jobs and the native `russh` backend. Versioned
+release directories avoid replacing a running `.exe`, while a small stable Rust launcher lets new
+MCP children select the current release without a permanent PowerShell proxy. Installation and
+lifecycle commands are documented in [Windows Installation and Operations](windows.md).
+
 ## Lifecycle Commands
 
 ```bash
@@ -63,13 +72,15 @@ page. After a UI-only update, reload the browser.
 
 ## Configuration
 
-The generated `service.env` configures the database, artifact root, connector identity, current
-network, SSH backend, host-key policy, timeouts, and worker concurrency. Local installation defaults
-to native `russh`, PTY backend mode `auto`, and a bounded operation worker pool.
+The generated macOS `service.env` or Windows `service.json` configures the database, artifact root,
+connector identity, current network, SSH backend, host-key policy, timeouts, and worker concurrency.
+Local installation defaults to native `russh`, PTY backend mode `auto`, and a bounded operation
+worker pool. Connector bootstrap and restart readiness are implemented by the Rust CLI, so neither
+platform needs an external `sqlite3` executable for service management.
 
-Do not put plaintext credentials in `service.env`. Host passwords and private keys belong in the
-encrypted credential tools. The vault-key file unlocks those encrypted rows and remains local with
-mode `0600`.
+Do not put plaintext credentials in the service config. Host passwords and private keys belong in
+the encrypted credential tools. The vault-key file unlocks those encrypted rows and remains local
+with mode `0600` on macOS or a current-user ACL on Windows.
 
 ## Normal Agent Operation
 
@@ -159,6 +170,26 @@ failed, read the PTY output and runtime snapshot; do not loop on the same PTY ID
 `strict` requires a known matching key. `add` accepts a new host and rejects changes. `accept` is an
 explicit productivity tradeoff for controlled VPN-contained routes. Relaxing host-key verification
 does not relax host identity, environment separation, mutation scoping, or artifact digest checks.
+
+## Observed macOS Resource Footprint
+
+The following sample was measured on the owner's Mac on 2026-08-03 with the release build managed by
+launchd. It represents an active, history-heavy installation rather than an empty database:
+
+| Process | RSS | CPU sample | Threads |
+| --- | ---: | ---: | ---: |
+| API | 8.8 MiB | 0.0% | 14 |
+| Connector | 47.1 MiB | 1.38% five-sample average | 23 |
+| Combined | about 55.9 MiB | mostly connector activity | 37 |
+
+The sample contained 88 hosts, 53 access paths, 1,555 Workspaces, 1,791 operations, 379 PTYs, 384
+topology nodes, and 1,207 topology edges. The release binary was 23 MiB. The data directory used 141
+MiB, including a 127 MiB SQLite database, a 7 MiB WAL, and 3.8 MiB of artifacts; logs used 192 KiB.
+
+Most disk use came from retained Workspace, operation, PTY, and topology history. These numbers are
+useful as a real daily-use reference, not a clean-install minimum or a guaranteed Windows footprint.
+Live SSH transports, active PTYs, large output retention, tracing level, and concurrent MCP children
+will change memory, CPU, and storage use.
 
 ## Operational Checks
 

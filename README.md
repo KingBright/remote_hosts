@@ -13,8 +13,9 @@ one MCP tool family per product.
 
 - Canonical host registry with duplicate detection, multiple environments, and multiple access
   paths per host.
-- Connector-owned OpenSSH or native `russh` connection reuse with bounded channel concurrency,
-  keepalive, reconnect control, and handshake rate protection.
+- Connector-owned native `russh` connection reuse on macOS, Linux, and Windows, plus an optional
+  Unix OpenSSH compatibility backend, with bounded channel concurrency, keepalive, reconnect
+  control, and handshake rate protection.
 - Arbitrary POSIX and PowerShell execution, persistent PTYs, bounded output, large-output artifacts,
   and state visible to the calling agent.
 - Verified upload and download over pooled SFTP, framed exec channels, or an already-selected
@@ -44,7 +45,9 @@ connector safely reuses the same authenticated transport across those conversati
 
 See [Architecture and Runtime](docs/architecture-and-runtime.md) for the detailed model.
 
-## Quick Start on macOS
+## Quick Start
+
+### macOS
 
 Install the release binary, database, launchd services, admin UI, and Agent Skills:
 
@@ -71,6 +74,20 @@ write leases. The `--force` option is reserved for an intentional interruption.
 See [Deployment and Operations](docs/deployment-and-operations.md) for paths, configuration,
 upgrade behavior, bastion guidance, retry policy, and troubleshooting.
 
+### Windows
+
+Build or download the Windows x64 ZIP, extract it, and run in Windows PowerShell:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\remote-hosts-service.ps1 Install
+.\remote-hosts-service.ps1 Status
+```
+
+The native installer uses current-user Task Scheduler jobs for login startup and failure recovery,
+keeps releases versioned for non-disruptive staging, and installs a stable Rust MCP launcher. See
+[Windows Installation and Operations](docs/windows.md).
+
 ## Agent Integration
 
 The default `agent` MCP profile exposes 18 task-oriented tools for host registration, credentials,
@@ -96,6 +113,7 @@ cargo fmt --all
 cargo test --workspace
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+scripts/build-windows-cross.sh
 ```
 
 Useful local entry points:
@@ -129,17 +147,20 @@ skills/                    Repository-owned Agent Skill
   architecture decisions, and roadmap.
 - [Architecture and Runtime](docs/architecture-and-runtime.md): transport reuse, Agent Sessions,
   scoped coordination, commands, PTYs, transfers, MCP tools, API surfaces, and security behavior.
-- [Deployment and Operations](docs/deployment-and-operations.md): launchd installation, updates,
-  configuration, production routes, retry rules, and operational diagnosis.
+- [Deployment and Operations](docs/deployment-and-operations.md): local services, updates,
+  configuration, resource reference, production routes, retry rules, and diagnosis.
 - [Infrastructure Topology](docs/infrastructure-topology.md): graph model, authoritative snapshot
   synchronization, stable identity, and credential binding.
+- [Windows Installation and Operations](docs/windows.md): native cross-compilation, Task Scheduler
+  services, versioned updates, paths, MCP launcher, and troubleshooting.
 
 ## Current Release
 
-The 2026-07-31 release adds runtime snapshot version 8, hierarchical Workspace coordination scopes,
-interactive-bastion downloads, capacity-aware scheduling, resumable verified transfers, transport
-evidence, grouped topology management, and an 18-tool Agent profile. Release-level implementation
-details are recorded in the architecture and operations documents rather than duplicated here.
+The 2026-08-03 release adds native Windows runtime and packaging support, a stable low-overhead MCP
+launcher, Rust-owned connector bootstrap and restart-readiness checks, runtime snapshot version 8,
+hierarchical Workspace coordination, capacity-aware scheduling, resumable verified transfers,
+transport evidence, grouped topology management, and an 18-tool Agent profile. Release-level
+implementation details stay in the architecture and operations documents.
 
 ## Security Summary
 

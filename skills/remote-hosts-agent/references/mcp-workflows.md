@@ -119,7 +119,7 @@ Process:
 1. Reuse an active PTY if one exists for the workspace.
 2. Inspect `backend_state` and `backend_capabilities`.
 3. Inspect `transport_evidence` after activation. It records the runtime id/generation and whether opening the PTY reused the authenticated SSH connection or performed a handshake.
-4. Prefer `russh_native_pty` or `openssh_control_master_tty` for true terminal behavior. Omit `session_id` when opening unless you have an explicit compatible session; the service owns session reuse/creation.
+4. Prefer `russh_native_pty` or, on Unix only, `openssh_control_master_tty` for true terminal behavior. Windows always uses `russh_native_pty`. Omit `session_id` when opening unless you have an explicit compatible session; the service owns session reuse/creation.
 5. Opening is proactive: the connector activates the pending backend without requiring dummy input. Follow `recommended_action=read_pty_output`, wait `poll_after_ms` when returned, and inspect the banner/menu before responding.
    The connector does not send an initial `cd` command on any `requires_tty=true` route, including when the logical target is recorded as a Linux host rather than a jump host.
 6. Queue input in small chunks with one semantic `idempotency_key` per intentional input; include trailing newline only when the user intended Enter.

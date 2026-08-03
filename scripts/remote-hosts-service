@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="remote-hosts"
 API_LABEL="com.remote-hosts.api"
 CONNECTOR_LABEL="com.remote-hosts.connector"
 
@@ -165,23 +164,6 @@ migrate_config_defaults() {
   load_config
 }
 
-sqlite_path_from_url() {
-  local url="$1"
-  if [[ "${url}" != sqlite://* ]]; then
-    echo "only sqlite:// database URLs are supported by this local service script: ${url}" >&2
-    return 1
-  fi
-  local path="${url#sqlite://}"
-  if [[ "${path}" != /* ]]; then
-    path="${ROOT_DIR}/${path}"
-  fi
-  printf '%s\n' "${path}"
-}
-
-sql_quote() {
-  printf "%s" "$1" | sed "s/'/''/g"
-}
-
 require_installed_binary() {
   if [[ ! -x "${BIN_PATH}" ]]; then
     echo "remote-hosts binary is not installed at ${BIN_PATH}; run install first" >&2
@@ -247,14 +229,8 @@ run_migrate() {
 
 ensure_default_connector() {
   load_config
-  local db_path
-  db_path="$(sqlite_path_from_url "${REMOTE_HOSTS_DATABASE_URL}")"
-  mkdir -p "$(dirname "${db_path}")" "${REMOTE_HOSTS_ARTIFACT_ROOT}"
-
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo "sqlite3 is unavailable; skipping default connector bootstrap" >&2
-    return
-  fi
+  require_installed_binary
+  mkdir -p "${REMOTE_HOSTS_ARTIFACT_ROOT}"
 
   if [[ -z "${REMOTE_HOSTS_CONNECTOR_ID:-}" ]]; then
     update_config_key "REMOTE_HOSTS_CONNECTOR_ID" "$(default_connector_id)"
@@ -265,41 +241,17 @@ ensure_default_connector() {
     load_config
   fi
 
-  local env_name connector_name current_network
-  env_name="$(sql_quote "${REMOTE_HOSTS_ENVIRONMENT_NAME:-local-macos}")"
-  connector_name="$(sql_quote "${REMOTE_HOSTS_CONNECTOR_NAME:-local-macos-connector}")"
-  current_network="$(sql_quote "${REMOTE_HOSTS_CURRENT_NETWORK:-local}")"
-
-  sqlite3 "${db_path}" <<SQL
-INSERT OR IGNORE INTO environments (
-  id, name, kind_json, description, trust_level_json, notes
-) VALUES (
-  '${REMOTE_HOSTS_ENVIRONMENT_ID}',
-  '${env_name}',
-  '"home_lan"',
-  'Local macOS launchd environment',
-  '"owned"',
-  'Created by scripts/remote-hosts-service'
-);
-
-INSERT INTO connectors (
-  id, name, environment_id, host_id, version, state_json, last_seen_at, current_network
-) VALUES (
-  '${REMOTE_HOSTS_CONNECTOR_ID}',
-  '${connector_name}',
-  '${REMOTE_HOSTS_ENVIRONMENT_ID}',
-  NULL,
-  '0.1.0',
-  '"not_configured"',
-  NULL,
-  '${current_network}'
-)
-ON CONFLICT(id) DO UPDATE SET
-  name = excluded.name,
-  environment_id = excluded.environment_id,
-  version = excluded.version,
-  current_network = excluded.current_network;
-SQL
+  "${BIN_PATH}" bootstrap-connector \
+    --database-url "${REMOTE_HOSTS_DATABASE_URL}" \
+    --connector-id "${REMOTE_HOSTS_CONNECTOR_ID}" \
+    --connector-name "${REMOTE_HOSTS_CONNECTOR_NAME:-local-macos-connector}" \
+    --environment-id "${REMOTE_HOSTS_ENVIRONMENT_ID}" \
+    --environment-name "${REMOTE_HOSTS_ENVIRONMENT_NAME:-local-macos}" \
+    --environment-kind home-lan \
+    --trust-level owned \
+    --environment-description "Local macOS launchd environment" \
+    --environment-notes "Created by scripts/remote-hosts-service" \
+    --current-network "${REMOTE_HOSTS_CURRENT_NETWORK:-local}" >/dev/null
 }
 
 write_wrappers() {
@@ -492,43 +444,12 @@ assert_restart_safe() {
   fi
 
   load_config
-  local db_path
-  db_path="$(sqlite_path_from_url "${REMOTE_HOSTS_DATABASE_URL}")"
-  if [[ ! -f "${db_path}" ]]; then
-    return
-  fi
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo "refusing to restart without sqlite3 to verify active conversation work; use --force only after manual verification" >&2
-    return 1
-  fi
-
-  local busy_summary
-  busy_summary="$(
-    sqlite3 -readonly -separator ' ' "${db_path}" "
-      SELECT
-        (SELECT COUNT(*) FROM operation_runs
-          WHERE state_json IN ('\"queued\"', '\"running\"')),
-        (SELECT COUNT(*) FROM pty_sessions
-          WHERE backend_state_json IN ('\"pending\"', '\"active\"')
-            AND input_allowed = 1),
-        (SELECT COUNT(*) FROM pty_input_events
-          WHERE state_json IN ('\"queued\"', '\"claimed\"')),
-        (SELECT COUNT(*) FROM host_write_leases
-          WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-    "
-  )"
-  local operation_count pty_count pty_input_count write_lease_count
-  read -r operation_count pty_count pty_input_count write_lease_count <<<"${busy_summary}"
-  if (( operation_count > 0 || pty_count > 0 || pty_input_count > 0 || write_lease_count > 0 )); then
-    cat >&2 <<EOF
-refusing to restart Remote Hosts while conversation work is active:
-  queued_or_running_operations=${operation_count}
-  pending_or_active_ptys=${pty_count}
-  queued_or_claimed_pty_inputs=${pty_input_count}
-  unexpired_write_leases=${write_lease_count}
-The new binary and service files may already be staged. Retry 'restart' when idle,
-or use '--force' only when interrupting those conversations is intentional.
-EOF
+  require_installed_binary
+  local readiness
+  if ! readiness="$("${BIN_PATH}" restart-readiness --database-url "${REMOTE_HOSTS_DATABASE_URL}" 2>&1)"; then
+    printf '%s\n' "refusing to restart Remote Hosts while conversation work is active:" >&2
+    printf '%s\n' "${readiness}" >&2
+    printf '%s\n' "The new release is staged. Retry when idle, or use --force only for an intentional interruption." >&2
     return 1
   fi
 }

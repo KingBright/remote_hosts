@@ -16,6 +16,7 @@ use remote_hosts_domain::{
     TopologyNode, TopologyNodeId, TopologySyncRun, TopologySyncRunId, WorkspaceId, WorkspaceState,
 };
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{
     Row, SqlitePool,
@@ -56,6 +57,29 @@ pub struct AccessPathChannelUsage {
     pub active_ptys: u32,
     /// Activatable PTYs waiting to reserve a channel.
     pub pending_ptys: u32,
+}
+
+/// Counts durable work that would be interrupted by restarting local services.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActiveWorkSummary {
+    /// Operations waiting for or currently using a connector channel.
+    pub queued_or_running_operations: i64,
+    /// PTYs waiting for activation or backed by a live connector process.
+    pub pending_or_active_ptys: i64,
+    /// PTY input events not yet delivered to the live backend.
+    pub queued_or_claimed_pty_inputs: i64,
+    /// Unexpired mutation coordination leases.
+    pub unexpired_write_leases: i64,
+}
+
+impl ActiveWorkSummary {
+    /// Returns true when a service restart will not interrupt durable conversation work.
+    pub fn is_idle(&self) -> bool {
+        self.queued_or_running_operations == 0
+            && self.pending_or_active_ptys == 0
+            && self.queued_or_claimed_pty_inputs == 0
+            && self.unexpired_write_leases == 0
+    }
 }
 
 /// Creates a `SQLite` pool.
@@ -167,6 +191,38 @@ impl Repositories {
             topology: TopologyRepository::new(pool.clone()),
             credential_bindings: CredentialBindingRepository::new(pool),
         }
+    }
+
+    /// Counts active work that must drain before a local service restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the activity query fails.
+    pub async fn active_work_summary(&self) -> Result<ActiveWorkSummary, DbError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM operation_runs
+                 WHERE state_json IN ('"queued"', '"running"')) AS operations,
+                (SELECT COUNT(*) FROM pty_sessions ps
+                 JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
+                 WHERE aw.state_json IN ('"idle"', '"working"')
+                   AND ps.backend_state_json IN ('"pending"', '"active"')
+                   AND ps.input_allowed = 1) AS ptys,
+                (SELECT COUNT(*) FROM pty_input_events
+                 WHERE state_json IN ('"queued"', '"claimed"')) AS pty_inputs,
+                (SELECT COUNT(*) FROM host_write_leases
+                 WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) AS write_leases
+            "#,
+        )
+        .fetch_one(&self.operations.pool)
+        .await?;
+        Ok(ActiveWorkSummary {
+            queued_or_running_operations: row.try_get("operations")?,
+            pending_or_active_ptys: row.try_get("ptys")?,
+            queued_or_claimed_pty_inputs: row.try_get("pty_inputs")?,
+            unexpired_write_leases: row.try_get("write_leases")?,
+        })
     }
 }
 
@@ -2310,12 +2366,15 @@ impl PtySessionRepository {
             FROM pty_sessions ps
             JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
             WHERE aw.host_id = ?
+              AND aw.state_json IN (?, ?)
               AND ps.state_json IN (?, ?)
               AND ps.input_allowed = 1
               AND ps.backend_state_json IN (?, ?)
             ",
         )
         .bind(host_id.to_string())
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&PtyBackendState::Pending)?)
@@ -5694,6 +5753,23 @@ mod tests {
                 .count_active_for_host(workspace.host_id)
                 .await?,
             1
+        );
+        repos
+            .workspaces
+            .update_state(second_workspace.id, WorkspaceState::Done, now)
+            .await?;
+        assert_eq!(
+            repos
+                .pty_sessions
+                .count_active_for_host(workspace.host_id)
+                .await?,
+            0,
+            "an active PTY belonging to a terminal workspace must not consume host capacity"
+        );
+        assert_eq!(
+            repos.active_work_summary().await?.pending_or_active_ptys,
+            0,
+            "terminal workspace PTYs must not block a service update"
         );
         second_pty.state = WorkspaceState::Done;
         second_pty.input_allowed = false;

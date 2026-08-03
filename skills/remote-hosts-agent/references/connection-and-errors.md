@@ -36,7 +36,8 @@ Before remote execution, inspect:
 
 Stop and diagnose instead of retrying when you see:
 
-- `connector_offline`: local connector is not heartbeating; check launchd service and logs.
+- `connector_offline`: local connector is not heartbeating; check the platform service manager and
+  logs.
 - `auth_failed`: first verify the selected host/access path. If the user supplies a replacement password or key, immediately store it with `remote_hosts_store_host_credential` and retry once; never repeat the value in the response.
 - `host_key_changed`: possible MITM or rebuilt host; ask the user to verify.
 - `rate_limited` or `throttled`: wait or reduce concurrency.
@@ -68,7 +69,16 @@ Local macOS service commands:
 /Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service restart
 ```
 
-Use restart only when the service appears stuck, crashed, or after config updates.
+Local Windows service commands:
+
+```powershell
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Status
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Logs
+& "$env:LOCALAPPDATA\RemoteHosts\bin\remote-hosts-service.ps1" Restart
+```
+
+Use restart only when the service appears stuck, crashed, or after config updates. Both platform
+managers refuse a normal restart while active conversation work has not drained.
 
 ## PTY Backend Capabilities
 

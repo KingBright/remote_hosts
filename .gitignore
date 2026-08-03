@@ -1,4 +1,5 @@
 /target/
+/dist/
 /.sqlx/
 *.db
 *.db-shm
