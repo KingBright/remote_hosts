@@ -876,6 +876,9 @@ async fn create_workspace(
             policy_profile: request
                 .policy_profile
                 .unwrap_or_else(|| "default".to_owned()),
+            coordination_scope: request
+                .coordination_scope
+                .unwrap_or_else(|| "host".to_owned()),
             ttl_seconds: request.ttl_seconds.unwrap_or(3600),
         },
         active_workspace_count,
@@ -1964,6 +1967,8 @@ pub struct CreateWorkspaceRequest {
     pub cwd: Option<String>,
     /// Optional policy profile.
     pub policy_profile: Option<String>,
+    /// Optional hierarchical write-coordination scope. Defaults to `host`.
+    pub coordination_scope: Option<String>,
     /// Optional TTL in seconds.
     pub ttl_seconds: Option<u64>,
 }
@@ -2832,6 +2837,7 @@ mod tests {
             cwd: Some("/tmp".to_owned()),
             state: WorkspaceState::Idle,
             policy_profile: "default".to_owned(),
+            coordination_scope: "host".to_owned(),
             created_at: now,
             last_activity_at: now,
             ttl_seconds: 3600,

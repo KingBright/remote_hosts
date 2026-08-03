@@ -971,8 +971,10 @@ pub struct OperationRun {
     pub agent_session_id: Option<AgentSessionId>,
     /// Optional caller-supplied retry key, unique within one agent session.
     pub idempotency_key: Option<String>,
-    /// Whether execution must hold the host write lease.
+    /// Whether execution must hold the Workspace's scoped host write lease.
     pub requires_write_lease: bool,
+    /// Hierarchical write-coordination scope inherited from the owning workspace.
+    pub coordination_scope: String,
     /// Operation type.
     pub operation_type: OperationType,
     /// Human or agent intent.
@@ -1599,6 +1601,8 @@ pub struct AgentWorkspace {
     pub state: WorkspaceState,
     /// Policy profile.
     pub policy_profile: String,
+    /// Hierarchical write-coordination scope. `host` preserves whole-host exclusion.
+    pub coordination_scope: String,
     /// Created timestamp.
     pub created_at: OffsetDateTime,
     /// Last activity timestamp.
@@ -1607,11 +1611,13 @@ pub struct AgentWorkspace {
     pub ttl_seconds: u64,
 }
 
-/// Exclusive write coordination lease for one host.
+/// Exclusive write coordination lease for one host and hierarchical resource scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostWriteLease {
     /// Host protected from cross-session write interleaving.
     pub host_id: HostId,
+    /// Protected scope. `host` conflicts with every scope on the host.
+    pub coordination_scope: String,
     /// Agent session currently allowed to submit mutations.
     pub holder_agent_session_id: AgentSessionId,
     /// Most recently active workspace for the holder.

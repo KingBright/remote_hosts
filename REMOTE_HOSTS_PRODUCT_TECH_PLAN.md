@@ -502,7 +502,7 @@ For this product, the lesson is not to depend on Herdr directly. The lesson is t
 
 An Agent Session represents one Codex/Antigravity conversation or one explicitly identified client instance. The boundary is logical: all conversations share the same connector-owned SSH transport pool for an access path, but each conversation exclusively owns its Workspaces, PTYs, queued inputs, operations, idempotency namespace, output, artifacts, and temporary context. The normal Agent profile cannot inspect or operate another Agent Session's resources; Admin/Full can inspect legacy or cross-session state for recovery.
 
-Mutations are serialized with a host-scoped write lease rather than by creating another SSH connection. Mutating shell operations, uploads, and PTY input acquire or renew the lease; read-only operations and downloads remain eligible. The lease is crash-safe, expires automatically, and exposes only `available`, `held_by_current_session`, or `held_by_other_session` to normal agents. PTY input retains it for 300 seconds, PTY output activity renews it, and PTY close, backend exit, or connector restart reconciliation shortens it to a bounded handoff grace. Session-scoped semantic idempotency keys return the original operation/input event on exact retry and reject key reuse with a different payload.
+Mutations coordinate through crash-safe hierarchical write leases rather than by creating another SSH connection. Every Workspace has a stable `coordination_scope`, defaulting to `host`. Mutating shell operations, uploads, and PTY input inherit that scope; read-only operations and downloads remain eligible. `host` conflicts with every scope, equal and parent/child scopes conflict, and siblings may mutate concurrently. This lets independent resources on one management host progress without weakening protection for the same Kubernetes object, namespace, filesystem subtree, or machine-wide state. Active scoped leases expire automatically and are all visible in runtime snapshot version 8. PTY input retains its scope for 300 seconds, PTY output activity renews it, and PTY close, backend exit, or connector restart reconciliation shortens it to a bounded handoff grace. Session-scoped semantic idempotency keys return the original operation/input event on exact retry and reject key reuse with a different payload.
 
 The supervisor should manage three different execution shapes:
 
@@ -611,6 +611,7 @@ Host
 - `last_activity_at`
 - `ttl_seconds`
 - `policy_profile`
+- `coordination_scope`: hierarchical mutation boundary, default `host`
 
 `PtySession` fields:
 
@@ -1190,7 +1191,7 @@ Success criteria:
 - Persistent workspace model.
 - One isolated PTY/workspace per Agent Session and host when interactive continuity is needed.
 - One shared physical SSH transport per access path across Agent Sessions.
-- Session-scoped idempotency and a host write lease for conflicting mutations.
+- Session-scoped idempotency and hierarchical resource write leases for conflicting mutations.
 - Workspace state: idle, working, blocked, done, failed, throttled.
 - Recent output snapshots and wait tools.
 - MCP tools for workspace creation, read, wait, and close.
@@ -1215,6 +1216,7 @@ Success criteria:
 - Native channel lifecycle and cancellation.
 - PTY resize/signal API and MCP controls.
 - Pooled OpenSSH/native SFTP upload and download with bounded size/time, SHA-256 verification, temporary placement, and overwrite policy.
+- Interactive asset-menu PTY upload and download with connector-local frame capture, per-chunk verification, whole-file source stability checks, and no file bodies in persisted audit output.
 - Port forward support.
 
 Success criteria:

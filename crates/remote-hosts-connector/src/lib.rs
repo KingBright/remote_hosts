@@ -83,12 +83,13 @@ const AUTHORIZED_KEY_BOOTSTRAP_MAX_FAILURES: u32 = 3;
 const EXEC_INLINE_UPLOAD_MAX_BYTES: u64 = 8 * 1024;
 const EXEC_UPLOAD_CHUNK_BYTES: usize = 24 * 1024;
 const PTY_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+const PTY_DOWNLOAD_CHUNK_BYTES: usize = 48 * 1024;
 const EXEC_UPLOAD_CHUNKS_PER_SESSION: u64 = 256;
 const EXEC_TRANSFER_MAX_STAGE_ATTEMPTS: u32 = 3;
 const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+const PTY_TRANSFER_CAPTURE_LIMIT_BYTES: usize = 128 * 1024;
 const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const PTY_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(180);
-const PTY_TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
 const PTY_WRITE_LEASE_SECONDS: i64 = 300;
 
@@ -5802,7 +5803,7 @@ pub enum ConnectorWorkerError {
     #[error("operation lease was lost before completion")]
     LeaseLost,
     /// Host write lease was lost while a mutating operation was running.
-    #[error("host write lease was lost before mutating operation completion")]
+    #[error("scoped host write lease was lost before mutating operation completion")]
     WriteLeaseLost,
     /// Artifact path is invalid or outside the artifact root.
     #[error("invalid artifact path: {0}")]
@@ -5987,6 +5988,20 @@ struct ActivePtyHandle {
     close_tx: Option<oneshot::Sender<()>>,
     _channel_permit: Option<OwnedSemaphorePermit>,
     transfer_lock: Arc<Mutex<()>>,
+    transfer_capture: Arc<StdMutex<Option<mpsc::Sender<PtyBackendOutput>>>>,
+}
+
+struct PtyTransferCaptureGuard {
+    capture: Arc<StdMutex<Option<mpsc::Sender<PtyBackendOutput>>>>,
+}
+
+impl Drop for PtyTransferCaptureGuard {
+    fn drop(&mut self) {
+        match self.capture.lock() {
+            Ok(mut capture) => *capture = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
+    }
 }
 
 /// Connector-local manager for persistent PTY backend processes.
@@ -6043,6 +6058,7 @@ where
                 shorten_host_write_lease(
                     &self.repositories,
                     workspace.host_id,
+                    &workspace.coordination_scope,
                     agent_session_id,
                     observed_at,
                 )
@@ -6308,12 +6324,24 @@ where
         };
         let observed_at = now_utc();
         let lease_seconds = i64::try_from(lease_seconds)?.max(PTY_WRITE_LEASE_SECONDS);
+        let workspace = self
+            .repositories
+            .workspaces
+            .get(event.workspace_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!(
+                    "workspace not found for PTY input: {}",
+                    event.workspace_id
+                ))
+            })?;
         Ok(self
             .repositories
             .host_write_leases
             .try_acquire(
                 &HostWriteLease {
                     host_id: event.host_id,
+                    coordination_scope: workspace.coordination_scope,
                     holder_agent_session_id: agent_session_id,
                     holder_workspace_id: event.workspace_id,
                     acquired_at: observed_at,
@@ -6333,9 +6361,21 @@ where
         let Some(agent_session_id) = event.agent_session_id else {
             return Ok(());
         };
+        let workspace = self
+            .repositories
+            .workspaces
+            .get(event.workspace_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!(
+                    "workspace not found for PTY input: {}",
+                    event.workspace_id
+                ))
+            })?;
         shorten_host_write_lease(
             &self.repositories,
             event.host_id,
+            &workspace.coordination_scope,
             agent_session_id,
             now_utc(),
         )
@@ -6389,6 +6429,7 @@ where
             shorten_host_write_lease(
                 &self.repositories,
                 workspace.host_id,
+                &workspace.coordination_scope,
                 agent_session_id,
                 closed.last_activity_at,
             )
@@ -6437,6 +6478,7 @@ where
                 shorten_host_write_lease(
                     &self.repositories,
                     workspace.host_id,
+                    &workspace.coordination_scope,
                     agent_session_id,
                     now_utc(),
                 )
@@ -6665,6 +6707,7 @@ where
             transport_evidence: _,
             channel_permit,
         } = process;
+        let transfer_capture = Arc::new(StdMutex::new(None));
         self.active.lock().await.insert(
             pty_session.pty_session_id,
             ActivePtyHandle {
@@ -6672,15 +6715,18 @@ where
                 close_tx: Some(close_tx),
                 _channel_permit: channel_permit,
                 transfer_lock: Arc::new(Mutex::new(())),
+                transfer_capture: Arc::clone(&transfer_capture),
             },
         );
-        self.spawn_output_writer(pty_session, output_rx);
+        self.spawn_output_writer(pty_session, output_rx, transfer_capture);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_output_writer(
         &self,
         pty_session: &PtySession,
         mut output_rx: mpsc::Receiver<PtyBackendOutput>,
+        transfer_capture: Arc<StdMutex<Option<mpsc::Sender<PtyBackendOutput>>>>,
     ) {
         let repositories = self.repositories.clone();
         let output_limit_bytes = self.config.output_limit_bytes;
@@ -6696,6 +6742,23 @@ where
                 .await
                 .unwrap_or(0);
             while let Some(output) = output_rx.recv().await {
+                let observed_at = now_utc();
+                record_pty_output_activity(
+                    &repositories,
+                    pty_session_id,
+                    workspace_id,
+                    lease_owner.clone(),
+                    observed_at,
+                )
+                .await;
+                let capture_tx = match transfer_capture.lock() {
+                    Ok(capture) => capture.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                if let Some(capture_tx) = capture_tx {
+                    let _ = capture_tx.send(output).await;
+                    continue;
+                }
                 let (redacted_text, truncated) =
                     redact_and_truncate(&redactor, &output.text, output_limit_bytes);
                 if redacted_text.is_empty() {
@@ -6710,16 +6773,8 @@ where
                     byte_len: u64::try_from(redacted_text.len()).unwrap_or(u64::MAX),
                     redacted_text,
                     truncated: output.truncated || truncated,
-                    created_at: now_utc(),
+                    created_at: observed_at,
                 };
-                record_pty_output_activity(
-                    &repositories,
-                    pty_session_id,
-                    workspace_id,
-                    lease_owner,
-                    chunk.created_at,
-                )
-                .await;
                 if repositories.pty_output_chunks.insert(&chunk).await.is_err() {
                     break;
                 }
@@ -6757,10 +6812,11 @@ where
                 .connection_sessions
                 .close_channel(session.session_id, session.last_activity_at)
                 .await;
-            if let Some((host_id, agent_session_id)) = lease_owner
+            if let Some((host_id, coordination_scope, agent_session_id)) = lease_owner
                 && let Err(error) = shorten_host_write_lease(
                     &repositories,
                     host_id,
+                    &coordination_scope,
                     agent_session_id,
                     session.last_activity_at,
                 )
@@ -6770,7 +6826,7 @@ where
                     %pty_session_id,
                     %workspace_id,
                     %error,
-                    "failed to shorten host write lease after PTY backend exit"
+                    "failed to shorten scoped host write lease after PTY backend exit"
                 );
             }
         });
@@ -6800,6 +6856,7 @@ where
             shorten_host_write_lease(
                 &self.repositories,
                 workspace.host_id,
+                &workspace.coordination_scope,
                 agent_session_id,
                 observed_at,
             )
@@ -7040,9 +7097,9 @@ where
 
 #[derive(Clone)]
 struct InteractivePtyTransferHandle {
-    pty_session_id: PtySessionId,
     input_tx: mpsc::Sender<String>,
     transfer_lock: Arc<Mutex<()>>,
+    transfer_capture: Arc<StdMutex<Option<mpsc::Sender<PtyBackendOutput>>>>,
 }
 
 enum InteractivePtyUploadPreparation {
@@ -7052,6 +7109,13 @@ enum InteractivePtyUploadPreparation {
         hasher: Sha256,
         resume_bytes: u64,
     },
+}
+
+struct InteractivePtyDownloadChunk {
+    index: u64,
+    offset: u64,
+    payload: Vec<u8>,
+    sha256: String,
 }
 
 impl<B> ConnectorPtyManager<B>
@@ -7078,9 +7142,9 @@ where
                 active
                     .get(&session.pty_session_id)
                     .map(|handle| InteractivePtyTransferHandle {
-                        pty_session_id: session.pty_session_id,
                         input_tx: handle.input_tx.clone(),
                         transfer_lock: Arc::clone(&handle.transfer_lock),
+                        transfer_capture: Arc::clone(&handle.transfer_capture),
                     })
             })
             .ok_or_else(|| {
@@ -7419,6 +7483,186 @@ where
         })
     }
 
+    async fn download_through_interactive_pty(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        request: &SftpRequest,
+    ) -> Result<SftpResult, TransportError> {
+        let spec = &request.spec;
+        let destination = Path::new(&spec.local_path);
+        ensure_local_destination(destination, spec.overwrite).await?;
+        let temporary_path = local_temporary_path(destination, request.operation_id)?;
+        cleanup_local_temporary_file(&temporary_path).await?;
+
+        let _transfer_guard = handle.transfer_lock.lock().await;
+        self.enter_pty_transfer_mode(handle, request.operation_id)
+            .await?;
+        let transfer = tokio::time::timeout(
+            Duration::from_secs(spec.timeout_seconds),
+            self.run_interactive_pty_download(handle, request, &temporary_path),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)
+        .and_then(std::convert::identity);
+        let restore = self
+            .leave_pty_transfer_mode(handle, request.operation_id)
+            .await;
+        let result = match (transfer, restore) {
+            (Ok(result), Ok(())) => place_local_file(&temporary_path, destination, spec.overwrite)
+                .await
+                .map(|()| result),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        };
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+        }
+        result
+    }
+
+    async fn run_interactive_pty_download(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        request: &SftpRequest,
+        temporary_path: &Path,
+    ) -> Result<SftpResult, TransportError> {
+        let spec = &request.spec;
+        let metadata_script = interactive_pty_download_metadata_command(spec);
+        let initial = self
+            .execute_pty_transfer_stage(
+                handle,
+                request.operation_id,
+                "download-metadata-initial",
+                &metadata_script,
+            )
+            .await?;
+        require_exec_transfer_success(
+            &initial,
+            "inspect interactive PTY download source",
+            &spec.remote_path,
+            "",
+        )?;
+        let (remote_size, remote_sha256) =
+            parse_transfer_marker(&initial.stdout, "REMOTE_HOSTS_DOWNLOAD_META")?;
+        ensure_size_within_limit(remote_size, spec.max_size_bytes)?;
+        ensure_expected_sha256(spec, &remote_sha256)?;
+
+        let local_sha256 = self
+            .stream_interactive_pty_download_chunks(handle, request, temporary_path, remote_size)
+            .await?;
+        if local_sha256 != remote_sha256 {
+            return Err(TransportError::FileTransfer(
+                "interactive PTY download whole-file verification failed".to_owned(),
+            ));
+        }
+        let final_metadata = self
+            .execute_pty_transfer_stage(
+                handle,
+                request.operation_id,
+                "download-metadata-final",
+                &metadata_script,
+            )
+            .await?;
+        require_exec_transfer_success(
+            &final_metadata,
+            "reinspect interactive PTY download source",
+            &spec.remote_path,
+            "",
+        )?;
+        let final_remote =
+            parse_transfer_marker(&final_metadata.stdout, "REMOTE_HOSTS_DOWNLOAD_META")?;
+        if final_remote != (remote_size, remote_sha256.clone()) {
+            return Err(TransportError::FileTransfer(
+                "remote source changed during interactive PTY download".to_owned(),
+            ));
+        }
+        if let Some(mode) = spec.mode {
+            set_local_mode(temporary_path, mode).await?;
+        }
+        emit_sftp_progress(request, "completed", remote_size, Some(remote_size), 0, 0);
+        Ok(SftpResult {
+            direction: spec.direction,
+            bytes_transferred: remote_size,
+            sha256: remote_sha256,
+            local_path: spec.local_path.clone(),
+            remote_path: spec.remote_path.clone(),
+            overwrite: spec.overwrite,
+        })
+    }
+
+    async fn stream_interactive_pty_download_chunks(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        request: &SftpRequest,
+        temporary_path: &Path,
+        remote_size: u64,
+    ) -> Result<String, TransportError> {
+        let spec = &request.spec;
+        let mut local = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temporary_path)
+            .await
+            .map_err(file_transfer_io)?;
+        let mut hasher = Sha256::new();
+        let mut bytes_transferred = 0_u64;
+        let mut chunk_index = 0_u64;
+        while bytes_transferred < remote_size {
+            let remaining = remote_size - bytes_transferred;
+            let expected_chunk_size = remaining.min(PTY_DOWNLOAD_CHUNK_BYTES as u64);
+            let chunk_script = interactive_pty_download_chunk_command(
+                spec,
+                remote_size,
+                chunk_index,
+                bytes_transferred,
+                expected_chunk_size,
+            );
+            let stage = format!("download-chunk-{chunk_index}");
+            let outcome = self
+                .execute_pty_transfer_stage(handle, request.operation_id, &stage, &chunk_script)
+                .await?;
+            require_exec_transfer_success(&outcome, &stage, &spec.remote_path, "")?;
+            let chunk = parse_interactive_pty_download_chunk(&outcome.stdout)?;
+            if chunk.index != chunk_index
+                || chunk.offset != bytes_transferred
+                || u64::try_from(chunk.payload.len()).map_err(file_transfer_conversion)?
+                    != expected_chunk_size
+            {
+                return Err(TransportError::FileTransfer(
+                    "interactive PTY download chunk metadata does not match the request".to_owned(),
+                ));
+            }
+            let actual_chunk_sha256 = format!("{:x}", Sha256::digest(&chunk.payload));
+            if actual_chunk_sha256 != chunk.sha256 {
+                return Err(TransportError::FileTransfer(
+                    "interactive PTY download chunk SHA-256 verification failed".to_owned(),
+                ));
+            }
+            local.write_all(&chunk.payload).await.map_err(|error| {
+                file_transfer_io_context("write interactive PTY download", error)
+            })?;
+            hasher.update(&chunk.payload);
+            bytes_transferred = bytes_transferred
+                .checked_add(expected_chunk_size)
+                .ok_or_else(|| TransportError::FileTransfer("file size overflow".to_owned()))?;
+            chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                TransportError::FileTransfer("download chunk index overflow".to_owned())
+            })?;
+            emit_sftp_progress(
+                request,
+                "downloading",
+                bytes_transferred,
+                Some(remote_size),
+                0,
+                0,
+            );
+        }
+        local
+            .shutdown()
+            .await
+            .map_err(|error| file_transfer_io_context("close local download file", error))?;
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
     async fn enter_pty_transfer_mode(
         &self,
         handle: &InteractivePtyTransferHandle,
@@ -7478,49 +7722,69 @@ where
         marker: &str,
         timeout: Duration,
     ) -> Result<String, TransportError> {
-        let next_sequence = self
-            .repositories
-            .pty_output_chunks
-            .next_sequence(handle.pty_session_id)
-            .await
-            .map_err(|error| TransportError::Backend(error.to_string()))?;
+        let (capture_tx, mut capture_rx) = mpsc::channel(8);
+        match handle.transfer_capture.lock() {
+            Ok(mut capture) => {
+                if capture.is_some() {
+                    return Err(TransportError::FileTransfer(
+                        "interactive PTY already has an active transfer capture".to_owned(),
+                    ));
+                }
+                *capture = Some(capture_tx);
+            }
+            Err(poisoned) => {
+                let mut capture = poisoned.into_inner();
+                if capture.is_some() {
+                    return Err(TransportError::FileTransfer(
+                        "interactive PTY already has an active transfer capture".to_owned(),
+                    ));
+                }
+                *capture = Some(capture_tx);
+            }
+        }
+        let _capture_guard = PtyTransferCaptureGuard {
+            capture: Arc::clone(&handle.transfer_capture),
+        };
         handle.input_tx.send(command).await.map_err(|_| {
             TransportError::FileTransfer(
                 "interactive PTY input channel closed during file transfer".to_owned(),
             )
         })?;
         let deadline = Instant::now() + timeout;
-        let mut after_sequence = next_sequence.checked_sub(1);
         let mut output = String::new();
         loop {
-            let chunks = self
-                .repositories
-                .pty_output_chunks
-                .list_for_session(handle.pty_session_id, after_sequence, 100)
-                .await
-                .map_err(|error| TransportError::Backend(error.to_string()))?;
-            for chunk in chunks {
-                after_sequence = Some(chunk.sequence);
-                output.push_str(&chunk.redacted_text);
-                if output.contains(marker) {
-                    return Ok(output);
-                }
-                if output.len() > EXEC_TRANSFER_OUTPUT_LIMIT_BYTES {
-                    let mut keep_from = output
-                        .len()
-                        .saturating_sub(EXEC_TRANSFER_OUTPUT_LIMIT_BYTES);
-                    while !output.is_char_boundary(keep_from) {
-                        keep_from = keep_from.saturating_add(1);
-                    }
-                    output = String::from_utf8_lossy(&output.as_bytes()[keep_from..]).into_owned();
-                }
-            }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(TransportError::FileTransfer(format!(
                     "interactive PTY transfer did not return marker {marker}"
                 )));
             }
-            tokio::time::sleep(PTY_TRANSFER_POLL_INTERVAL).await;
+            let captured = tokio::time::timeout(remaining, capture_rx.recv())
+                .await
+                .map_err(|_| {
+                    TransportError::FileTransfer(format!(
+                        "interactive PTY transfer did not return marker {marker}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    TransportError::FileTransfer(
+                        "interactive PTY output channel closed during file transfer".to_owned(),
+                    )
+                })?;
+            if captured.truncated {
+                return Err(TransportError::FileTransfer(
+                    "interactive PTY backend truncated transfer output".to_owned(),
+                ));
+            }
+            output.push_str(&captured.text);
+            if output.len() > PTY_TRANSFER_CAPTURE_LIMIT_BYTES {
+                return Err(TransportError::FileTransfer(format!(
+                    "interactive PTY transfer output exceeded {PTY_TRANSFER_CAPTURE_LIMIT_BYTES} bytes before marker {marker}"
+                )));
+            }
+            if output.contains(marker) {
+                return Ok(output);
+            }
         }
     }
 }
@@ -7558,6 +7822,118 @@ fn pty_transfer_leave_command(operation_id: OperationId) -> (String, String) {
         "stty echo icanon && printf '\\nREMOTE_HOSTS_PTY_TRANSFER_RESTORED_%s\\n' '{operation_id_text}'\n"
     );
     (command, marker)
+}
+
+fn interactive_pty_download_metadata_command(spec: &FileTransferSpec) -> String {
+    let source = shell_quote(&spec.remote_path);
+    let expected_digest = spec
+        .expected_sha256
+        .as_deref()
+        .map_or_else(String::new, |digest| {
+            format!("[ \"$digest\" = \"{digest}\" ] || exit 76\n")
+        });
+    format!(
+        "set -eu\nsrc={source}\n[ -f \"$src\" ] && [ ! -L \"$src\" ] || exit 71\nbytes=$(wc -c < \"$src\" | tr -d '[:space:]')\n[ \"$bytes\" -le \"{}\" ] || exit 77\nif command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum \"$src\" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then digest=$(shasum -a 256 \"$src\" | awk '{{print $1}}'); else exit 75; fi\n{expected_digest}printf 'REMOTE_HOSTS_DOWNLOAD_META %s %s\\n' \"$bytes\" \"$digest\"\n",
+        spec.max_size_bytes
+    )
+}
+
+fn interactive_pty_download_chunk_command(
+    spec: &FileTransferSpec,
+    remote_size: u64,
+    chunk_index: u64,
+    offset: u64,
+    expected_chunk_size: u64,
+) -> String {
+    let source = shell_quote(&spec.remote_path);
+    format!(
+        "set -eu\nsrc={source}\n[ -f \"$src\" ] && [ ! -L \"$src\" ] || exit 71\n[ \"$(wc -c < \"$src\" | tr -d '[:space:]')\" = \"{remote_size}\" ] || exit 78\nread_chunk() {{ dd if=\"$src\" bs={PTY_DOWNLOAD_CHUNK_BYTES} skip={chunk_index} count=1 2>/dev/null; }}\nif command -v sha256sum >/dev/null 2>&1; then chunk_digest=$(read_chunk | sha256sum | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then chunk_digest=$(read_chunk | shasum -a 256 | awk '{{print $1}}'); else exit 75; fi\nprintf 'REMOTE_HOSTS_DOWNLOAD_CHUNK_BEGIN {chunk_index} {offset} {expected_chunk_size} %s\\n' \"$chunk_digest\"\nread_chunk | base64 | tr -d '\\r\\n'\nprintf '\\nREMOTE_HOSTS_DOWNLOAD_CHUNK_END {chunk_index}\\n'\n"
+    )
+}
+
+fn parse_interactive_pty_download_chunk(
+    output: &str,
+) -> Result<InteractivePtyDownloadChunk, TransportError> {
+    let lines = output
+        .lines()
+        .map(|line| line.trim_matches('\r'))
+        .collect::<Vec<_>>();
+    let (begin_position, begin) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.starts_with("REMOTE_HOSTS_DOWNLOAD_CHUNK_BEGIN "))
+        .ok_or_else(|| {
+            TransportError::FileTransfer(
+                "interactive PTY download chunk start marker is missing".to_owned(),
+            )
+        })?;
+    let mut fields = begin.split_ascii_whitespace();
+    if fields.next() != Some("REMOTE_HOSTS_DOWNLOAD_CHUNK_BEGIN") {
+        return Err(TransportError::FileTransfer(
+            "interactive PTY download chunk start marker is malformed".to_owned(),
+        ));
+    }
+    let index = parse_download_chunk_number(fields.next(), "index")?;
+    let offset = parse_download_chunk_number(fields.next(), "offset")?;
+    let expected_size = parse_download_chunk_number(fields.next(), "size")?;
+    let sha256 = fields
+        .next()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            TransportError::FileTransfer(
+                "interactive PTY download chunk SHA-256 is malformed".to_owned(),
+            )
+        })?
+        .to_ascii_lowercase();
+    if fields.next().is_some() {
+        return Err(TransportError::FileTransfer(
+            "interactive PTY download chunk start marker has extra fields".to_owned(),
+        ));
+    }
+    let payload_text = lines.get(begin_position + 1).ok_or_else(|| {
+        TransportError::FileTransfer("interactive PTY download chunk payload is missing".to_owned())
+    })?;
+    let end = lines.get(begin_position + 2).ok_or_else(|| {
+        TransportError::FileTransfer(
+            "interactive PTY download chunk end marker is missing".to_owned(),
+        )
+    })?;
+    if *end != format!("REMOTE_HOSTS_DOWNLOAD_CHUNK_END {index}") {
+        return Err(TransportError::FileTransfer(
+            "interactive PTY download chunk end marker is malformed".to_owned(),
+        ));
+    }
+    let payload = BASE64_STANDARD.decode(payload_text).map_err(|_| {
+        TransportError::FileTransfer(
+            "interactive PTY download chunk Base64 payload is malformed".to_owned(),
+        )
+    })?;
+    if u64::try_from(payload.len()).map_err(file_transfer_conversion)? != expected_size {
+        return Err(TransportError::FileTransfer(
+            "interactive PTY download chunk payload length is invalid".to_owned(),
+        ));
+    }
+    Ok(InteractivePtyDownloadChunk {
+        index,
+        offset,
+        payload,
+        sha256,
+    })
+}
+
+fn parse_download_chunk_number(value: Option<&str>, label: &str) -> Result<u64, TransportError> {
+    value
+        .ok_or_else(|| {
+            TransportError::FileTransfer(format!(
+                "interactive PTY download chunk {label} is missing"
+            ))
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            TransportError::FileTransfer(format!(
+                "parse interactive PTY download chunk {label}: {error}"
+            ))
+        })
 }
 
 #[async_trait]
@@ -7601,15 +7977,17 @@ where
         if access_path.route_type != RouteType::Bastion || !access_path.proxy_chain.is_empty() {
             return Ok(None);
         }
-        if request.spec.direction != SftpDirection::Upload {
-            return Err(TransportError::FileTransfer(
-                "interactive bastion PTY transfer currently supports uploads only".to_owned(),
-            ));
-        }
         let handle = self.interactive_transfer_handle(workspace_id).await?;
-        let result = self
-            .upload_through_interactive_pty(&handle, &request)
-            .await?;
+        let result = match request.spec.direction {
+            SftpDirection::Upload => {
+                self.upload_through_interactive_pty(&handle, &request)
+                    .await?
+            }
+            SftpDirection::Download => {
+                self.download_through_interactive_pty(&handle, &request)
+                    .await?
+            }
+        };
         Ok(Some(result))
     }
 }
@@ -7860,6 +8238,7 @@ where
             .try_acquire(
                 &HostWriteLease {
                     host_id: operation.host_id,
+                    coordination_scope: operation.coordination_scope.clone(),
                     holder_agent_session_id: agent_session_id,
                     holder_workspace_id: workspace_id,
                     acquired_at: observed_at,
@@ -7872,7 +8251,8 @@ where
         if acquired.is_some() {
             return Ok(None);
         }
-        let summary = "operation is waiting for another agent session's host write lease to expire";
+        let summary =
+            "operation is waiting for another agent session's overlapping write scope to expire";
         self.append_system_chunk(operation, summary).await?;
         if !self
             .repositories
@@ -8209,6 +8589,7 @@ where
             .host_write_leases
             .renew(
                 operation.host_id,
+                &operation.coordination_scope,
                 agent_session_id,
                 workspace_id,
                 heartbeat_at,
@@ -8664,7 +9045,11 @@ where
         if self
             .repositories
             .host_write_leases
-            .has_pending_write_work(operation.host_id, agent_session_id)
+            .has_pending_write_work(
+                operation.host_id,
+                agent_session_id,
+                &operation.coordination_scope,
+            )
             .await?
         {
             return Ok(());
@@ -8673,6 +9058,7 @@ where
             .host_write_leases
             .shorten(
                 operation.host_id,
+                &operation.coordination_scope,
                 agent_session_id,
                 finished_at,
                 finished_at + time::Duration::seconds(WRITE_LEASE_HANDOFF_GRACE_SECONDS),
@@ -9343,12 +9729,13 @@ fn validate_pty_input(input: &str, max_input_bytes: usize) -> Result<(), Connect
 async fn shorten_host_write_lease(
     repositories: &Repositories,
     host_id: HostId,
+    coordination_scope: &str,
     agent_session_id: AgentSessionId,
     observed_at: time::OffsetDateTime,
 ) -> Result<(), DbError> {
     if repositories
         .host_write_leases
-        .has_pending_write_work(host_id, agent_session_id)
+        .has_pending_write_work(host_id, agent_session_id, coordination_scope)
         .await?
     {
         return Ok(());
@@ -9357,6 +9744,7 @@ async fn shorten_host_write_lease(
         .host_write_leases
         .shorten(
             host_id,
+            coordination_scope,
             agent_session_id,
             observed_at,
             observed_at + time::Duration::seconds(WRITE_LEASE_HANDOFF_GRACE_SECONDS),
@@ -9369,7 +9757,7 @@ async fn record_pty_output_activity(
     repositories: &Repositories,
     pty_session_id: PtySessionId,
     workspace_id: WorkspaceId,
-    lease_owner: Option<(HostId, AgentSessionId)>,
+    lease_owner: Option<(HostId, String, AgentSessionId)>,
     observed_at: time::OffsetDateTime,
 ) {
     match repositories
@@ -9378,11 +9766,12 @@ async fn record_pty_output_activity(
         .await
     {
         Ok(true) => {
-            if let Some((host_id, agent_session_id)) = lease_owner
+            if let Some((host_id, coordination_scope, agent_session_id)) = lease_owner
                 && let Err(error) = repositories
                     .host_write_leases
                     .renew(
                         host_id,
+                        &coordination_scope,
                         agent_session_id,
                         workspace_id,
                         observed_at,
@@ -9394,7 +9783,7 @@ async fn record_pty_output_activity(
                     %pty_session_id,
                     %workspace_id,
                     %error,
-                    "failed to renew host write lease from PTY output activity"
+                    "failed to renew scoped host write lease from PTY output activity"
                 );
             }
         }
@@ -9413,7 +9802,7 @@ async fn record_pty_output_activity(
 async fn pty_lease_owner(
     repositories: &Repositories,
     workspace_id: WorkspaceId,
-) -> Option<(HostId, AgentSessionId)> {
+) -> Option<(HostId, String, AgentSessionId)> {
     repositories
         .workspaces
         .get(workspace_id)
@@ -9421,9 +9810,13 @@ async fn pty_lease_owner(
         .ok()
         .flatten()
         .and_then(|workspace| {
-            workspace
-                .agent_session_id
-                .map(|agent_session_id| (workspace.host_id, agent_session_id))
+            workspace.agent_session_id.map(|agent_session_id| {
+                (
+                    workspace.host_id,
+                    workspace.coordination_scope,
+                    agent_session_id,
+                )
+            })
         })
 }
 
@@ -9520,6 +9913,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
+    use base64::Engine as _;
     use remote_hosts_core::{
         CheckRequest, CheckResult, CommandClass, CommandProfile, CommandProfileCatalog,
         DEFAULT_SFTP_MAX_SIZE_BYTES, DEFAULT_SFTP_TIMEOUT_SECONDS, ExecRequest, ExecResult,
@@ -10297,6 +10691,13 @@ mod tests {
         output_rx: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<PtyBackendOutput>>>>,
     }
 
+    #[derive(Clone)]
+    struct LocalScriptPtyBackend {
+        inputs: Arc<tokio::sync::Mutex<Vec<String>>>,
+        output_tx: mpsc::Sender<PtyBackendOutput>,
+        output_rx: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<PtyBackendOutput>>>>,
+    }
+
     struct EndingPtyBackend;
 
     struct HandshakeBudgetPtyBackend {
@@ -10432,6 +10833,17 @@ mod tests {
         }
     }
 
+    impl LocalScriptPtyBackend {
+        fn new() -> Self {
+            let (output_tx, output_rx) = mpsc::channel(16);
+            Self {
+                inputs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                output_tx,
+                output_rx: Arc::new(tokio::sync::Mutex::new(Some(output_rx))),
+            }
+        }
+    }
+
     #[async_trait]
     impl ManagedPtyBackend for CapturingPtyBackend {
         fn capabilities(&self) -> PtyBackendCapabilities {
@@ -10447,6 +10859,60 @@ mod tests {
             tokio::spawn(async move {
                 while let Some(input) = input_rx.recv().await {
                     inputs.lock().await.push(input);
+                }
+            });
+            let output_rx =
+                self.output_rx.lock().await.take().ok_or_else(|| {
+                    super::ConnectorPtyError::Backend("already spawned".to_owned())
+                })?;
+            let (close_tx, _close_rx) = oneshot::channel();
+            Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx))
+        }
+    }
+
+    #[async_trait]
+    impl ManagedPtyBackend for LocalScriptPtyBackend {
+        fn capabilities(&self) -> PtyBackendCapabilities {
+            PtyBackendCapabilities::openssh_pipe_shell()
+        }
+
+        async fn spawn(
+            &self,
+            _request: PtyBackendSpawnRequest,
+        ) -> Result<ManagedPtyProcess, super::ConnectorPtyError> {
+            let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
+            let inputs = Arc::clone(&self.inputs);
+            let output_tx = self.output_tx.clone();
+            tokio::spawn(async move {
+                while let Some(input) = input_rx.recv().await {
+                    inputs.lock().await.push(input.clone());
+                    let executable = input
+                        .replace("stty -echo -icanon min 1 time 0 && ", "")
+                        .replace("stty echo icanon && ", "");
+                    let output = tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(executable)
+                        .output()
+                        .await;
+                    let text = match output {
+                        Ok(output) => format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        ),
+                        Err(error) => format!("local scripted PTY failed: {error}\n"),
+                    };
+                    if output_tx
+                        .send(PtyBackendOutput {
+                            stream: OutputStream::Stdout,
+                            text,
+                            truncated: false,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             });
             let output_rx =
@@ -11694,6 +12160,7 @@ mod tests {
             .try_acquire(
                 &HostWriteLease {
                     host_id: fixture.host_id,
+                    coordination_scope: "host".to_owned(),
                     holder_agent_session_id: foreign_session.id,
                     holder_workspace_id: foreign_workspace.id,
                     acquired_at: lease_at,
@@ -11754,7 +12221,13 @@ mod tests {
         fixture
             .repositories
             .host_write_leases
-            .shorten(fixture.host_id, foreign_session.id, handoff_at, handoff_at)
+            .shorten(
+                fixture.host_id,
+                "host",
+                foreign_session.id,
+                handoff_at,
+                handoff_at,
+            )
             .await?;
         let outcome = worker
             .run_once()
@@ -11766,8 +12239,10 @@ mod tests {
         let lease = fixture
             .repositories
             .host_write_leases
-            .get_active(fixture.host_id, observed_at)
+            .list_active(fixture.host_id, observed_at)
             .await?
+            .into_iter()
+            .next()
             .ok_or("completed mutation should retain a short handoff grace")?;
         assert_eq!(lease.holder_agent_session_id, fixture.agent_session_id);
         assert!(lease.expires_at <= observed_at + time::Duration::seconds(16));
@@ -12396,6 +12871,129 @@ mod tests {
         manager
             .close(opened.pty_session.pty_session_id, Some(1))
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interactive_bastion_download_reuses_pty_and_keeps_file_bytes_out_of_audit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let mut access_path = fixture
+            .repositories
+            .access_paths
+            .get(workspace.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        access_path.route_type = RouteType::Bastion;
+        access_path.requires_tty = true;
+        fixture
+            .repositories
+            .access_paths
+            .upsert(&access_path)
+            .await?;
+
+        let directory = tempfile::tempdir()?;
+        let remote_source = directory.path().join("remote-source.bin");
+        let local_destination = directory.path().join("downloaded.bin");
+        let payload = (0..(super::PTY_DOWNLOAD_CHUNK_BYTES * 2 + 17))
+            .map(|index| u8::try_from(index % 251))
+            .collect::<Result<Vec<_>, _>>()?;
+        tokio::fs::write(&remote_source, &payload).await?;
+        let payload_sha256 = format!("{:x}", Sha256::digest(&payload));
+
+        let backend = LocalScriptPtyBackend::new();
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let result = super::InteractiveFileTransferBackend::transfer_for_workspace(
+            &manager,
+            fixture.workspace_id,
+            SftpRequest {
+                operation_id: OperationId::new(),
+                host_id: fixture.host_id,
+                access_path_id: access_path.id,
+                spec: FileTransferSpec {
+                    direction: SftpDirection::Download,
+                    local_path: local_destination.to_string_lossy().into_owned(),
+                    remote_path: remote_source.to_string_lossy().into_owned(),
+                    overwrite: SftpOverwritePolicy::Deny,
+                    mode: Some(0o600),
+                    max_size_bytes: u64::try_from(payload.len())?,
+                    expected_sha256: Some(payload_sha256.clone()),
+                    timeout_seconds: 30,
+                },
+                progress_tx: None,
+            },
+        )
+        .await?
+        .ok_or("interactive bastion should handle the download")?;
+
+        assert_eq!(result.direction, SftpDirection::Download);
+        assert_eq!(result.bytes_transferred, u64::try_from(payload.len())?);
+        assert_eq!(result.sha256, payload_sha256);
+        assert_eq!(tokio::fs::read(&local_destination).await?, payload);
+        let transfer_chunks = fixture
+            .repositories
+            .pty_output_chunks
+            .list_for_session(opened.pty_session.pty_session_id, None, 20)
+            .await?;
+        assert!(
+            transfer_chunks.is_empty(),
+            "download frames and file bodies must stay out of persisted PTY output"
+        );
+
+        manager
+            .write_input(
+                opened.pty_session.pty_session_id,
+                "printf 'ordinary-output-after-transfer\\n'\n".to_owned(),
+            )
+            .await?;
+        wait_for_pty_output(
+            &fixture.repositories,
+            opened.pty_session.pty_session_id,
+            "ordinary-output-after-transfer",
+        )
+        .await?;
+        manager
+            .close(opened.pty_session.pty_session_id, Some(0))
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_pty_download_parser_rejects_malformed_or_mismatched_frames()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = b"download-payload";
+        let sha256 = format!("{:x}", Sha256::digest(payload));
+        let valid = format!(
+            "banner\nREMOTE_HOSTS_DOWNLOAD_CHUNK_BEGIN 2 64 {} {sha256}\n{}\nREMOTE_HOSTS_DOWNLOAD_CHUNK_END 2\n",
+            payload.len(),
+            super::BASE64_STANDARD.encode(payload)
+        );
+        let parsed = super::parse_interactive_pty_download_chunk(&valid)?;
+        assert_eq!(parsed.index, 2);
+        assert_eq!(parsed.offset, 64);
+        assert_eq!(parsed.payload, payload);
+
+        let malformed = valid.replace("REMOTE_HOSTS_DOWNLOAD_CHUNK_END 2", "BROKEN_END 2");
+        assert!(super::parse_interactive_pty_download_chunk(&malformed).is_err());
+        let wrong_size = valid.replacen(
+            &format!("BEGIN 2 64 {}", payload.len()),
+            "BEGIN 2 64 999",
+            1,
+        );
+        assert!(super::parse_interactive_pty_download_chunk(&wrong_size).is_err());
         Ok(())
     }
 
@@ -13435,8 +14033,10 @@ mod tests {
         let initial_lease = fixture
             .repositories
             .host_write_leases
-            .get_active(workspace.host_id, observed_after_input)
+            .list_active(workspace.host_id, observed_after_input)
             .await?
+            .into_iter()
+            .next()
             .ok_or("PTY input should retain a write lease")?;
         assert_eq!(
             initial_lease.holder_agent_session_id,
@@ -13478,6 +14078,7 @@ mod tests {
                 .try_acquire(
                     &HostWriteLease {
                         host_id: workspace.host_id,
+                        coordination_scope: workspace.coordination_scope.clone(),
                         holder_agent_session_id: foreign_session.id,
                         holder_workspace_id: foreign_workspace.id,
                         acquired_at: observed_after_input,
@@ -13507,8 +14108,10 @@ mod tests {
         let renewed_lease = fixture
             .repositories
             .host_write_leases
-            .get_active(workspace.host_id, now_utc())
+            .list_active(workspace.host_id, now_utc())
             .await?
+            .into_iter()
+            .next()
             .ok_or("PTY output should keep the write lease active")?;
         assert!(renewed_lease.heartbeat_at > initial_lease.heartbeat_at);
         assert!(renewed_lease.expires_at > initial_lease.expires_at);
@@ -13527,8 +14130,10 @@ mod tests {
         let closing_lease = fixture
             .repositories
             .host_write_leases
-            .get_active(workspace.host_id, observed_after_close)
+            .list_active(workspace.host_id, observed_after_close)
             .await?
+            .into_iter()
+            .next()
             .ok_or("closed PTY should retain only a short handoff grace")?;
         assert!(
             closing_lease.expires_at
@@ -13543,6 +14148,7 @@ mod tests {
             .try_acquire(
                 &HostWriteLease {
                     host_id: workspace.host_id,
+                    coordination_scope: workspace.coordination_scope.clone(),
                     holder_agent_session_id: foreign_session.id,
                     holder_workspace_id: foreign_workspace.id,
                     acquired_at: takeover_at,
@@ -14662,6 +15268,7 @@ mod tests {
                 cwd: Some("/tmp".to_owned()),
                 state: WorkspaceState::Idle,
                 policy_profile: "default".to_owned(),
+                coordination_scope: "host".to_owned(),
                 created_at: now,
                 last_activity_at: now,
                 ttl_seconds: 3600,

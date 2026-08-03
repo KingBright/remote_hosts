@@ -50,7 +50,7 @@ Stop and diagnose instead of retrying when you see:
 - transport runtime `state=runtime_lost`: its id, generation, and counters are historical evidence only. The next successful command should report `runtime_replaced=true` and one new handshake; never count the old runtime as connected.
 - PTY system output containing `automatic retry disabled`: activation reached a terminal failure such as a missing or unusable backing connection. Do not poll or queue input again for that PTY id; inspect the workspace/connection state and open a replacement only after recovery.
 - `circuit_open`: do not create another session id to bypass cooldown; wait until `next_retry_at` or change the route.
-- `host_write_lease_wait` or `write_lease.state=held_by_other_session`: another Agent Session is mutating this physical host. Wait and refresh state; do not create another workspace, PTY, route, or SSH connection. This does not mark the connector or target unhealthy.
+- `host_write_lease_wait`: another Agent Session holds an equal, parent, child, or broad `host` scope that overlaps this queued mutation. Inspect `write_lease.active_leases`, wait, and refresh state; do not create another PTY, route, or SSH connection. Use `wait_for_overlapping_scope_or_refine_scope` only when the Workspace scope was genuinely over-broad before side effects began, never to invent a differently spelled sibling. A foreign non-overlapping sibling lease does not block this task and does not mark the connector or target unhealthy.
 - `ssh_channel_capacity_saturated`: the selected path has no unreserved SSH channels. Follow `recommended_action=wait_for_channel_or_raise_limit`, keep the same logical task ids, and wait for an operation or PTY reservation to clear. Do not create another route or SSH connection. Increase the path limit only after verifying the target and bastion support it.
 - `tcp_unreachable` or `ssh_handshake_failed`: check network, VPN, route, port, and connector environment.
 - `ssh_route_unsupported`: stop immediately. The configured route needs one or more jump hosts and was rejected before handshake; do not retry or substitute a direct connection.
@@ -86,7 +86,7 @@ track output sequence; do not probe by opening a new SSH transport for every com
 
 ## Transport Runtime Evidence
 
-Snapshot version 7 separates the real connector-local SSH runtime from logical sessions and workspaces, exposes privacy-aware Agent Session ownership and host write-lease state, and reports scheduler-visible channel pressure.
+Snapshot version 8 separates the real connector-local SSH runtime from logical sessions and workspaces, exposes privacy-aware Agent Session ownership and all active scoped write leases, and reports scheduler-visible channel pressure.
 
 Interpret access-path `channel_capacity`:
 

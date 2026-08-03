@@ -703,6 +703,8 @@ pub struct CreateWorkspaceRequest {
     pub cwd: Option<String>,
     /// Optional policy profile.
     pub policy_profile: Option<String>,
+    /// Hierarchical write-coordination scope. Defaults to `host`.
+    pub coordination_scope: Option<String>,
     /// Optional TTL in seconds.
     pub ttl_seconds: Option<u64>,
 }
@@ -721,6 +723,8 @@ pub struct PrepareWorkspaceRequest {
     pub cwd: Option<String>,
     /// Policy profile used only for workspace creation.
     pub policy_profile: Option<String>,
+    /// Hierarchical write-coordination scope. Defaults to `host`.
+    pub coordination_scope: Option<String>,
     /// TTL used only for workspace creation. Defaults to 3600 seconds.
     pub ttl_seconds: Option<u64>,
 }
@@ -1372,6 +1376,7 @@ impl RemoteHostsMcpServer {
             .try_acquire(
                 &HostWriteLease {
                     host_id: operation.host_id,
+                    coordination_scope: operation.coordination_scope.clone(),
                     holder_agent_session_id: agent_session_id,
                     holder_workspace_id: workspace_id,
                     acquired_at: observed_at,
@@ -3298,18 +3303,14 @@ impl RemoteHostsMcpServer {
         let mut local_handshake_budget_ready_paths = BTreeSet::new();
         let mut attention = Vec::new();
         let generated_at = now_utc();
-        let write_lease = self
+        let write_leases = self
             .repositories
             .host_write_leases
-            .get_active(host_id, generated_at)
+            .list_active(host_id, generated_at)
             .await
             .map_err(|error| tool_error(&error))?;
-        let write_lease_held_by_current = write_lease
-            .as_ref()
-            .is_some_and(|lease| lease.holder_agent_session_id == self.agent_session.id);
-        let write_lease_held_by_other = write_lease.is_some() && !write_lease_held_by_current;
         let write_lease_snapshot = write_lease_snapshot_value(
-            write_lease.as_ref(),
+            &write_leases,
             self.agent_session.id,
             !self.requires_workspace_ownership(),
             generated_at,
@@ -3542,12 +3543,17 @@ impl RemoteHostsMcpServer {
                 .list_for_workspace(workspace.id, 10)
                 .await
                 .map_err(|error| tool_error(&error))?;
-            if write_lease_held_by_other
-                && recent_operations.iter().any(|operation| {
-                    operation.requires_write_lease
-                        && operation.state == remote_hosts_domain::OperationState::Queued
-                })
-            {
+            if recent_operations.iter().any(|operation| {
+                operation.requires_write_lease
+                    && operation.state == remote_hosts_domain::OperationState::Queued
+                    && write_leases.iter().any(|lease| {
+                        lease.holder_agent_session_id != self.agent_session.id
+                            && coordination_scopes_overlap(
+                                &lease.coordination_scope,
+                                &operation.coordination_scope,
+                            )
+                    })
+            }) {
                 current_session_waits_for_write_lease = true;
             }
             if workspace.state == WorkspaceState::Blocked {
@@ -3585,9 +3591,9 @@ impl RemoteHostsMcpServer {
                 entity_type: "host".to_owned(),
                 entity_id: host_id.to_string(),
                 message:
-                    "mutating work is queued behind another conversation's active host write lease"
+                    "mutating work is queued behind another conversation's overlapping write-coordination scope"
                         .to_owned(),
-                recommended_action: "wait_for_write_lease".to_owned(),
+                recommended_action: "wait_for_overlapping_scope_or_refine_scope".to_owned(),
             });
         }
         for session in &sessions {
@@ -3614,7 +3620,7 @@ impl RemoteHostsMcpServer {
         }
 
         Ok(Json(HostRuntimeSnapshotOutput {
-            snapshot_version: 7,
+            snapshot_version: 8,
             event_cursor,
             generated_at: generated_at.to_string(),
             agent_session: to_json_value(self.agent_session.as_ref())?,
@@ -3907,6 +3913,8 @@ impl RemoteHostsMcpServer {
                     policy_profile: request
                         .policy_profile
                         .unwrap_or_else(|| "default".to_owned()),
+                    coordination_scope: trim_optional(request.coordination_scope)
+                        .unwrap_or_else(|| "host".to_owned()),
                     ttl_seconds: request.ttl_seconds.unwrap_or(3600),
                 },
                 self.active_workspace_count(host_id).await?,
@@ -3944,6 +3952,8 @@ impl RemoteHostsMcpServer {
             .as_deref()
             .map(parse_access_path_id)
             .transpose()?;
+        let requested_coordination_scope =
+            trim_optional(request.coordination_scope.clone()).unwrap_or_else(|| "host".to_owned());
         let workspaces = if self.requires_workspace_ownership() {
             self.repositories
                 .workspaces
@@ -3959,6 +3969,7 @@ impl RemoteHostsMcpServer {
                 WorkspaceState::Idle | WorkspaceState::Working
             ) && requested_access_path_id
                 .is_none_or(|access_path_id| workspace.access_path_id == access_path_id)
+                && workspace.coordination_scope == requested_coordination_scope
         });
 
         let (workspace, reused) = if let Some(workspace) = reusable {
@@ -3972,6 +3983,7 @@ impl RemoteHostsMcpServer {
                     label: trim_optional(request.label).unwrap_or_else(|| "agent-main".to_owned()),
                     cwd: trim_optional(request.cwd),
                     policy_profile: trim_optional(request.policy_profile),
+                    coordination_scope: Some(requested_coordination_scope),
                     ttl_seconds: request.ttl_seconds,
                 }))
                 .await?;
@@ -4187,6 +4199,7 @@ impl RemoteHostsMcpServer {
                 .try_acquire(
                     &HostWriteLease {
                         host_id: plan.event.host_id,
+                        coordination_scope: workspace.coordination_scope.clone(),
                         holder_agent_session_id: agent_session_id,
                         holder_workspace_id: plan.event.workspace_id,
                         acquired_at: observed_at,
@@ -6054,49 +6067,85 @@ fn public_operation_values(items: &[OperationRun]) -> Result<Vec<Value>, String>
 }
 
 fn write_lease_snapshot_value(
-    lease: Option<&HostWriteLease>,
+    leases: &[HostWriteLease],
     current_agent_session_id: AgentSessionId,
     disclose_holder: bool,
     observed_at: time::OffsetDateTime,
 ) -> Value {
-    let Some(lease) = lease else {
+    if leases.is_empty() {
         return json!({
             "state": "available",
             "retry_after_seconds": null,
-            "expires_at": null
+            "expires_at": null,
+            "active_leases": []
         });
-    };
-    let held_by_current = lease.holder_agent_session_id == current_agent_session_id;
-    let retry_after_seconds =
-        u64::try_from((lease.expires_at - observed_at).whole_seconds().max(0)).unwrap_or(u64::MAX);
-    let mut value = json!({
-        "state": if held_by_current {
-            "held_by_current_session"
-        } else {
-            "held_by_other_session"
-        },
-        "retry_after_seconds": if held_by_current {
-            Value::Null
-        } else {
-            json!(retry_after_seconds)
-        },
-        "acquired_at": lease.acquired_at,
-        "heartbeat_at": lease.heartbeat_at,
-        "expires_at": lease.expires_at
-    });
-    if (held_by_current || disclose_holder)
-        && let Some(object) = value.as_object_mut()
-    {
-        object.insert(
-            "holder_agent_session_id".to_owned(),
-            json!(lease.holder_agent_session_id.to_string()),
-        );
-        object.insert(
-            "holder_workspace_id".to_owned(),
-            json!(lease.holder_workspace_id.to_string()),
-        );
     }
-    value
+    let mut has_current = false;
+    let mut has_other = false;
+    let mut retry_after_seconds: Option<u64> = None;
+    let mut latest_expiry = observed_at;
+    let active_leases = leases
+        .iter()
+        .map(|lease| {
+            let held_by_current = lease.holder_agent_session_id == current_agent_session_id;
+            has_current |= held_by_current;
+            has_other |= !held_by_current;
+            latest_expiry = latest_expiry.max(lease.expires_at);
+            let retry = u64::try_from((lease.expires_at - observed_at).whole_seconds().max(0))
+                .unwrap_or(u64::MAX);
+            if !held_by_current {
+                retry_after_seconds = Some(retry_after_seconds.map_or(retry, |old| old.min(retry)));
+            }
+            let mut value = json!({
+                "coordination_scope": lease.coordination_scope,
+                "state": if held_by_current {
+                    "held_by_current_session"
+                } else {
+                    "held_by_other_session"
+                },
+                "retry_after_seconds": if held_by_current { Value::Null } else { json!(retry) },
+                "acquired_at": lease.acquired_at,
+                "heartbeat_at": lease.heartbeat_at,
+                "expires_at": lease.expires_at
+            });
+            if (held_by_current || disclose_holder)
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert(
+                    "holder_agent_session_id".to_owned(),
+                    json!(lease.holder_agent_session_id.to_string()),
+                );
+                object.insert(
+                    "holder_workspace_id".to_owned(),
+                    json!(lease.holder_workspace_id.to_string()),
+                );
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "state": match (has_current, has_other) {
+            (true, true) => "mixed",
+            (true, false) => "held_by_current_session",
+            (false, true) => "held_by_other_session",
+            (false, false) => "available",
+        },
+        "retry_after_seconds": retry_after_seconds,
+        "expires_at": latest_expiry,
+        "active_leases": active_leases
+    })
+}
+
+fn coordination_scopes_overlap(left: &str, right: &str) -> bool {
+    left == "host"
+        || right == "host"
+        || left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn public_operation_value(operation: &OperationRun) -> Result<Value, String> {
@@ -6768,7 +6817,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(snapshot["snapshot_version"], json!(7));
+        assert_eq!(snapshot["snapshot_version"], json!(8));
         assert_eq!(snapshot["event_cursor"], json!(0));
         assert_eq!(snapshot["host"]["id"], json!(fixture.host_id.to_string()));
         assert_eq!(snapshot["aggregate"]["overall"], json!("healthy"));
@@ -6841,7 +6890,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(snapshot["snapshot_version"], json!(7));
+        assert_eq!(snapshot["snapshot_version"], json!(8));
         assert_eq!(
             snapshot["access_paths"][0]["channel_capacity"],
             json!({
@@ -7179,6 +7228,28 @@ mod tests {
                 .as_array()
                 .is_some_and(|items| !items.is_empty())
         );
+
+        let scoped_arguments = Some(json!({
+            "host_id": fixture.host_id.to_string(),
+            "label": "prepared-agent",
+            "cwd": "/tmp",
+            "coordination_scope": "k8s/test/service/api"
+        }));
+        let scoped = call_tool(
+            fixture.server(),
+            tools::PREPARE_WORKSPACE,
+            scoped_arguments.clone(),
+        )
+        .await?;
+        let scoped_reused =
+            call_tool(fixture.server(), tools::PREPARE_WORKSPACE, scoped_arguments).await?;
+        assert_eq!(scoped["reused"], json!(false));
+        assert_eq!(scoped_reused["reused"], json!(true));
+        assert_ne!(created["workspace"]["id"], scoped["workspace"]["id"]);
+        assert_eq!(
+            scoped["workspace"]["coordination_scope"],
+            json!("k8s/test/service/api")
+        );
         Ok(())
     }
 
@@ -7400,12 +7471,123 @@ mod tests {
             snapshot["write_lease"]["state"],
             json!("held_by_other_session")
         );
-        assert_eq!(snapshot["snapshot_version"], json!(7));
+        assert_eq!(snapshot["snapshot_version"], json!(8));
         assert!(snapshot["attention"].as_array().is_some_and(|attention| {
             attention
                 .iter()
                 .any(|item| item["code"] == json!("host_write_lease_wait"))
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mcp_scoped_mutations_allow_siblings_but_block_parent_scopes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let service_agent =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent);
+        let deployment_agent =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent);
+        let parent_agent =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent);
+        let service = call_tool(
+            service_agent.clone(),
+            tools::PREPARE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "coordination_scope": "k8s/datatool-dev/service/file-gateway"
+            })),
+        )
+        .await?;
+        let deployment = call_tool(
+            deployment_agent.clone(),
+            tools::PREPARE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "coordination_scope": "k8s/datatool-dev/deployment/report-worker"
+            })),
+        )
+        .await?;
+        call_tool(
+            service_agent,
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": service["workspace"]["id"],
+                "command_profile": "shell.posix",
+                "args": ["touch /tmp/scoped-service"],
+                "idempotency_key": "scoped-service"
+            })),
+        )
+        .await?;
+        call_tool(
+            deployment_agent.clone(),
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": deployment["workspace"]["id"],
+                "command_profile": "shell.posix",
+                "args": ["touch /tmp/scoped-deployment"],
+                "idempotency_key": "scoped-deployment"
+            })),
+        )
+        .await?;
+        let sibling_snapshot = call_tool(
+            deployment_agent,
+            tools::GET_HOST_RUNTIME_SNAPSHOT,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        assert_eq!(sibling_snapshot["snapshot_version"], json!(8));
+        assert_eq!(sibling_snapshot["write_lease"]["state"], json!("mixed"));
+        assert_eq!(
+            sibling_snapshot["write_lease"]["active_leases"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(
+            sibling_snapshot["attention"]
+                .as_array()
+                .is_some_and(|attention| attention
+                    .iter()
+                    .all(|item| item["code"] != json!("host_write_lease_wait")))
+        );
+
+        let parent = call_tool(
+            parent_agent.clone(),
+            tools::PREPARE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "coordination_scope": "k8s/datatool-dev"
+            })),
+        )
+        .await?;
+        call_tool(
+            parent_agent.clone(),
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": parent["workspace"]["id"],
+                "command_profile": "shell.posix",
+                "args": ["touch /tmp/scoped-parent"],
+                "idempotency_key": "scoped-parent"
+            })),
+        )
+        .await?;
+        let parent_snapshot = call_tool(
+            parent_agent,
+            tools::GET_HOST_RUNTIME_SNAPSHOT,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        assert!(
+            parent_snapshot["attention"]
+                .as_array()
+                .is_some_and(|attention| attention.iter().any(|item| {
+                    item["code"] == json!("host_write_lease_wait")
+                        && item["recommended_action"]
+                            == json!("wait_for_overlapping_scope_or_refine_scope")
+                }))
+        );
         Ok(())
     }
 
@@ -7424,6 +7606,7 @@ mod tests {
             cwd: Some("/tmp".to_owned()),
             state: WorkspaceState::Idle,
             policy_profile: "default".to_owned(),
+            coordination_scope: "host".to_owned(),
             created_at: now,
             last_activity_at: now,
             ttl_seconds: 3600,
@@ -8249,6 +8432,7 @@ mod tests {
             agent_session_id: None,
             idempotency_key: None,
             requires_write_lease: false,
+            coordination_scope: "host".to_owned(),
             operation_type: OperationType::ReadonlyExec,
             intent: "capture long output".to_owned(),
             state: OperationState::Succeeded,

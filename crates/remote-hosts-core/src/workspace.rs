@@ -26,6 +26,8 @@ pub struct WorkspaceCreateCommand {
     pub cwd: Option<String>,
     /// Policy profile name.
     pub policy_profile: String,
+    /// Hierarchical write-coordination scope.
+    pub coordination_scope: String,
     /// Workspace TTL in seconds.
     pub ttl_seconds: u64,
 }
@@ -45,6 +47,11 @@ pub enum WorkspaceSupervisorError {
     /// TTL is outside supported range.
     #[error("workspace ttl must be between 60 and 86400 seconds")]
     InvalidTtl,
+    /// Coordination scope is malformed.
+    #[error(
+        "coordination scope must be `host` or 1..=160 lowercase ASCII path characters without empty, dot, or dot-dot segments"
+    )]
+    InvalidCoordinationScope,
 }
 
 /// Creates and validates agent workspaces under a server protection policy.
@@ -89,6 +96,7 @@ impl WorkspaceSupervisor {
             cwd: command.cwd,
             state: WorkspaceState::Idle,
             policy_profile: command.policy_profile,
+            coordination_scope: command.coordination_scope,
             created_at: now,
             last_activity_at: now,
             ttl_seconds: command.ttl_seconds,
@@ -118,6 +126,27 @@ fn validate_command(command: &WorkspaceCreateCommand) -> Result<(), WorkspaceSup
         return Err(WorkspaceSupervisorError::InvalidTtl);
     }
 
+    validate_coordination_scope(&command.coordination_scope)?;
+
+    Ok(())
+}
+
+fn validate_coordination_scope(scope: &str) -> Result<(), WorkspaceSupervisorError> {
+    if scope.is_empty()
+        || scope.len() > 160
+        || !scope.is_ascii()
+        || scope.starts_with('/')
+        || scope.ends_with('/')
+        || scope.split('/').any(|segment| {
+            segment.is_empty()
+                || matches!(segment, "." | "..")
+                || !segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._:-@".contains(&byte)
+                })
+        })
+    {
+        return Err(WorkspaceSupervisorError::InvalidCoordinationScope);
+    }
     Ok(())
 }
 
@@ -136,6 +165,7 @@ mod tests {
             label: "agent-main".to_owned(),
             cwd: Some("/tmp".to_owned()),
             policy_profile: "default".to_owned(),
+            coordination_scope: "host".to_owned(),
             ttl_seconds: 3600,
         }
     }
@@ -148,6 +178,36 @@ mod tests {
         assert_eq!(workspace.label, "agent-main");
         assert_eq!(workspace.state, WorkspaceState::Idle);
         assert_eq!(workspace.ttl_seconds, 3600);
+        assert_eq!(workspace.coordination_scope, "host");
+        Ok(())
+    }
+
+    #[test]
+    fn validates_hierarchical_coordination_scope() -> Result<(), WorkspaceSupervisorError> {
+        let supervisor = WorkspaceSupervisor::default();
+        let mut scoped = command();
+        scoped.coordination_scope = "k8s/datatool-dev/service/file-gateway".to_owned();
+        assert_eq!(
+            supervisor.create_workspace(scoped, 0)?.coordination_scope,
+            "k8s/datatool-dev/service/file-gateway"
+        );
+
+        for invalid in [
+            "",
+            "/k8s/ns",
+            "k8s/ns/",
+            "k8s//service",
+            "k8s/../service",
+            "HOST",
+            "k8s/Test/service/api",
+        ] {
+            let mut command = command();
+            command.coordination_scope = invalid.to_owned();
+            assert!(matches!(
+                supervisor.create_workspace(command, 0),
+                Err(WorkspaceSupervisorError::InvalidCoordinationScope)
+            ));
+        }
         Ok(())
     }
 

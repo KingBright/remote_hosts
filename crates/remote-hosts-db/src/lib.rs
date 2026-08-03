@@ -1670,9 +1670,10 @@ impl AgentWorkspaceRepository {
             r"
             INSERT INTO agent_workspaces (
                 workspace_id, agent_session_id, host_id, access_path_id, connector_id, label, cwd,
-                state_json, policy_profile, created_at, last_activity_at, ttl_seconds
+                state_json, policy_profile, coordination_scope, created_at, last_activity_at,
+                ttl_seconds
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )
         .bind(workspace.id.to_string())
@@ -1684,6 +1685,7 @@ impl AgentWorkspaceRepository {
         .bind(&workspace.cwd)
         .bind(to_json(&workspace.state)?)
         .bind(&workspace.policy_profile)
+        .bind(&workspace.coordination_scope)
         .bind(workspace.created_at)
         .bind(workspace.last_activity_at)
         .bind(u64_to_i64(workspace.ttl_seconds)?)
@@ -1702,15 +1704,17 @@ impl AgentWorkspaceRepository {
             r"
             INSERT INTO agent_workspaces (
                 workspace_id, agent_session_id, host_id, access_path_id, connector_id, label, cwd,
-                state_json, policy_profile, created_at, last_activity_at, ttl_seconds
+                state_json, policy_profile, coordination_scope, created_at, last_activity_at,
+                ttl_seconds
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(workspace_id) DO UPDATE SET
                 agent_session_id = excluded.agent_session_id,
                 label = excluded.label,
                 cwd = excluded.cwd,
                 state_json = excluded.state_json,
                 policy_profile = excluded.policy_profile,
+                coordination_scope = excluded.coordination_scope,
                 last_activity_at = excluded.last_activity_at,
                 ttl_seconds = excluded.ttl_seconds
             ",
@@ -1724,6 +1728,7 @@ impl AgentWorkspaceRepository {
         .bind(&workspace.cwd)
         .bind(to_json(&workspace.state)?)
         .bind(&workspace.policy_profile)
+        .bind(&workspace.coordination_scope)
         .bind(workspace.created_at)
         .bind(workspace.last_activity_at)
         .bind(u64_to_i64(workspace.ttl_seconds)?)
@@ -1741,7 +1746,8 @@ impl AgentWorkspaceRepository {
         let row = sqlx::query(
             r"
             SELECT workspace_id, agent_session_id, host_id, access_path_id, connector_id, label,
-                   cwd, state_json, policy_profile, created_at, last_activity_at, ttl_seconds
+                   cwd, state_json, policy_profile, coordination_scope, created_at,
+                   last_activity_at, ttl_seconds
             FROM agent_workspaces
             WHERE workspace_id = ?
             ",
@@ -1761,7 +1767,8 @@ impl AgentWorkspaceRepository {
         let rows = sqlx::query(
             r"
             SELECT workspace_id, agent_session_id, host_id, access_path_id, connector_id, label,
-                   cwd, state_json, policy_profile, created_at, last_activity_at, ttl_seconds
+                   cwd, state_json, policy_profile, coordination_scope, created_at,
+                   last_activity_at, ttl_seconds
             FROM agent_workspaces
             WHERE host_id = ?
             ORDER BY last_activity_at DESC
@@ -1786,7 +1793,8 @@ impl AgentWorkspaceRepository {
         let rows = sqlx::query(
             r"
             SELECT workspace_id, agent_session_id, host_id, access_path_id, connector_id, label,
-                   cwd, state_json, policy_profile, created_at, last_activity_at, ttl_seconds
+                   cwd, state_json, policy_profile, coordination_scope, created_at,
+                   last_activity_at, ttl_seconds
             FROM agent_workspaces
             WHERE host_id = ? AND agent_session_id = ?
             ORDER BY last_activity_at DESC
@@ -1821,8 +1829,7 @@ impl AgentWorkspaceRepository {
 }
 
 impl HostWriteLeaseRepository {
-    /// Acquires or refreshes a host write lease when it is free, expired, or already held by the
-    /// same agent session.
+    /// Acquires or refreshes a scoped host write lease when no foreign overlapping lease is live.
     ///
     /// Returns `None` when another live agent session owns the lease.
     ///
@@ -1837,11 +1844,33 @@ impl HostWriteLeaseRepository {
         let row = sqlx::query(
             r"
             INSERT INTO host_write_leases (
-                host_id, holder_agent_session_id, holder_workspace_id,
+                host_id, coordination_scope, holder_agent_session_id, holder_workspace_id,
                 acquired_at, heartbeat_at, expires_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(host_id) DO UPDATE SET
+            SELECT ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM host_write_leases conflicting
+                WHERE conflicting.host_id = ?
+                  AND conflicting.expires_at > ?
+                  AND conflicting.holder_agent_session_id != ?
+                  AND (
+                    conflicting.coordination_scope = 'host'
+                    OR ? = 'host'
+                    OR conflicting.coordination_scope = ?
+                    OR substr(
+                        conflicting.coordination_scope,
+                        1,
+                        length(?) + 1
+                    ) = ? || '/'
+                    OR substr(
+                        ?,
+                        1,
+                        length(conflicting.coordination_scope) + 1
+                    ) = conflicting.coordination_scope || '/'
+                  )
+            )
+            ON CONFLICT(host_id, coordination_scope) DO UPDATE SET
                 holder_agent_session_id = excluded.holder_agent_session_id,
                 holder_workspace_id = excluded.holder_workspace_id,
                 acquired_at = excluded.acquired_at,
@@ -1853,39 +1882,49 @@ impl HostWriteLeaseRepository {
             ",
         )
         .bind(lease.host_id.to_string())
+        .bind(&lease.coordination_scope)
         .bind(lease.holder_agent_session_id.to_string())
         .bind(lease.holder_workspace_id.to_string())
         .bind(lease.acquired_at)
         .bind(lease.heartbeat_at)
         .bind(lease.expires_at)
+        .bind(lease.host_id.to_string())
+        .bind(observed_at)
+        .bind(lease.holder_agent_session_id.to_string())
+        .bind(&lease.coordination_scope)
+        .bind(&lease.coordination_scope)
+        .bind(&lease.coordination_scope)
+        .bind(&lease.coordination_scope)
+        .bind(&lease.coordination_scope)
         .bind(observed_at)
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(row_to_host_write_lease).transpose()
     }
 
-    /// Gets the active write lease for a host.
+    /// Lists active write leases for a host.
     ///
     /// # Errors
     ///
     /// Returns an error if querying or decoding fails.
-    pub async fn get_active(
+    pub async fn list_active(
         &self,
         host_id: HostId,
         observed_at: OffsetDateTime,
-    ) -> Result<Option<HostWriteLease>, DbError> {
-        let row = sqlx::query(
+    ) -> Result<Vec<HostWriteLease>, DbError> {
+        let rows = sqlx::query(
             r"
             SELECT *
             FROM host_write_leases
             WHERE host_id = ? AND expires_at > ?
+            ORDER BY coordination_scope ASC
             ",
         )
         .bind(host_id.to_string())
         .bind(observed_at)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        row.as_ref().map(row_to_host_write_lease).transpose()
+        rows.iter().map(row_to_host_write_lease).collect()
     }
 
     /// Renews a lease only while the expected agent session still owns it.
@@ -1896,6 +1935,7 @@ impl HostWriteLeaseRepository {
     pub async fn renew(
         &self,
         host_id: HostId,
+        coordination_scope: &str,
         agent_session_id: AgentSessionId,
         workspace_id: WorkspaceId,
         heartbeat_at: OffsetDateTime,
@@ -1905,13 +1945,16 @@ impl HostWriteLeaseRepository {
             r"
             UPDATE host_write_leases
             SET holder_workspace_id = ?, heartbeat_at = ?, expires_at = ?
-            WHERE host_id = ? AND holder_agent_session_id = ?
+            WHERE host_id = ?
+              AND coordination_scope = ?
+              AND holder_agent_session_id = ?
             ",
         )
         .bind(workspace_id.to_string())
         .bind(heartbeat_at)
         .bind(expires_at)
         .bind(host_id.to_string())
+        .bind(coordination_scope)
         .bind(agent_session_id.to_string())
         .execute(&self.pool)
         .await?;
@@ -1926,6 +1969,7 @@ impl HostWriteLeaseRepository {
     pub async fn shorten(
         &self,
         host_id: HostId,
+        coordination_scope: &str,
         agent_session_id: AgentSessionId,
         heartbeat_at: OffsetDateTime,
         expires_at: OffsetDateTime,
@@ -1934,12 +1978,15 @@ impl HostWriteLeaseRepository {
             r"
             UPDATE host_write_leases
             SET heartbeat_at = ?, expires_at = MIN(expires_at, ?)
-            WHERE host_id = ? AND holder_agent_session_id = ?
+            WHERE host_id = ?
+              AND coordination_scope = ?
+              AND holder_agent_session_id = ?
             ",
         )
         .bind(heartbeat_at)
         .bind(expires_at)
         .bind(host_id.to_string())
+        .bind(coordination_scope)
         .bind(agent_session_id.to_string())
         .execute(&self.pool)
         .await?;
@@ -1955,6 +2002,7 @@ impl HostWriteLeaseRepository {
         &self,
         host_id: HostId,
         agent_session_id: AgentSessionId,
+        coordination_scope: &str,
     ) -> Result<bool, DbError> {
         let count: i64 = sqlx::query_scalar(
             r"
@@ -1966,14 +2014,39 @@ impl HostWriteLeaseRepository {
                       AND agent_session_id = ?
                       AND requires_write_lease = 1
                       AND state_json IN (?, ?)
+                      AND (
+                        coordination_scope = 'host'
+                        OR ? = 'host'
+                        OR coordination_scope = ?
+                        OR substr(coordination_scope, 1, length(?) + 1) = ? || '/'
+                        OR substr(?, 1, length(coordination_scope) + 1)
+                            = coordination_scope || '/'
+                      )
                 )
                 +
                 (
                     SELECT COUNT(*)
-                    FROM pty_input_events
-                    WHERE host_id = ?
-                      AND agent_session_id = ?
-                      AND state_json IN (?, ?)
+                    FROM pty_input_events input
+                    JOIN agent_workspaces workspace
+                      ON workspace.workspace_id = input.workspace_id
+                    WHERE input.host_id = ?
+                      AND input.agent_session_id = ?
+                      AND input.state_json IN (?, ?)
+                      AND (
+                        workspace.coordination_scope = 'host'
+                        OR ? = 'host'
+                        OR workspace.coordination_scope = ?
+                        OR substr(
+                            workspace.coordination_scope,
+                            1,
+                            length(?) + 1
+                        ) = ? || '/'
+                        OR substr(
+                            ?,
+                            1,
+                            length(workspace.coordination_scope) + 1
+                        ) = workspace.coordination_scope || '/'
+                      )
                 )
             ",
         )
@@ -1981,10 +2054,20 @@ impl HostWriteLeaseRepository {
         .bind(agent_session_id.to_string())
         .bind(to_json(&OperationState::Queued)?)
         .bind(to_json(&OperationState::Running)?)
+        .bind(coordination_scope)
+        .bind(coordination_scope)
+        .bind(coordination_scope)
+        .bind(coordination_scope)
+        .bind(coordination_scope)
         .bind(host_id.to_string())
         .bind(agent_session_id.to_string())
         .bind(to_json(&PtyInputEventState::Queued)?)
         .bind(to_json(&PtyInputEventState::Claimed)?)
+        .bind(coordination_scope)
+        .bind(coordination_scope)
+        .bind(coordination_scope)
+        .bind(coordination_scope)
+        .bind(coordination_scope)
         .fetch_one(&self.pool)
         .await?;
         Ok(count > 0)
@@ -2667,6 +2750,22 @@ impl PtyInputEventRepository {
                           AND host_write_leases.expires_at > ?
                           AND host_write_leases.holder_agent_session_id
                               != queued_input.agent_session_id
+                          AND (
+                            host_write_leases.coordination_scope = 'host'
+                            OR target_workspace.coordination_scope = 'host'
+                            OR host_write_leases.coordination_scope
+                                = target_workspace.coordination_scope
+                            OR substr(
+                                host_write_leases.coordination_scope,
+                                1,
+                                length(target_workspace.coordination_scope) + 1
+                            ) = target_workspace.coordination_scope || '/'
+                            OR substr(
+                                target_workspace.coordination_scope,
+                                1,
+                                length(host_write_leases.coordination_scope) + 1
+                            ) = host_write_leases.coordination_scope || '/'
+                          )
                     )
                   )
                   AND (
@@ -2813,14 +2912,14 @@ impl OperationRunRepository {
             r"
             INSERT INTO operation_runs (
                 id, host_id, access_path_id, connector_id, session_id, workspace_id,
-                agent_session_id, idempotency_key, requires_write_lease,
+                agent_session_id, idempotency_key, requires_write_lease, coordination_scope,
                 operation_type_json, intent, state_json, started_at, finished_at, exit_code,
                 timeout_seconds, redacted_command_summary, command_profile_json,
                 transport_evidence_json,
                 redacted_output_summary, log_ref, attempt_count, claim_token, claimed_at,
                 lease_expires_at, last_error
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )
         .bind(operation.id.to_string())
@@ -2832,6 +2931,7 @@ impl OperationRunRepository {
         .bind(operation.agent_session_id.map(|id| id.to_string()))
         .bind(&operation.idempotency_key)
         .bind(operation.requires_write_lease)
+        .bind(&operation.coordination_scope)
         .bind(to_json(&operation.operation_type)?)
         .bind(&operation.intent)
         .bind(to_json(&operation.state)?)
@@ -2980,6 +3080,21 @@ impl OperationRunRepository {
                           AND running_write.state_json = ?
                           AND running_write.lease_expires_at IS NOT NULL
                           AND running_write.lease_expires_at > ?
+                          AND (
+                            running_write.coordination_scope = 'host'
+                            OR candidate.coordination_scope = 'host'
+                            OR running_write.coordination_scope = candidate.coordination_scope
+                            OR substr(
+                                running_write.coordination_scope,
+                                1,
+                                length(candidate.coordination_scope) + 1
+                            ) = candidate.coordination_scope || '/'
+                            OR substr(
+                                candidate.coordination_scope,
+                                1,
+                                length(running_write.coordination_scope) + 1
+                            ) = running_write.coordination_scope || '/'
+                          )
                     )
                   )
                   AND (
@@ -2992,6 +3107,22 @@ impl OperationRunRepository {
                           AND host_write_leases.expires_at > ?
                           AND host_write_leases.holder_agent_session_id
                               != candidate.agent_session_id
+                          AND (
+                            host_write_leases.coordination_scope = 'host'
+                            OR candidate.coordination_scope = 'host'
+                            OR host_write_leases.coordination_scope
+                                = candidate.coordination_scope
+                            OR substr(
+                                host_write_leases.coordination_scope,
+                                1,
+                                length(candidate.coordination_scope) + 1
+                            ) = candidate.coordination_scope || '/'
+                            OR substr(
+                                candidate.coordination_scope,
+                                1,
+                                length(host_write_leases.coordination_scope) + 1
+                            ) = host_write_leases.coordination_scope || '/'
+                          )
                     )
                   )
                   AND (
@@ -3165,7 +3296,7 @@ impl OperationRunRepository {
 
     /// Returns a claimed operation to the queue without consuming a retry attempt.
     ///
-    /// Used when another agent wins a host write-lease race after this connector selected the
+    /// Used when another agent wins an overlapping write-scope race after this connector selected the
     /// operation.
     ///
     /// # Errors
@@ -4378,6 +4509,7 @@ fn row_to_agent_workspace(row: &SqliteRow) -> Result<AgentWorkspace, DbError> {
         cwd: row.try_get("cwd")?,
         state: from_json_col(row, "state_json")?,
         policy_profile: row.try_get("policy_profile")?,
+        coordination_scope: row.try_get("coordination_scope")?,
         created_at: row.try_get("created_at")?,
         last_activity_at: row.try_get("last_activity_at")?,
         ttl_seconds: i64_to_u64(row.try_get("ttl_seconds")?)?,
@@ -4387,6 +4519,7 @@ fn row_to_agent_workspace(row: &SqliteRow) -> Result<AgentWorkspace, DbError> {
 fn row_to_host_write_lease(row: &SqliteRow) -> Result<HostWriteLease, DbError> {
     Ok(HostWriteLease {
         host_id: parse_id(row, "host_id")?,
+        coordination_scope: row.try_get("coordination_scope")?,
         holder_agent_session_id: parse_id(row, "holder_agent_session_id")?,
         holder_workspace_id: parse_id(row, "holder_workspace_id")?,
         acquired_at: row.try_get("acquired_at")?,
@@ -4519,6 +4652,7 @@ fn row_to_operation_run(row: &SqliteRow) -> Result<OperationRun, DbError> {
         agent_session_id: parse_optional_id(row, "agent_session_id")?,
         idempotency_key: row.try_get("idempotency_key")?,
         requires_write_lease: i64_to_bool(row.try_get("requires_write_lease")?),
+        coordination_scope: row.try_get("coordination_scope")?,
         operation_type: from_json_col(row, "operation_type_json")?,
         intent: row.try_get("intent")?,
         state: from_json_col(row, "state_json")?,
@@ -4776,8 +4910,151 @@ mod tests {
         StoredCredential, TrustLevel, WorkspaceId, WorkspaceState, now_utc,
     };
     use serde_json::json;
+    use sqlx::Row as _;
 
     use super::{ClaimedOperationFinish, Repositories, connect_sqlite, migrate};
+
+    async fn apply_pre_scoped_lease_schema(
+        connection: &mut sqlx::SqliteConnection,
+    ) -> Result<(), sqlx::Error> {
+        for migration in [
+            include_str!("../../../migrations/0001_initial.sql"),
+            include_str!("../../../migrations/0002_workspace_operations.sql"),
+            include_str!("../../../migrations/0003_operation_claim_leases.sql"),
+            include_str!("../../../migrations/0004_output_artifacts.sql"),
+            include_str!("../../../migrations/0005_pty_output_chunks.sql"),
+            include_str!("../../../migrations/0006_pty_input_events.sql"),
+            include_str!("../../../migrations/0007_pty_backend_capabilities.sql"),
+            include_str!("../../../migrations/0008_state_event_sequence.sql"),
+            include_str!("../../../migrations/0009_authorized_key_bootstrap.sql"),
+            include_str!("../../../migrations/0010_ssh_transport_runtime.sql"),
+            include_str!("../../../migrations/0011_agent_session_isolation.sql"),
+            include_str!("../../../migrations/0012_agent_operation_coordination.sql"),
+            include_str!("../../../migrations/0013_infrastructure_topology.sql"),
+            include_str!("../../../migrations/0014_channel_capacity_scheduler.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&mut *connection).await?;
+        }
+        Ok(())
+    }
+
+    async fn seed_legacy_scoped_lease_fixture(
+        connection: &mut sqlx::SqliteConnection,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO hosts VALUES (
+                'host-1', 'legacy-host', 'Legacy Host', '"linux"', NULL, '[]', NULL,
+                '"development"', '2026-07-31T00:00:00Z', '2026-07-31T00:00:00Z'
+            );
+            INSERT INTO environments VALUES (
+                'env-1', 'legacy-env', '"company_lan"', NULL, '"trusted"', NULL
+            );
+            INSERT INTO connectors VALUES (
+                'connector-1', 'legacy-connector', 'env-1', NULL, '0.1.0', '"healthy"',
+                '2026-07-31T00:00:00Z', 'test'
+            );
+            INSERT INTO credentials VALUES (
+                'credential-1', 'legacy-credential', '"ssh_private_key"', 'ops', '{}',
+                '2026-07-31T00:00:00Z', '2026-07-31T00:00:00Z', NULL
+            );
+            INSERT INTO access_paths VALUES (
+                'path-1', 'host-1', 'env-1', 'connector-1', '"ssh"', '10.0.0.1', 22,
+                'ops', 'credential-1', '"lan"', '[]', 1, 1, '"pooled"', 600, 30, 8, 3,
+                0, NULL
+            );
+            INSERT INTO agent_sessions VALUES (
+                'agent-1', 'codex', 'legacy-client', 'remote-hosts', 'legacy-task', '"active"',
+                '2026-07-31T00:00:00Z', '2026-07-31T00:00:00Z', '2026-08-01T00:00:00Z'
+            );
+            INSERT INTO agent_workspaces (
+                workspace_id, host_id, access_path_id, connector_id, label, cwd, state_json,
+                policy_profile, created_at, last_activity_at, ttl_seconds, agent_session_id
+            ) VALUES (
+                'workspace-1', 'host-1', 'path-1', 'connector-1', 'legacy', '/tmp', '"idle"',
+                'default', '2026-07-31T00:00:00Z', '2026-07-31T00:00:00Z', 3600, 'agent-1'
+            );
+            INSERT INTO host_write_leases VALUES (
+                'host-1', 'agent-1', 'workspace-1', '2026-07-31T00:00:00Z',
+                '2026-07-31T00:00:01Z', '2026-07-31T00:05:00Z'
+            );
+            "#,
+        )
+        .execute(connection)
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_write_lease_migration_preserves_an_active_legacy_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        let mut connection = pool.acquire().await?;
+        apply_pre_scoped_lease_schema(&mut connection).await?;
+        seed_legacy_scoped_lease_fixture(&mut connection).await?;
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0015_scoped_write_leases.sql"
+        ))
+        .execute(&mut *connection)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0016_pty_input_legacy_idempotency_compat.sql"
+        ))
+        .execute(&mut *connection)
+        .await?;
+
+        // The MCP process can outlive the local service during a rolling update.
+        // Verify an older client can still prepare its original conflict target.
+        sqlx::query(
+            r#"
+            EXPLAIN INSERT INTO pty_input_events (
+                id, pty_session_id, workspace_id, connector_id, state_json, sequence,
+                redacted_input_summary, byte_len, created_at
+            ) VALUES (
+                'event-1', 'pty-1', 'workspace-1', 'connector-1', '"queued"', 0,
+                'queued PTY input', 1, '2026-07-31T00:00:00Z'
+            ) ON CONFLICT(pty_session_id, idempotency_key) DO NOTHING
+            "#,
+        )
+        .fetch_all(&mut *connection)
+        .await?;
+
+        let lease = sqlx::query(
+            "SELECT coordination_scope, holder_agent_session_id, expires_at FROM host_write_leases WHERE host_id = 'host-1'",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
+        assert_eq!(lease.try_get::<String, _>("coordination_scope")?, "host");
+        assert_eq!(
+            lease.try_get::<String, _>("holder_agent_session_id")?,
+            "agent-1"
+        );
+        assert_eq!(
+            lease.try_get::<String, _>("expires_at")?,
+            "2026-07-31T00:05:00Z"
+        );
+        sqlx::query(
+            r"
+            INSERT INTO host_write_leases (
+                host_id, coordination_scope, holder_agent_session_id, holder_workspace_id,
+                acquired_at, heartbeat_at, expires_at
+            ) VALUES (
+                'host-1', 'k8s/test/service/api', 'agent-1', 'workspace-1',
+                '2026-07-31T00:00:00Z', '2026-07-31T00:00:01Z', '2026-07-31T00:05:00Z'
+            )
+            ",
+        )
+        .execute(&mut *connection)
+        .await?;
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM host_write_leases WHERE host_id = 'host-1'",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
+        assert_eq!(count, 2);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn state_event_cursor_is_monotonic_and_filterable()
@@ -5066,6 +5343,7 @@ mod tests {
             cwd: Some("/tmp".to_owned()),
             state: WorkspaceState::Idle,
             policy_profile: "default".to_owned(),
+            coordination_scope: "host".to_owned(),
             created_at: now,
             last_activity_at: now,
             ttl_seconds: 3600,
@@ -5080,6 +5358,7 @@ mod tests {
         assert_eq!(scoped_workspaces[0].id, workspace.id);
         let lease_a = HostWriteLease {
             host_id: host.id,
+            coordination_scope: "host".to_owned(),
             holder_agent_session_id: agent_session.id,
             holder_workspace_id: workspace.id,
             acquired_at: now,
@@ -5088,7 +5367,7 @@ mod tests {
         };
         assert_eq!(
             repos.host_write_leases.try_acquire(&lease_a, now).await?,
-            Some(lease_a)
+            Some(lease_a.clone())
         );
         let agent_session_b = AgentSession {
             id: AgentSessionId::new(),
@@ -5111,6 +5390,7 @@ mod tests {
         repos.workspaces.insert(&workspace_b).await?;
         let lease_b = HostWriteLease {
             host_id: host.id,
+            coordination_scope: "host".to_owned(),
             holder_agent_session_id: agent_session_b.id,
             holder_workspace_id: workspace_b.id,
             acquired_at: now,
@@ -5129,7 +5409,7 @@ mod tests {
             acquired_at: takeover_at,
             heartbeat_at: takeover_at,
             expires_at: takeover_at + time::Duration::minutes(5),
-            ..lease_b
+            ..lease_b.clone()
         };
         assert_eq!(
             repos
@@ -5140,7 +5420,89 @@ mod tests {
         );
         repos
             .host_write_leases
-            .shorten(host.id, agent_session_b.id, takeover_at, now)
+            .shorten(host.id, "host", agent_session_b.id, takeover_at, now)
+            .await?;
+        let scoped_at = takeover_at + time::Duration::minutes(6);
+        let service_scope = HostWriteLease {
+            coordination_scope: "k8s/datatool-dev/service/file-gateway".to_owned(),
+            acquired_at: scoped_at,
+            heartbeat_at: scoped_at,
+            expires_at: scoped_at + time::Duration::minutes(5),
+            ..lease_a.clone()
+        };
+        assert_eq!(
+            repos
+                .host_write_leases
+                .try_acquire(&service_scope, scoped_at)
+                .await?,
+            Some(service_scope.clone())
+        );
+        let deployment_scope = HostWriteLease {
+            coordination_scope: "k8s/datatool-dev/deployment/report-worker".to_owned(),
+            acquired_at: scoped_at,
+            heartbeat_at: scoped_at,
+            expires_at: scoped_at + time::Duration::minutes(5),
+            ..lease_b.clone()
+        };
+        assert_eq!(
+            repos
+                .host_write_leases
+                .try_acquire(&deployment_scope, scoped_at)
+                .await?,
+            Some(deployment_scope.clone()),
+            "sibling resource scopes should execute concurrently"
+        );
+        let namespace_scope = HostWriteLease {
+            coordination_scope: "k8s/datatool-dev".to_owned(),
+            ..deployment_scope.clone()
+        };
+        assert!(
+            repos
+                .host_write_leases
+                .try_acquire(&namespace_scope, scoped_at)
+                .await?
+                .is_none(),
+            "a parent namespace scope must conflict with a foreign child scope"
+        );
+        let broad_scope = HostWriteLease {
+            coordination_scope: "host".to_owned(),
+            ..deployment_scope.clone()
+        };
+        assert!(
+            repos
+                .host_write_leases
+                .try_acquire(&broad_scope, scoped_at)
+                .await?
+                .is_none(),
+            "the default host scope must continue to conflict with every resource scope"
+        );
+        assert_eq!(
+            repos
+                .host_write_leases
+                .list_active(host.id, scoped_at)
+                .await?
+                .len(),
+            2
+        );
+        repos
+            .host_write_leases
+            .shorten(
+                host.id,
+                &service_scope.coordination_scope,
+                agent_session.id,
+                now,
+                now,
+            )
+            .await?;
+        repos
+            .host_write_leases
+            .shorten(
+                host.id,
+                &deployment_scope.coordination_scope,
+                agent_session_b.id,
+                now,
+                now,
+            )
             .await?;
         let updated_workspace = repos
             .workspaces
@@ -5483,6 +5845,7 @@ mod tests {
             agent_session_id: workspace.agent_session_id,
             idempotency_key: None,
             requires_write_lease: false,
+            coordination_scope: workspace.coordination_scope.clone(),
             operation_type: OperationType::Probe,
             intent: "check gpu".to_owned(),
             state: OperationState::Queued,
@@ -5617,6 +5980,7 @@ mod tests {
         let lock_at = now + time::Duration::seconds(1);
         let active_a_lease = HostWriteLease {
             host_id: host.id,
+            coordination_scope: "host".to_owned(),
             holder_agent_session_id: agent_session.id,
             holder_workspace_id: workspace.id,
             acquired_at: lock_at,
@@ -5693,7 +6057,7 @@ mod tests {
         );
         repos
             .host_write_leases
-            .shorten(host.id, agent_session.id, lock_at, lock_at)
+            .shorten(host.id, "host", agent_session.id, lock_at, lock_at)
             .await?;
         let claimed_mutation = repos
             .operations
@@ -5755,6 +6119,100 @@ mod tests {
             .await?
             .ok_or_else(|| io::Error::other("next mutation should run after prior completion"))?;
         assert_eq!(claimed_second_mutation.id, same_session_mutation.id);
+        repos
+            .operations
+            .finish_claimed(ClaimedOperationFinish {
+                id: claimed_second_mutation.id,
+                claim_token: "claim-same-session-write-2",
+                state: OperationState::Succeeded,
+                finished_at: lock_at,
+                exit_code: Some(0),
+                redacted_output_summary: Some("ok"),
+                last_error: None,
+            })
+            .await?;
+
+        let scoped_schedule_at = lock_at + time::Duration::minutes(10);
+        let scoped_service_lease = HostWriteLease {
+            host_id: host.id,
+            coordination_scope: "k8s/datatool-dev/service/file-gateway".to_owned(),
+            holder_agent_session_id: agent_session.id,
+            holder_workspace_id: workspace.id,
+            acquired_at: scoped_schedule_at,
+            heartbeat_at: scoped_schedule_at,
+            expires_at: scoped_schedule_at + time::Duration::minutes(5),
+        };
+        assert!(
+            repos
+                .host_write_leases
+                .try_acquire(&scoped_service_lease, scoped_schedule_at)
+                .await?
+                .is_some()
+        );
+        let mut sibling_mutation = mutating_b.clone();
+        sibling_mutation.id = OperationId::new();
+        sibling_mutation.coordination_scope =
+            "k8s/datatool-dev/deployment/report-worker".to_owned();
+        sibling_mutation.idempotency_key = Some("scoped-sibling-write".to_owned());
+        sibling_mutation.state = OperationState::Queued;
+        sibling_mutation.started_at = scoped_schedule_at;
+        sibling_mutation.finished_at = None;
+        sibling_mutation.claim_token = None;
+        sibling_mutation.claimed_at = None;
+        sibling_mutation.lease_expires_at = None;
+        sibling_mutation.attempt_count = 0;
+        repos.operations.insert(&sibling_mutation).await?;
+        let claimed_sibling = repos
+            .operations
+            .claim_next_for_connector(
+                connector.id,
+                "claim-scoped-sibling",
+                scoped_schedule_at,
+                scoped_schedule_at + time::Duration::minutes(5),
+                3,
+            )
+            .await?
+            .ok_or_else(|| io::Error::other("sibling resource mutation should run concurrently"))?;
+        assert_eq!(claimed_sibling.id, sibling_mutation.id);
+        repos
+            .operations
+            .finish_claimed(ClaimedOperationFinish {
+                id: claimed_sibling.id,
+                claim_token: "claim-scoped-sibling",
+                state: OperationState::Succeeded,
+                finished_at: scoped_schedule_at,
+                exit_code: Some(0),
+                redacted_output_summary: Some("ok"),
+                last_error: None,
+            })
+            .await?;
+
+        let mut parent_mutation = sibling_mutation.clone();
+        parent_mutation.id = OperationId::new();
+        parent_mutation.coordination_scope = "k8s/datatool-dev".to_owned();
+        parent_mutation.idempotency_key = Some("scoped-parent-write".to_owned());
+        parent_mutation.state = OperationState::Queued;
+        parent_mutation.started_at = scoped_schedule_at + time::Duration::seconds(1);
+        parent_mutation.finished_at = None;
+        parent_mutation.claim_token = None;
+        parent_mutation.claimed_at = None;
+        parent_mutation.lease_expires_at = None;
+        parent_mutation.attempt_count = 0;
+        repos.operations.insert(&parent_mutation).await?;
+        assert!(
+            repos
+                .operations
+                .claim_next_for_connector(
+                    connector.id,
+                    "claim-scoped-parent",
+                    scoped_schedule_at,
+                    scoped_schedule_at + time::Duration::minutes(5),
+                    3,
+                )
+                .await?
+                .is_none(),
+            "a parent scope mutation must wait for an active child resource lease"
+        );
 
         let chunk = OperationOutputChunk {
             id: OperationOutputChunkId::new(),

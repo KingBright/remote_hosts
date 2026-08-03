@@ -85,17 +85,18 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [x] Successful PTY activation converges access-path health to connected and clears expired local-handshake throttle attention.
 - [x] Runtime snapshots convert expired local-handshake throttles into `local_handshake_budget_ready` with one-retry guidance instead of a zero-second wait loop.
 - [x] Connector startup invalidates connector-local `connected/healthy/resolving` sessions and clears open-channel counts so persisted history cannot masquerade as a live SSH transport.
-- [x] Snapshot v6 connector-local SSH runtime telemetry and per-channel evidence for exec, file transfer, and PTY, distinguishing handshake, real transport reuse, same-runtime reconnect, and runtime replacement.
+- [x] Connector-local SSH runtime telemetry and per-channel evidence for exec, file transfer, and PTY, distinguishing handshake, real transport reuse, same-runtime reconnect, and runtime replacement.
 - [x] Durable Agent Session identity with session-owned Workspaces, PTYs, operations, output, artifacts, and legacy-state recovery rules.
 - [x] Session-scoped semantic idempotency for commands, file transfers, and PTY input, including exact retry reuse and mismatched-payload rejection.
-- [x] Host-scoped write leases that serialize cross-conversation mutations without blocking read-only work or creating another SSH transport.
+- [x] Hierarchical Workspace `coordination_scope` leases: `host` remains the safe default, equal and parent/child resources serialize, and independent sibling resources can mutate concurrently.
+- [x] Interactive asset-menu bastion downloads through the selected active PTY with in-memory frame capture, per-chunk and whole-file SHA-256 verification, source-change detection, and atomic local placement.
 - [x] PTY lease continuity with a 300-second post-input window, output/activity renewal, and bounded handoff after close, backend exit, or connector restart.
 - [x] Arbitrary POSIX/PowerShell commands over reused exec channels plus persistent PTY state when shell context must survive between inputs.
 - [x] CLI `worker-daemon --pty-backend-mode auto|control-master-tty|pipe-shell|russh-native-pty`.
 - [x] macOS launchd service management script for install/update/start/stop/restart/status/logs.
 - [x] Local launchd deployment running API and connector daemon with release binary, SQLite database, logs, and default connector bootstrap.
 - [x] Verification: `cargo fmt --all`, `cargo test --workspace`, `cargo check --workspace`, strict clippy.
-- [x] Release deployment smoke: migration applied, launchd API/connector healthy, fresh MCP stdio exposes 18 Agent tools and `snapshot_version=6` without opening a remote SSH connection.
+- [x] Release deployment smoke: migration applied, launchd API/connector healthy, fresh MCP stdio exposes 18 Agent tools and the current runtime snapshot without opening a remote SSH connection.
 - [x] Generic infrastructure topology graph for hosts, clusters, VMs, reverse proxies, middleware, data services, business services, and arbitrary directed dependencies.
 - [x] Source- and scope-aware topology snapshot reconciliation with idempotent upserts and non-destructive inactive history.
 - [x] Encrypted credential storage and purpose-specific bindings for any topology resource, with metadata-only HTTP responses.

@@ -363,6 +363,7 @@ mod tests {
             cwd: Some("/tmp".to_owned()),
             state,
             policy_profile: "default".to_owned(),
+            coordination_scope: "host".to_owned(),
             created_at: now,
             last_activity_at: now,
             ttl_seconds: 3600,
