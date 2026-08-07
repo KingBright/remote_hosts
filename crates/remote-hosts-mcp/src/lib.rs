@@ -16,7 +16,7 @@ use remote_hosts_core::{
     SftpDirection, SftpOverwritePolicy, WorkspaceCreateCommand, WorkspaceFileTransfer,
     WorkspaceOperationSupervisor, WorkspaceRunCommand, WorkspaceSupervisor,
 };
-use remote_hosts_db::{DbError, Repositories};
+use remote_hosts_db::{DbError, Repositories, WorkspaceCapacityStatus};
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentSessionState,
     AgentWorkspace, ConnectionMode, ConnectionSession, Connector, ConnectorId, CredentialId,
@@ -1222,23 +1222,47 @@ impl RemoteHostsMcpServer {
             .map_err(|error| resolution_error(&error))
     }
 
-    async fn active_workspace_count(&self, host_id: HostId) -> Result<u32, String> {
-        let workspaces = self
-            .repositories
+    async fn workspace_capacity(
+        &self,
+        host_id: HostId,
+        agent_session_id: AgentSessionId,
+    ) -> Result<WorkspaceCapacityStatus, String> {
+        self.repositories
             .workspaces
-            .list_for_host(host_id)
+            .capacity_for_host(host_id, Some(agent_session_id), now_utc())
+            .await
+            .map_err(|error| tool_error(&error))
+    }
+
+    async fn reconcile_workspace_capacity(
+        &self,
+        host_id: HostId,
+        agent_session_id: AgentSessionId,
+    ) -> Result<(u64, WorkspaceCapacityStatus), String> {
+        let policy = ServerProtectionPolicy::default();
+        let observed_at = now_utc();
+        self.repositories
+            .agent_sessions
+            .reconcile_expired(observed_at, 1_000)
             .await
             .map_err(|error| tool_error(&error))?;
-        let count = workspaces
-            .into_iter()
-            .filter(|workspace| {
-                matches!(
-                    workspace.state,
-                    WorkspaceState::Idle | WorkspaceState::Working
-                )
-            })
-            .count();
-        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        let expired_reaped = self
+            .repositories
+            .workspaces
+            .reconcile_expired_for_host(
+                host_id,
+                observed_at,
+                policy.max_active_workspaces_per_host.saturating_mul(32),
+            )
+            .await
+            .map_err(|error| tool_error(&error))?;
+        let capacity = self
+            .repositories
+            .workspaces
+            .capacity_for_host(host_id, Some(agent_session_id), observed_at)
+            .await
+            .map_err(|error| tool_error(&error))?;
+        Ok((expired_reaped, capacity))
     }
 
     async fn connection_for_workspace(
@@ -3303,6 +3327,39 @@ impl RemoteHostsMcpServer {
         let mut local_handshake_budget_ready_paths = BTreeSet::new();
         let mut attention = Vec::new();
         let generated_at = now_utc();
+        let workspace_capacity_status = self
+            .repositories
+            .workspaces
+            .capacity_for_host(host_id, Some(self.agent_session.id), generated_at)
+            .await
+            .map_err(|error| tool_error(&error))?;
+        let workspace_capacity = WorkspaceCapacityOutput::new(workspace_capacity_status, 0);
+        if workspace_capacity.expired_reapable > 0 {
+            attention.push(RuntimeAttentionOutput {
+                code: "expired_workspace_state_reapable".to_owned(),
+                entity_type: "host".to_owned(),
+                entity_id: host_id.to_string(),
+                message: format!(
+                    "{} expired logical Workspace records are safe to reconcile; this is not SSH channel pressure",
+                    workspace_capacity.expired_reapable
+                ),
+                recommended_action: "prepare_workspace_to_reconcile_state".to_owned(),
+            });
+        }
+        if workspace_capacity.effective_active >= workspace_capacity.limit {
+            attention.push(RuntimeAttentionOutput {
+                code: "logical_workspace_capacity_saturated".to_owned(),
+                entity_type: "host".to_owned(),
+                entity_id: host_id.to_string(),
+                message: format!(
+                    "logical Workspace capacity is full: limit={}, current_agent_session_active={}, other_agent_sessions_active={}",
+                    workspace_capacity.limit,
+                    workspace_capacity.current_agent_session_active,
+                    workspace_capacity.other_agent_sessions_active
+                ),
+                recommended_action: "close_owned_workspace_or_wait_for_live_work".to_owned(),
+            });
+        }
         let write_leases = self
             .repositories
             .host_write_leases
@@ -3620,7 +3677,7 @@ impl RemoteHostsMcpServer {
         }
 
         Ok(Json(HostRuntimeSnapshotOutput {
-            snapshot_version: 8,
+            snapshot_version: 9,
             event_cursor,
             generated_at: generated_at.to_string(),
             agent_session: to_json_value(self.agent_session.as_ref())?,
@@ -3630,6 +3687,7 @@ impl RemoteHostsMcpServer {
             access_paths: access_path_snapshots,
             connection_sessions: values(&sessions)?,
             write_lease: write_lease_snapshot,
+            workspace_capacity,
             workspaces: workspace_snapshots,
             attention,
         }))
@@ -3901,6 +3959,11 @@ impl RemoteHostsMcpServer {
             return Err(format!("connector not found: {connector_id}"));
         }
 
+        let (_, capacity) = self
+            .reconcile_workspace_capacity(host_id, agent_session.id)
+            .await?;
+        let policy = ServerProtectionPolicy::default();
+
         let workspace = WorkspaceSupervisor::default()
             .create_workspace(
                 WorkspaceCreateCommand {
@@ -3917,14 +3980,23 @@ impl RemoteHostsMcpServer {
                         .unwrap_or_else(|| "host".to_owned()),
                     ttl_seconds: request.ttl_seconds.unwrap_or(3600),
                 },
-                self.active_workspace_count(host_id).await?,
+                capacity.effective_active,
             )
-            .map_err(|error| error.to_string())?;
-        self.repositories
+            .map_err(|error| workspace_capacity_error(&error.to_string(), &capacity, &policy))?;
+        let inserted = self
+            .repositories
             .workspaces
-            .insert(&workspace)
+            .insert_below_active_limit(&workspace, policy.max_active_workspaces_per_host)
             .await
             .map_err(|error| tool_error(&error))?;
+        if !inserted {
+            let current = self.workspace_capacity(host_id, agent_session.id).await?;
+            return Err(workspace_capacity_error(
+                "logical Workspace capacity changed concurrently",
+                &current,
+                &policy,
+            ));
+        }
         Ok(Json(WorkspaceOutput {
             workspace: to_json_value(&workspace)?,
         }))
@@ -3947,6 +4019,9 @@ impl RemoteHostsMcpServer {
     ) -> Result<Json<PreparedWorkspaceOutput>, String> {
         let agent_session = self.ensure_agent_session().await?;
         let host_id = parse_host_id(&request.host_id)?;
+        let (expired_reaped, _) = self
+            .reconcile_workspace_capacity(host_id, agent_session.id)
+            .await?;
         let requested_access_path_id = request
             .access_path_id
             .as_deref()
@@ -3995,11 +4070,16 @@ impl RemoteHostsMcpServer {
             }))
             .await?;
         let command_profiles = CommandProfileCatalog::list_builtin();
+        let workspace_capacity = WorkspaceCapacityOutput::new(
+            self.workspace_capacity(host_id, agent_session.id).await?,
+            expired_reaped,
+        );
 
         Ok(Json(PreparedWorkspaceOutput {
             reused,
             agent_session: to_json_value(&agent_session)?,
             workspace,
+            workspace_capacity,
             runtime_snapshot,
             command_profile_count: command_profiles.len(),
             command_profiles: values(&command_profiles)?,
@@ -5057,6 +5137,8 @@ pub struct HostRuntimeSnapshotOutput {
     pub connection_sessions: Vec<Value>,
     /// Host-level write coordination state for this conversation.
     pub write_lease: Value,
+    /// Logical Workspace capacity, independent from per-access-path SSH channel capacity.
+    pub workspace_capacity: WorkspaceCapacityOutput,
     /// Workspace, PTY, and recent operation snapshots.
     pub workspaces: Vec<RuntimeWorkspaceSnapshotOutput>,
     /// Runtime conditions that need agent attention.
@@ -5241,6 +5323,42 @@ pub struct WorkspaceOutput {
     pub workspace: Value,
 }
 
+/// Transparent logical Workspace capacity and stale-state reconciliation counters.
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+pub struct WorkspaceCapacityOutput {
+    /// Maximum idle or working Workspace records allowed for one host.
+    pub limit: u32,
+    /// Idle or working Workspace rows recorded after the latest reconciliation.
+    pub recorded_active: u32,
+    /// Recorded rows that still count after excluding safely reapable history.
+    pub effective_active: u32,
+    /// Expired rows currently safe to close.
+    pub expired_reapable: u32,
+    /// Expired rows automatically closed during this operation.
+    pub expired_reaped: u64,
+    /// Effective active rows after Workspace preparation.
+    pub active_after_prepare: u32,
+    /// Effective active rows owned by this Agent Session.
+    pub current_agent_session_active: u32,
+    /// Effective active rows owned by other or legacy Agent Sessions.
+    pub other_agent_sessions_active: u32,
+}
+
+impl WorkspaceCapacityOutput {
+    fn new(status: WorkspaceCapacityStatus, expired_reaped: u64) -> Self {
+        Self {
+            limit: ServerProtectionPolicy::default().max_active_workspaces_per_host,
+            recorded_active: status.recorded_active,
+            effective_active: status.effective_active,
+            expired_reapable: status.expired_reapable,
+            expired_reaped,
+            active_after_prepare: status.effective_active,
+            current_agent_session_active: status.current_agent_session_active,
+            other_agent_sessions_active: status.other_agent_sessions_active,
+        }
+    }
+}
+
 /// Prepared workspace and its task-oriented execution context.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct PreparedWorkspaceOutput {
@@ -5250,6 +5368,8 @@ pub struct PreparedWorkspaceOutput {
     pub agent_session: Value,
     /// Selected workspace record as JSON.
     pub workspace: Value,
+    /// Logical Workspace capacity and automatic stale-state recovery performed for this request.
+    pub workspace_capacity: WorkspaceCapacityOutput,
     /// Fresh host runtime snapshot captured after workspace preparation.
     pub runtime_snapshot: HostRuntimeSnapshotOutput,
     /// Number of available structured command profiles.
@@ -6210,6 +6330,22 @@ fn tool_error(error: &DbError) -> String {
     format!("database error: {error}")
 }
 
+fn workspace_capacity_error(
+    reason: &str,
+    capacity: &WorkspaceCapacityStatus,
+    policy: &ServerProtectionPolicy,
+) -> String {
+    format!(
+        "{reason}; logical Workspace capacity is independent from SSH channel capacity: limit={}, recorded_active={}, effective_active={}, expired_reapable={}, current_agent_session_active={}, other_agent_sessions_active={}; close an owned Workspace or wait for live operations/PTYs to finish",
+        policy.max_active_workspaces_per_host,
+        capacity.recorded_active,
+        capacity.effective_active,
+        capacity.expired_reapable,
+        capacity.current_agent_session_active,
+        capacity.other_agent_sessions_active,
+    )
+}
+
 fn resolution_error(error: &AccessResolutionError) -> String {
     format!(
         "{}; state={:?}; reason={:?}; hint={:?}; retry_after_seconds={:?}",
@@ -6227,14 +6363,15 @@ mod tests {
 
     use remote_hosts_db::{Repositories, connect_sqlite, migrate};
     use remote_hosts_domain::{
-        AccessPath, AccessPathHealth, AccessPathId, AgentWorkspace, AuthorizedKeyBootstrap,
-        AuthorizedKeyBootstrapReason, AuthorizedKeyBootstrapState, ConnectionMode,
-        ConnectionSession, Connector, ConnectorId, CredentialId, CredentialKind,
-        CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind, Host, HostId,
-        HostKind, OperationId, OperationOutputArtifact, OperationOutputArtifactId, OperationRun,
-        OperationState, OperationType, OutputStream, Protocol, PtyOutputChunk, PtyOutputChunkId,
-        PtySessionId, RiskLevel, RouteType, SessionId, SshFileTransferMode, SshTransportBackend,
-        SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
+        AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId,
+        AgentSessionState, AgentWorkspace, AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason,
+        AuthorizedKeyBootstrapState, ConnectionMode, ConnectionSession, Connector, ConnectorId,
+        CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId,
+        EnvironmentKind, Host, HostId, HostKind, OperationId, OperationOutputArtifact,
+        OperationOutputArtifactId, OperationRun, OperationState, OperationType, OutputStream,
+        Protocol, PtyBackendCapabilities, PtyBackendState, PtyOutputChunk, PtyOutputChunkId,
+        PtySession, PtySessionId, RiskLevel, RouteType, SessionId, SshFileTransferMode,
+        SshTransportBackend, SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
         SshTransportRuntimeState, SshTransportTelemetry, StateReasonCode, StoredCredential,
         TrustLevel, WorkspaceId, WorkspaceState, now_utc,
     };
@@ -6817,7 +6954,9 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(snapshot["snapshot_version"], json!(8));
+        assert_eq!(snapshot["snapshot_version"], json!(9));
+        assert_eq!(snapshot["workspace_capacity"]["limit"], json!(32));
+        assert_eq!(snapshot["workspace_capacity"]["effective_active"], json!(1));
         assert_eq!(snapshot["event_cursor"], json!(0));
         assert_eq!(snapshot["host"]["id"], json!(fixture.host_id.to_string()));
         assert_eq!(snapshot["aggregate"]["overall"], json!("healthy"));
@@ -6890,7 +7029,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(snapshot["snapshot_version"], json!(8));
+        assert_eq!(snapshot["snapshot_version"], json!(9));
         assert_eq!(
             snapshot["access_paths"][0]["channel_capacity"],
             json!({
@@ -6903,11 +7042,15 @@ mod tests {
                 "state": "saturated"
             })
         );
+        assert_eq!(snapshot["workspace_capacity"]["limit"], json!(32));
+        assert_eq!(snapshot["workspace_capacity"]["effective_active"], json!(1));
         assert!(snapshot["attention"].as_array().is_some_and(|attention| {
             attention.iter().any(|item| {
                 item["code"] == json!("ssh_channel_capacity_saturated")
                     && item["recommended_action"] == json!("wait_for_channel_or_raise_limit")
-            })
+            }) && attention
+                .iter()
+                .all(|item| item["code"] != json!("logical_workspace_capacity_saturated"))
         }));
         Ok(())
     }
@@ -7471,7 +7614,7 @@ mod tests {
             snapshot["write_lease"]["state"],
             json!("held_by_other_session")
         );
-        assert_eq!(snapshot["snapshot_version"], json!(8));
+        assert_eq!(snapshot["snapshot_version"], json!(9));
         assert!(snapshot["attention"].as_array().is_some_and(|attention| {
             attention
                 .iter()
@@ -7537,7 +7680,7 @@ mod tests {
             Some(json!({"host_id": fixture.host_id.to_string()})),
         )
         .await?;
-        assert_eq!(sibling_snapshot["snapshot_version"], json!(8));
+        assert_eq!(sibling_snapshot["snapshot_version"], json!(9));
         assert_eq!(sibling_snapshot["write_lease"]["state"], json!("mixed"));
         assert_eq!(
             sibling_snapshot["write_lease"]["active_leases"]
@@ -7685,6 +7828,273 @@ mod tests {
             assert_ne!(replacement["workspace"]["id"], created["workspace"]["id"]);
             assert_eq!(replacement["workspace"]["state"], json!("idle"));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_prepare_workspace_reaps_expired_foreign_capacity_and_explains_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let now = now_utc();
+        let foreign_session = AgentSession {
+            id: AgentSessionId::new(),
+            client_kind: "codex".to_owned(),
+            client_instance_id: "expired-conversation".to_owned(),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("expired-conversation".to_owned()),
+            state: AgentSessionState::Active,
+            created_at: now - time::Duration::hours(3),
+            last_seen_at: now - time::Duration::hours(3),
+            expires_at: now - time::Duration::hours(2),
+        };
+        fixture
+            .repositories
+            .agent_sessions
+            .upsert(&foreign_session)
+            .await?;
+        for index in 0..32 {
+            fixture
+                .repositories
+                .workspaces
+                .insert(&AgentWorkspace {
+                    id: WorkspaceId::new(),
+                    agent_session_id: Some(foreign_session.id),
+                    host_id: fixture.host_id,
+                    access_path_id: fixture.access_path_id,
+                    connector_id: fixture.connector_id,
+                    label: format!("expired-{index}"),
+                    cwd: Some("/tmp".to_owned()),
+                    state: WorkspaceState::Idle,
+                    policy_profile: "default".to_owned(),
+                    coordination_scope: "host".to_owned(),
+                    created_at: now - time::Duration::hours(2),
+                    last_activity_at: now - time::Duration::hours(2),
+                    ttl_seconds: 60,
+                })
+                .await?;
+        }
+
+        let prepared = call_tool(
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent),
+            tools::PREPARE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "label": "current-conversation"
+            })),
+        )
+        .await?;
+
+        assert_eq!(prepared["reused"], json!(false));
+        assert_eq!(prepared["workspace"]["state"], json!("idle"));
+        assert_eq!(prepared["workspace_capacity"]["limit"], json!(32));
+        assert_eq!(prepared["workspace_capacity"]["expired_reaped"], json!(32));
+        assert_eq!(
+            prepared["workspace_capacity"]["active_after_prepare"],
+            json!(1)
+        );
+        assert_eq!(
+            prepared["workspace_capacity"]["current_agent_session_active"],
+            json!(1)
+        );
+        assert_eq!(
+            prepared["workspace_capacity"]["other_agent_sessions_active"],
+            json!(0)
+        );
+        assert_eq!(
+            fixture
+                .repositories
+                .agent_sessions
+                .get(foreign_session.id)
+                .await?
+                .ok_or("foreign Agent Session history should remain inspectable")?
+                .state,
+            AgentSessionState::Expired
+        );
+        assert_eq!(prepared["runtime_snapshot"]["snapshot_version"], json!(9));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn expired_workspace_reconciliation_preserves_live_operation_and_pty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let now = now_utc();
+        let expired_session = AgentSession {
+            id: AgentSessionId::new(),
+            client_kind: "codex".to_owned(),
+            client_instance_id: "expired-owner".to_owned(),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("expired-owner".to_owned()),
+            state: AgentSessionState::Expired,
+            created_at: now - time::Duration::hours(3),
+            last_seen_at: now - time::Duration::hours(3),
+            expires_at: now - time::Duration::hours(2),
+        };
+        fixture
+            .repositories
+            .agent_sessions
+            .upsert(&expired_session)
+            .await?;
+        let expired_workspace = |label: &str| AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(expired_session.id),
+            host_id: fixture.host_id,
+            access_path_id: fixture.access_path_id,
+            connector_id: fixture.connector_id,
+            label: label.to_owned(),
+            cwd: Some("/tmp".to_owned()),
+            state: WorkspaceState::Idle,
+            policy_profile: "default".to_owned(),
+            coordination_scope: "host".to_owned(),
+            created_at: now - time::Duration::hours(2),
+            last_activity_at: now - time::Duration::hours(2),
+            ttl_seconds: 60,
+        };
+        let operation_workspace = expired_workspace("protected-operation");
+        let pty_workspace = expired_workspace("protected-pty");
+        fixture
+            .repositories
+            .workspaces
+            .insert(&operation_workspace)
+            .await?;
+        fixture
+            .repositories
+            .workspaces
+            .insert(&pty_workspace)
+            .await?;
+        let operation = OperationRun {
+            id: OperationId::new(),
+            host_id: fixture.host_id,
+            access_path_id: fixture.access_path_id,
+            connector_id: fixture.connector_id,
+            session_id: None,
+            workspace_id: Some(operation_workspace.id),
+            agent_session_id: Some(expired_session.id),
+            idempotency_key: Some("protected-operation".to_owned()),
+            requires_write_lease: false,
+            coordination_scope: "host".to_owned(),
+            operation_type: OperationType::ReadonlyExec,
+            intent: "preserve queued work".to_owned(),
+            state: OperationState::Queued,
+            started_at: now - time::Duration::hours(2),
+            finished_at: None,
+            exit_code: None,
+            timeout_seconds: 30,
+            redacted_command_summary: "uptime".to_owned(),
+            command_profile_json: Some(json!({"name": "host.uptime"})),
+            transport_evidence: None,
+            redacted_output_summary: None,
+            log_ref: None,
+            attempt_count: 0,
+            claim_token: None,
+            claimed_at: None,
+            lease_expires_at: None,
+            last_error: None,
+        };
+        fixture.repositories.operations.insert(&operation).await?;
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&PtySession {
+                pty_session_id: PtySessionId::new(),
+                workspace_id: pty_workspace.id,
+                session_id: fixture.session_id,
+                state: WorkspaceState::Idle,
+                foreground_process: None,
+                cwd: Some("/tmp".to_owned()),
+                recent_output_ref: None,
+                last_exit_code: None,
+                input_allowed: true,
+                backend_state: PtyBackendState::Active,
+                backend_capabilities: PtyBackendCapabilities::unknown(),
+                transport_evidence: None,
+                created_at: now - time::Duration::hours(2),
+                last_activity_at: now - time::Duration::hours(2),
+            })
+            .await?;
+
+        assert_eq!(
+            fixture
+                .repositories
+                .workspaces
+                .reconcile_expired_for_host(fixture.host_id, now, 100)
+                .await?,
+            0
+        );
+        let capacity = fixture
+            .repositories
+            .workspaces
+            .capacity_for_host(fixture.host_id, None, now)
+            .await?;
+        assert_eq!(capacity.recorded_active, 2);
+        assert_eq!(capacity.effective_active, 2);
+        assert_eq!(capacity.expired_reapable, 0);
+        assert_eq!(
+            fixture
+                .repositories
+                .workspaces
+                .get(operation_workspace.id)
+                .await?
+                .ok_or("operation workspace should exist")?
+                .state,
+            WorkspaceState::Idle
+        );
+        assert_eq!(
+            fixture
+                .repositories
+                .workspaces
+                .get(pty_workspace.id)
+                .await?
+                .ok_or("PTY workspace should exist")?
+                .state,
+            WorkspaceState::Idle
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_workspace_inserts_cannot_exceed_logical_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let now = now_utc();
+        let mut inserts = tokio::task::JoinSet::new();
+        for index in 0..64 {
+            let repository = fixture.repositories.workspaces.clone();
+            let workspace = AgentWorkspace {
+                id: WorkspaceId::new(),
+                agent_session_id: None,
+                host_id: fixture.host_id,
+                access_path_id: fixture.access_path_id,
+                connector_id: fixture.connector_id,
+                label: format!("concurrent-{index}"),
+                cwd: Some("/tmp".to_owned()),
+                state: WorkspaceState::Idle,
+                policy_profile: "default".to_owned(),
+                coordination_scope: "host".to_owned(),
+                created_at: now,
+                last_activity_at: now,
+                ttl_seconds: 3_600,
+            };
+            inserts
+                .spawn(async move { repository.insert_below_active_limit(&workspace, 32).await });
+        }
+        let mut inserted = 0;
+        while let Some(result) = inserts.join_next().await {
+            if result?? {
+                inserted += 1;
+            }
+        }
+
+        assert_eq!(inserted, 32);
+        let capacity = fixture
+            .repositories
+            .workspaces
+            .capacity_for_host(fixture.host_id, None, now)
+            .await?;
+        assert_eq!(capacity.recorded_active, 32);
+        assert_eq!(capacity.effective_active, 32);
+        assert_eq!(capacity.expired_reapable, 0);
         Ok(())
     }
 

@@ -43,6 +43,27 @@ enum Command {
         #[arg(long, env = "REMOTE_HOSTS_DATABASE_URL")]
         database_url: String,
     },
+    /// Compress legacy PTY output and reclaim redundant `SQLite` storage.
+    OptimizeStorage {
+        /// Database URL, for example `<sqlite://remote-hosts.db>`.
+        #[arg(long, env = "REMOTE_HOSTS_DATABASE_URL")]
+        database_url: String,
+        /// Maximum legacy chunks moved by one short transaction.
+        #[arg(long, default_value_t = 2048)]
+        batch_chunks: u32,
+        /// Logical UTF-8 bytes targeted per compressed history segment.
+        #[arg(long, default_value_t = 1024 * 1024)]
+        segment_target_bytes: u64,
+        /// Rebuild `SQLite` after compaction so reusable pages leave the physical file.
+        #[arg(long)]
+        vacuum: bool,
+        /// Confirm every MCP child has reloaded, migrate legacy rows, and enable compressed writes.
+        #[arg(long)]
+        activate_compressed_writes: bool,
+        /// Allow a requested vacuum even while conversation work is active.
+        #[arg(long, requires = "vacuum")]
+        force: bool,
+    },
     /// Check whether local services can restart without interrupting active work.
     RestartReadiness {
         /// Database URL, for example `<sqlite://remote-hosts.db>`.
@@ -311,6 +332,25 @@ async fn main() -> anyhow::Result<()> {
             migrate_database(&database_url).await?;
             println!("migrations applied");
         }
+        Command::OptimizeStorage {
+            database_url,
+            batch_chunks,
+            segment_target_bytes,
+            vacuum,
+            activate_compressed_writes,
+            force,
+        } => {
+            let report = optimize_storage(
+                &database_url,
+                batch_chunks,
+                segment_target_bytes,
+                vacuum,
+                activate_compressed_writes,
+                force,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Command::RestartReadiness { database_url } => {
             let repositories = connect_repositories(&database_url).await?;
             let summary = repositories
@@ -523,6 +563,191 @@ async fn connect_repositories(database_url: &str) -> anyhow::Result<remote_hosts
         .await
         .context("run migrations")?;
     Ok(remote_hosts_db::Repositories::new(pool))
+}
+
+async fn optimize_storage(
+    database_url: &str,
+    batch_chunks: u32,
+    segment_target_bytes: u64,
+    vacuum: bool,
+    activate_compressed_writes: bool,
+    force: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let repositories = connect_repositories(database_url).await?;
+    let compressed_writes_before = repositories.compressed_output_writes_enabled().await?;
+    if !compressed_writes_before && !activate_compressed_writes {
+        anyhow::bail!(
+            "compressed output storage is not active; reload every MCP child, then rerun with --activate-compressed-writes"
+        );
+    }
+    if (vacuum || !compressed_writes_before) && !force {
+        require_idle_for_storage_transition(
+            &repositories,
+            "refusing to migrate or vacuum output while conversation work is active; wait for drain",
+        )
+        .await?;
+    }
+    let before_output = repositories.pty_output_chunks.storage_stats().await?;
+    let before_operation_output = repositories.operation_output_chunks.storage_stats().await?;
+    let before_sqlite = repositories.sqlite_storage_stats().await?;
+    let (pty_batches, compacted) =
+        compact_pty_output(&repositories, batch_chunks, segment_target_bytes).await?;
+    let (operation_batches, operation_compacted) =
+        compact_operation_output(&repositories, batch_chunks, segment_target_bytes).await?;
+    let migrated_output = repositories.pty_output_chunks.storage_stats().await?;
+    let migrated_operation_output = repositories.operation_output_chunks.storage_stats().await?;
+    if migrated_output.legacy_chunks != 0 || migrated_operation_output.legacy_chunks != 0 {
+        anyhow::bail!(
+            "output migration did not drain all legacy rows; compressed writes remain unchanged"
+        );
+    }
+    if !compressed_writes_before && !force {
+        require_idle_for_storage_transition(
+            &repositories,
+            "conversation work started during output migration; compressed writes remain disabled",
+        )
+        .await?;
+    }
+    let vacuumed = if vacuum && !force {
+        repositories
+            .active_work_summary()
+            .await
+            .context("recheck active work before vacuum")?
+            .is_idle()
+    } else {
+        vacuum
+    };
+    repositories.optimize_sqlite(vacuumed).await?;
+    if !compressed_writes_before {
+        repositories.activate_compressed_output_writes().await?;
+    }
+    let compressed_writes_after = repositories.compressed_output_writes_enabled().await?;
+    let after_output = repositories.pty_output_chunks.storage_stats().await?;
+    let after_operation_output = repositories.operation_output_chunks.storage_stats().await?;
+    let after_sqlite = repositories.sqlite_storage_stats().await?;
+    let total_original_bytes = compacted
+        .original_storage_bytes
+        .saturating_add(operation_compacted.original_storage_bytes);
+    let total_compressed_bytes = compacted
+        .compressed_bytes
+        .saturating_add(operation_compacted.compressed_bytes);
+    let payload_ratio_basis_points = if total_original_bytes == 0 {
+        10_000
+    } else {
+        total_compressed_bytes
+            .saturating_mul(10_000)
+            .checked_div(total_original_bytes)
+            .unwrap_or(10_000)
+    };
+    Ok(serde_json::json!({
+        "batches": {
+            "pty": pty_batches,
+            "operation": operation_batches,
+        },
+        "vacuum_requested": vacuum,
+        "vacuumed": vacuumed,
+        "vacuum_deferred_for_active_work": vacuum && !vacuumed,
+        "compressed_writes_before": compressed_writes_before,
+        "compressed_writes_after": compressed_writes_after,
+        "compaction": {
+            "pty": compacted,
+            "operation": operation_compacted,
+        },
+        "compressed_payload_ratio_basis_points": payload_ratio_basis_points,
+        "before": {
+            "pty_output": before_output,
+            "operation_output": before_operation_output,
+            "sqlite": before_sqlite,
+        },
+        "after": {
+            "pty_output": after_output,
+            "operation_output": after_operation_output,
+            "sqlite": after_sqlite,
+        }
+    }))
+}
+
+async fn require_idle_for_storage_transition(
+    repositories: &remote_hosts_db::Repositories,
+    failure_message: &str,
+) -> anyhow::Result<()> {
+    let active = repositories
+        .active_work_summary()
+        .await
+        .context("check active work before storage transition")?;
+    if !active.is_idle() {
+        anyhow::bail!(failure_message.to_owned());
+    }
+    Ok(())
+}
+
+async fn compact_pty_output(
+    repositories: &remote_hosts_db::Repositories,
+    batch_chunks: u32,
+    segment_target_bytes: u64,
+) -> anyhow::Result<(u64, remote_hosts_db::PtyOutputCompactionBatch)> {
+    let mut total = remote_hosts_db::PtyOutputCompactionBatch::default();
+    let mut batches = 0_u64;
+    loop {
+        let batch = repositories
+            .pty_output_chunks
+            .compact_legacy_batch(batch_chunks, segment_target_bytes)
+            .await?;
+        if batch.legacy_chunks == 0 {
+            break;
+        }
+        batches = batches.saturating_add(1);
+        add_compaction_batch(&mut total, &batch);
+        if batches.is_multiple_of(100) {
+            tracing::info!(
+                batches,
+                legacy_chunks = total.legacy_chunks,
+                compressed_bytes = total.compressed_bytes,
+                "PTY output compaction progress"
+            );
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok((batches, total))
+}
+
+async fn compact_operation_output(
+    repositories: &remote_hosts_db::Repositories,
+    batch_chunks: u32,
+    segment_target_bytes: u64,
+) -> anyhow::Result<(u64, remote_hosts_db::OperationOutputCompactionBatch)> {
+    let mut total = remote_hosts_db::OperationOutputCompactionBatch::default();
+    let mut batches = 0_u64;
+    loop {
+        let batch = repositories
+            .operation_output_chunks
+            .compact_legacy_batch(batch_chunks, segment_target_bytes)
+            .await?;
+        if batch.legacy_chunks == 0 {
+            break;
+        }
+        batches = batches.saturating_add(1);
+        add_compaction_batch(&mut total, &batch);
+        tokio::task::yield_now().await;
+    }
+    Ok((batches, total))
+}
+
+fn add_compaction_batch(
+    total: &mut remote_hosts_db::PtyOutputCompactionBatch,
+    batch: &remote_hosts_db::PtyOutputCompactionBatch,
+) {
+    total.legacy_chunks = total.legacy_chunks.saturating_add(batch.legacy_chunks);
+    total.segments_written = total
+        .segments_written
+        .saturating_add(batch.segments_written);
+    total.original_storage_bytes = total
+        .original_storage_bytes
+        .saturating_add(batch.original_storage_bytes);
+    total.encoded_bytes = total.encoded_bytes.saturating_add(batch.encoded_bytes);
+    total.compressed_bytes = total
+        .compressed_bytes
+        .saturating_add(batch.compressed_bytes);
 }
 
 #[derive(Clone)]
@@ -1014,6 +1239,58 @@ mod tests {
             anyhow::bail!("expected mcp-stdio command");
         };
         assert_eq!(tool_profile, McpToolProfile::Full);
+        Ok(())
+    }
+
+    #[test]
+    fn optimize_storage_uses_bounded_batches_and_requires_vacuum_for_force() -> anyhow::Result<()> {
+        let parsed = Cli::try_parse_from([
+            "remote-hosts",
+            "optimize-storage",
+            "--database-url",
+            "sqlite::memory:",
+        ])?;
+        let Command::OptimizeStorage {
+            batch_chunks,
+            segment_target_bytes,
+            vacuum,
+            force,
+            activate_compressed_writes,
+            ..
+        } = parsed.command
+        else {
+            anyhow::bail!("expected optimize-storage command");
+        };
+        assert_eq!(batch_chunks, 2048);
+        assert_eq!(segment_target_bytes, 1024 * 1024);
+        assert!(!vacuum);
+        assert!(!force);
+        assert!(!activate_compressed_writes);
+        let activation = Cli::try_parse_from([
+            "remote-hosts",
+            "optimize-storage",
+            "--database-url",
+            "sqlite::memory:",
+            "--activate-compressed-writes",
+        ])?;
+        let Command::OptimizeStorage {
+            activate_compressed_writes,
+            ..
+        } = activation.command
+        else {
+            anyhow::bail!("expected optimize-storage command");
+        };
+        assert!(activate_compressed_writes);
+        assert!(
+            Cli::try_parse_from([
+                "remote-hosts",
+                "optimize-storage",
+                "--database-url",
+                "sqlite::memory:",
+                "--force",
+            ])
+            .is_err()
+        );
         Ok(())
     }
 

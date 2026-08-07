@@ -225,7 +225,10 @@ mod tests {
             WorkspaceSupervisorError::PolicyDenied(decision) => {
                 assert!(!decision.allowed);
                 assert_eq!(decision.state, EntityState::RateLimited);
-                assert_eq!(decision.human_message, "active workspace limit reached");
+                assert_eq!(
+                    decision.human_message,
+                    "logical workspace capacity limit reached"
+                );
             }
             other => return Err(format!("unexpected error: {other:?}").into()),
         }

@@ -40,7 +40,7 @@ provider; the native backend caches an authenticated `russh` session. Exec comma
 and PTYs reserve channels from the same access-path capacity budget.
 
 The default path capacity is eight channels. Connector workers skip saturated paths instead of
-occupying global worker slots while waiting. Runtime snapshot version 8 exposes configured,
+occupying global worker slots while waiting. Runtime snapshot version 9 exposes configured,
 reserved, and available channels, active and pending PTYs, and current operation pressure.
 
 Logical connection sessions and physical transport runtimes are separate. Every runtime records a
@@ -162,15 +162,22 @@ configured; an empty-chain `bastion` route remains one physical SSH endpoint.
 
 ## Runtime State
 
-Runtime snapshot version 8 returns one consistent view containing:
+Runtime snapshot version 9 returns one consistent view containing:
 
 - current Agent Session identity;
+- host-level logical Workspace capacity, including recorded, effective, expired/reapable, and per-session counts;
 - connector health and freshness;
 - enabled access paths, route health, key-bootstrap state, transport runtime, and channel capacity;
 - current logical connection sessions;
 - session-owned Workspaces, PTYs, and recent operations;
 - active scoped write leases;
 - actionable attention records and an event cursor.
+
+Workspace TTL is enforced automatically. MCP/API creation first closes expired `idle`/`working`
+records only when they own neither a queued/running operation nor an active PTY. The Connector
+performs the same bounded reconciliation at startup and on heartbeats. Agent Session ownership is
+not relaxed: one task never reuses another task's Workspace even when both share one pooled SSH
+transport.
 
 `remote_hosts_wait_runtime_events` and the HTTP runtime wait endpoint require explicit `live_only` or
 `after_cursor` behavior. This prevents retained history from being mistaken for a new event and

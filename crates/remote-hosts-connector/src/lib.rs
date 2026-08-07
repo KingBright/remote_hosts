@@ -94,6 +94,8 @@ const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const PTY_TRANSFER_CAPTURE_LIMIT_BYTES: usize = 128 * 1024;
 const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const PTY_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(180);
+const PTY_OUTPUT_BATCH_TARGET_BYTES: usize = 64 * 1024;
+const PTY_OUTPUT_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
 const PTY_WRITE_LEASE_SECONDS: i64 = 300;
 
@@ -6778,7 +6780,27 @@ where
                 .next_sequence(pty_session_id)
                 .await
                 .unwrap_or(0);
-            while let Some(output) = output_rx.recv().await {
+            let mut pending = Vec::new();
+            let mut pending_bytes = 0_usize;
+            let mut flush_interval = tokio::time::interval_at(
+                Instant::now() + PTY_OUTPUT_BATCH_MAX_DELAY,
+                PTY_OUTPUT_BATCH_MAX_DELAY,
+            );
+            flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let output = tokio::select! {
+                    output = output_rx.recv() => output,
+                    _ = flush_interval.tick(), if !pending.is_empty() => {
+                        if flush_pty_output_batch(&repositories, &mut pending).await.is_err() {
+                            break;
+                        }
+                        pending_bytes = 0;
+                        continue;
+                    }
+                };
+                let Some(output) = output else {
+                    break;
+                };
                 let observed_at = now_utc();
                 record_pty_output_activity(
                     &repositories,
@@ -6793,6 +6815,13 @@ where
                     Err(poisoned) => poisoned.into_inner().clone(),
                 };
                 if let Some(capture_tx) = capture_tx {
+                    if flush_pty_output_batch(&repositories, &mut pending)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    pending_bytes = 0;
                     let _ = capture_tx.send(output).await;
                     continue;
                 }
@@ -6801,7 +6830,8 @@ where
                 if redacted_text.is_empty() {
                     continue;
                 }
-                let chunk = PtyOutputChunk {
+                pending_bytes = pending_bytes.saturating_add(redacted_text.len());
+                pending.push(PtyOutputChunk {
                     id: PtyOutputChunkId::new(),
                     pty_session_id,
                     workspace_id,
@@ -6811,11 +6841,26 @@ where
                     redacted_text,
                     truncated: output.truncated || truncated,
                     created_at: observed_at,
-                };
-                if repositories.pty_output_chunks.insert(&chunk).await.is_err() {
-                    break;
-                }
+                });
                 sequence = sequence.saturating_add(1);
+                if pending_bytes >= PTY_OUTPUT_BATCH_TARGET_BYTES {
+                    if flush_pty_output_batch(&repositories, &mut pending)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    pending_bytes = 0;
+                }
+            }
+            if flush_pty_output_batch(&repositories, &mut pending)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    %pty_session_id,
+                    "failed to persist the final compressed PTY output segment"
+                );
             }
             let owns_channel_cleanup = active.lock().await.remove(&pty_session_id).is_some();
             if !owns_channel_cleanup {
@@ -7102,6 +7147,18 @@ where
             .await?;
         Ok(())
     }
+}
+
+async fn flush_pty_output_batch(
+    repositories: &Repositories,
+    pending: &mut Vec<PtyOutputChunk>,
+) -> Result<(), DbError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    repositories.pty_output_chunks.insert_batch(pending).await?;
+    pending.clear();
+    Ok(())
 }
 
 #[async_trait]
@@ -9259,6 +9316,10 @@ pub struct ConnectorDaemonReport {
     pub reconciled_transport_runtimes: u64,
     /// Number of stale active PTY records reconciled at connector startup.
     pub reconciled_pty_sessions: u64,
+    /// Number of Agent Sessions whose expired lease was persisted.
+    pub reconciled_expired_agent_sessions: u64,
+    /// Number of expired logical Workspaces closed without interrupting active work.
+    pub reconciled_expired_workspaces: u64,
     /// Number of completed worker iterations with claimed operations.
     pub completed_operations: u64,
     /// Number of queued PTY input events delivered by an attached pump.
@@ -9279,6 +9340,8 @@ fn initial_connector_daemon_report() -> ConnectorDaemonReport {
         reconciled_connection_sessions: 0,
         reconciled_transport_runtimes: 0,
         reconciled_pty_sessions: 0,
+        reconciled_expired_agent_sessions: 0,
+        reconciled_expired_workspaces: 0,
         completed_operations: 0,
         delivered_pty_inputs: 0,
         failed_pty_inputs: 0,
@@ -9409,7 +9472,8 @@ where
                     accepting_operations = changed.is_ok() && !*shutdown.borrow();
                 }
                 () = &mut heartbeat_due => {
-                    self.record_connector_state(EntityState::Healthy).await?;
+                    let state = self.reconcile_expired_workspaces(&mut report).await;
+                    self.record_connector_state(state).await?;
                     next_heartbeat = Instant::now() + heartbeat_interval;
                 }
                 () = &mut claim_due,
@@ -9558,18 +9622,81 @@ where
             .ssh_transport_runtimes
             .mark_runtime_lost_for_connector(self.config.connector_id, observed_at)
             .await?;
-        self.record_connector_state(EntityState::Healthy).await?;
+        let mut state = EntityState::Healthy;
         if let Some(pump) = &self.pty_input_pump {
             match pump.reconcile_startup().await {
                 Ok(count) => report.reconciled_pty_sessions = count,
                 Err(error) => {
                     report.infrastructure_errors += 1;
                     tracing::warn!(%error, "connector daemon PTY startup reconciliation failed");
-                    self.record_connector_state(EntityState::Degraded).await?;
+                    state = EntityState::Degraded;
                 }
             }
         }
+        if self.reconcile_expired_workspaces(report).await == EntityState::Degraded {
+            state = EntityState::Degraded;
+        }
+        self.record_connector_state(state).await?;
         Ok(())
+    }
+
+    async fn reconcile_expired_workspaces(
+        &self,
+        report: &mut ConnectorDaemonReport,
+    ) -> EntityState {
+        let mut state = EntityState::Healthy;
+        match self
+            .repositories
+            .agent_sessions
+            .reconcile_expired(now_utc(), 1_000)
+            .await
+        {
+            Ok(count) => {
+                report.reconciled_expired_agent_sessions = report
+                    .reconciled_expired_agent_sessions
+                    .saturating_add(count);
+                if count > 0 {
+                    tracing::info!(
+                        reconciled_expired_agent_sessions = count,
+                        "persisted expired Agent Session leases"
+                    );
+                }
+            }
+            Err(error) => {
+                report.infrastructure_errors = report.infrastructure_errors.saturating_add(1);
+                tracing::warn!(
+                    %error,
+                    "connector daemon Agent Session reconciliation failed"
+                );
+                state = EntityState::Degraded;
+            }
+        }
+        match self
+            .repositories
+            .workspaces
+            .reconcile_expired(now_utc(), 1_000)
+            .await
+        {
+            Ok(count) => {
+                report.reconciled_expired_workspaces =
+                    report.reconciled_expired_workspaces.saturating_add(count);
+                if count > 0 {
+                    tracing::info!(
+                        reconciled_expired_workspaces = count,
+                        "closed expired logical Workspaces with no active operation or PTY"
+                    );
+                }
+                state
+            }
+            Err(error) => {
+                report.infrastructure_errors = report.infrastructure_errors.saturating_add(1);
+                tracing::warn!(
+                    %error,
+                    "connector daemon Workspace lifecycle reconciliation failed"
+                );
+                EntityState::Degraded
+            }
+        }
     }
 
     async fn record_connector_state(&self, state: EntityState) -> Result<(), ConnectorDaemonError> {
@@ -12788,9 +12915,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn connector_pty_manager_streams_redacted_output_and_accepts_input()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
+        fixture
+            .repositories
+            .activate_compressed_output_writes()
+            .await?;
         let backend = CapturingPtyBackend::new();
         let output_tx = backend.output_tx.clone();
         let inputs = Arc::clone(&backend.inputs);
@@ -12851,6 +12983,38 @@ mod tests {
         assert_eq!(chunks[0].stream, OutputStream::Stdout);
         assert!(!chunks[0].redacted_text.contains("hunter2"));
         assert!(chunks[0].redacted_text.contains("<redacted>"));
+
+        for index in 0..10 {
+            output_tx
+                .send(PtyBackendOutput {
+                    stream: OutputStream::Stdout,
+                    text: format!("batched-output-{index}\n"),
+                    truncated: false,
+                })
+                .await?;
+        }
+        wait_for_pty_output(
+            &fixture.repositories,
+            opened.pty_session.pty_session_id,
+            "batched-output-9",
+        )
+        .await?;
+        let chunks = fixture
+            .repositories
+            .pty_output_chunks
+            .list_for_session(opened.pty_session.pty_session_id, None, 20)
+            .await?;
+        assert_eq!(chunks.len(), 11);
+        let storage = fixture
+            .repositories
+            .pty_output_chunks
+            .storage_stats()
+            .await?;
+        assert_eq!(storage.compressed_chunks, 11);
+        assert!(
+            storage.compressed_segments <= 3,
+            "rapid output should be persisted in a bounded number of compressed segments"
+        );
 
         let closed = manager
             .close(opened.pty_session.pty_session_id, Some(0))
@@ -13875,6 +14039,33 @@ mod tests {
         stale.backend_state = PtyBackendState::Active;
         stale.backend_capabilities = PtyBackendCapabilities::openssh_pipe_shell();
         fixture.repositories.pty_sessions.upsert(&stale).await?;
+        let queued_input = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: stale.pty_session_id,
+            workspace_id: fixture.workspace_id,
+            connector_id: fixture.connector_id,
+            host_id: workspace.host_id,
+            agent_session_id: workspace.agent_session_id,
+            idempotency_key: Some("startup-reconciliation-input".to_owned()),
+            input_fingerprint: Some("startup-reconciliation-fingerprint".to_owned()),
+            state: PtyInputEventState::Queued,
+            sequence: 0,
+            redacted_input_summary: "queued input awaiting stale PTY".to_owned(),
+            byte_len: 12,
+            requested_by: Some("agent".to_owned()),
+            created_at: now_utc(),
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&queued_input, "never send\n")
+            .await?;
 
         let manager = ConnectorPtyManager::new(
             fixture.repositories.clone(),
@@ -13893,6 +14084,14 @@ mod tests {
         assert_eq!(lost.state, WorkspaceState::Blocked);
         assert_eq!(lost.backend_state, PtyBackendState::Failed);
         assert!(!lost.input_allowed);
+        let terminal_input = fixture
+            .repositories
+            .pty_input_events
+            .get(queued_input.id)
+            .await?
+            .ok_or("queued input should still have public metadata")?;
+        assert_eq!(terminal_input.state, PtyInputEventState::Failed);
+        assert!(terminal_input.failed_at.is_some());
         let workspace = fixture
             .repositories
             .workspaces
@@ -14633,6 +14832,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn connector_daemon_processes_operations_heartbeats_and_stops()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
@@ -14642,6 +14842,26 @@ mod tests {
             .get(fixture.operation_id)
             .await?
             .ok_or("operation should exist")?;
+        let operation_workspace_id = operation
+            .workspace_id
+            .ok_or("operation should belong to a Workspace")?;
+        let mut expired_workspace = fixture
+            .repositories
+            .workspaces
+            .get(operation_workspace_id)
+            .await?
+            .ok_or("operation Workspace should exist")?;
+        expired_workspace.id = WorkspaceId::new();
+        expired_workspace.label = "expired-history".to_owned();
+        expired_workspace.agent_session_id = None;
+        expired_workspace.state = WorkspaceState::Idle;
+        expired_workspace.last_activity_at = now_utc() - time::Duration::hours(2);
+        expired_workspace.ttl_seconds = 60;
+        fixture
+            .repositories
+            .workspaces
+            .insert(&expired_workspace)
+            .await?;
         seed_ssh_transport_runtime(
             &fixture.repositories,
             &operation,
@@ -14686,9 +14906,20 @@ mod tests {
 
         assert_eq!(report.reconciled_connection_sessions, 1);
         assert_eq!(report.reconciled_transport_runtimes, 1);
+        assert_eq!(report.reconciled_expired_workspaces, 1);
         assert_eq!(report.completed_operations, 1);
         assert_eq!(report.delivered_pty_inputs, 1);
         assert_eq!(report.failed_pty_inputs, 0);
+        assert_eq!(
+            fixture
+                .repositories
+                .workspaces
+                .get(expired_workspace.id)
+                .await?
+                .ok_or("expired Workspace history should remain inspectable")?
+                .state,
+            WorkspaceState::Closed
+        );
         let stale_session = fixture
             .repositories
             .connection_sessions

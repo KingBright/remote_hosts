@@ -124,9 +124,9 @@ impl ServerProtectionPolicy {
             return ProtectionDecision::deny(
                 EntityState::RateLimited,
                 StateReasonCode::PolicyRejected,
-                AgentHint::UseExistingWorkspace,
+                AgentHint::WaitBeforeRetry,
                 Some(10),
-                "active workspace limit reached",
+                "logical workspace capacity limit reached",
             );
         }
 

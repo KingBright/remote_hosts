@@ -4,7 +4,7 @@ param(
     [ValidateSet(
         'Help', 'Install', 'Stage', 'Update', 'Start', 'Stop', 'Restart', 'Status',
         'Logs', 'Ui', 'Skills', 'Doctor', 'PrintConfig', 'Uninstall', 'RunApi',
-        'RunConnector'
+        'RunConnector', 'OptimizeStorage'
     )]
     [string]$Action = 'Help',
 
@@ -53,6 +53,8 @@ Actions:
   Ui            Refresh only the hot-swappable admin page
   Skills        Install the Agent Skill into Codex and Antigravity
   Doctor        Run the installed binary's local diagnostics
+  OptimizeStorage
+                Compress output history and reclaim SQLite pages without restarting
   PrintConfig   Print service paths and the MCP command
   Uninstall     Remove scheduled tasks; add -PurgeData to delete local state
 
@@ -371,6 +373,19 @@ function Assert-RestartSafe([hashtable]$Config) {
     )
 }
 
+function Optimize-Storage([hashtable]$Config) {
+    $arguments = @(
+        'optimize-storage',
+        '--database-url', [string]$Config['DatabaseUrl'],
+        '--vacuum',
+        '--activate-compressed-writes'
+    )
+    if ($Force) {
+        $arguments += '--force'
+    }
+    Invoke-Installed $Config $arguments
+}
+
 function Restart-ServiceTasks([hashtable]$Config) {
     Assert-RestartSafe $Config
     Stop-ServiceTasks
@@ -525,6 +540,7 @@ try {
             Write-Output 'Remote Hosts Agent Skill installed for Codex and Antigravity'
         }
         'Doctor' { Invoke-Installed (Read-Config) @('doctor') }
+        'OptimizeStorage' { Optimize-Storage (Read-Config) }
         'PrintConfig' { Show-Config }
         'Uninstall' { Uninstall-Services }
         'RunApi' { Run-ApiService }

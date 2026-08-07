@@ -85,7 +85,7 @@ with mode `0600` on macOS or a current-user ACL on Windows.
 ## Normal Agent Operation
 
 1. Resolve or register the canonical host and intended access path.
-2. Read runtime snapshot version 8 before reasoning about transport or channel state.
+2. Read runtime snapshot version 9 before reasoning about state. Treat host-level logical `workspace_capacity` and per-access-path SSH `channel_capacity` as independent limits.
 3. Prepare a Workspace with a stable coordination scope.
 4. Run `shell.posix`, `shell.powershell`, or open a persistent PTY.
 5. Reuse the Workspace and semantic idempotency key while waiting or retrying.
@@ -186,10 +186,46 @@ The sample contained 88 hosts, 53 access paths, 1,555 Workspaces, 1,791 operatio
 topology nodes, and 1,207 topology edges. The release binary was 23 MiB. The data directory used 141
 MiB, including a 127 MiB SQLite database, a 7 MiB WAL, and 3.8 MiB of artifacts; logs used 192 KiB.
 
-Most disk use came from retained Workspace, operation, PTY, and topology history. These numbers are
-useful as a real daily-use reference, not a clean-install minimum or a guaranteed Windows footprint.
-Live SSH transports, active PTYs, large output retention, tracing level, and concurrent MCP children
-will change memory, CPU, and storage use.
+Most disk use came from retained PTY and command output; host, route, topology, credential, and
+knowledge records were a small minority. These numbers are useful as a real daily-use reference,
+not a clean-install minimum or a guaranteed Windows footprint. Live SSH transports, active PTYs,
+large output retention, tracing level, and concurrent MCP children will change memory, CPU, and
+storage use.
+
+## Compressed Output Storage
+
+Current releases support low-latency compressed PTY batches. Each segment stores repeated Session
+and Workspace metadata once, encodes logical chunks with Postcard, and compresses the result with
+Zstandard level 9. Command output uses the same format and appends small chunks to a bounded segment.
+The API and MCP repositories decompress transparently, preserving chunk ids, sequence cursors,
+timestamps, redaction, stream identity, and truncation flags.
+
+A binary update leaves compressed-only writes disabled. New API and Connector processes therefore
+continue writing the legacy tables until the migration is explicitly activated, so resident older
+MCP children do not lose output. Reload every Codex and Antigravity MCP child, wait for operations,
+PTYs, queued input, and write leases to drain, then run:
+
+```bash
+scripts/remote-hosts-service optimize-storage
+```
+
+The service helper supplies the CLI's explicit `--activate-compressed-writes` confirmation. The
+command processes one Session or operation per short transaction, verifies the encoded payload
+before deleting exact legacy row ids, updates planner statistics, vacuums the database, then enables
+compressed writes and prints before/after JSON counters. It does not restart either service. A
+failed migration never activates compressed-only writes. Physical reclamation refuses to run while
+operations, live PTYs, queued PTY input, or write leases remain. `--force` exists for an intentional
+maintenance window, not routine use. Running the command again is idempotent.
+
+Migration `0018` also terminalizes queued or claimed input for a PTY or Workspace that can no longer
+deliver it. It clears the raw input payload and keeps redacted failure metadata, preventing stale
+input from blocking a later service restart.
+
+On a consistent copy of the 2026-08-03 daily-use database, 111,480 PTY chunks and 15,921 command
+chunks contained 67.2 MB of redacted text. They became 2,199 compressed segments with 11.67 MB of
+payload. After `VACUUM`, the SQLite file fell from 139.7 MB to 26.2 MB, an 81.3% physical reduction;
+the complete migration took about 14 seconds with the Release binary on the sampled Mac. The source
+database and running services were not modified during this benchmark.
 
 ## Operational Checks
 

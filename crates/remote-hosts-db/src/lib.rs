@@ -1,6 +1,6 @@
 //! Database access layer and migrations.
 
-use std::{io, str::FromStr};
+use std::{io, str::FromStr, time::Duration as StdDuration};
 
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentWorkspace,
@@ -19,7 +19,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{
-    Row, SqlitePool,
+    QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
 use thiserror::Error;
@@ -46,6 +46,70 @@ pub enum DbError {
     /// Integer conversion error.
     #[error("integer conversion error: {0}")]
     Int(#[from] std::num::TryFromIntError),
+    /// Compact output serialization error.
+    #[error("output serialization error: {0}")]
+    Postcard(#[from] postcard::Error),
+    /// Output compression or decompression error.
+    #[error("output compression error: {0}")]
+    Io(#[from] io::Error),
+    /// Compressed output segment failed structural validation.
+    #[error("invalid compressed output segment: {0}")]
+    InvalidOutputSegment(String),
+}
+
+/// Result of one bounded legacy PTY output compaction transaction.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PtyOutputCompactionBatch {
+    /// Legacy chunk rows moved into compressed storage.
+    pub legacy_chunks: u64,
+    /// Compressed segment rows written by this batch.
+    pub segments_written: u64,
+    /// UTF-8 text bytes represented by the legacy rows.
+    pub original_storage_bytes: u64,
+    /// Compact binary bytes before Zstandard compression.
+    pub encoded_bytes: u64,
+    /// Bytes stored in the compressed payload.
+    pub compressed_bytes: u64,
+}
+
+/// Aggregate physical and logical size counters for durable PTY output.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PtyOutputStorageStats {
+    /// Rows still using the legacy one-chunk-per-row table.
+    pub legacy_chunks: u64,
+    /// UTF-8 bytes retained in legacy rows.
+    pub legacy_text_bytes: u64,
+    /// Rows in compressed segment storage.
+    pub compressed_segments: u64,
+    /// Logical chunks represented by compressed segments.
+    pub compressed_chunks: u64,
+    /// UTF-8 bytes represented by compressed segments.
+    pub compressed_text_bytes: u64,
+    /// Compact binary bytes before Zstandard compression.
+    pub encoded_bytes: u64,
+    /// Physical Zstandard payload bytes.
+    pub compressed_bytes: u64,
+}
+
+/// Result of one bounded legacy command-output compaction transaction.
+pub type OperationOutputCompactionBatch = PtyOutputCompactionBatch;
+
+/// Aggregate physical and logical size counters for durable command output.
+pub type OperationOutputStorageStats = PtyOutputStorageStats;
+
+/// `SQLite` page counters used to report real file reclamation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SqliteStorageStats {
+    /// Database page size in bytes.
+    pub page_size: u64,
+    /// Total pages in the main database file.
+    pub page_count: u64,
+    /// Currently reusable pages inside the main database file.
+    pub freelist_count: u64,
+    /// Main database bytes represented by all pages.
+    pub database_bytes: u64,
+    /// Bytes represented by reusable pages.
+    pub reusable_bytes: u64,
 }
 
 /// Scheduler-visible channel reservations for one SSH access path.
@@ -72,6 +136,21 @@ pub struct ActiveWorkSummary {
     pub unexpired_write_leases: i64,
 }
 
+/// Logical workspace capacity after classifying expired, safely reapable records.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceCapacityStatus {
+    /// Idle or working workspace rows currently recorded for the host.
+    pub recorded_active: u32,
+    /// Active rows that still count after excluding safely reapable history.
+    pub effective_active: u32,
+    /// Expired active rows with no queued/running operation or active PTY.
+    pub expired_reapable: u32,
+    /// Effective active rows owned by the requesting agent session.
+    pub current_agent_session_active: u32,
+    /// Effective active rows owned by other or legacy agent sessions.
+    pub other_agent_sessions_active: u32,
+}
+
 impl ActiveWorkSummary {
     /// Returns true when a service restart will not interrupt durable conversation work.
     pub fn is_idle(&self) -> bool {
@@ -91,7 +170,8 @@ pub async fn connect_sqlite(database_url: &str) -> Result<SqlitePool, DbError> {
     let options = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .foreign_keys(true)
-        .journal_mode(SqliteJournalMode::Wal);
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(StdDuration::from_secs(5));
 
     SqlitePoolOptions::new()
         .max_connections(10)
@@ -193,6 +273,38 @@ impl Repositories {
         }
     }
 
+    /// Returns whether new PTY and command output may use compressed-only storage.
+    ///
+    /// The setting defaults to disabled so replacing the API or connector binary cannot make
+    /// output disappear from already-running legacy MCP children.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the durable setting cannot be queried.
+    pub async fn compressed_output_writes_enabled(&self) -> Result<bool, DbError> {
+        compressed_output_writes_enabled(&self.operations.pool).await
+    }
+
+    /// Activates compressed-only output writes after all MCP clients have been reloaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the durable setting cannot be updated.
+    pub async fn activate_compressed_output_writes(&self) -> Result<(), DbError> {
+        sqlx::query(
+            r"
+            INSERT INTO system_settings(setting_key, value)
+            VALUES (?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value
+            ",
+        )
+        .bind(COMPRESSED_OUTPUT_WRITES_SETTING)
+        .bind(COMPRESSED_OUTPUT_WRITES_ENABLED)
+        .execute(&self.operations.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Counts active work that must drain before a local service restart.
     ///
     /// # Errors
@@ -224,6 +336,64 @@ impl Repositories {
             unexpired_write_leases: row.try_get("write_leases")?,
         })
     }
+
+    /// Returns physical `SQLite` page and freelist counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `SQLite` pragmas cannot be queried or converted.
+    pub async fn sqlite_storage_stats(&self) -> Result<SqliteStorageStats, DbError> {
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&self.operations.pool)
+            .await?;
+        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&self.operations.pool)
+            .await?;
+        let freelist_count: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&self.operations.pool)
+            .await?;
+        let page_size = i64_to_u64(page_size)?;
+        let page_count = i64_to_u64(page_count)?;
+        let freelist_count = i64_to_u64(freelist_count)?;
+        Ok(SqliteStorageStats {
+            page_size,
+            page_count,
+            freelist_count,
+            database_bytes: page_size.saturating_mul(page_count),
+            reusable_bytes: page_size.saturating_mul(freelist_count),
+        })
+    }
+
+    /// Updates `SQLite` planner statistics and optionally rebuilds the file to reclaim free pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if optimization, vacuuming, or WAL checkpointing fails.
+    pub async fn optimize_sqlite(&self, vacuum: bool) -> Result<(), DbError> {
+        sqlx::query("PRAGMA optimize")
+            .execute(&self.operations.pool)
+            .await?;
+        if vacuum {
+            sqlx::query("VACUUM").execute(&self.operations.pool).await?;
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_all(&self.operations.pool)
+                .await?;
+        } else {
+            sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                .fetch_all(&self.operations.pool)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+async fn compressed_output_writes_enabled(pool: &SqlitePool) -> Result<bool, DbError> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM system_settings WHERE setting_key = ?")
+            .bind(COMPRESSED_OUTPUT_WRITES_SETTING)
+            .fetch_optional(pool)
+            .await?;
+    Ok(value.as_deref() == Some(COMPRESSED_OUTPUT_WRITES_ENABLED))
 }
 
 macro_rules! repo {
@@ -1713,6 +1883,39 @@ impl AgentSessionRepository {
         .await?;
         row.as_ref().map(row_to_agent_session).transpose()
     }
+
+    /// Persists expiry for a bounded number of stale active Agent Sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying, serialization, or updating fails.
+    pub async fn reconcile_expired(
+        &self,
+        observed_at: OffsetDateTime,
+        limit: u32,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            r"
+            UPDATE agent_sessions
+            SET state_json = ?
+            WHERE id IN (
+                SELECT id
+                FROM agent_sessions
+                WHERE state_json = ?
+                  AND julianday(expires_at) <= julianday(?)
+                ORDER BY expires_at ASC
+                LIMIT ?
+            )
+            ",
+        )
+        .bind(to_json(&remote_hosts_domain::AgentSessionState::Expired)?)
+        .bind(to_json(&remote_hosts_domain::AgentSessionState::Active)?)
+        .bind(observed_at)
+        .bind(i64::from(limit.max(1)))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 impl AgentWorkspaceRepository {
@@ -1861,6 +2064,250 @@ impl AgentWorkspaceRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_agent_workspace).collect()
+    }
+
+    /// Classifies logical workspace capacity without mutating history.
+    ///
+    /// An expired workspace remains effective while it owns queued/running work or an active PTY.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or serialization fails.
+    pub async fn capacity_for_host(
+        &self,
+        host_id: HostId,
+        current_agent_session_id: Option<AgentSessionId>,
+        observed_at: OffsetDateTime,
+    ) -> Result<WorkspaceCapacityStatus, DbError> {
+        let row = sqlx::query(
+            r"
+            WITH classified AS (
+                SELECT aw.agent_session_id,
+                       CASE WHEN (
+                           (
+                               julianday(aw.last_activity_at)
+                                   + (CAST(aw.ttl_seconds AS REAL) / 86400.0)
+                                   <= julianday(?)
+                               OR (
+                                   session.id IS NOT NULL
+                                   AND (
+                                       julianday(session.expires_at) <= julianday(?)
+                                       OR session.state_json IN (?, ?)
+                                   )
+                               )
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM operation_runs operation
+                               WHERE operation.workspace_id = aw.workspace_id
+                                 AND operation.state_json IN (?, ?)
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM pty_sessions pty
+                               WHERE pty.workspace_id = aw.workspace_id
+                                 AND pty.state_json IN (?, ?)
+                                 AND pty.input_allowed = 1
+                                 AND pty.backend_state_json IN (?, ?)
+                           )
+                       ) THEN 1 ELSE 0 END AS reapable
+                FROM agent_workspaces aw
+                LEFT JOIN agent_sessions session ON session.id = aw.agent_session_id
+                WHERE aw.host_id = ?
+                  AND aw.state_json IN (?, ?)
+            )
+            SELECT COUNT(*) AS recorded_active,
+                   COALESCE(SUM(CASE WHEN reapable = 0 THEN 1 ELSE 0 END), 0)
+                       AS effective_active,
+                   COALESCE(SUM(reapable), 0) AS expired_reapable,
+                   COALESCE(SUM(
+                       CASE WHEN reapable = 0 AND agent_session_id = ? THEN 1 ELSE 0 END
+                   ), 0) AS current_agent_session_active
+            FROM classified
+            ",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .bind(to_json(&remote_hosts_domain::AgentSessionState::Expired)?)
+        .bind(to_json(&remote_hosts_domain::AgentSessionState::Closed)?)
+        .bind(to_json(&OperationState::Queued)?)
+        .bind(to_json(&OperationState::Running)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&PtyBackendState::Pending)?)
+        .bind(to_json(&PtyBackendState::Active)?)
+        .bind(host_id.to_string())
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(current_agent_session_id.map(|id| id.to_string()))
+        .fetch_one(&self.pool)
+        .await?;
+        let recorded_active = i64_to_u32(row.try_get("recorded_active")?)?;
+        let effective_active = i64_to_u32(row.try_get("effective_active")?)?;
+        let expired_reapable = i64_to_u32(row.try_get("expired_reapable")?)?;
+        let current_agent_session_active =
+            i64_to_u32(row.try_get("current_agent_session_active")?)?;
+        Ok(WorkspaceCapacityStatus {
+            recorded_active,
+            effective_active,
+            expired_reapable,
+            current_agent_session_active,
+            other_agent_sessions_active: effective_active
+                .saturating_sub(current_agent_session_active),
+        })
+    }
+
+    /// Closes a bounded number of expired workspaces that own no active durable work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying, serialization, or updating fails.
+    pub async fn reconcile_expired_for_host(
+        &self,
+        host_id: HostId,
+        observed_at: OffsetDateTime,
+        limit: u32,
+    ) -> Result<u64, DbError> {
+        self.reconcile_expired_matching(Some(host_id), observed_at, limit)
+            .await
+    }
+
+    /// Closes a bounded number of expired workspaces across all hosts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying, serialization, or updating fails.
+    pub async fn reconcile_expired(
+        &self,
+        observed_at: OffsetDateTime,
+        limit: u32,
+    ) -> Result<u64, DbError> {
+        self.reconcile_expired_matching(None, observed_at, limit)
+            .await
+    }
+
+    async fn reconcile_expired_matching(
+        &self,
+        host_id: Option<HostId>,
+        observed_at: OffsetDateTime,
+        limit: u32,
+    ) -> Result<u64, DbError> {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r"
+            UPDATE agent_workspaces
+            SET state_json = ",
+        );
+        query.push_bind(to_json(&WorkspaceState::Closed)?);
+        query.push(", last_activity_at = ");
+        query.push_bind(observed_at);
+        query.push(
+            r"
+            WHERE workspace_id IN (
+                SELECT aw.workspace_id
+                FROM agent_workspaces aw
+                LEFT JOIN agent_sessions session ON session.id = aw.agent_session_id
+                WHERE aw.state_json IN (",
+        );
+        query.push_bind(to_json(&WorkspaceState::Idle)?);
+        query.push(", ");
+        query.push_bind(to_json(&WorkspaceState::Working)?);
+        query.push(") AND (");
+        query.push(
+            r"
+                    julianday(aw.last_activity_at)
+                        + (CAST(aw.ttl_seconds AS REAL) / 86400.0)
+                        <= julianday(",
+        );
+        query.push_bind(observed_at);
+        query.push(") OR (session.id IS NOT NULL AND (julianday(session.expires_at) <= julianday(");
+        query.push_bind(observed_at);
+        query.push(") OR session.state_json IN (");
+        query.push_bind(to_json(&remote_hosts_domain::AgentSessionState::Expired)?);
+        query.push(", ");
+        query.push_bind(to_json(&remote_hosts_domain::AgentSessionState::Closed)?);
+        query.push("))))");
+        if let Some(host_id) = host_id {
+            query.push(" AND aw.host_id = ");
+            query.push_bind(host_id.to_string());
+        }
+        query.push(
+            r"
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM operation_runs operation
+                    WHERE operation.workspace_id = aw.workspace_id
+                      AND operation.state_json IN (",
+        );
+        query.push_bind(to_json(&OperationState::Queued)?);
+        query.push(", ");
+        query.push_bind(to_json(&OperationState::Running)?);
+        query.push(
+            r"))
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM pty_sessions pty
+                    WHERE pty.workspace_id = aw.workspace_id
+                      AND pty.state_json IN (",
+        );
+        query.push_bind(to_json(&WorkspaceState::Idle)?);
+        query.push(", ");
+        query.push_bind(to_json(&WorkspaceState::Working)?);
+        query.push(") AND pty.input_allowed = 1 AND pty.backend_state_json IN (");
+        query.push_bind(to_json(&PtyBackendState::Pending)?);
+        query.push(", ");
+        query.push_bind(to_json(&PtyBackendState::Active)?);
+        query.push(") ) ORDER BY aw.last_activity_at ASC LIMIT ");
+        query.push_bind(i64::from(limit.max(1)));
+        query.push(")");
+        let result = query.build().execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Inserts a workspace only while the host remains below the logical capacity limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the database rejects the insert.
+    pub async fn insert_below_active_limit(
+        &self,
+        workspace: &AgentWorkspace,
+        active_limit: u32,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            r"
+            INSERT INTO agent_workspaces (
+                workspace_id, agent_session_id, host_id, access_path_id, connector_id, label, cwd,
+                state_json, policy_profile, coordination_scope, created_at, last_activity_at,
+                ttl_seconds
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE (
+                SELECT COUNT(*)
+                FROM agent_workspaces
+                WHERE host_id = ? AND state_json IN (?, ?)
+            ) < ?
+            ",
+        )
+        .bind(workspace.id.to_string())
+        .bind(workspace.agent_session_id.map(|id| id.to_string()))
+        .bind(workspace.host_id.to_string())
+        .bind(workspace.access_path_id.to_string())
+        .bind(workspace.connector_id.to_string())
+        .bind(&workspace.label)
+        .bind(&workspace.cwd)
+        .bind(to_json(&workspace.state)?)
+        .bind(&workspace.policy_profile)
+        .bind(&workspace.coordination_scope)
+        .bind(workspace.created_at)
+        .bind(workspace.last_activity_at)
+        .bind(u64_to_i64(workspace.ttl_seconds)?)
+        .bind(workspace.host_id.to_string())
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(i64::from(active_limit))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Updates workspace state and returns the updated workspace.
@@ -2542,6 +2989,38 @@ impl PtySessionRepository {
     }
 }
 
+const PTY_OUTPUT_SEGMENT_ENCODING: &str = "postcard+zstd-v1";
+const PTY_OUTPUT_SEGMENT_VERSION: u8 = 1;
+const MAX_PTY_OUTPUT_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
+const PTY_OUTPUT_COMPRESSION_LEVEL: i32 = 9;
+const COMPRESSED_OUTPUT_WRITES_SETTING: &str = "compressed_output_writes_v1";
+const COMPRESSED_OUTPUT_WRITES_ENABLED: &str = "enabled";
+
+#[derive(Serialize)]
+struct PtyOutputSegmentPayloadRef<'a> {
+    version: u8,
+    chunks: &'a [PtyOutputChunk],
+}
+
+#[derive(Deserialize)]
+struct PtyOutputSegmentPayload {
+    version: u8,
+    chunks: Vec<PtyOutputChunk>,
+}
+
+struct EncodedPtyOutputSegment {
+    pty_session_id: PtySessionId,
+    workspace_id: WorkspaceId,
+    first_sequence: u64,
+    last_sequence: u64,
+    chunk_count: u64,
+    original_text_bytes: u64,
+    encoded_bytes: u64,
+    compressed_bytes: u64,
+    payload: Vec<u8>,
+    created_at: OffsetDateTime,
+}
+
 impl PtyOutputChunkRepository {
     /// Inserts a PTY output chunk.
     ///
@@ -2549,24 +3028,67 @@ impl PtyOutputChunkRepository {
     ///
     /// Returns an error if serialization fails or the database rejects the insert.
     pub async fn insert(&self, chunk: &PtyOutputChunk) -> Result<(), DbError> {
+        self.insert_batch(std::slice::from_ref(chunk)).await
+    }
+
+    /// Inserts one compressed PTY output segment containing multiple logical chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when chunks span sessions, are not ordered, cannot be compressed, or the
+    /// database rejects the segment.
+    pub async fn insert_batch(&self, chunks: &[PtyOutputChunk]) -> Result<(), DbError> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        if !compressed_output_writes_enabled(&self.pool).await? {
+            let mut transaction = self.pool.begin().await?;
+            for chunk in chunks {
+                sqlx::query(
+                    r"
+                    INSERT INTO pty_output_chunks (
+                        id, pty_session_id, workspace_id, stream_json, sequence, redacted_text,
+                        byte_len, truncated, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ",
+                )
+                .bind(chunk.id.to_string())
+                .bind(chunk.pty_session_id.to_string())
+                .bind(chunk.workspace_id.to_string())
+                .bind(to_json(&chunk.stream)?)
+                .bind(u64_to_i64(chunk.sequence)?)
+                .bind(&chunk.redacted_text)
+                .bind(u64_to_i64(chunk.byte_len)?)
+                .bind(bool_to_i64(chunk.truncated))
+                .bind(chunk.created_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+            return Ok(());
+        }
+        let segment = encode_pty_output_segment(chunks)?;
         sqlx::query(
             r"
-            INSERT INTO pty_output_chunks (
-                id, pty_session_id, workspace_id, stream_json, sequence, redacted_text,
-                byte_len, truncated, created_at
+            INSERT INTO pty_output_segments (
+                pty_session_id, workspace_id, first_sequence, last_sequence, chunk_count,
+                encoding, original_text_byte_len, uncompressed_byte_len, compressed_byte_len,
+                payload, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )
-        .bind(chunk.id.to_string())
-        .bind(chunk.pty_session_id.to_string())
-        .bind(chunk.workspace_id.to_string())
-        .bind(to_json(&chunk.stream)?)
-        .bind(u64_to_i64(chunk.sequence)?)
-        .bind(&chunk.redacted_text)
-        .bind(u64_to_i64(chunk.byte_len)?)
-        .bind(bool_to_i64(chunk.truncated))
-        .bind(chunk.created_at)
+        .bind(segment.pty_session_id.to_string())
+        .bind(segment.workspace_id.to_string())
+        .bind(u64_to_i64(segment.first_sequence)?)
+        .bind(u64_to_i64(segment.last_sequence)?)
+        .bind(u64_to_i64(segment.chunk_count)?)
+        .bind(PTY_OUTPUT_SEGMENT_ENCODING)
+        .bind(u64_to_i64(segment.original_text_bytes)?)
+        .bind(u64_to_i64(segment.encoded_bytes)?)
+        .bind(u64_to_i64(segment.compressed_bytes)?)
+        .bind(segment.payload)
+        .bind(segment.created_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2584,7 +3106,7 @@ impl PtyOutputChunkRepository {
         limit: u32,
     ) -> Result<Vec<PtyOutputChunk>, DbError> {
         let start_sequence = after_sequence.map_or(0, |sequence| sequence.saturating_add(1));
-        let rows = sqlx::query(
+        let legacy_rows = sqlx::query(
             r"
             SELECT id, pty_session_id, workspace_id, stream_json, sequence, redacted_text,
                    byte_len, truncated, created_at
@@ -2599,7 +3121,38 @@ impl PtyOutputChunkRepository {
         .bind(u32_to_i64(limit))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_pty_output_chunk).collect()
+        let segment_rows = sqlx::query(
+            r"
+            SELECT pty_session_id, workspace_id, first_sequence, last_sequence, chunk_count,
+                   encoding, original_text_byte_len, uncompressed_byte_len,
+                   compressed_byte_len, payload, created_at
+            FROM pty_output_segments
+            WHERE pty_session_id = ? AND last_sequence >= ?
+            ORDER BY first_sequence ASC
+            LIMIT ?
+            ",
+        )
+        .bind(pty_session_id.to_string())
+        .bind(u64_to_i64(start_sequence)?)
+        .bind(u32_to_i64(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut chunks = legacy_rows
+            .iter()
+            .map(row_to_pty_output_chunk)
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in &segment_rows {
+            chunks.extend(
+                decode_pty_output_segment(row)?
+                    .into_iter()
+                    .filter(|chunk| chunk.sequence >= start_sequence),
+            );
+        }
+        chunks.sort_by_key(|chunk| (chunk.sequence, chunk.id));
+        chunks.dedup_by_key(|chunk| chunk.sequence);
+        chunks.truncate(usize::try_from(limit)?);
+        Ok(chunks)
     }
 
     /// Returns the next PTY output sequence number for a session.
@@ -2610,11 +3163,19 @@ impl PtyOutputChunkRepository {
     pub async fn next_sequence(&self, pty_session_id: PtySessionId) -> Result<u64, DbError> {
         let current: Option<i64> = sqlx::query_scalar(
             r"
-            SELECT MAX(sequence)
-            FROM pty_output_chunks
-            WHERE pty_session_id = ?
+            SELECT MAX(last_sequence)
+            FROM (
+                SELECT MAX(sequence) AS last_sequence
+                FROM pty_output_chunks
+                WHERE pty_session_id = ?
+                UNION ALL
+                SELECT MAX(last_sequence) AS last_sequence
+                FROM pty_output_segments
+                WHERE pty_session_id = ?
+            )
             ",
         )
+        .bind(pty_session_id.to_string())
         .bind(pty_session_id.to_string())
         .fetch_one(&self.pool)
         .await?;
@@ -2623,6 +3184,255 @@ impl PtyOutputChunkRepository {
             None => 0,
         })
     }
+
+    /// Returns aggregate logical and compressed PTY output counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage counters cannot be queried or converted.
+    pub async fn storage_stats(&self) -> Result<PtyOutputStorageStats, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT
+                (SELECT COUNT(*) FROM pty_output_chunks) AS legacy_chunks,
+                (SELECT COALESCE(SUM(byte_len), 0) FROM pty_output_chunks)
+                    AS legacy_text_bytes,
+                (SELECT COUNT(*) FROM pty_output_segments) AS compressed_segments,
+                (SELECT COALESCE(SUM(chunk_count), 0) FROM pty_output_segments)
+                    AS compressed_chunks,
+                (SELECT COALESCE(SUM(original_text_byte_len), 0) FROM pty_output_segments)
+                    AS compressed_text_bytes,
+                (SELECT COALESCE(SUM(uncompressed_byte_len), 0) FROM pty_output_segments)
+                    AS encoded_bytes,
+                (SELECT COALESCE(SUM(compressed_byte_len), 0) FROM pty_output_segments)
+                    AS compressed_bytes
+            ",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(PtyOutputStorageStats {
+            legacy_chunks: i64_to_u64(row.try_get("legacy_chunks")?)?,
+            legacy_text_bytes: i64_to_u64(row.try_get("legacy_text_bytes")?)?,
+            compressed_segments: i64_to_u64(row.try_get("compressed_segments")?)?,
+            compressed_chunks: i64_to_u64(row.try_get("compressed_chunks")?)?,
+            compressed_text_bytes: i64_to_u64(row.try_get("compressed_text_bytes")?)?,
+            encoded_bytes: i64_to_u64(row.try_get("encoded_bytes")?)?,
+            compressed_bytes: i64_to_u64(row.try_get("compressed_bytes")?)?,
+        })
+    }
+
+    /// Moves one bounded batch of legacy PTY rows into a compressed segment transactionally.
+    ///
+    /// The method is repeatable and selects exact legacy row ids before deletion, so output
+    /// appended concurrently at a higher sequence remains untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if rows cannot be read, encoded, inserted, or deleted atomically.
+    pub async fn compact_legacy_batch(
+        &self,
+        max_chunks: u32,
+        target_uncompressed_bytes: u64,
+    ) -> Result<PtyOutputCompactionBatch, DbError> {
+        let max_chunks = max_chunks.clamp(1, 10_000);
+        let target_uncompressed_bytes =
+            target_uncompressed_bytes.clamp(1, u64::try_from(MAX_PTY_OUTPUT_SEGMENT_BYTES)?);
+        let Some(pty_session_id): Option<String> = sqlx::query_scalar(
+            r"
+            SELECT pty_session_id
+            FROM pty_output_chunks
+            ORDER BY created_at ASC, sequence ASC, id ASC
+            LIMIT 1
+            ",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(PtyOutputCompactionBatch::default());
+        };
+        let rows = sqlx::query(
+            r"
+            SELECT id, pty_session_id, workspace_id, stream_json, sequence, redacted_text,
+                   byte_len, truncated, created_at
+            FROM pty_output_chunks
+            WHERE pty_session_id = ?
+            ORDER BY sequence ASC, id ASC
+            LIMIT ?
+            ",
+        )
+        .bind(pty_session_id)
+        .bind(u32_to_i64(max_chunks))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut chunks = Vec::with_capacity(rows.len());
+        let mut logical_bytes = 0_u64;
+        for row in &rows {
+            let chunk = row_to_pty_output_chunk(row)?;
+            if !chunks.is_empty() && logical_bytes >= target_uncompressed_bytes {
+                break;
+            }
+            logical_bytes = logical_bytes.saturating_add(chunk.byte_len);
+            chunks.push(chunk);
+        }
+        if chunks.is_empty() {
+            return Ok(PtyOutputCompactionBatch::default());
+        }
+        let segment = encode_pty_output_segment(&chunks)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            r"
+            INSERT INTO pty_output_segments (
+                pty_session_id, workspace_id, first_sequence, last_sequence, chunk_count,
+                encoding, original_text_byte_len, uncompressed_byte_len, compressed_byte_len,
+                payload, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(segment.pty_session_id.to_string())
+        .bind(segment.workspace_id.to_string())
+        .bind(u64_to_i64(segment.first_sequence)?)
+        .bind(u64_to_i64(segment.last_sequence)?)
+        .bind(u64_to_i64(segment.chunk_count)?)
+        .bind(PTY_OUTPUT_SEGMENT_ENCODING)
+        .bind(u64_to_i64(segment.original_text_bytes)?)
+        .bind(u64_to_i64(segment.encoded_bytes)?)
+        .bind(u64_to_i64(segment.compressed_bytes)?)
+        .bind(&segment.payload)
+        .bind(segment.created_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        let mut delete = QueryBuilder::<Sqlite>::new("DELETE FROM pty_output_chunks WHERE id IN (");
+        let mut ids = delete.separated(", ");
+        for chunk in &chunks {
+            ids.push_bind(chunk.id.to_string());
+        }
+        ids.push_unseparated(")");
+        let deleted = delete.build().execute(&mut *transaction).await?;
+        if deleted.rows_affected() != u64::try_from(chunks.len())? {
+            return Err(DbError::InvalidOutputSegment(format!(
+                "legacy compaction selected {} rows but deleted {}",
+                chunks.len(),
+                deleted.rows_affected()
+            )));
+        }
+        transaction.commit().await?;
+        Ok(PtyOutputCompactionBatch {
+            legacy_chunks: u64::try_from(chunks.len())?,
+            segments_written: 1,
+            original_storage_bytes: segment.original_text_bytes,
+            encoded_bytes: segment.encoded_bytes,
+            compressed_bytes: segment.compressed_bytes,
+        })
+    }
+}
+
+fn encode_pty_output_segment(
+    chunks: &[PtyOutputChunk],
+) -> Result<EncodedPtyOutputSegment, DbError> {
+    let first = chunks
+        .first()
+        .ok_or_else(|| DbError::InvalidOutputSegment("segment cannot be empty".to_owned()))?;
+    let last = chunks
+        .last()
+        .ok_or_else(|| DbError::InvalidOutputSegment("segment cannot be empty".to_owned()))?;
+    let mut previous_sequence = None;
+    let mut original_text_bytes = 0_u64;
+    for chunk in chunks {
+        if chunk.pty_session_id != first.pty_session_id || chunk.workspace_id != first.workspace_id
+        {
+            return Err(DbError::InvalidOutputSegment(
+                "all chunks in a segment must share one PTY session and workspace".to_owned(),
+            ));
+        }
+        if previous_sequence.is_some_and(|previous| chunk.sequence <= previous) {
+            return Err(DbError::InvalidOutputSegment(
+                "chunk sequences must be strictly increasing".to_owned(),
+            ));
+        }
+        if chunk.byte_len != u64::try_from(chunk.redacted_text.len())? {
+            return Err(DbError::InvalidOutputSegment(format!(
+                "chunk {} byte length does not match its UTF-8 payload",
+                chunk.id
+            )));
+        }
+        previous_sequence = Some(chunk.sequence);
+        original_text_bytes = original_text_bytes.saturating_add(chunk.byte_len);
+    }
+    let encoded = postcard::to_allocvec(&PtyOutputSegmentPayloadRef {
+        version: PTY_OUTPUT_SEGMENT_VERSION,
+        chunks,
+    })?;
+    if encoded.len() > MAX_PTY_OUTPUT_SEGMENT_BYTES {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "encoded segment exceeds {MAX_PTY_OUTPUT_SEGMENT_BYTES} bytes"
+        )));
+    }
+    let payload = zstd::bulk::compress(&encoded, PTY_OUTPUT_COMPRESSION_LEVEL)?;
+    Ok(EncodedPtyOutputSegment {
+        pty_session_id: first.pty_session_id,
+        workspace_id: first.workspace_id,
+        first_sequence: first.sequence,
+        last_sequence: last.sequence,
+        chunk_count: u64::try_from(chunks.len())?,
+        original_text_bytes,
+        encoded_bytes: u64::try_from(encoded.len())?,
+        compressed_bytes: u64::try_from(payload.len())?,
+        payload,
+        created_at: first.created_at,
+    })
+}
+
+fn decode_pty_output_segment(row: &SqliteRow) -> Result<Vec<PtyOutputChunk>, DbError> {
+    let encoding: String = row.try_get("encoding")?;
+    if encoding != PTY_OUTPUT_SEGMENT_ENCODING {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "unsupported encoding {encoding}"
+        )));
+    }
+    let expected_bytes = i64_to_u64(row.try_get("uncompressed_byte_len")?)?;
+    let expected_bytes = usize::try_from(expected_bytes)?;
+    if expected_bytes == 0 || expected_bytes > MAX_PTY_OUTPUT_SEGMENT_BYTES {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "invalid uncompressed length {expected_bytes}"
+        )));
+    }
+    let compressed: Vec<u8> = row.try_get("payload")?;
+    let decoded = zstd::bulk::decompress(&compressed, expected_bytes)?;
+    if decoded.len() != expected_bytes {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "decoded {} bytes but expected {expected_bytes}",
+            decoded.len()
+        )));
+    }
+    let payload: PtyOutputSegmentPayload = postcard::from_bytes(&decoded)?;
+    if payload.version != PTY_OUTPUT_SEGMENT_VERSION {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "unsupported payload version {}",
+            payload.version
+        )));
+    }
+    let pty_session_id: PtySessionId = row.try_get::<String, _>("pty_session_id")?.parse()?;
+    let workspace_id: WorkspaceId = row.try_get::<String, _>("workspace_id")?.parse()?;
+    let first_sequence = i64_to_u64(row.try_get("first_sequence")?)?;
+    let last_sequence = i64_to_u64(row.try_get("last_sequence")?)?;
+    let chunk_count = i64_to_u64(row.try_get("chunk_count")?)?;
+    if payload.chunks.len() != usize::try_from(chunk_count)?
+        || payload.chunks.first().map(|chunk| chunk.sequence) != Some(first_sequence)
+        || payload.chunks.last().map(|chunk| chunk.sequence) != Some(last_sequence)
+        || payload.chunks.iter().any(|chunk| {
+            chunk.pty_session_id != pty_session_id || chunk.workspace_id != workspace_id
+        })
+        || payload
+            .chunks
+            .windows(2)
+            .any(|pair| pair[0].sequence >= pair[1].sequence)
+    {
+        return Err(DbError::InvalidOutputSegment(
+            "payload metadata does not match its segment row".to_owned(),
+        ));
+    }
+    Ok(payload.chunks)
 }
 
 impl PtyInputEventRepository {
@@ -3587,6 +4397,33 @@ impl OperationRunRepository {
     }
 }
 
+const OPERATION_OUTPUT_APPEND_TARGET_BYTES: u64 = 64 * 1024;
+
+#[derive(Serialize)]
+struct OperationOutputSegmentPayloadRef<'a> {
+    version: u8,
+    chunks: &'a [OperationOutputChunk],
+}
+
+#[derive(Deserialize)]
+struct OperationOutputSegmentPayload {
+    version: u8,
+    chunks: Vec<OperationOutputChunk>,
+}
+
+struct EncodedOperationOutputSegment {
+    operation_id: OperationId,
+    workspace_id: WorkspaceId,
+    first_sequence: u64,
+    last_sequence: u64,
+    chunk_count: u64,
+    original_text_bytes: u64,
+    encoded_bytes: u64,
+    compressed_bytes: u64,
+    payload: Vec<u8>,
+    created_at: OffsetDateTime,
+}
+
 impl OperationOutputChunkRepository {
     /// Inserts an output chunk.
     ///
@@ -3594,24 +4431,110 @@ impl OperationOutputChunkRepository {
     ///
     /// Returns an error if serialization fails or the database rejects the insert.
     pub async fn insert(&self, chunk: &OperationOutputChunk) -> Result<(), DbError> {
-        sqlx::query(
-            r"
-            INSERT INTO operation_output_chunks (
-                id, operation_id, workspace_id, stream_json, sequence, redacted_text,
-                byte_len, truncated, created_at
+        if !compressed_output_writes_enabled(&self.pool).await? {
+            sqlx::query(
+                r"
+                INSERT INTO operation_output_chunks (
+                    id, operation_id, workspace_id, stream_json, sequence, redacted_text,
+                    byte_len, truncated, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ",
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            .bind(chunk.id.to_string())
+            .bind(chunk.operation_id.to_string())
+            .bind(chunk.workspace_id.to_string())
+            .bind(to_json(&chunk.stream)?)
+            .bind(u64_to_i64(chunk.sequence)?)
+            .bind(&chunk.redacted_text)
+            .bind(u64_to_i64(chunk.byte_len)?)
+            .bind(bool_to_i64(chunk.truncated))
+            .bind(chunk.created_at)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        let latest = sqlx::query(
+            r"
+            SELECT segment_id, operation_id, workspace_id, first_sequence, last_sequence,
+                   chunk_count, encoding, original_text_byte_len, uncompressed_byte_len,
+                   compressed_byte_len, payload, created_at
+            FROM operation_output_segments
+            WHERE operation_id = ?
+            ORDER BY last_sequence DESC
+            LIMIT 1
             ",
         )
-        .bind(chunk.id.to_string())
         .bind(chunk.operation_id.to_string())
-        .bind(chunk.workspace_id.to_string())
-        .bind(to_json(&chunk.stream)?)
-        .bind(u64_to_i64(chunk.sequence)?)
-        .bind(&chunk.redacted_text)
-        .bind(u64_to_i64(chunk.byte_len)?)
-        .bind(bool_to_i64(chunk.truncated))
-        .bind(chunk.created_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = latest {
+            let segment_id: i64 = row.try_get("segment_id")?;
+            let previous_last = i64_to_u64(row.try_get("last_sequence")?)?;
+            let original_text_bytes = i64_to_u64(row.try_get("original_text_byte_len")?)?;
+            if previous_last < chunk.sequence
+                && original_text_bytes.saturating_add(chunk.byte_len)
+                    <= OPERATION_OUTPUT_APPEND_TARGET_BYTES
+            {
+                let mut chunks = decode_operation_output_segment(&row)?;
+                chunks.push(chunk.clone());
+                let segment = encode_operation_output_segment(&chunks)?;
+                let updated = sqlx::query(
+                    r"
+                    UPDATE operation_output_segments
+                    SET last_sequence = ?, chunk_count = ?, original_text_byte_len = ?,
+                        uncompressed_byte_len = ?, compressed_byte_len = ?, payload = ?
+                    WHERE segment_id = ? AND last_sequence = ?
+                    ",
+                )
+                .bind(u64_to_i64(segment.last_sequence)?)
+                .bind(u64_to_i64(segment.chunk_count)?)
+                .bind(u64_to_i64(segment.original_text_bytes)?)
+                .bind(u64_to_i64(segment.encoded_bytes)?)
+                .bind(u64_to_i64(segment.compressed_bytes)?)
+                .bind(segment.payload)
+                .bind(segment_id)
+                .bind(u64_to_i64(previous_last)?)
+                .execute(&self.pool)
+                .await?;
+                if updated.rows_affected() == 1 {
+                    return Ok(());
+                }
+            }
+        }
+        self.insert_batch(std::slice::from_ref(chunk)).await
+    }
+
+    /// Inserts one compressed command-output segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when chunks do not share an operation, are unordered, cannot be encoded,
+    /// or the database rejects the segment.
+    pub async fn insert_batch(&self, chunks: &[OperationOutputChunk]) -> Result<(), DbError> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let segment = encode_operation_output_segment(chunks)?;
+        sqlx::query(
+            r"
+            INSERT INTO operation_output_segments (
+                operation_id, workspace_id, first_sequence, last_sequence, chunk_count,
+                encoding, original_text_byte_len, uncompressed_byte_len, compressed_byte_len,
+                payload, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(segment.operation_id.to_string())
+        .bind(segment.workspace_id.to_string())
+        .bind(u64_to_i64(segment.first_sequence)?)
+        .bind(u64_to_i64(segment.last_sequence)?)
+        .bind(u64_to_i64(segment.chunk_count)?)
+        .bind(PTY_OUTPUT_SEGMENT_ENCODING)
+        .bind(u64_to_i64(segment.original_text_bytes)?)
+        .bind(u64_to_i64(segment.encoded_bytes)?)
+        .bind(u64_to_i64(segment.compressed_bytes)?)
+        .bind(segment.payload)
+        .bind(segment.created_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -3625,11 +4548,19 @@ impl OperationOutputChunkRepository {
     pub async fn next_sequence(&self, operation_id: OperationId) -> Result<u64, DbError> {
         let next: i64 = sqlx::query_scalar(
             r"
-            SELECT COALESCE(MAX(sequence), -1) + 1
-            FROM operation_output_chunks
-            WHERE operation_id = ?
+            SELECT COALESCE(MAX(last_sequence), -1) + 1
+            FROM (
+                SELECT MAX(sequence) AS last_sequence
+                FROM operation_output_chunks
+                WHERE operation_id = ?
+                UNION ALL
+                SELECT MAX(last_sequence) AS last_sequence
+                FROM operation_output_segments
+                WHERE operation_id = ?
+            )
             ",
         )
+        .bind(operation_id.to_string())
         .bind(operation_id.to_string())
         .fetch_one(&self.pool)
         .await?;
@@ -3649,7 +4580,7 @@ impl OperationOutputChunkRepository {
         limit: u32,
     ) -> Result<Vec<OperationOutputChunk>, DbError> {
         let start_sequence = after_sequence.map_or(0, |sequence| sequence.saturating_add(1));
-        let rows = if let Some(operation_id) = operation_id {
+        let legacy_rows = if let Some(operation_id) = operation_id {
             sqlx::query(
                 r"
                 SELECT id, operation_id, workspace_id, stream_json, sequence, redacted_text,
@@ -3683,8 +4614,310 @@ impl OperationOutputChunkRepository {
             .fetch_all(&self.pool)
             .await?
         };
-        rows.iter().map(row_to_operation_output_chunk).collect()
+        let segment_rows = if let Some(operation_id) = operation_id {
+            sqlx::query(
+                r"
+                SELECT operation_id, workspace_id, first_sequence, last_sequence, chunk_count,
+                       encoding, original_text_byte_len, uncompressed_byte_len,
+                       compressed_byte_len, payload, created_at
+                FROM operation_output_segments
+                WHERE workspace_id = ? AND operation_id = ? AND last_sequence >= ?
+                ORDER BY created_at ASC, first_sequence ASC
+                LIMIT ?
+                ",
+            )
+            .bind(workspace_id.to_string())
+            .bind(operation_id.to_string())
+            .bind(u64_to_i64(start_sequence)?)
+            .bind(u32_to_i64(limit))
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r"
+                SELECT operation_id, workspace_id, first_sequence, last_sequence, chunk_count,
+                       encoding, original_text_byte_len, uncompressed_byte_len,
+                       compressed_byte_len, payload, created_at
+                FROM operation_output_segments
+                WHERE workspace_id = ? AND last_sequence >= ?
+                ORDER BY created_at ASC, first_sequence ASC
+                LIMIT ?
+                ",
+            )
+            .bind(workspace_id.to_string())
+            .bind(u64_to_i64(start_sequence)?)
+            .bind(u32_to_i64(limit))
+            .fetch_all(&self.pool)
+            .await?
+        };
+        let mut chunks = legacy_rows
+            .iter()
+            .map(row_to_operation_output_chunk)
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in &segment_rows {
+            chunks.extend(
+                decode_operation_output_segment(row)?
+                    .into_iter()
+                    .filter(|chunk| chunk.sequence >= start_sequence),
+            );
+        }
+        chunks.sort_by_key(|chunk| {
+            (
+                chunk.created_at,
+                chunk.sequence,
+                chunk.operation_id,
+                chunk.id,
+            )
+        });
+        chunks.dedup_by_key(|chunk| (chunk.operation_id, chunk.sequence));
+        chunks.truncate(usize::try_from(limit)?);
+        Ok(chunks)
     }
+
+    /// Returns aggregate logical and compressed command-output counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage counters cannot be queried or converted.
+    pub async fn storage_stats(&self) -> Result<OperationOutputStorageStats, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT
+                (SELECT COUNT(*) FROM operation_output_chunks) AS legacy_chunks,
+                (SELECT COALESCE(SUM(byte_len), 0) FROM operation_output_chunks)
+                    AS legacy_text_bytes,
+                (SELECT COUNT(*) FROM operation_output_segments) AS compressed_segments,
+                (SELECT COALESCE(SUM(chunk_count), 0) FROM operation_output_segments)
+                    AS compressed_chunks,
+                (SELECT COALESCE(SUM(original_text_byte_len), 0)
+                 FROM operation_output_segments) AS compressed_text_bytes,
+                (SELECT COALESCE(SUM(uncompressed_byte_len), 0)
+                 FROM operation_output_segments) AS encoded_bytes,
+                (SELECT COALESCE(SUM(compressed_byte_len), 0)
+                 FROM operation_output_segments) AS compressed_bytes
+            ",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(OperationOutputStorageStats {
+            legacy_chunks: i64_to_u64(row.try_get("legacy_chunks")?)?,
+            legacy_text_bytes: i64_to_u64(row.try_get("legacy_text_bytes")?)?,
+            compressed_segments: i64_to_u64(row.try_get("compressed_segments")?)?,
+            compressed_chunks: i64_to_u64(row.try_get("compressed_chunks")?)?,
+            compressed_text_bytes: i64_to_u64(row.try_get("compressed_text_bytes")?)?,
+            encoded_bytes: i64_to_u64(row.try_get("encoded_bytes")?)?,
+            compressed_bytes: i64_to_u64(row.try_get("compressed_bytes")?)?,
+        })
+    }
+
+    /// Moves one bounded operation's legacy output rows into compressed storage atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if rows cannot be read, encoded, inserted, or deleted atomically.
+    pub async fn compact_legacy_batch(
+        &self,
+        max_chunks: u32,
+        target_uncompressed_bytes: u64,
+    ) -> Result<OperationOutputCompactionBatch, DbError> {
+        let max_chunks = max_chunks.clamp(1, 10_000);
+        let target_uncompressed_bytes =
+            target_uncompressed_bytes.clamp(1, u64::try_from(MAX_PTY_OUTPUT_SEGMENT_BYTES)?);
+        let Some(operation_id): Option<String> = sqlx::query_scalar(
+            r"
+            SELECT operation_id
+            FROM operation_output_chunks
+            ORDER BY created_at ASC, sequence ASC, id ASC
+            LIMIT 1
+            ",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(OperationOutputCompactionBatch::default());
+        };
+        let rows = sqlx::query(
+            r"
+            SELECT id, operation_id, workspace_id, stream_json, sequence, redacted_text,
+                   byte_len, truncated, created_at
+            FROM operation_output_chunks
+            WHERE operation_id = ?
+            ORDER BY sequence ASC, id ASC
+            LIMIT ?
+            ",
+        )
+        .bind(operation_id)
+        .bind(u32_to_i64(max_chunks))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut chunks = Vec::with_capacity(rows.len());
+        let mut logical_bytes = 0_u64;
+        for row in &rows {
+            let chunk = row_to_operation_output_chunk(row)?;
+            if !chunks.is_empty() && logical_bytes >= target_uncompressed_bytes {
+                break;
+            }
+            logical_bytes = logical_bytes.saturating_add(chunk.byte_len);
+            chunks.push(chunk);
+        }
+        if chunks.is_empty() {
+            return Ok(OperationOutputCompactionBatch::default());
+        }
+        let segment = encode_operation_output_segment(&chunks)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            r"
+            INSERT INTO operation_output_segments (
+                operation_id, workspace_id, first_sequence, last_sequence, chunk_count,
+                encoding, original_text_byte_len, uncompressed_byte_len, compressed_byte_len,
+                payload, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(segment.operation_id.to_string())
+        .bind(segment.workspace_id.to_string())
+        .bind(u64_to_i64(segment.first_sequence)?)
+        .bind(u64_to_i64(segment.last_sequence)?)
+        .bind(u64_to_i64(segment.chunk_count)?)
+        .bind(PTY_OUTPUT_SEGMENT_ENCODING)
+        .bind(u64_to_i64(segment.original_text_bytes)?)
+        .bind(u64_to_i64(segment.encoded_bytes)?)
+        .bind(u64_to_i64(segment.compressed_bytes)?)
+        .bind(&segment.payload)
+        .bind(segment.created_at)
+        .execute(&mut *transaction)
+        .await?;
+        let mut delete =
+            QueryBuilder::<Sqlite>::new("DELETE FROM operation_output_chunks WHERE id IN (");
+        let mut ids = delete.separated(", ");
+        for chunk in &chunks {
+            ids.push_bind(chunk.id.to_string());
+        }
+        ids.push_unseparated(")");
+        let deleted = delete.build().execute(&mut *transaction).await?;
+        if deleted.rows_affected() != u64::try_from(chunks.len())? {
+            return Err(DbError::InvalidOutputSegment(format!(
+                "command-output compaction selected {} rows but deleted {}",
+                chunks.len(),
+                deleted.rows_affected()
+            )));
+        }
+        transaction.commit().await?;
+        Ok(OperationOutputCompactionBatch {
+            legacy_chunks: u64::try_from(chunks.len())?,
+            segments_written: 1,
+            original_storage_bytes: segment.original_text_bytes,
+            encoded_bytes: segment.encoded_bytes,
+            compressed_bytes: segment.compressed_bytes,
+        })
+    }
+}
+
+fn encode_operation_output_segment(
+    chunks: &[OperationOutputChunk],
+) -> Result<EncodedOperationOutputSegment, DbError> {
+    let first = chunks
+        .first()
+        .ok_or_else(|| DbError::InvalidOutputSegment("segment cannot be empty".to_owned()))?;
+    let last = chunks
+        .last()
+        .ok_or_else(|| DbError::InvalidOutputSegment("segment cannot be empty".to_owned()))?;
+    let mut previous_sequence = None;
+    let mut original_text_bytes = 0_u64;
+    for chunk in chunks {
+        if chunk.operation_id != first.operation_id || chunk.workspace_id != first.workspace_id {
+            return Err(DbError::InvalidOutputSegment(
+                "all chunks in a segment must share one operation and workspace".to_owned(),
+            ));
+        }
+        if previous_sequence.is_some_and(|previous| chunk.sequence <= previous) {
+            return Err(DbError::InvalidOutputSegment(
+                "chunk sequences must be strictly increasing".to_owned(),
+            ));
+        }
+        if chunk.byte_len != u64::try_from(chunk.redacted_text.len())? {
+            return Err(DbError::InvalidOutputSegment(format!(
+                "chunk {} byte length does not match its UTF-8 payload",
+                chunk.id
+            )));
+        }
+        previous_sequence = Some(chunk.sequence);
+        original_text_bytes = original_text_bytes.saturating_add(chunk.byte_len);
+    }
+    let encoded = postcard::to_allocvec(&OperationOutputSegmentPayloadRef {
+        version: PTY_OUTPUT_SEGMENT_VERSION,
+        chunks,
+    })?;
+    if encoded.len() > MAX_PTY_OUTPUT_SEGMENT_BYTES {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "encoded segment exceeds {MAX_PTY_OUTPUT_SEGMENT_BYTES} bytes"
+        )));
+    }
+    let payload = zstd::bulk::compress(&encoded, PTY_OUTPUT_COMPRESSION_LEVEL)?;
+    Ok(EncodedOperationOutputSegment {
+        operation_id: first.operation_id,
+        workspace_id: first.workspace_id,
+        first_sequence: first.sequence,
+        last_sequence: last.sequence,
+        chunk_count: u64::try_from(chunks.len())?,
+        original_text_bytes,
+        encoded_bytes: u64::try_from(encoded.len())?,
+        compressed_bytes: u64::try_from(payload.len())?,
+        payload,
+        created_at: first.created_at,
+    })
+}
+
+fn decode_operation_output_segment(row: &SqliteRow) -> Result<Vec<OperationOutputChunk>, DbError> {
+    let encoding: String = row.try_get("encoding")?;
+    if encoding != PTY_OUTPUT_SEGMENT_ENCODING {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "unsupported encoding {encoding}"
+        )));
+    }
+    let expected_bytes = usize::try_from(i64_to_u64(row.try_get("uncompressed_byte_len")?)?)?;
+    if expected_bytes == 0 || expected_bytes > MAX_PTY_OUTPUT_SEGMENT_BYTES {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "invalid uncompressed length {expected_bytes}"
+        )));
+    }
+    let compressed: Vec<u8> = row.try_get("payload")?;
+    let decoded = zstd::bulk::decompress(&compressed, expected_bytes)?;
+    if decoded.len() != expected_bytes {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "decoded {} bytes but expected {expected_bytes}",
+            decoded.len()
+        )));
+    }
+    let payload: OperationOutputSegmentPayload = postcard::from_bytes(&decoded)?;
+    if payload.version != PTY_OUTPUT_SEGMENT_VERSION {
+        return Err(DbError::InvalidOutputSegment(format!(
+            "unsupported payload version {}",
+            payload.version
+        )));
+    }
+    let operation_id: OperationId = row.try_get::<String, _>("operation_id")?.parse()?;
+    let workspace_id: WorkspaceId = row.try_get::<String, _>("workspace_id")?.parse()?;
+    let first_sequence = i64_to_u64(row.try_get("first_sequence")?)?;
+    let last_sequence = i64_to_u64(row.try_get("last_sequence")?)?;
+    let chunk_count = usize::try_from(i64_to_u64(row.try_get("chunk_count")?)?)?;
+    if payload.chunks.len() != chunk_count
+        || payload.chunks.first().map(|chunk| chunk.sequence) != Some(first_sequence)
+        || payload.chunks.last().map(|chunk| chunk.sequence) != Some(last_sequence)
+        || payload
+            .chunks
+            .iter()
+            .any(|chunk| chunk.operation_id != operation_id || chunk.workspace_id != workspace_id)
+        || payload
+            .chunks
+            .windows(2)
+            .any(|pair| pair[0].sequence >= pair[1].sequence)
+    {
+        return Err(DbError::InvalidOutputSegment(
+            "payload metadata does not match its segment row".to_owned(),
+        ));
+    }
+    Ok(payload.chunks)
 }
 
 impl OperationOutputArtifactRepository {
@@ -5120,7 +6353,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let pool = connect_sqlite("sqlite::memory:").await?;
         migrate(&pool).await?;
-        let repos = Repositories::new(pool);
+        let repos = Repositories::new(pool.clone());
         let connector_id = ConnectorId::new().to_string();
         let observed_at = now_utc();
 
@@ -5177,7 +6410,7 @@ mod tests {
     async fn registry_repositories_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let pool = connect_sqlite("sqlite::memory:").await?;
         migrate(&pool).await?;
-        let repos = Repositories::new(pool);
+        let repos = Repositories::new(pool.clone());
         let now = now_utc();
 
         let host = Host {
@@ -5795,6 +7028,24 @@ mod tests {
             created_at: now,
         };
         repos.pty_output_chunks.insert(&pty_chunk).await?;
+        assert!(
+            !repos.compressed_output_writes_enabled().await?,
+            "a routine binary upgrade must keep output visible to resident legacy MCP readers"
+        );
+        let legacy_visible_text: String = sqlx::query_scalar(
+            "SELECT redacted_text FROM pty_output_chunks WHERE pty_session_id = ? AND sequence = 0",
+        )
+        .bind(pty.pty_session_id.to_string())
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(legacy_visible_text, "pty hello");
+        let compressed_before_activation: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pty_output_segments")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(compressed_before_activation, 0);
+        repos.activate_compressed_output_writes().await?;
+        assert!(repos.compressed_output_writes_enabled().await?);
         assert_eq!(
             repos
                 .pty_output_chunks
@@ -5808,6 +7059,108 @@ mod tests {
             .await?;
         assert_eq!(pty_chunks.len(), 1);
         assert_eq!(pty_chunks[0].redacted_text, "pty hello");
+        let batched_chunks = (1_u64..=3)
+            .map(
+                |sequence| -> Result<PtyOutputChunk, std::num::TryFromIntError> {
+                    let redacted_text = format!("repeated terminal output {sequence}\n").repeat(32);
+                    Ok(PtyOutputChunk {
+                        id: PtyOutputChunkId::new(),
+                        pty_session_id: pty.pty_session_id,
+                        workspace_id: workspace.id,
+                        stream: OutputStream::Stdout,
+                        sequence,
+                        byte_len: u64::try_from(redacted_text.len())?,
+                        redacted_text,
+                        truncated: false,
+                        created_at: now + time::Duration::milliseconds(i64::try_from(sequence)?),
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        repos
+            .pty_output_chunks
+            .insert_batch(&batched_chunks)
+            .await?;
+        assert_eq!(
+            repos
+                .pty_output_chunks
+                .next_sequence(pty.pty_session_id)
+                .await?,
+            4
+        );
+        let after_first = repos
+            .pty_output_chunks
+            .list_for_session(pty.pty_session_id, Some(0), 2)
+            .await?;
+        assert_eq!(
+            after_first
+                .iter()
+                .map(|chunk| chunk.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(
+            after_first
+                .iter()
+                .all(|chunk| chunk.redacted_text.starts_with("repeated terminal output"))
+        );
+
+        for sequence in 4_u64..=7 {
+            let redacted_text = format!("legacy output {sequence}\n").repeat(16);
+            let legacy = PtyOutputChunk {
+                id: PtyOutputChunkId::new(),
+                pty_session_id: pty.pty_session_id,
+                workspace_id: workspace.id,
+                stream: OutputStream::Stderr,
+                sequence,
+                byte_len: u64::try_from(redacted_text.len())?,
+                redacted_text,
+                truncated: sequence == 7,
+                created_at: now + time::Duration::milliseconds(i64::try_from(sequence)?),
+            };
+            sqlx::query(
+                r"
+                INSERT INTO pty_output_chunks (
+                    id, pty_session_id, workspace_id, stream_json, sequence, redacted_text,
+                    byte_len, truncated, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ",
+            )
+            .bind(legacy.id.to_string())
+            .bind(legacy.pty_session_id.to_string())
+            .bind(legacy.workspace_id.to_string())
+            .bind(serde_json::to_string(&legacy.stream)?)
+            .bind(i64::try_from(legacy.sequence)?)
+            .bind(&legacy.redacted_text)
+            .bind(i64::try_from(legacy.byte_len)?)
+            .bind(i64::from(legacy.truncated))
+            .bind(legacy.created_at)
+            .execute(&pool)
+            .await?;
+        }
+        let compacted = repos
+            .pty_output_chunks
+            .compact_legacy_batch(100, 1024 * 1024)
+            .await?;
+        assert_eq!(compacted.legacy_chunks, 5);
+        assert_eq!(compacted.segments_written, 1);
+        assert!(compacted.compressed_bytes < compacted.original_storage_bytes);
+        let legacy_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pty_output_chunks")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(legacy_rows, 0);
+        let all_pty_chunks = repos
+            .pty_output_chunks
+            .list_for_session(pty.pty_session_id, None, 20)
+            .await?;
+        assert_eq!(
+            all_pty_chunks
+                .iter()
+                .map(|chunk| chunk.sequence)
+                .collect::<Vec<_>>(),
+            (0_u64..=7).collect::<Vec<_>>()
+        );
+        assert!(all_pty_chunks[7].truncated);
         let mut input_pty = pty.clone();
         input_pty.state = WorkspaceState::Working;
         input_pty.input_allowed = true;
@@ -5906,10 +7259,68 @@ mod tests {
                 .await?
                 .is_none()
         );
+        let undeliverable_input = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: input_pty.pty_session_id,
+            workspace_id: workspace.id,
+            connector_id: connector.id,
+            host_id: host.id,
+            agent_session_id: workspace.agent_session_id,
+            idempotency_key: Some("close-before-delivery".to_owned()),
+            input_fingerprint: Some("close-before-delivery-fingerprint".to_owned()),
+            state: PtyInputEventState::Queued,
+            sequence: 1,
+            redacted_input_summary: "queued input awaiting close".to_owned(),
+            byte_len: 11,
+            requested_by: Some("agent".to_owned()),
+            created_at: now,
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        repos
+            .pty_input_events
+            .insert(&undeliverable_input, "never send\n")
+            .await?;
         repos
             .pty_sessions
             .close(input_pty.pty_session_id, Some(0), now)
             .await?;
+        let failed_input = repos
+            .pty_input_events
+            .get(undeliverable_input.id)
+            .await?
+            .ok_or_else(|| io::Error::other("failed PTY input metadata exists"))?;
+        assert_eq!(failed_input.state, PtyInputEventState::Failed);
+        assert!(failed_input.failed_at.is_some());
+        assert_eq!(
+            failed_input.last_error.as_deref(),
+            Some("pty_input_delivery_unavailable")
+        );
+        let raw_input: Option<String> =
+            sqlx::query_scalar("SELECT input_text FROM pty_input_events WHERE id = ?")
+                .bind(undeliverable_input.id.to_string())
+                .fetch_one(&pool)
+                .await?;
+        assert!(raw_input.is_none());
+        let mut raced_input = undeliverable_input.clone();
+        raced_input.id = PtyInputEventId::new();
+        raced_input.sequence = 2;
+        raced_input.idempotency_key = Some("insert-after-close".to_owned());
+        repos
+            .pty_input_events
+            .insert(&raced_input, "also never send\n")
+            .await?;
+        let raced_input = repos
+            .pty_input_events
+            .get(raced_input.id)
+            .await?
+            .ok_or_else(|| io::Error::other("raced PTY input metadata exists"))?;
+        assert_eq!(raced_input.state, PtyInputEventState::Failed);
+        assert!(raced_input.failed_at.is_some());
 
         let operation = OperationRun {
             id: OperationId::new(),
@@ -6301,13 +7712,115 @@ mod tests {
             truncated: false,
             created_at: now,
         };
+        sqlx::query(
+            "UPDATE system_settings SET value = 'disabled' WHERE setting_key = 'compressed_output_writes_v1'",
+        )
+        .execute(&pool)
+        .await?;
         repos.operation_output_chunks.insert(&chunk).await?;
+        let legacy_command_text: String = sqlx::query_scalar(
+            "SELECT redacted_text FROM operation_output_chunks WHERE operation_id = ? AND sequence = 0",
+        )
+        .bind(operation.id.to_string())
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(legacy_command_text, "queued");
+        repos.activate_compressed_output_writes().await?;
         let chunks = repos
             .operation_output_chunks
             .list_for_workspace(workspace.id, Some(operation.id), None, 10)
             .await?;
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].stream, OutputStream::System);
+        for sequence in 1_u64..=3 {
+            let redacted_text = format!("compressed command output {sequence}\n").repeat(16);
+            repos
+                .operation_output_chunks
+                .insert(&OperationOutputChunk {
+                    id: OperationOutputChunkId::new(),
+                    operation_id: operation.id,
+                    workspace_id: workspace.id,
+                    stream: OutputStream::Stdout,
+                    sequence,
+                    byte_len: u64::try_from(redacted_text.len())?,
+                    redacted_text,
+                    truncated: false,
+                    created_at: now + time::Duration::milliseconds(i64::try_from(sequence)?),
+                })
+                .await?;
+        }
+        assert_eq!(
+            repos
+                .operation_output_chunks
+                .next_sequence(operation.id)
+                .await?,
+            4
+        );
+        let operation_storage = repos.operation_output_chunks.storage_stats().await?;
+        assert_eq!(operation_storage.compressed_chunks, 3);
+        assert_eq!(operation_storage.compressed_segments, 1);
+        let after_operation_sequence = repos
+            .operation_output_chunks
+            .list_for_workspace(workspace.id, Some(operation.id), Some(1), 10)
+            .await?;
+        assert_eq!(
+            after_operation_sequence
+                .iter()
+                .map(|chunk| chunk.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        for sequence in 4_u64..=6 {
+            let redacted_text = format!("legacy command output {sequence}\n").repeat(16);
+            let legacy = OperationOutputChunk {
+                id: OperationOutputChunkId::new(),
+                operation_id: operation.id,
+                workspace_id: workspace.id,
+                stream: OutputStream::Stderr,
+                sequence,
+                byte_len: u64::try_from(redacted_text.len())?,
+                redacted_text,
+                truncated: sequence == 6,
+                created_at: now + time::Duration::milliseconds(i64::try_from(sequence)?),
+            };
+            sqlx::query(
+                r"
+                INSERT INTO operation_output_chunks (
+                    id, operation_id, workspace_id, stream_json, sequence, redacted_text,
+                    byte_len, truncated, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ",
+            )
+            .bind(legacy.id.to_string())
+            .bind(legacy.operation_id.to_string())
+            .bind(legacy.workspace_id.to_string())
+            .bind(serde_json::to_string(&legacy.stream)?)
+            .bind(i64::try_from(legacy.sequence)?)
+            .bind(&legacy.redacted_text)
+            .bind(i64::try_from(legacy.byte_len)?)
+            .bind(i64::from(legacy.truncated))
+            .bind(legacy.created_at)
+            .execute(&pool)
+            .await?;
+        }
+        let compacted_operation_output = repos
+            .operation_output_chunks
+            .compact_legacy_batch(100, 1024 * 1024)
+            .await?;
+        assert_eq!(compacted_operation_output.legacy_chunks, 4);
+        let all_operation_chunks = repos
+            .operation_output_chunks
+            .list_for_workspace(workspace.id, Some(operation.id), None, 20)
+            .await?;
+        assert_eq!(
+            all_operation_chunks
+                .iter()
+                .map(|chunk| chunk.sequence)
+                .collect::<Vec<_>>(),
+            (0_u64..=6).collect::<Vec<_>>()
+        );
+        assert!(all_operation_chunks[6].truncated);
 
         let artifact = OperationOutputArtifact {
             id: OperationOutputArtifactId::new(),

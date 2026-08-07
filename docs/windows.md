@@ -42,6 +42,7 @@ copy in a newly extracted release for `Update`:
 .\remote-hosts-service.ps1 Ui
 .\remote-hosts-service.ps1 Skills
 .\remote-hosts-service.ps1 Doctor
+.\remote-hosts-service.ps1 OptimizeStorage
 .\remote-hosts-service.ps1 PrintConfig
 ```
 
@@ -49,6 +50,13 @@ copy in a newly extracted release for `Update`:
 still running. `Update` stages first, then asks the Rust CLI to verify that no operation, PTY input,
 live PTY, or write lease would be interrupted. It switches the scheduled tasks only after that
 drain gate passes. `-Force` is available only for an intentional interruption.
+
+`OptimizeStorage` explicitly activates compressed writes, moves legacy PTY and command output into
+compact Postcard plus Zstandard segments, then vacuums SQLite. A routine update keeps writing the
+legacy-compatible format until this command runs, so resident old MCP children retain output. Run
+it only after updating the API and connector and reloading every MCP child onto the same release. It
+refuses migration while conversation work is active unless `-Force` is explicitly supplied; it does
+not restart either scheduled task.
 
 The UI remains a separate file. `Ui` replaces it atomically and does not restart the API or
 connector. `Uninstall` removes the scheduled tasks but preserves local data; add `-PurgeData` only

@@ -81,13 +81,22 @@ Windows uses the same Rust `restart-readiness` query and `-Force` spelling. Its 
 directories avoid overwriting an executable that is still in use. Neither macOS nor Windows service
 management depends on an external SQLite CLI.
 
+Output storage supports compact Postcard plus Zstandard segments. A routine binary update remains in
+legacy-compatible write mode so an already-running old MCP child keeps seeing new output. Reload all
+Codex and Antigravity MCP children before running `remote-hosts-service optimize-storage` on macOS or
+`remote-hosts-service.ps1 OptimizeStorage` on Windows. That explicit command migrates and verifies
+all legacy PTY and command output, enables compressed writes, and reclaims physical SQLite pages
+without restarting either service. It refuses migration while conversation work remains unless
+interruption is explicitly forced. PTY or Workspace terminal transitions also fail and scrub any
+input that can no longer be delivered, so stale queue entries do not block service lifecycle actions.
+
 After the installed API has been restarted once with external admin UI support,
 `remote-hosts-service ui` atomically updates only
 `~/.local/share/remote-hosts/ui/admin.html`. Reloading `/admin` picks up that file without
 restarting the API, connector, MCP children, PTYs, or active operations.
 
 - Complete any required calls on the current MCP transport before reloading it.
-- Reload MCP servers or begin the next agent task after an update, then require runtime `snapshot_version=8`.
+- Reload MCP servers or begin the next agent task after an update, then require runtime `snapshot_version=9` and inspect host-level `workspace_capacity` independently from per-access-path `channel_capacity`.
 - Do not kill the MCP child mid-task and expect the same task transport to reconnect automatically.
 - For deployment smoke tests, a separate freshly launched MCP stdio client may verify the installed binary without disturbing an active task.
 

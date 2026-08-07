@@ -111,6 +111,7 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [x] Stable low-overhead Rust MCP launcher for Windows so new Agent Sessions follow the current version pointer without a PowerShell proxy or client-config rewrite.
 - [x] Rust-owned local connector bootstrap and restart-readiness commands, removing the service scripts' dependency on an external SQLite CLI.
 - [x] Documented real macOS resource sample for a history-heavy daily-use installation.
+- [x] Compact Postcard plus Zstandard output segments, upgrade-safe legacy write compatibility, explicit compressed-write activation, low-latency PTY batch writes, transparent legacy reads, bounded history migration, stale PTY-input cleanup, and guarded SQLite reclamation on macOS and Windows.
 
 ## Next
 

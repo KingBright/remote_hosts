@@ -43,6 +43,8 @@ Commands:
   status         Print launchd status for API and connector
   logs           Tail API and connector logs
   migrate        Run database migrations with the installed binary
+  optimize-storage
+                 Compress output history and reclaim SQLite pages without restarting services
   doctor         Run remote-hosts doctor with the installed binary
   print-config   Print service paths and config location
 
@@ -50,7 +52,7 @@ Config:
   ${CONFIG_FILE}
 
 Options:
-  --force        Allow install/update/restart to interrupt active operations or PTYs
+  --force        Allow lifecycle actions or storage vacuum to proceed with active work
 EOF
 }
 
@@ -225,6 +227,22 @@ run_migrate() {
   load_config
   require_installed_binary
   "${BIN_PATH}" migrate --database-url "${REMOTE_HOSTS_DATABASE_URL}"
+}
+
+run_optimize_storage() {
+  local force_optimize="${1:-0}"
+  load_config
+  require_installed_binary
+  local args=(
+    optimize-storage
+    --database-url "${REMOTE_HOSTS_DATABASE_URL}"
+    --vacuum
+    --activate-compressed-writes
+  )
+  if [[ "${force_optimize}" == "1" ]]; then
+    args+=(--force)
+  fi
+  "${BIN_PATH}" "${args[@]}"
 }
 
 ensure_default_connector() {
@@ -541,6 +559,9 @@ case "${command}" in
   migrate)
     run_migrate
     ensure_default_connector
+    ;;
+  optimize-storage)
+    run_optimize_storage "${force_restart}"
     ;;
   doctor)
     require_installed_binary

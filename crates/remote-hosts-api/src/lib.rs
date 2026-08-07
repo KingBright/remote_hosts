@@ -849,21 +849,32 @@ async fn create_workspace(
         ));
     }
 
-    let active_workspace_count = state
+    let policy = remote_hosts_core::ServerProtectionPolicy::default();
+    let observed_at = now_utc();
+    let expired_reaped = state
         .repositories
         .workspaces
-        .list_for_host(host_id)
-        .await?
-        .into_iter()
-        .filter(|workspace| {
-            matches!(
-                workspace.state,
-                WorkspaceState::Idle | WorkspaceState::Working
-            )
-        })
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX);
+        .reconcile_expired_for_host(
+            host_id,
+            observed_at,
+            policy.max_active_workspaces_per_host.saturating_mul(32),
+        )
+        .await?;
+    let capacity = state
+        .repositories
+        .workspaces
+        .capacity_for_host(host_id, None, observed_at)
+        .await?;
+    if capacity.effective_active >= policy.max_active_workspaces_per_host {
+        return Err(ApiError::WorkspaceCapacity(format!(
+            "logical Workspace capacity is full: limit={}, recorded_active={}, effective_active={}, expired_reapable={}, expired_reaped={}; this is independent from SSH channel capacity",
+            policy.max_active_workspaces_per_host,
+            capacity.recorded_active,
+            capacity.effective_active,
+            capacity.expired_reapable,
+            expired_reaped,
+        )));
+    }
 
     let workspace = WorkspaceSupervisor::default().create_workspace(
         WorkspaceCreateCommand {
@@ -881,9 +892,28 @@ async fn create_workspace(
                 .unwrap_or_else(|| "host".to_owned()),
             ttl_seconds: request.ttl_seconds.unwrap_or(3600),
         },
-        active_workspace_count,
+        capacity.effective_active,
     )?;
-    state.repositories.workspaces.insert(&workspace).await?;
+    if !state
+        .repositories
+        .workspaces
+        .insert_below_active_limit(&workspace, policy.max_active_workspaces_per_host)
+        .await?
+    {
+        let current = state
+            .repositories
+            .workspaces
+            .capacity_for_host(host_id, None, now_utc())
+            .await?;
+        return Err(ApiError::WorkspaceCapacity(format!(
+            "logical Workspace capacity changed concurrently: limit={}, recorded_active={}, effective_active={}, expired_reapable={}, expired_reaped={}; this is independent from SSH channel capacity",
+            policy.max_active_workspaces_per_host,
+            current.recorded_active,
+            current.effective_active,
+            current.expired_reapable,
+            expired_reaped,
+        )));
+    }
     Ok((StatusCode::CREATED, Json(workspace)))
 }
 
@@ -2209,6 +2239,9 @@ pub enum ApiError {
     /// Workspace supervisor rejected the request.
     #[error(transparent)]
     WorkspaceSupervisor(#[from] WorkspaceSupervisorError),
+    /// Logical Workspace capacity changed between policy evaluation and insertion.
+    #[error("{0}")]
+    WorkspaceCapacity(String),
     /// Workspace operation rejected the request.
     #[error(transparent)]
     WorkspaceOperation(#[from] WorkspaceOperationError),
@@ -2227,6 +2260,7 @@ impl IntoResponse for ApiError {
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::WorkspaceSupervisor(WorkspaceSupervisorError::PolicyDenied(_))
+            | Self::WorkspaceCapacity(_)
             | Self::WorkspaceOperation(WorkspaceOperationError::PolicyDenied(_))
             | Self::PtySessionSupervisor(PtySessionSupervisorError::PolicyDenied(_)) => {
                 StatusCode::TOO_MANY_REQUESTS
@@ -2634,7 +2668,7 @@ mod tests {
         };
         repos.access_paths.insert(&access_path).await?;
 
-        let app = router_with_state(ApiState::new(repos));
+        let app = router_with_state(ApiState::new(repos.clone()));
         let create_body = json!({
             "access_path_id": access_path.id,
             "label": "agent-main",
@@ -2725,12 +2759,52 @@ mod tests {
                     .method("POST")
                     .uri(format!("/v1/hosts/{}/workspaces", host.id))
                     .header("content-type", "application/json")
-                    .body(body::Body::from(create_body))?,
+                    .body(body::Body::from(create_body.clone()))?,
             )
             .await?;
         assert_eq!(
             limited_response.status(),
             axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let protected_workspace_id: WorkspaceId = workspace_id.parse()?;
+        for mut workspace in repos.workspaces.list_for_host(host.id).await? {
+            if workspace.id == protected_workspace_id {
+                continue;
+            }
+            workspace.last_activity_at = now - time::Duration::hours(2);
+            workspace.ttl_seconds = 60;
+            repos.workspaces.upsert(&workspace).await?;
+        }
+        let recovered_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/hosts/{}/workspaces", host.id))
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(create_body))?,
+            )
+            .await?;
+        assert_eq!(recovered_response.status(), axum::http::StatusCode::CREATED);
+        let recovered_workspaces = repos.workspaces.list_for_host(host.id).await?;
+        assert_eq!(
+            recovered_workspaces
+                .iter()
+                .filter(|workspace| matches!(
+                    workspace.state,
+                    WorkspaceState::Idle | WorkspaceState::Working
+                ))
+                .count(),
+            2,
+            "the protected queued operation and new Workspace should remain active"
+        );
+        assert_eq!(
+            recovered_workspaces
+                .iter()
+                .filter(|workspace| workspace.state == WorkspaceState::Closed)
+                .count(),
+            31
         );
 
         let list_response = app
@@ -2742,7 +2816,7 @@ mod tests {
             .await?;
         let bytes = body::to_bytes(list_response.into_body(), usize::MAX).await?;
         let list_body: serde_json::Value = serde_json::from_slice(&bytes)?;
-        assert_eq!(list_body.as_array().map(Vec::len), Some(32));
+        assert_eq!(list_body.as_array().map(Vec::len), Some(33));
         Ok(())
     }
 
