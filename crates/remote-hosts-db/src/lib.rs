@@ -1122,7 +1122,7 @@ impl AccessPathRepository {
                       AND ps.backend_state_json = ?
                       AND ps.input_allowed = 1
                       AND ps.state_json IN (?, ?)
-                      AND aw.state_json IN (?, ?)
+                      AND aw.state_json IN (?, ?, ?)
                 ) AS active_ptys,
                 (
                     SELECT COUNT(*)
@@ -1132,7 +1132,7 @@ impl AccessPathRepository {
                       AND ps.backend_state_json = ?
                       AND ps.input_allowed = 1
                       AND ps.state_json IN (?, ?)
-                      AND aw.state_json IN (?, ?)
+                      AND aw.state_json IN (?, ?, ?)
                 ) AS pending_ptys
             ",
         )
@@ -1145,12 +1145,14 @@ impl AccessPathRepository {
         .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
         .bind(access_path_id.to_string())
         .bind(to_json(&PtyBackendState::Pending)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
         .fetch_one(&self.pool)
         .await?;
         Ok(AccessPathChannelUsage {
@@ -2114,7 +2116,7 @@ impl AgentWorkspaceRepository {
                 FROM agent_workspaces aw
                 LEFT JOIN agent_sessions session ON session.id = aw.agent_session_id
                 WHERE aw.host_id = ?
-                  AND aw.state_json IN (?, ?)
+                  AND aw.state_json IN (?, ?, ?)
             )
             SELECT COUNT(*) AS recorded_active,
                    COALESCE(SUM(CASE WHEN reapable = 0 THEN 1 ELSE 0 END), 0)
@@ -2139,6 +2141,7 @@ impl AgentWorkspaceRepository {
         .bind(host_id.to_string())
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
         .bind(current_agent_session_id.map(|id| id.to_string()))
         .fetch_one(&self.pool)
         .await?;
@@ -2211,6 +2214,8 @@ impl AgentWorkspaceRepository {
         query.push_bind(to_json(&WorkspaceState::Idle)?);
         query.push(", ");
         query.push_bind(to_json(&WorkspaceState::Working)?);
+        query.push(", ");
+        query.push_bind(to_json(&WorkspaceState::Blocked)?);
         query.push(") AND (");
         query.push(
             r"
@@ -2284,7 +2289,7 @@ impl AgentWorkspaceRepository {
             WHERE (
                 SELECT COUNT(*)
                 FROM agent_workspaces
-                WHERE host_id = ? AND state_json IN (?, ?)
+                WHERE host_id = ? AND state_json IN (?, ?, ?)
             ) < ?
             ",
         )
@@ -2304,6 +2309,7 @@ impl AgentWorkspaceRepository {
         .bind(workspace.host_id.to_string())
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
         .bind(i64::from(active_limit))
         .execute(&self.pool)
         .await?;
@@ -2589,9 +2595,9 @@ impl PtySessionRepository {
             INSERT INTO pty_sessions (
                 pty_session_id, workspace_id, session_id, state_json, foreground_process, cwd,
                 recent_output_ref, last_exit_code, input_allowed, backend_state_json,
-                backend_capabilities_json, transport_evidence_json, created_at, last_activity_at
+                backend_capabilities_json, interaction_json, transport_evidence_json, created_at, last_activity_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pty_session_id) DO UPDATE SET
                 state_json = excluded.state_json,
                 foreground_process = excluded.foreground_process,
@@ -2601,6 +2607,7 @@ impl PtySessionRepository {
                 input_allowed = excluded.input_allowed,
                 backend_state_json = excluded.backend_state_json,
                 backend_capabilities_json = excluded.backend_capabilities_json,
+                interaction_json = excluded.interaction_json,
                 transport_evidence_json = excluded.transport_evidence_json,
                 last_activity_at = excluded.last_activity_at
             ",
@@ -2616,6 +2623,7 @@ impl PtySessionRepository {
         .bind(bool_to_i64(pty.input_allowed))
         .bind(to_json(&pty.backend_state)?)
         .bind(to_json(&pty.backend_capabilities)?)
+        .bind(optional_json(pty.interaction.as_ref())?)
         .bind(optional_json(pty.transport_evidence.as_ref())?)
         .bind(pty.created_at)
         .bind(pty.last_activity_at)
@@ -2634,7 +2642,7 @@ impl PtySessionRepository {
             r"
             SELECT pty_session_id, workspace_id, session_id, state_json, foreground_process, cwd,
                    recent_output_ref, last_exit_code, input_allowed, backend_state_json,
-                   backend_capabilities_json, transport_evidence_json, created_at, last_activity_at
+                   backend_capabilities_json, interaction_json, transport_evidence_json, created_at, last_activity_at
             FROM pty_sessions
             WHERE pty_session_id = ?
             ",
@@ -2688,7 +2696,7 @@ impl PtySessionRepository {
             r"
             SELECT pty_session_id, workspace_id, session_id, state_json, foreground_process, cwd,
                    recent_output_ref, last_exit_code, input_allowed, backend_state_json,
-                   backend_capabilities_json, transport_evidence_json, created_at, last_activity_at
+                   backend_capabilities_json, interaction_json, transport_evidence_json, created_at, last_activity_at
             FROM pty_sessions
             WHERE workspace_id = ?
             ORDER BY last_activity_at DESC, pty_session_id ASC
@@ -2715,14 +2723,14 @@ impl PtySessionRepository {
             SELECT ps.pty_session_id, ps.workspace_id, ps.session_id, ps.state_json,
                    ps.foreground_process, ps.cwd, ps.recent_output_ref, ps.last_exit_code,
                    ps.input_allowed, ps.backend_state_json, ps.backend_capabilities_json,
-                   ps.transport_evidence_json, ps.created_at, ps.last_activity_at
+                   ps.interaction_json, ps.transport_evidence_json, ps.created_at, ps.last_activity_at
             FROM pty_sessions ps
             JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
             JOIN access_paths ap ON ap.id = aw.access_path_id
             WHERE aw.connector_id = ?
               AND ps.backend_state_json = ?
               AND ps.input_allowed = 1
-              AND aw.state_json IN (?, ?)
+              AND aw.state_json IN (?, ?, ?)
               AND ps.state_json IN (?, ?)
               AND (
                 (
@@ -2734,7 +2742,7 @@ impl PtySessionRepository {
                       AND active_ps.backend_state_json = ?
                       AND active_ps.input_allowed = 1
                       AND active_ps.state_json IN (?, ?)
-                      AND active_aw.state_json IN (?, ?)
+                      AND active_aw.state_json IN (?, ?, ?)
                 )
                 +
                 (
@@ -2758,6 +2766,7 @@ impl PtySessionRepository {
         .bind(to_json(&PtyBackendState::Pending)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&PtyBackendState::Active)?)
@@ -2765,6 +2774,7 @@ impl PtySessionRepository {
         .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
         .bind(to_json(&OperationState::Running)?)
         .bind(observed_at)
         .fetch_optional(&self.pool)
@@ -2813,7 +2823,7 @@ impl PtySessionRepository {
             FROM pty_sessions ps
             JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
             WHERE aw.host_id = ?
-              AND aw.state_json IN (?, ?)
+              AND aw.state_json IN (?, ?, ?)
               AND ps.state_json IN (?, ?)
               AND ps.input_allowed = 1
               AND ps.backend_state_json IN (?, ?)
@@ -2822,6 +2832,7 @@ impl PtySessionRepository {
         .bind(host_id.to_string())
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&PtyBackendState::Pending)?)
@@ -2859,7 +2870,7 @@ impl PtySessionRepository {
             )
             RETURNING pty_session_id, workspace_id, session_id, state_json, foreground_process, cwd,
                       recent_output_ref, last_exit_code, input_allowed, backend_state_json,
-                      backend_capabilities_json, transport_evidence_json, created_at, last_activity_at
+                      backend_capabilities_json, interaction_json, transport_evidence_json, created_at, last_activity_at
             ",
         )
         .bind(to_json(&WorkspaceState::Blocked)?)
@@ -2896,7 +2907,7 @@ impl PtySessionRepository {
             WHERE pty_session_id = ?
             RETURNING pty_session_id, workspace_id, session_id, state_json, foreground_process, cwd,
                       recent_output_ref, last_exit_code, input_allowed, backend_state_json,
-                      backend_capabilities_json, transport_evidence_json, created_at, last_activity_at
+                      backend_capabilities_json, interaction_json, transport_evidence_json, created_at, last_activity_at
             ",
         )
         .bind(to_json(&WorkspaceState::Closed)?)
@@ -2931,7 +2942,7 @@ impl PtySessionRepository {
               AND state_json != ?
             RETURNING pty_session_id, workspace_id, session_id, state_json, foreground_process, cwd,
                       recent_output_ref, last_exit_code, input_allowed, backend_state_json,
-                      backend_capabilities_json, transport_evidence_json, created_at, last_activity_at
+                      backend_capabilities_json, interaction_json, transport_evidence_json, created_at, last_activity_at
             ",
         )
         .bind(to_json(&WorkspaceState::Closed)?)
@@ -2974,7 +2985,7 @@ impl PtySessionRepository {
             )
             RETURNING pty_session_id, workspace_id, session_id, state_json, foreground_process, cwd,
                       recent_output_ref, last_exit_code, input_allowed, backend_state_json,
-                      backend_capabilities_json, transport_evidence_json, created_at, last_activity_at
+                      backend_capabilities_json, interaction_json, transport_evidence_json, created_at, last_activity_at
             ",
         )
         .bind(to_json(&WorkspaceState::Closed)?)
@@ -3608,7 +3619,7 @@ impl PtyInputEventRepository {
                   AND target_pty.backend_state_json = ?
                   AND target_pty.input_allowed = 1
                   AND target_pty.state_json IN (?, ?)
-                  AND target_workspace.state_json IN (?, ?)
+                  AND target_workspace.state_json IN (?, ?, ?)
                   AND queued_input.attempt_count < ?
                   AND (
                     queued_input.agent_session_id IS NULL
@@ -3661,6 +3672,7 @@ impl PtyInputEventRepository {
         .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
         .bind(u32_to_i64(max_attempts))
         .bind(claimed_at)
         .bind(to_json(&PtyInputEventState::Queued)?)
@@ -3932,7 +3944,7 @@ impl OperationRunRepository {
                           AND reserved_pty.backend_state_json IN (?, ?)
                           AND reserved_pty.input_allowed = 1
                           AND reserved_pty.state_json IN (?, ?)
-                          AND reserved_workspace.state_json IN (?, ?)
+                          AND reserved_workspace.state_json IN (?, ?, ?)
                     )
                   ) < CASE
                         WHEN candidate_path.max_concurrent_channels > 0
@@ -4023,6 +4035,7 @@ impl OperationRunRepository {
         .bind(to_json(&WorkspaceState::Working)?)
         .bind(to_json(&WorkspaceState::Idle)?)
         .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
         .bind(to_json(&OperationState::Running)?)
         .bind(claimed_at)
         .bind(claimed_at)
@@ -5835,6 +5848,7 @@ fn row_to_pty_session(row: &SqliteRow) -> Result<PtySession, DbError> {
             .unwrap_or(PtyBackendState::Unknown),
         backend_capabilities: optional_json_col(row, "backend_capabilities_json")?
             .unwrap_or_else(PtyBackendCapabilities::unknown),
+        interaction: optional_json_col(row, "interaction_json")?,
         transport_evidence: optional_json_col(row, "transport_evidence_json")?,
         created_at: row.try_get("created_at")?,
         last_activity_at: row.try_get("last_activity_at")?,
@@ -6931,6 +6945,7 @@ mod tests {
             input_allowed: true,
             backend_state: PtyBackendState::Pending,
             backend_capabilities: PtyBackendCapabilities::unknown(),
+            interaction: None,
             transport_evidence: None,
             created_at: now,
             last_activity_at: now,

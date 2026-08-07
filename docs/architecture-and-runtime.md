@@ -40,7 +40,7 @@ provider; the native backend caches an authenticated `russh` session. Exec comma
 and PTYs reserve channels from the same access-path capacity budget.
 
 The default path capacity is eight channels. Connector workers skip saturated paths instead of
-occupying global worker slots while waiting. Runtime snapshot version 9 exposes configured,
+occupying global worker slots while waiting. Runtime snapshot version 10 exposes configured,
 reserved, and available channels, active and pending PTYs, and current operation pressure.
 
 Logical connection sessions and physical transport runtimes are separate. Every runtime records a
@@ -97,6 +97,8 @@ resources uses their real common parent.
 `shell.posix` and `shell.powershell` are the normal extension surface. Narrow read-only profiles are
 convenience shortcuts, not the product boundary. `run_in_workspace` validates the profile, applies
 host policy, creates a queued operation, and lets the connector execute it on the pooled transport.
+For short commands, `wait_timeout_ms` atomically submits and observes that exact operation for up
+to 60 seconds, removing the queue-to-wait race without adding another MCP tool.
 
 POSIX execution carries an in-band completion frame. This preserves the real exit status when a
 gateway omits or falsifies the SSH exit-status message. Healthy completion keeps the transport
@@ -120,9 +122,14 @@ blocking input delivery to already-active PTYs. MCP reports `backend_ready`, `re
 and `poll_after_ms` so pending activation is not confused with an unsupported shell.
 
 PTY input is database-backed and connector-owned. The API and MCP enqueue redacted input metadata;
-the connector claims, delivers, and terminalizes each event. Backend exit, explicit close, or
-connector restart converges PTY, Workspace, lease, and channel state. A lost runtime is marked
-`blocked/failed` rather than silently replaced with a fresh shell that has different context.
+the connector claims, delivers, and terminalizes each event. Redacted output-tail detection exposes
+password, sudo-password, host-key confirmation, confirmation, pager, and menu prompts as an
+`interaction` on the live PTY. The owning Workspace becomes `blocked` to prevent unrelated work,
+but the active input-capable PTY retains its channel reservation and can receive the response.
+Runtime snapshots emit `pty_input_required` rather than treating that case as a failed connection.
+Backend exit, explicit close, or connector restart clears the interaction and converges PTY,
+Workspace, lease, and channel state. A lost runtime is marked `blocked/failed` rather than silently
+replaced with a fresh shell that has different context.
 
 ## File Transfer
 
@@ -162,18 +169,18 @@ configured; an empty-chain `bastion` route remains one physical SSH endpoint.
 
 ## Runtime State
 
-Runtime snapshot version 9 returns one consistent view containing:
+Runtime snapshot version 10 returns one consistent view containing:
 
 - current Agent Session identity;
 - host-level logical Workspace capacity, including recorded, effective, expired/reapable, and per-session counts;
 - connector health and freshness;
 - enabled access paths, route health, key-bootstrap state, transport runtime, and channel capacity;
 - current logical connection sessions;
-- session-owned Workspaces, PTYs, and recent operations;
+- session-owned Workspaces, PTYs (including live `interaction` state), and recent operations;
 - active scoped write leases;
 - actionable attention records and an event cursor.
 
-Workspace TTL is enforced automatically. MCP/API creation first closes expired `idle`/`working`
+Workspace TTL is enforced automatically. MCP/API creation first closes expired `idle`/`working`/`blocked`
 records only when they own neither a queued/running operation nor an active PTY. The Connector
 performs the same bounded reconciliation at startup and on heartbeats. Agent Session ownership is
 not relaxed: one task never reuses another task's Workspace even when both share one pooled SSH

@@ -157,7 +157,7 @@ skills/                    Repository-owned Agent Skill
 ## Current Release
 
 The 2026-08-03 release adds native Windows runtime and packaging support, a stable low-overhead MCP
-launcher, Rust-owned connector bootstrap and restart-readiness checks, runtime snapshot version 9,
+launcher, Rust-owned connector bootstrap and restart-readiness checks, runtime snapshot version 10,
 hierarchical Workspace coordination, capacity-aware scheduling, resumable verified transfers,
 transport evidence, grouped topology management, compact Zstandard output history, guarded storage
 reclamation, and an 18-tool Agent profile. Release-level implementation details stay in the

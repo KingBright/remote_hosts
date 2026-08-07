@@ -96,7 +96,7 @@ After the installed API has been restarted once with external admin UI support,
 restarting the API, connector, MCP children, PTYs, or active operations.
 
 - Complete any required calls on the current MCP transport before reloading it.
-- Reload MCP servers or begin the next agent task after an update, then require runtime `snapshot_version=9` and inspect host-level `workspace_capacity` independently from per-access-path `channel_capacity`.
+- Reload MCP servers or begin the next agent task after an update, then require runtime `snapshot_version=10` and inspect host-level `workspace_capacity` independently from per-access-path `channel_capacity`, including `pty_input_required` before treating a blocked workspace as broken.
 - Do not kill the MCP child mid-task and expect the same task transport to reconnect automatically.
 - For deployment smoke tests, a separate freshly launched MCP stdio client may verify the installed binary without disturbing an active task.
 

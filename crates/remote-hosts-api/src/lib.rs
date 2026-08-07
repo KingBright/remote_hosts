@@ -28,11 +28,11 @@ use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AgentWorkspace, ConnectionSession, Connector, ConnectorId,
     CredentialBinding, CredentialBindingId, CredentialBindingView, CredentialKind,
     CredentialMetadata, EntityState, Host, HostFact, HostId, OperationId, OperationOutputArtifact,
-    OperationOutputArtifactId, OperationOutputChunk, OperationRun, PtyInputEvent, PtyOutputChunk,
-    PtySession, PtySessionId, SequencedStateEvent, SessionId, StateEvent, StateSnapshot,
-    StoredCredential, TopologyEdge, TopologyEdgeId, TopologyNode, TopologyNodeId, TopologyNodeKind,
-    TopologyNodeStatus, TopologyRelation, TopologySyncRun, TopologySyncRunId, WorkspaceId,
-    WorkspaceState, now_utc,
+    OperationOutputArtifactId, OperationOutputChunk, OperationRun, OperationState, PtyInputEvent,
+    PtyOutputChunk, PtySession, PtySessionId, SequencedStateEvent, SessionId, StateEvent,
+    StateSnapshot, StoredCredential, TopologyEdge, TopologyEdgeId, TopologyNode, TopologyNodeId,
+    TopologyNodeKind, TopologyNodeStatus, TopologyRelation, TopologySyncRun, TopologySyncRunId,
+    WorkspaceId, WorkspaceState, now_utc,
 };
 use remote_hosts_vault::{CredentialSecret, CredentialVault};
 use secrecy::SecretString;
@@ -937,7 +937,8 @@ async fn run_workspace_operation(
     Json(request): Json<RunWorkspaceOperationRequest>,
 ) -> Result<(StatusCode, Json<RunWorkspaceOperationResponse>), ApiError> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let response = queue_workspace_operation(
+    let wait_timeout_ms = request.wait_timeout_ms;
+    let mut response = queue_workspace_operation(
         &state,
         workspace_id,
         &request.command_profile,
@@ -947,6 +948,17 @@ async fn run_workspace_operation(
         request.output_limit_bytes,
     )
     .await?;
+    if let Some(wait_timeout_ms) = wait_timeout_ms {
+        response.completion = Some(
+            wait_for_workspace_operation(
+                &state,
+                workspace_id,
+                response.operation.id,
+                wait_timeout_ms,
+            )
+            .await?,
+        );
+    }
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -1512,7 +1524,57 @@ async fn queue_workspace_operation(
         workspace,
         initial_output_chunk: plan.initial_output_chunk,
         protection_decision: plan.decision,
+        completion: None,
     })
+}
+
+async fn wait_for_workspace_operation(
+    state: &ApiState,
+    workspace_id: WorkspaceId,
+    operation_id: OperationId,
+    requested_timeout_ms: u64,
+) -> Result<OperationCompletionResponse, ApiError> {
+    let timeout_ms = requested_timeout_ms.min(60_000);
+    let poll_interval_ms = 100_u64;
+    let started_at = std::time::Instant::now();
+    loop {
+        let workspace = state
+            .repositories
+            .workspaces
+            .get(workspace_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        let operation = state
+            .repositories
+            .operations
+            .get(operation_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        if operation.workspace_id != Some(workspace_id) {
+            return Err(ApiError::BadRequest(
+                "operation does not belong to workspace".to_owned(),
+            ));
+        }
+        if is_terminal_operation_state(&operation.state) {
+            return Ok(OperationCompletionResponse {
+                completed: true,
+                operation,
+                workspace,
+                elapsed_ms: elapsed_ms(started_at),
+                retry_after_ms: None,
+            });
+        }
+        if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
+            return Ok(OperationCompletionResponse {
+                completed: false,
+                operation,
+                workspace,
+                elapsed_ms: elapsed_ms(started_at),
+                retry_after_ms: Some(poll_interval_ms),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
 }
 
 async fn connector_snapshots_for_paths(
@@ -1723,6 +1785,18 @@ fn default_wait_states() -> Vec<WorkspaceState> {
 
 fn elapsed_ms(started_at: std::time::Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn is_terminal_operation_state(state: &OperationState) -> bool {
+    matches!(
+        state,
+        OperationState::Succeeded
+            | OperationState::Failed
+            | OperationState::TimedOut
+            | OperationState::Cancelled
+            | OperationState::Rejected
+            | OperationState::Exhausted
+    )
 }
 
 fn default_topology_status() -> TopologyNodeStatus {
@@ -2123,6 +2197,8 @@ pub struct RunWorkspaceOperationRequest {
     pub timeout_seconds: Option<u64>,
     /// Optional captured output limit override in bytes, up to 8 MiB.
     pub output_limit_bytes: Option<usize>,
+    /// Atomically wait for this exact queued operation, capped at 60 seconds.
+    pub wait_timeout_ms: Option<u64>,
 }
 
 /// Run workspace operation response.
@@ -2136,6 +2212,23 @@ pub struct RunWorkspaceOperationResponse {
     pub initial_output_chunk: OperationOutputChunk,
     /// Policy decision that allowed the operation.
     pub protection_decision: ProtectionDecision,
+    /// Exact-operation completion observed during an optional submit-and-wait.
+    pub completion: Option<OperationCompletionResponse>,
+}
+
+/// Bounded completion observation for one exact operation.
+#[derive(Clone, Debug, Serialize)]
+pub struct OperationCompletionResponse {
+    /// Whether the exact operation reached a terminal state during the wait.
+    pub completed: bool,
+    /// Latest operation record.
+    pub operation: OperationRun,
+    /// Latest workspace record.
+    pub workspace: AgentWorkspace,
+    /// Elapsed wait time in milliseconds.
+    pub elapsed_ms: u64,
+    /// Suggested next poll delay when the operation remains non-terminal.
+    pub retry_after_ms: Option<u64>,
 }
 
 /// List workspace operations query.
@@ -2705,7 +2798,8 @@ mod tests {
                         json!({
                             "command_profile": "host.uptime",
                             "args": [],
-                            "intent": "check whether the host is responsive"
+                            "intent": "check whether the host is responsive",
+                            "wait_timeout_ms": 0
                         })
                         .to_string(),
                     ))?,
@@ -2716,6 +2810,9 @@ mod tests {
         let run_body: serde_json::Value = serde_json::from_slice(&bytes)?;
         assert_eq!(run_body["operation"]["state"], "queued");
         assert_eq!(run_body["workspace"]["state"], "working");
+        assert_eq!(run_body["completion"]["completed"], false);
+        assert_eq!(run_body["completion"]["operation"]["state"], "queued");
+        assert_eq!(run_body["completion"]["retry_after_ms"], 100);
         let operation_id = run_body["operation"]["id"]
             .as_str()
             .ok_or("operation id should be a string")?;

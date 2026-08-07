@@ -564,6 +564,35 @@ pub enum PtyBackendState {
     Closed,
 }
 
+/// Generic type of interactive input requested by a live PTY.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PtyInteractionKind {
+    /// SSH or another program requests a password or passphrase.
+    Password,
+    /// `sudo` requests a password.
+    SudoPassword,
+    /// SSH requests explicit host-key confirmation.
+    HostKeyConfirmation,
+    /// A command requests a yes/no confirmation.
+    Confirmation,
+    /// A pager waits for a navigation key.
+    Pager,
+    /// An interactive menu requests an option selection.
+    SelectionMenu,
+}
+
+/// Agent-visible observation that an active PTY needs input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PtyInteraction {
+    /// Detected interaction category.
+    pub kind: PtyInteractionKind,
+    /// Detector confidence from 0 through 100.
+    pub confidence: u8,
+    /// When the connector observed the prompt.
+    pub observed_at: OffsetDateTime,
+}
+
 /// Agent-visible PTY backend capability summary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -1442,6 +1471,8 @@ pub struct PtySession {
     pub backend_state: PtyBackendState,
     /// Capabilities reported by the connector backend.
     pub backend_capabilities: PtyBackendCapabilities,
+    /// Latest live input request, if the connector recognized one.
+    pub interaction: Option<PtyInteraction>,
     /// Structured evidence of the SSH transport used to open this PTY channel.
     pub transport_evidence: Option<SshChannelTransportEvidence>,
     /// Created timestamp.

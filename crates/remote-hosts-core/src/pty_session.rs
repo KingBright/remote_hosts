@@ -155,6 +155,7 @@ impl PtySessionSupervisor {
             input_allowed: true,
             backend_state: PtyBackendState::Pending,
             backend_capabilities: PtyBackendCapabilities::unknown(),
+            interaction: None,
             transport_evidence: None,
             created_at: now,
             last_activity_at: now,
@@ -254,6 +255,15 @@ impl PtySessionSupervisor {
                 session.state,
                 WorkspaceState::Closed | WorkspaceState::Failed | WorkspaceState::Throttled
             );
+        if matches!(
+            session.state,
+            WorkspaceState::Done
+                | WorkspaceState::Closed
+                | WorkspaceState::Failed
+                | WorkspaceState::Throttled
+        ) {
+            session.interaction = None;
+        }
         session.last_activity_at = now_utc();
         Ok(session)
     }
@@ -264,6 +274,7 @@ impl PtySessionSupervisor {
         session.input_allowed = false;
         session.foreground_process = None;
         session.backend_state = PtyBackendState::Closed;
+        session.interaction = None;
         session.last_exit_code = last_exit_code.or(session.last_exit_code);
         session.last_activity_at = now_utc();
         session
@@ -289,6 +300,7 @@ impl PtySessionSupervisor {
         closed.input_allowed = false;
         closed.foreground_process = None;
         closed.backend_state = PtyBackendState::Closed;
+        closed.interaction = None;
         closed.last_activity_at = now;
         (closed, true)
     }

@@ -85,7 +85,7 @@ with mode `0600` on macOS or a current-user ACL on Windows.
 ## Normal Agent Operation
 
 1. Resolve or register the canonical host and intended access path.
-2. Read runtime snapshot version 9 before reasoning about state. Treat host-level logical `workspace_capacity` and per-access-path SSH `channel_capacity` as independent limits.
+2. Read runtime snapshot version 10 before reasoning about state. Treat host-level logical `workspace_capacity` and per-access-path SSH `channel_capacity` as independent limits; `pty_input_required` means an active PTY is waiting for input, not that its SSH connection failed.
 3. Prepare a Workspace with a stable coordination scope.
 4. Run `shell.posix`, `shell.powershell`, or open a persistent PTY.
 5. Reuse the Workspace and semantic idempotency key while waiting or retrying.

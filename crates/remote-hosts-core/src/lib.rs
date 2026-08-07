@@ -3,6 +3,7 @@
 pub mod command;
 pub mod connector_state;
 pub mod policy;
+pub mod pty_interaction;
 pub mod pty_session;
 pub mod redaction;
 pub mod resolver;
@@ -17,6 +18,7 @@ pub use command::{
 };
 pub use connector_state::{ConnectorHeartbeatOutcome, ConnectorStateTracker};
 pub use policy::{ProtectionDecision, ServerProtectionPolicy};
+pub use pty_interaction::detect_pty_interaction;
 pub use pty_session::{
     PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionInputPlan, PtySessionOpenCommand,
     PtySessionSupervisor, PtySessionSupervisorError,

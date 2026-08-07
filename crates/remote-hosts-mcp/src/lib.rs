@@ -22,10 +22,10 @@ use remote_hosts_domain::{
     AgentWorkspace, ConnectionMode, ConnectionSession, Connector, ConnectorId, CredentialId,
     CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind,
     FactSource, Host, HostFact, HostFactId, HostId, HostKind, HostWriteLease, KnowledgeItem,
-    KnowledgeItemId, OperationId, OperationOutputArtifactId, OperationRun, Protocol,
-    PtyBackendState, PtyInputEvent, PtySession, PtySessionId, RiskLevel, RouteType, SessionId,
-    SoftwareInstallId, StateReasonCode, StateSnapshot, StoredCredential, TrustLevel, WorkspaceId,
-    WorkspaceState, now_utc,
+    KnowledgeItemId, OperationId, OperationOutputArtifactId, OperationRun, OperationState,
+    Protocol, PtyBackendState, PtyInputEvent, PtySession, PtySessionId, RiskLevel, RouteType,
+    SessionId, SoftwareInstallId, StateReasonCode, StateSnapshot, StoredCredential, TrustLevel,
+    WorkspaceId, WorkspaceState, now_utc,
 };
 use rmcp::{
     Json, ServerHandler, ServiceExt,
@@ -836,6 +836,8 @@ pub struct RunInWorkspaceRequest {
     pub timeout_seconds: Option<u64>,
     /// Optional captured output limit override in bytes, up to 8 MiB.
     pub output_limit_bytes: Option<usize>,
+    /// Atomically wait for this exact queued operation, capped at 60 seconds.
+    pub wait_timeout_ms: Option<u64>,
     /// Stable retry key. Reusing it in this conversation returns the original operation.
     pub idempotency_key: Option<String>,
 }
@@ -1380,6 +1382,7 @@ impl RemoteHostsMcpServer {
                 "human_message": "existing idempotent operation returned"
             }),
             idempotency_reused: true,
+            completion: None,
         })
     }
 
@@ -1414,6 +1417,7 @@ impl RemoteHostsMcpServer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn queue_workspace_operation(
         &self,
         request: RunInWorkspaceRequest,
@@ -1517,7 +1521,53 @@ impl RemoteHostsMcpServer {
             initial_output_chunk: to_json_value(&plan.initial_output_chunk)?,
             protection_decision: to_json_value(&plan.decision)?,
             idempotency_reused: false,
+            completion: None,
         })
+    }
+
+    async fn wait_for_operation_completion(
+        &self,
+        workspace_id: WorkspaceId,
+        operation_id: OperationId,
+        requested_timeout_ms: u64,
+    ) -> Result<OperationCompletionOutput, String> {
+        let timeout_ms = requested_timeout_ms.min(60_000);
+        let poll_interval_ms = 100_u64;
+        let started_at = Instant::now();
+        loop {
+            let workspace = self.workspace_for_tool(workspace_id).await?;
+            let operation = self
+                .repositories
+                .operations
+                .get(operation_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .ok_or_else(|| format!("operation not found: {operation_id}"))?;
+            if operation.workspace_id != Some(workspace_id) {
+                return Err(format!(
+                    "operation does not belong to workspace: {operation_id}"
+                ));
+            }
+            if is_terminal_operation_state(&operation.state) {
+                return Ok(OperationCompletionOutput {
+                    completed: true,
+                    operation: public_operation_value(&operation)?,
+                    workspace: to_json_value(&workspace)?,
+                    elapsed_ms: elapsed_ms(started_at),
+                    retry_after_ms: None,
+                });
+            }
+            if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
+                return Ok(OperationCompletionOutput {
+                    completed: false,
+                    operation: public_operation_value(&operation)?,
+                    workspace: to_json_value(&workspace)?,
+                    elapsed_ms: elapsed_ms(started_at),
+                    retry_after_ms: Some(poll_interval_ms),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+        }
     }
 
     async fn queue_workspace_file_transfer(
@@ -1601,6 +1651,7 @@ impl RemoteHostsMcpServer {
             initial_output_chunk: to_json_value(&plan.initial_output_chunk)?,
             protection_decision: to_json_value(&plan.decision)?,
             idempotency_reused: false,
+            completion: None,
         })
     }
 
@@ -3613,7 +3664,12 @@ impl RemoteHostsMcpServer {
             }) {
                 current_session_waits_for_write_lease = true;
             }
-            if workspace.state == WorkspaceState::Blocked {
+            let has_live_pty_interaction = pty_sessions.iter().any(|pty| {
+                pty.backend_state == remote_hosts_domain::PtyBackendState::Active
+                    && pty.input_allowed
+                    && pty.interaction.is_some()
+            });
+            if workspace.state == WorkspaceState::Blocked && !has_live_pty_interaction {
                 attention.push(RuntimeAttentionOutput {
                     code: "workspace_blocked".to_owned(),
                     entity_type: "workspace".to_owned(),
@@ -3624,7 +3680,21 @@ impl RemoteHostsMcpServer {
                 });
             }
             for pty in &pty_sessions {
-                if pty.backend_state == remote_hosts_domain::PtyBackendState::Failed {
+                if let Some(interaction) = &pty.interaction
+                    && pty.backend_state == remote_hosts_domain::PtyBackendState::Active
+                    && pty.input_allowed
+                {
+                    attention.push(RuntimeAttentionOutput {
+                        code: "pty_input_required".to_owned(),
+                        entity_type: "pty_session".to_owned(),
+                        entity_id: pty.pty_session_id.to_string(),
+                        message: format!(
+                            "active PTY is waiting for {:?}; read the latest PTY output, then queue input on this same PTY",
+                            interaction.kind
+                        ),
+                        recommended_action: "read_pty_output_then_queue_input".to_owned(),
+                    });
+                } else if pty.backend_state == remote_hosts_domain::PtyBackendState::Failed {
                     attention.push(RuntimeAttentionOutput {
                         code: "pty_runtime_lost".to_owned(),
                         entity_type: "pty_session".to_owned(),
@@ -3677,7 +3747,7 @@ impl RemoteHostsMcpServer {
         }
 
         Ok(Json(HostRuntimeSnapshotOutput {
-            snapshot_version: 9,
+            snapshot_version: 10,
             event_cursor,
             generated_at: generated_at.to_string(),
             agent_session: to_json_value(self.agent_session.as_ref())?,
@@ -4548,7 +4618,21 @@ impl RemoteHostsMcpServer {
         &self,
         Parameters(request): Parameters<RunInWorkspaceRequest>,
     ) -> Result<Json<QueuedOperationOutput>, String> {
-        let output = self.queue_workspace_operation(request).await?;
+        let workspace_id = parse_workspace_id(&request.workspace_id)?;
+        let wait_timeout_ms = request.wait_timeout_ms;
+        let mut output = self.queue_workspace_operation(request).await?;
+        if let Some(wait_timeout_ms) = wait_timeout_ms {
+            let operation_id = output
+                .operation
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "queued operation response omitted its id".to_owned())
+                .and_then(parse_operation_id)?;
+            output.completion = Some(
+                self.wait_for_operation_completion(workspace_id, operation_id, wait_timeout_ms)
+                    .await?,
+            );
+        }
         Ok(Json(output))
     }
 
@@ -5461,6 +5545,23 @@ pub struct QueuedOperationOutput {
     pub protection_decision: Value,
     /// Whether an earlier operation was returned for the same retry key.
     pub idempotency_reused: bool,
+    /// Exact-operation completion observed during an optional atomic submit-and-wait.
+    pub completion: Option<OperationCompletionOutput>,
+}
+
+/// Bounded completion observation for one exact operation.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct OperationCompletionOutput {
+    /// Whether the exact operation reached a terminal state during the wait.
+    pub completed: bool,
+    /// Latest operation record as JSON.
+    pub operation: Value,
+    /// Latest workspace record as JSON.
+    pub workspace: Value,
+    /// Elapsed wait time in milliseconds.
+    pub elapsed_ms: u64,
+    /// Suggested next poll delay when the operation remains non-terminal.
+    pub retry_after_ms: Option<u64>,
 }
 
 /// Workspace output chunks.
@@ -6156,6 +6257,18 @@ fn elapsed_ms(started_at: std::time::Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn is_terminal_operation_state(state: &OperationState) -> bool {
+    matches!(
+        state,
+        OperationState::Succeeded
+            | OperationState::Failed
+            | OperationState::TimedOut
+            | OperationState::Cancelled
+            | OperationState::Rejected
+            | OperationState::Exhausted
+    )
+}
+
 fn retain_runtime_connection_sessions(
     sessions: &mut Vec<ConnectionSession>,
     access_paths: &[AccessPath],
@@ -6369,11 +6482,12 @@ mod tests {
         CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId,
         EnvironmentKind, Host, HostId, HostKind, OperationId, OperationOutputArtifact,
         OperationOutputArtifactId, OperationRun, OperationState, OperationType, OutputStream,
-        Protocol, PtyBackendCapabilities, PtyBackendState, PtyOutputChunk, PtyOutputChunkId,
-        PtySession, PtySessionId, RiskLevel, RouteType, SessionId, SshFileTransferMode,
-        SshTransportBackend, SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
-        SshTransportRuntimeState, SshTransportTelemetry, StateReasonCode, StoredCredential,
-        TrustLevel, WorkspaceId, WorkspaceState, now_utc,
+        Protocol, PtyBackendCapabilities, PtyBackendState, PtyInteraction, PtyInteractionKind,
+        PtyOutputChunk, PtyOutputChunkId, PtySession, PtySessionId, RiskLevel, RouteType,
+        SessionId, SshFileTransferMode, SshTransportBackend, SshTransportCapabilities,
+        SshTransportRuntime, SshTransportRuntimeId, SshTransportRuntimeState,
+        SshTransportTelemetry, StateReasonCode, StoredCredential, TrustLevel, WorkspaceId,
+        WorkspaceState, now_utc,
     };
     use remote_hosts_vault::{CredentialVault, EncryptedCredentialBlob};
     use rmcp::{
@@ -6954,7 +7068,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(snapshot["snapshot_version"], json!(9));
+        assert_eq!(snapshot["snapshot_version"], json!(10));
         assert_eq!(snapshot["workspace_capacity"]["limit"], json!(32));
         assert_eq!(snapshot["workspace_capacity"]["effective_active"], json!(1));
         assert_eq!(snapshot["event_cursor"], json!(0));
@@ -7029,7 +7143,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(snapshot["snapshot_version"], json!(9));
+        assert_eq!(snapshot["snapshot_version"], json!(10));
         assert_eq!(
             snapshot["access_paths"][0]["channel_capacity"],
             json!({
@@ -7614,7 +7728,7 @@ mod tests {
             snapshot["write_lease"]["state"],
             json!("held_by_other_session")
         );
-        assert_eq!(snapshot["snapshot_version"], json!(9));
+        assert_eq!(snapshot["snapshot_version"], json!(10));
         assert!(snapshot["attention"].as_array().is_some_and(|attention| {
             attention
                 .iter()
@@ -7680,7 +7794,7 @@ mod tests {
             Some(json!({"host_id": fixture.host_id.to_string()})),
         )
         .await?;
-        assert_eq!(sibling_snapshot["snapshot_version"], json!(9));
+        assert_eq!(sibling_snapshot["snapshot_version"], json!(10));
         assert_eq!(sibling_snapshot["write_lease"]["state"], json!("mixed"));
         assert_eq!(
             sibling_snapshot["write_lease"]["active_leases"]
@@ -7910,7 +8024,7 @@ mod tests {
                 .state,
             AgentSessionState::Expired
         );
-        assert_eq!(prepared["runtime_snapshot"]["snapshot_version"], json!(9));
+        assert_eq!(prepared["runtime_snapshot"]["snapshot_version"], json!(10));
         Ok(())
     }
 
@@ -8008,6 +8122,7 @@ mod tests {
                 input_allowed: true,
                 backend_state: PtyBackendState::Active,
                 backend_capabilities: PtyBackendCapabilities::unknown(),
+                interaction: None,
                 transport_evidence: None,
                 created_at: now - time::Duration::hours(2),
                 last_activity_at: now - time::Duration::hours(2),
@@ -8617,6 +8732,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_run_in_workspace_can_atomically_wait_for_its_exact_operation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let created = call_tool(
+            fixture.server(),
+            tools::CREATE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "access_path_id": fixture.access_path_id.to_string(),
+                "label": "atomic-wait",
+                "cwd": "/tmp"
+            })),
+        )
+        .await?;
+        let workspace_id = WorkspaceId::from(uuid::Uuid::parse_str(
+            created["workspace"]["id"]
+                .as_str()
+                .ok_or("created workspace id should be a string")?,
+        )?);
+        let repositories = fixture.repositories.clone();
+        let completer = tokio::spawn(async move {
+            for _ in 0..100 {
+                let operations = repositories
+                    .operations
+                    .list_for_workspace(workspace_id, 10)
+                    .await?;
+                if let Some(operation) = operations.into_iter().next() {
+                    repositories
+                        .operations
+                        .update_state(
+                            operation.id,
+                            OperationState::Succeeded,
+                            Some(now_utc()),
+                            Some(0),
+                            Some("test completion"),
+                        )
+                        .await?;
+                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(operation.id);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err::<OperationId, Box<dyn std::error::Error + Send + Sync>>(
+                "queued operation did not appear".into(),
+            )
+        });
+
+        let wait_result = call_tool(
+            fixture.server(),
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": workspace_id.to_string(),
+                "command_profile": "host.uptime",
+                "args": [],
+                "wait_timeout_ms": 1_000
+            })),
+        )
+        .await?;
+        let completed_operation_id = match completer.await? {
+            Ok(operation_id) => operation_id,
+            Err(error) => return Err(std::io::Error::other(error.to_string()).into()),
+        };
+        assert_eq!(wait_result["completion"]["completed"], json!(true));
+        assert_eq!(wait_result["completion"]["retry_after_ms"], Value::Null);
+        assert_eq!(
+            wait_result["completion"]["operation"]["id"],
+            json!(completed_operation_id.to_string())
+        );
+        assert_eq!(
+            wait_result["operation"]["id"],
+            wait_result["completion"]["operation"]["id"]
+        );
+
+        let timed_out = call_tool(
+            fixture.server(),
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": workspace_id.to_string(),
+                "command_profile": "host.uptime",
+                "args": [],
+                "wait_timeout_ms": 0
+            })),
+        )
+        .await?;
+        assert_eq!(timed_out["completion"]["completed"], json!(false));
+        assert_eq!(
+            timed_out["completion"]["operation"]["state"],
+            json!("queued")
+        );
+        assert_eq!(timed_out["completion"]["retry_after_ms"], json!(100));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mcp_run_in_workspace_rejects_exec_for_tty_only_access_path()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = TestFixture::new().await?;
@@ -8784,6 +8992,81 @@ mod tests {
         .await?;
         assert_eq!(waited["matched"], json!(true));
         assert_eq!(waited["workspace"]["state"], json!("idle"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_exposes_live_pty_input_without_generic_workspace_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let created = call_tool(
+            fixture.server(),
+            tools::CREATE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "access_path_id": fixture.access_path_id.to_string(),
+                "label": "interactive-prompt",
+                "cwd": "/tmp"
+            })),
+        )
+        .await?;
+        let workspace_id = WorkspaceId::from(uuid::Uuid::parse_str(
+            created["workspace"]["id"]
+                .as_str()
+                .ok_or("created workspace id should be a string")?,
+        )?);
+        let now = now_utc();
+        let pty_session_id = PtySessionId::new();
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&PtySession {
+                pty_session_id,
+                workspace_id,
+                session_id: fixture.session_id,
+                state: WorkspaceState::Working,
+                foreground_process: Some("sudo apt update".to_owned()),
+                cwd: Some("/tmp".to_owned()),
+                recent_output_ref: None,
+                last_exit_code: None,
+                input_allowed: true,
+                backend_state: PtyBackendState::Active,
+                backend_capabilities: PtyBackendCapabilities::unknown(),
+                interaction: Some(PtyInteraction {
+                    kind: PtyInteractionKind::SudoPassword,
+                    confidence: 100,
+                    observed_at: now,
+                }),
+                transport_evidence: None,
+                created_at: now,
+                last_activity_at: now,
+            })
+            .await?;
+        fixture
+            .repositories
+            .workspaces
+            .update_state(workspace_id, WorkspaceState::Blocked, now)
+            .await?;
+
+        let snapshot = call_tool(
+            fixture.server(),
+            tools::GET_HOST_RUNTIME_SNAPSHOT,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        let attention = snapshot["attention"]
+            .as_array()
+            .ok_or("attention should be an array")?;
+        assert!(attention.iter().any(|item| {
+            item["code"] == json!("pty_input_required")
+                && item["entity_type"] == json!("pty_session")
+                && item["entity_id"] == json!(pty_session_id.to_string())
+                && item["recommended_action"] == json!("read_pty_output_then_queue_input")
+        }));
+        assert!(!attention.iter().any(|item| {
+            item["code"] == json!("workspace_blocked")
+                && item["entity_id"] == json!(workspace_id.to_string())
+        }));
         Ok(())
     }
 

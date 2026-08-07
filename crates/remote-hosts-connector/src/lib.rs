@@ -29,7 +29,7 @@ use remote_hosts_core::{
     ExecRequest, ExecResult, FileTransferSpec, ForwardHandle, ForwardRequest,
     PtySessionOpenCommand, PtySessionSupervisor, PtySessionSupervisorError, RemoteTransport,
     SecretRedactor, ServerProtectionPolicy, SftpDirection, SftpOverwritePolicy, SftpProgress,
-    SftpRequest, SftpResult, transport::TransportError,
+    SftpRequest, SftpResult, detect_pty_interaction, transport::TransportError,
 };
 use remote_hosts_db::{
     AuthorizedKeyBootstrapRepository, ClaimedOperationFinish, DbError, Repositories,
@@ -96,6 +96,7 @@ const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const PTY_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(180);
 const PTY_OUTPUT_BATCH_TARGET_BYTES: usize = 64 * 1024;
 const PTY_OUTPUT_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
+const PTY_INTERACTION_TAIL_BYTES: usize = 4 * 1024;
 const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
 const PTY_WRITE_LEASE_SECONDS: i64 = 300;
 
@@ -6236,6 +6237,7 @@ where
         input: String,
     ) -> Result<ConnectorPtyInputOutcome, ConnectorPtyError> {
         validate_pty_input(&input, self.config.max_input_bytes)?;
+        let byte_len = input.len();
         let (input_tx, transfer_lock) = {
             let active = self.active.lock().await;
             active
@@ -6243,15 +6245,63 @@ where
                 .map(|handle| (handle.input_tx.clone(), Arc::clone(&handle.transfer_lock)))
                 .ok_or(ConnectorPtyError::NotActive)?
         };
-        let _input_guard = transfer_lock.lock().await;
+        let input_guard = transfer_lock.lock().await;
         input_tx
-            .send(input.clone())
+            .send(input)
             .await
             .map_err(|_| ConnectorPtyError::InputClosed)?;
+        drop(input_guard);
+        self.clear_interaction_after_input(pty_session_id).await;
         Ok(ConnectorPtyInputOutcome {
             pty_session_id,
-            byte_len: input.len(),
+            byte_len,
         })
+    }
+
+    async fn clear_interaction_after_input(&self, pty_session_id: PtySessionId) {
+        let observed_at = now_utc();
+        let session = match self.repositories.pty_sessions.get(pty_session_id).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%pty_session_id, %error, "failed to load PTY after input delivery");
+                return;
+            }
+        };
+        if session.interaction.is_none() {
+            return;
+        }
+
+        let workspace_id = session.workspace_id;
+        let mut updated_session = session;
+        updated_session.interaction = None;
+        updated_session.last_activity_at = observed_at;
+        if let Err(error) = self
+            .repositories
+            .pty_sessions
+            .upsert(&updated_session)
+            .await
+        {
+            tracing::warn!(%pty_session_id, %error, "failed to clear PTY interaction after accepted input");
+            return;
+        }
+
+        match self.repositories.workspaces.get(workspace_id).await {
+            Ok(Some(workspace)) if workspace.state == WorkspaceState::Blocked => {
+                if let Err(error) = self
+                    .repositories
+                    .workspaces
+                    .update_state(workspace_id, WorkspaceState::Working, observed_at)
+                    .await
+                {
+                    tracing::warn!(%pty_session_id, %workspace_id, %error, "failed to resume workspace after accepted PTY input");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%pty_session_id, %workspace_id, %error, "failed to load workspace after accepted PTY input");
+            }
+        }
     }
 
     /// Claims and delivers one queued PTY input event owned by this connector.
@@ -6494,7 +6544,7 @@ where
                 && session.input_allowed
                 && matches!(
                     session.state,
-                    WorkspaceState::Idle | WorkspaceState::Working
+                    WorkspaceState::Idle | WorkspaceState::Working | WorkspaceState::Blocked
                 );
             if persisted_active {
                 continue;
@@ -6782,6 +6832,7 @@ where
                 .unwrap_or(0);
             let mut pending = Vec::new();
             let mut pending_bytes = 0_usize;
+            let mut recent_redacted_tail = String::new();
             let mut flush_interval = tokio::time::interval_at(
                 Instant::now() + PTY_OUTPUT_BATCH_MAX_DELAY,
                 PTY_OUTPUT_BATCH_MAX_DELAY,
@@ -6830,6 +6881,18 @@ where
                 if redacted_text.is_empty() {
                     continue;
                 }
+                append_pty_interaction_tail(&mut recent_redacted_tail, &redacted_text);
+                if let Some(interaction) =
+                    detect_pty_interaction(&recent_redacted_tail, observed_at)
+                {
+                    mark_pty_interaction_blocked(
+                        &repositories,
+                        pty_session_id,
+                        workspace_id,
+                        interaction,
+                    )
+                    .await;
+                }
                 pending_bytes = pending_bytes.saturating_add(redacted_text.len());
                 pending.push(PtyOutputChunk {
                     id: PtyOutputChunkId::new(),
@@ -6874,6 +6937,7 @@ where
                 session.input_allowed = false;
                 session.foreground_process = None;
                 session.backend_state = PtyBackendState::Closed;
+                session.interaction = None;
                 session.last_activity_at = now_utc();
                 if repositories.pty_sessions.upsert(&session).await.is_err() {
                     return;
@@ -6920,6 +6984,7 @@ where
         session.input_allowed = false;
         session.foreground_process = None;
         session.backend_state = PtyBackendState::Failed;
+        session.interaction = None;
         session.last_activity_at = observed_at;
         self.repositories.pty_sessions.upsert(&session).await?;
         self.mark_connection_channel_closed(session.session_id)
@@ -6962,6 +7027,7 @@ where
         session.input_allowed = false;
         session.foreground_process = None;
         session.backend_state = PtyBackendState::Failed;
+        session.interaction = None;
         session.last_activity_at = observed_at;
         self.repositories.pty_sessions.upsert(&session).await?;
         if block_workspace
@@ -7146,6 +7212,73 @@ where
             })
             .await?;
         Ok(())
+    }
+}
+
+fn append_pty_interaction_tail(tail: &mut String, text: &str) {
+    tail.push_str(text);
+    if tail.len() <= PTY_INTERACTION_TAIL_BYTES {
+        return;
+    }
+
+    let bytes_to_drop = tail.len().saturating_sub(PTY_INTERACTION_TAIL_BYTES);
+    let start = tail
+        .char_indices()
+        .find_map(|(index, _)| (index >= bytes_to_drop).then_some(index))
+        .unwrap_or(tail.len());
+    tail.drain(..start);
+}
+
+async fn mark_pty_interaction_blocked(
+    repositories: &Repositories,
+    pty_session_id: PtySessionId,
+    workspace_id: WorkspaceId,
+    interaction: remote_hosts_domain::PtyInteraction,
+) {
+    let mut session = match repositories.pty_sessions.get(pty_session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%pty_session_id, %error, "failed to load PTY for interaction detection");
+            return;
+        }
+    };
+    if session
+        .interaction
+        .as_ref()
+        .is_some_and(|existing| existing.kind == interaction.kind)
+    {
+        return;
+    }
+
+    let observed_at = interaction.observed_at;
+    match repositories.workspaces.get(workspace_id).await {
+        Ok(Some(workspace))
+            if matches!(
+                workspace.state,
+                WorkspaceState::Idle | WorkspaceState::Working
+            ) =>
+        {
+            if let Err(error) = repositories
+                .workspaces
+                .update_state(workspace_id, WorkspaceState::Blocked, observed_at)
+                .await
+            {
+                tracing::warn!(%pty_session_id, %workspace_id, %error, "failed to mark workspace blocked for PTY interaction");
+                return;
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%pty_session_id, %workspace_id, %error, "failed to load workspace for PTY interaction");
+            return;
+        }
+    }
+
+    session.interaction = Some(interaction);
+    session.last_activity_at = observed_at;
+    if let Err(error) = repositories.pty_sessions.upsert(&session).await {
+        tracing::warn!(%pty_session_id, %error, "failed to persist detected PTY interaction");
     }
 }
 
@@ -10095,9 +10228,9 @@ mod tests {
         CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId,
         EnvironmentKind, Host, HostId, HostKind, HostWriteLease, OperationId, OperationRun,
         OperationState, OutputStream, Protocol, PtyBackendCapabilities, PtyBackendState,
-        PtyInputEvent, PtyInputEventId, PtyInputEventState, PtySessionId, RiskLevel, RouteType,
-        SessionId, SshChannelKind, SshConnectionUse, SshFileTransferMode, SshTransportBackend,
-        SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
+        PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyInteractionKind, PtySessionId,
+        RiskLevel, RouteType, SessionId, SshChannelKind, SshConnectionUse, SshFileTransferMode,
+        SshTransportBackend, SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
         SshTransportRuntimeState, SshTransportTelemetry, StateReasonCode, StoredCredential,
         TrustLevel, WorkspaceId, WorkspaceState, now_utc,
     };
@@ -12915,6 +13048,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interactive_prompt_blocks_workspace_without_releasing_pty_channel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let backend = CapturingPtyBackend::new();
+        let output_tx = backend.output_tx.clone();
+        let inputs = Arc::clone(&backend.inputs);
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+
+        output_tx
+            .send(PtyBackendOutput {
+                stream: OutputStream::Stdout,
+                text: "[sudo] password for ops: ".to_owned(),
+                truncated: false,
+            })
+            .await?;
+        wait_for_pty_interaction(
+            &fixture.repositories,
+            opened.pty_session.pty_session_id,
+            PtyInteractionKind::SudoPassword,
+        )
+        .await?;
+
+        let pty = fixture
+            .repositories
+            .pty_sessions
+            .get(opened.pty_session.pty_session_id)
+            .await?
+            .ok_or("PTY should exist")?;
+        assert_eq!(pty.backend_state, PtyBackendState::Active);
+        assert!(pty.input_allowed);
+        assert_eq!(
+            pty.interaction
+                .as_ref()
+                .map(|interaction| &interaction.kind),
+            Some(&PtyInteractionKind::SudoPassword)
+        );
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Blocked);
+        let access_path = fixture
+            .repositories
+            .access_paths
+            .get(workspace.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        let usage = fixture
+            .repositories
+            .access_paths
+            .channel_usage(access_path.id, now_utc())
+            .await?;
+        assert_eq!(usage.active_ptys, 1);
+
+        manager
+            .write_input(
+                opened.pty_session.pty_session_id,
+                "supplied-input\n".to_owned(),
+            )
+            .await?;
+        assert_eq!(inputs.lock().await.as_slice(), ["supplied-input\n"]);
+        let resumed_pty = fixture
+            .repositories
+            .pty_sessions
+            .get(opened.pty_session.pty_session_id)
+            .await?
+            .ok_or("PTY should exist")?;
+        assert!(resumed_pty.interaction.is_none());
+        let resumed_workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(resumed_workspace.state, WorkspaceState::Working);
+        manager
+            .close(opened.pty_session.pty_session_id, Some(0))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn connector_pty_manager_streams_redacted_output_and_accepts_input()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -15407,6 +15631,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         Err("pty output did not reach expected text".into())
+    }
+
+    async fn wait_for_pty_interaction(
+        repositories: &Repositories,
+        pty_session_id: PtySessionId,
+        expected_kind: PtyInteractionKind,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..100 {
+            let pty = repositories
+                .pty_sessions
+                .get(pty_session_id)
+                .await?
+                .ok_or("PTY should exist")?;
+            if pty
+                .interaction
+                .as_ref()
+                .is_some_and(|interaction| interaction.kind == expected_kind)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Err("PTY did not reach expected interaction state".into())
     }
 
     struct WorkerFixture {
