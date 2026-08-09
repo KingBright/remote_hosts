@@ -3457,11 +3457,11 @@ impl PtyInputEventRepository {
             r"
             INSERT INTO pty_input_events (
                 id, pty_session_id, workspace_id, connector_id, host_id, agent_session_id,
-                idempotency_key, input_fingerprint, state_json, sequence, input_text,
+                idempotency_key, payload_kind_json, input_fingerprint, state_json, sequence, input_text,
                 redacted_input_summary, byte_len, requested_by, created_at, claimed_at,
                 lease_expires_at, delivered_at, failed_at, attempt_count, claim_token, last_error
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )
         .bind(event.id.to_string())
@@ -3471,6 +3471,7 @@ impl PtyInputEventRepository {
         .bind(event.host_id.to_string())
         .bind(event.agent_session_id.map(|id| id.to_string()))
         .bind(&event.idempotency_key)
+        .bind(to_json(&event.payload_kind)?)
         .bind(&event.input_fingerprint)
         .bind(to_json(&event.state)?)
         .bind(u64_to_i64(event.sequence)?)
@@ -5913,6 +5914,7 @@ fn row_to_pty_input_event(row: &SqliteRow) -> Result<PtyInputEvent, DbError> {
         host_id: parse_id(row, "host_id")?,
         agent_session_id: parse_optional_id(row, "agent_session_id")?,
         idempotency_key: row.try_get("idempotency_key")?,
+        payload_kind: from_json_col(row, "payload_kind_json")?,
         input_fingerprint: row.try_get("input_fingerprint")?,
         state: from_json_col(row, "state_json")?,
         sequence: i64_to_u64(row.try_get("sequence")?)?,
@@ -6208,10 +6210,10 @@ mod tests {
         KnowledgeItem, KnowledgeItemId, OperationId, OperationOutputArtifact,
         OperationOutputArtifactId, OperationOutputChunk, OperationOutputChunkId, OperationRun,
         OperationState, OperationType, OutputStream, Protocol, PtyBackendCapabilities,
-        PtyBackendState, PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyOutputChunk,
-        PtyOutputChunkId, PtySession, PtySessionId, RiskLevel, RouteType, SessionId,
-        SshChannelKind, SshChannelTransportEvidence, SshFileTransferMode, SshTransportBackend,
-        SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
+        PtyBackendState, PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyInputPayloadKind,
+        PtyOutputChunk, PtyOutputChunkId, PtySession, PtySessionId, RiskLevel, RouteType,
+        SessionId, SshChannelKind, SshChannelTransportEvidence, SshFileTransferMode,
+        SshTransportBackend, SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
         SshTransportRuntimeState, SshTransportTelemetry, StateEvent, StateReasonCode,
         StoredCredential, TrustLevel, WorkspaceId, WorkspaceState, now_utc,
     };
@@ -7189,6 +7191,7 @@ mod tests {
             host_id: host.id,
             agent_session_id: workspace.agent_session_id,
             idempotency_key: None,
+            payload_kind: PtyInputPayloadKind::Text,
             input_fingerprint: None,
             state: PtyInputEventState::Queued,
             sequence: repos
@@ -7282,6 +7285,7 @@ mod tests {
             host_id: host.id,
             agent_session_id: workspace.agent_session_id,
             idempotency_key: Some("close-before-delivery".to_owned()),
+            payload_kind: PtyInputPayloadKind::Text,
             input_fingerprint: Some("close-before-delivery-fingerprint".to_owned()),
             state: PtyInputEventState::Queued,
             sequence: 1,

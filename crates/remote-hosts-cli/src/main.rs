@@ -8,7 +8,8 @@ use remote_hosts_connector::{
     ConnectorDaemon, ConnectorDaemonConfig, ConnectorOperationWorker,
     ConnectorOperationWorkerConfig, ConnectorPtyManager, ConnectorPtyManagerConfig,
     FileOutputArtifactStore, HostKeyPolicy, InteractiveFileTransferBackend, QueuedPtyInputPump,
-    RusshPtyBackendFactory, RusshTransportPool, RusshTransportProvider, VaultSshCredentialProvider,
+    RusshPtyBackendFactory, RusshTransportPool, RusshTransportProvider, SshCredentialProvider,
+    VaultSshCredentialProvider,
 };
 #[cfg(unix)]
 use remote_hosts_connector::{
@@ -985,6 +986,15 @@ async fn run_worker_daemon(args: WorkerDaemonArgs) -> anyhow::Result<()> {
     match ssh_backend {
         #[cfg(unix)]
         SshBackend::OpenSsh => {
+            let sudo_credential_provider = read_optional_vault_master_password(
+                args.vault_master_password_file.as_ref(),
+            )?
+            .map(|master_password| {
+                Arc::new(VaultSshCredentialProvider::new(
+                    repositories.clone(),
+                    master_password,
+                )) as Arc<dyn SshCredentialProvider>
+            });
             let openssh_pool = Arc::new(OpenSshTransportPool::new(
                 repositories.clone(),
                 host_key_policy,
@@ -1000,6 +1010,7 @@ async fn run_worker_daemon(args: WorkerDaemonArgs) -> anyhow::Result<()> {
                 &args,
                 pty_backend_mode,
                 SharedPtyTransportPool::OpenSsh(openssh_pool),
+                sudo_credential_provider,
             )?;
             run_worker_daemon_with_provider(
                 repositories,
@@ -1015,6 +1026,7 @@ async fn run_worker_daemon(args: WorkerDaemonArgs) -> anyhow::Result<()> {
                 repositories.clone(),
                 read_required_vault_master_password(args.vault_master_password_file.as_ref())?,
             ));
+            let sudo_credential_provider: Arc<dyn SshCredentialProvider> = credentials.clone();
             let russh_pool = Arc::new(RusshTransportPool::new(
                 repositories.clone(),
                 credentials,
@@ -1033,6 +1045,7 @@ async fn run_worker_daemon(args: WorkerDaemonArgs) -> anyhow::Result<()> {
                 &args,
                 pty_backend_mode,
                 SharedPtyTransportPool::Russh(russh_pool),
+                Some(sudo_credential_provider),
             )?;
             run_worker_daemon_with_provider(
                 repositories,
@@ -1065,6 +1078,7 @@ fn build_pty_input_pump(
     args: &WorkerDaemonArgs,
     mode: PtyBackendMode,
     shared_pool: SharedPtyTransportPool,
+    sudo_credential_provider: Option<Arc<dyn SshCredentialProvider>>,
 ) -> anyhow::Result<ConnectorPtyServices> {
     let config = ConnectorPtyManagerConfig {
         connector_id,
@@ -1078,7 +1092,12 @@ fn build_pty_input_pump(
         (PtyBackendMode::OpenSsh(mode), SharedPtyTransportPool::OpenSsh(pool)) => {
             let backend =
                 OpenSshPtyBackendFactory::with_pool(repositories.clone(), pool).with_mode(mode);
-            let manager = Arc::new(ConnectorPtyManager::new(repositories, backend, config));
+            let manager = ConnectorPtyManager::new(repositories, backend, config);
+            let manager = match sudo_credential_provider {
+                Some(provider) => manager.with_sudo_credential_provider(provider),
+                None => manager,
+            };
+            let manager = Arc::new(manager);
             Ok(ConnectorPtyServices {
                 input_pump: manager.clone(),
                 interactive_file_transfer: manager,
@@ -1086,7 +1105,12 @@ fn build_pty_input_pump(
         }
         (PtyBackendMode::RusshNativePty, SharedPtyTransportPool::Russh(pool)) => {
             let backend = RusshPtyBackendFactory::with_pool(repositories.clone(), pool);
-            let manager = Arc::new(ConnectorPtyManager::new(repositories, backend, config));
+            let manager = ConnectorPtyManager::new(repositories, backend, config);
+            let manager = match sudo_credential_provider {
+                Some(provider) => manager.with_sudo_credential_provider(provider),
+                None => manager,
+            };
+            let manager = Arc::new(manager);
             Ok(ConnectorPtyServices {
                 input_pump: manager.clone(),
                 interactive_file_transfer: manager,

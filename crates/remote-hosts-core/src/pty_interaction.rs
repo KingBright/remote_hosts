@@ -15,6 +15,10 @@ pub fn detect_pty_interaction(text: &str, observed_at: OffsetDateTime) -> Option
         (PtyInteractionKind::HostKeyConfirmation, 100)
     } else if sudo_password().is_some_and(|regex| regex.is_match(trimmed)) {
         (PtyInteractionKind::SudoPassword, 100)
+    } else if macos_sudo_password().is_some_and(|regex| regex.is_match(trimmed)) {
+        // macOS sudo uses a bare `Password:` prompt. It is accepted only by the explicit
+        // stored-sudo input mode, never injected automatically from prompt detection alone.
+        (PtyInteractionKind::SudoPassword, 85)
     } else if password().is_some_and(|regex| regex.is_match(trimmed)) {
         (PtyInteractionKind::Password, 92)
     } else if confirmation().is_some_and(|regex| regex.is_match(trimmed)) {
@@ -44,6 +48,12 @@ fn host_key_confirmation() -> Option<&'static Regex> {
 fn sudo_password() -> Option<&'static Regex> {
     static PATTERN: LazyLock<Option<Regex>> =
         LazyLock::new(|| compile_pattern(r"(?i)\[sudo\]\s+password for [^:\n]{1,160}:$"));
+    PATTERN.as_ref()
+}
+
+fn macos_sudo_password() -> Option<&'static Regex> {
+    static PATTERN: LazyLock<Option<Regex>> =
+        LazyLock::new(|| compile_pattern(r"(?i)(?:^|\n)password\s*:$"));
     PATTERN.as_ref()
 }
 
@@ -98,6 +108,7 @@ mod tests {
                 "[sudo] password for ops: ",
                 PtyInteractionKind::SudoPassword,
             ),
+            ("Password: ", PtyInteractionKind::SudoPassword),
             (
                 "Are you sure you want to continue connecting (yes/no/[fingerprint])? ",
                 PtyInteractionKind::HostKeyConfirmation,

@@ -155,7 +155,16 @@ the SSH channel claims exit status zero.
 ## Credentials and Authentication
 
 The local vault encrypts password, private-key, passphrase, and sudo-password fields. Plaintext is
-accepted only by dedicated credential tools and is never returned by HTTP or MCP.
+accepted only by dedicated credential tools and is never returned by HTTP or MCP. When an active
+PTY reports a live sudo prompt, the existing PTY-input tool can request
+`use_stored_sudo_password=true` without a text payload. The connector rechecks that prompt,
+decrypts only the access path's dedicated sudo field in memory, and writes it directly to that
+same PTY. Queue records retain only the `stored_sudo_password` type, a fixed redacted summary, and
+zero payload bytes; the password never enters MCP arguments, output artifacts, audit rows, or the
+SQLite input payload. Canonical `[sudo] password ...` prompts and macOS's bare `Password:` prompt
+are supported, but no password is injected automatically merely because a prompt was detected. For
+the bare macOS form, the installed Agent skill requires an explicit `sudo` command immediately
+before the prompt on the same PTY, with no intervening input.
 
 Native SSH authentication tries a stored key, bounded SSH-agent identities, default local keys when
 the agent is empty, and then the encrypted password. After password authentication, the connector

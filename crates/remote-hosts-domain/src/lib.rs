@@ -400,6 +400,16 @@ pub enum PtyInputEventState {
     Failed,
 }
 
+/// Source of a queued PTY input payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PtyInputPayloadKind {
+    /// The event carries caller-provided text in its private queue payload.
+    Text,
+    /// The connector resolves a stored sudo password only when delivering the event.
+    StoredSudoPassword,
+}
+
 /// State values visible to agents.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1521,6 +1531,8 @@ pub struct PtyInputEvent {
     pub agent_session_id: Option<AgentSessionId>,
     /// Optional caller-supplied retry key, unique within one agent session.
     pub idempotency_key: Option<String>,
+    /// Source used to resolve the private input payload.
+    pub payload_kind: PtyInputPayloadKind,
     /// Non-reversible input digest used only to reject mismatched idempotent retries.
     #[serde(skip)]
     pub input_fingerprint: Option<String>,

@@ -784,8 +784,13 @@ pub struct ReadPtyOutputRequest {
 pub struct QueuePtyInputRequest {
     /// PTY session id as UUID string.
     pub pty_session_id: String,
-    /// Raw input to enqueue for connector-owned PTY delivery.
-    pub input: String,
+    /// Raw input to enqueue for connector-owned PTY delivery. Required unless
+    /// `use_stored_sudo_password` is true.
+    pub input: Option<String>,
+    /// Resolve the access path's encrypted sudo password inside the connector and send it only
+    /// to a live sudo prompt. This mode rejects a caller-provided `input` value.
+    #[serde(default)]
+    pub use_stored_sudo_password: bool,
     /// Optional requester label.
     pub requested_by: Option<String>,
     /// Stable retry key. Reusing it in this conversation returns the original input event.
@@ -4268,7 +4273,7 @@ impl RemoteHostsMcpServer {
     /// Queue input for connector-owned PTY delivery.
     #[tool(
         name = "remote_hosts_queue_pty_input",
-        description = "Queue input for a persistent PTY session; the owning connector delivers it to the live backend.",
+        description = "Queue text for a persistent PTY, or set use_stored_sudo_password=true to inject the route's encrypted sudo password only into a live sudo prompt. The password never enters MCP arguments, output, or audit records.",
         annotations(
             title = "Queue PTY Input",
             read_only_hint = false,
@@ -4290,18 +4295,42 @@ impl RemoteHostsMcpServer {
             .next_sequence(pty_session_id)
             .await
             .map_err(|error| tool_error(&error))?;
-        let plan = PtySessionSupervisor::default()
-            .queue_input(
-                &pty_session,
-                &workspace,
-                next_sequence,
-                PtySessionInputCommand {
-                    input: request.input,
-                    requested_by: request.requested_by,
+        let plan = if request.use_stored_sudo_password {
+            if request.input.is_some() {
+                return Err(
+                    "input must be omitted when use_stored_sudo_password is true".to_owned(),
+                );
+            }
+            if request.requested_by.is_some() {
+                return Err(
+                    "requested_by must be omitted when use_stored_sudo_password is true".to_owned(),
+                );
+            }
+            PtySessionSupervisor::default()
+                .queue_stored_sudo_password(
+                    &pty_session,
+                    &workspace,
+                    next_sequence,
                     idempotency_key,
-                },
-            )
-            .map_err(|error| error.to_string())?;
+                )
+                .map_err(|error| error.to_string())?
+        } else {
+            let input = request.input.ok_or_else(|| {
+                "input is required unless use_stored_sudo_password is true".to_owned()
+            })?;
+            PtySessionSupervisor::default()
+                .queue_input(
+                    &pty_session,
+                    &workspace,
+                    next_sequence,
+                    PtySessionInputCommand {
+                        input,
+                        requested_by: request.requested_by,
+                        idempotency_key,
+                    },
+                )
+                .map_err(|error| error.to_string())?
+        };
         if let (Some(agent_session_id), Some(idempotency_key)) = (
             plan.event.agent_session_id,
             plan.event.idempotency_key.as_deref(),
@@ -5677,6 +5706,7 @@ fn ensure_matching_pty_idempotent_request(
     idempotency_key: &str,
 ) -> Result<(), String> {
     if existing.pty_session_id != requested.pty_session_id
+        || existing.payload_kind != requested.payload_kind
         || existing.input_fingerprint != requested.input_fingerprint
         || existing.requested_by != requested.requested_by
     {
@@ -9067,6 +9097,27 @@ mod tests {
             item["code"] == json!("workspace_blocked")
                 && item["entity_id"] == json!(workspace_id.to_string())
         }));
+
+        let queued_sudo = call_tool(
+            fixture.server(),
+            tools::QUEUE_PTY_INPUT,
+            Some(json!({
+                "pty_session_id": pty_session_id.to_string(),
+                "use_stored_sudo_password": true,
+                "idempotency_key": "sudo-prompt-1"
+            })),
+        )
+        .await?;
+        assert_eq!(
+            queued_sudo["input_event"]["payload_kind"],
+            json!("stored_sudo_password")
+        );
+        assert_eq!(queued_sudo["input_event"]["byte_len"], json!(0));
+        assert_eq!(
+            queued_sudo["input_event"]["redacted_input_summary"],
+            json!("stored sudo password queued for pty input")
+        );
+        assert!(!queued_sudo.to_string().contains("password="));
         Ok(())
     }
 

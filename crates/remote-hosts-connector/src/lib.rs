@@ -40,11 +40,11 @@ use remote_hosts_domain::{
     ConnectionSession, ConnectorId, EntityState, HostId, HostKind, HostWriteLease, OperationId,
     OperationOutputArtifact, OperationOutputArtifactId, OperationOutputChunk,
     OperationOutputChunkId, OperationRun, OperationState, OutputStream, PtyBackendCapabilities,
-    PtyBackendState, PtyInputEventId, PtyInputEventState, PtyOutputChunk, PtyOutputChunkId,
-    PtySession, PtySessionId, RouteType, SessionId, SshChannelKind, SshChannelTransportEvidence,
-    SshFileTransferMode, SshTransportBackend, SshTransportCapabilities, SshTransportRuntime,
-    SshTransportRuntimeId, SshTransportRuntimeState, SshTransportTelemetry, StateReasonCode,
-    WorkspaceId, WorkspaceState, now_utc,
+    PtyBackendState, PtyInputEventId, PtyInputEventState, PtyInputPayloadKind, PtyOutputChunk,
+    PtyOutputChunkId, PtySession, PtySessionId, RouteType, SessionId, SshChannelKind,
+    SshChannelTransportEvidence, SshFileTransferMode, SshTransportBackend,
+    SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId, SshTransportRuntimeState,
+    SshTransportTelemetry, StateReasonCode, WorkspaceId, WorkspaceState, now_utc,
 };
 use remote_hosts_vault::{CredentialSecret, CredentialVault, EncryptedCredentialBlob};
 use russh::{
@@ -1982,6 +1982,9 @@ pub enum SshCredentialError {
     /// Credential does not contain SSH authentication material.
     #[error("credential does not contain ssh password or private key material")]
     MissingSshMaterial,
+    /// Credential does not contain a dedicated sudo password.
+    #[error("credential does not contain a sudo password")]
+    MissingSudoPassword,
     /// Database error.
     #[error("database error: {0}")]
     Database(#[from] DbError),
@@ -1995,6 +1998,15 @@ pub trait SshCredentialProvider: Send + Sync {
         &self,
         access_path_id: AccessPathId,
     ) -> Result<SshCredentialSecret, SshCredentialError>;
+
+    /// Returns a sudo password for one access path when the connector needs to answer a live
+    /// sudo prompt. Implementations must never expose it outside the connector process.
+    async fn sudo_password_for(
+        &self,
+        _access_path_id: AccessPathId,
+    ) -> Result<SecretString, SshCredentialError> {
+        Err(SshCredentialError::MissingSudoPassword)
+    }
 }
 
 /// Vault-backed credential provider for native SSH transports.
@@ -2056,6 +2068,37 @@ impl SshCredentialProvider for VaultSshCredentialProvider {
             return Err(SshCredentialError::MissingSshMaterial);
         }
         Ok(secret)
+    }
+
+    async fn sudo_password_for(
+        &self,
+        access_path_id: AccessPathId,
+    ) -> Result<SecretString, SshCredentialError> {
+        let access_path = self
+            .repositories
+            .access_paths
+            .get(access_path_id)
+            .await?
+            .ok_or(SshCredentialError::NotFound)?;
+        let stored = self
+            .repositories
+            .credentials
+            .get(access_path.credential_id)
+            .await?
+            .ok_or(SshCredentialError::NotFound)?;
+        if is_openssh_agent_reference(&stored.encrypted_blob_json) {
+            return Err(SshCredentialError::MissingSudoPassword);
+        }
+        let blob: EncryptedCredentialBlob = serde_json::from_value(stored.encrypted_blob_json)
+            .map_err(|_| SshCredentialError::InvalidBlob)?;
+        let mut secret = CredentialVault::decrypt(&self.master_password, &blob)
+            .map_err(|_| SshCredentialError::VaultLocked)?;
+        secret
+            .sudo_password
+            .take()
+            .filter(|password| !password.is_empty())
+            .map(SecretString::from)
+            .ok_or(SshCredentialError::MissingSudoPassword)
     }
 }
 
@@ -6018,6 +6061,12 @@ pub enum ConnectorPtyError {
     /// PTY input could not be delivered.
     #[error("pty input channel is closed")]
     InputClosed,
+    /// A vault-backed sudo response was requested when no live sudo prompt remains.
+    #[error("stored sudo password injection requires a live sudo password prompt")]
+    StoredSudoPromptUnavailable,
+    /// The connector cannot resolve a dedicated sudo credential for this access path.
+    #[error("stored sudo password injection is unavailable for this access path")]
+    StoredSudoPasswordUnavailable,
     /// Integer conversion failed.
     #[error("integer conversion error: {0}")]
     Int(#[from] std::num::TryFromIntError),
@@ -6049,6 +6098,7 @@ pub struct ConnectorPtyManager<B> {
     repositories: Repositories,
     backend: B,
     config: ConnectorPtyManagerConfig,
+    sudo_credential_provider: Option<Arc<dyn SshCredentialProvider>>,
     active: Arc<Mutex<BTreeMap<PtySessionId, ActivePtyHandle>>>,
 }
 
@@ -6062,8 +6112,19 @@ where
             repositories,
             backend,
             config,
+            sudo_credential_provider: None,
             active: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Enables connector-local injection of stored sudo passwords for live PTY prompts.
+    #[must_use]
+    pub fn with_sudo_credential_provider(
+        mut self,
+        provider: Arc<dyn SshCredentialProvider>,
+    ) -> Self {
+        self.sudo_credential_provider = Some(provider);
+        self
     }
 
     /// Reconciles stale active PTY records left by an earlier connector process.
@@ -6334,7 +6395,7 @@ where
 
         let input_event_id = claimed.event.id;
         let pty_session_id = claimed.event.pty_session_id;
-        let byte_len = claimed.input_text.len();
+        let byte_len = usize::try_from(claimed.event.byte_len).unwrap_or(usize::MAX);
         if !self
             .acquire_pty_input_write_lease(&claimed.event, lease_seconds)
             .await?
@@ -6357,10 +6418,16 @@ where
                 error: None,
             }));
         }
-        match self
-            .deliver_input_text(pty_session_id, claimed.input_text)
-            .await
-        {
+        let delivery = match claimed.event.payload_kind {
+            PtyInputPayloadKind::Text => {
+                self.deliver_input_text(pty_session_id, claimed.input_text)
+                    .await
+            }
+            PtyInputPayloadKind::StoredSudoPassword => {
+                self.deliver_stored_sudo_password(pty_session_id).await
+            }
+        };
+        match delivery {
             Ok(_) => {
                 let finished = self
                     .repositories
@@ -6590,6 +6657,66 @@ where
             }
             result => result,
         }
+    }
+
+    async fn deliver_stored_sudo_password(
+        &self,
+        pty_session_id: PtySessionId,
+    ) -> Result<ConnectorPtyInputOutcome, ConnectorPtyError> {
+        let provider = self
+            .sudo_credential_provider
+            .as_ref()
+            .ok_or(ConnectorPtyError::StoredSudoPasswordUnavailable)?;
+        let session = self.ensure_live_sudo_prompt(pty_session_id).await?;
+        let connection = self
+            .repositories
+            .connection_sessions
+            .get(session.session_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!(
+                    "connection session not found: {}",
+                    session.session_id
+                ))
+            })?;
+        let password = provider
+            .sudo_password_for(connection.access_path_id)
+            .await
+            .map_err(|_| ConnectorPtyError::StoredSudoPasswordUnavailable)?;
+
+        // A prompt can disappear while the connector reads the vault. Recheck before writing so
+        // this path never answers a later unrelated interactive request.
+        self.ensure_live_sudo_prompt(pty_session_id).await?;
+        let mut input = Zeroizing::new(password.expose_secret().to_owned());
+        input.push('\n');
+        self.write_input(pty_session_id, input.to_string()).await
+    }
+
+    async fn ensure_live_sudo_prompt(
+        &self,
+        pty_session_id: PtySessionId,
+    ) -> Result<PtySession, ConnectorPtyError> {
+        let session = self
+            .repositories
+            .pty_sessions
+            .get(pty_session_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!("pty session not found: {pty_session_id}"))
+            })?;
+        if session.backend_state != PtyBackendState::Active
+            || !session.input_allowed
+            || !matches!(
+                session
+                    .interaction
+                    .as_ref()
+                    .map(|interaction| &interaction.kind),
+                Some(remote_hosts_domain::PtyInteractionKind::SudoPassword)
+            )
+        {
+            return Err(ConnectorPtyError::StoredSudoPromptUnavailable);
+        }
+        Ok(session)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7061,6 +7188,13 @@ where
         connection: &ConnectionSession,
         error: &ConnectorPtyError,
     ) -> Result<(), ConnectorPtyError> {
+        if matches!(
+            error,
+            ConnectorPtyError::StoredSudoPromptUnavailable
+                | ConnectorPtyError::StoredSudoPasswordUnavailable
+        ) {
+            return Ok(());
+        }
         let observed_at = now_utc();
         let message = SecretRedactor::default().redact(&error.to_string());
         let local_handshake_budget = matches!(
@@ -7094,6 +7228,8 @@ where
             | ConnectorPtyError::InputNotAllowed
             | ConnectorPtyError::InvalidInput(_)
             | ConnectorPtyError::InputClosed
+            | ConnectorPtyError::StoredSudoPromptUnavailable
+            | ConnectorPtyError::StoredSudoPasswordUnavailable
             | ConnectorPtyError::Int(_) => (
                 EntityState::Degraded,
                 StateReasonCode::SshHandshakeFailed,
@@ -10228,11 +10364,12 @@ mod tests {
         CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId,
         EnvironmentKind, Host, HostId, HostKind, HostWriteLease, OperationId, OperationRun,
         OperationState, OutputStream, Protocol, PtyBackendCapabilities, PtyBackendState,
-        PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyInteractionKind, PtySessionId,
-        RiskLevel, RouteType, SessionId, SshChannelKind, SshConnectionUse, SshFileTransferMode,
-        SshTransportBackend, SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
-        SshTransportRuntimeState, SshTransportTelemetry, StateReasonCode, StoredCredential,
-        TrustLevel, WorkspaceId, WorkspaceState, now_utc,
+        PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyInputPayloadKind, PtyInteraction,
+        PtyInteractionKind, PtySessionId, RiskLevel, RouteType, SessionId, SshChannelKind,
+        SshConnectionUse, SshFileTransferMode, SshTransportBackend, SshTransportCapabilities,
+        SshTransportRuntime, SshTransportRuntimeId, SshTransportRuntimeState,
+        SshTransportTelemetry, StateReasonCode, StoredCredential, TrustLevel, WorkspaceId,
+        WorkspaceState, now_utc,
     };
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -10246,8 +10383,9 @@ mod tests {
         ManagedPtyBackend, ManagedPtyProcess, OutputArtifactStore, PtyBackendOutput,
         PtyBackendSpawnRequest, QueuedPtyInputPump, RusshPtyBackendFactory, RusshTransportPool,
         SshCredentialProvider, StaticTransportProvider, TransportTelemetryTracker,
-        authorized_key_bootstrap_failure_state, authorized_key_bootstrap_is_eligible,
-        execute_authorized_key_install_with_timeout, initial_pty_cwd, russh_inactivity_timeout,
+        VaultSshCredentialProvider, authorized_key_bootstrap_failure_state,
+        authorized_key_bootstrap_is_eligible, execute_authorized_key_install_with_timeout,
+        initial_pty_cwd, russh_inactivity_timeout,
     };
     #[cfg(unix)]
     use super::{
@@ -13839,6 +13977,7 @@ mod tests {
             host_id: fixture.host_id,
             agent_session_id: Some(fixture.agent_session_id),
             idempotency_key: Some("pending-input".to_owned()),
+            payload_kind: PtyInputPayloadKind::Text,
             input_fingerprint: None,
             state: PtyInputEventState::Queued,
             sequence: 0,
@@ -14271,6 +14410,7 @@ mod tests {
             host_id: workspace.host_id,
             agent_session_id: workspace.agent_session_id,
             idempotency_key: Some("startup-reconciliation-input".to_owned()),
+            payload_kind: PtyInputPayloadKind::Text,
             input_fingerprint: Some("startup-reconciliation-fingerprint".to_owned()),
             state: PtyInputEventState::Queued,
             sequence: 0,
@@ -14399,6 +14539,7 @@ mod tests {
             host_id: workspace.host_id,
             agent_session_id: workspace.agent_session_id,
             idempotency_key: None,
+            payload_kind: PtyInputPayloadKind::Text,
             input_fingerprint: None,
             state: PtyInputEventState::Queued,
             sequence: 0,
@@ -14443,6 +14584,196 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn connector_injects_stored_sudo_password_without_persisting_the_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        let access_path = fixture
+            .repositories
+            .access_paths
+            .get(connection.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        let existing_credential = fixture
+            .repositories
+            .credentials
+            .get(access_path.credential_id)
+            .await?
+            .ok_or("credential should exist")?;
+        let master = SecretString::from("connector-sudo-test-master".to_owned());
+        let sudo_password = "connector-only-sudo-password";
+        let blob = CredentialVault::encrypt(
+            &master,
+            &CredentialSecret {
+                password: Some("ssh-password-not-used-for-sudo".to_owned()),
+                private_key_pem: None,
+                private_key_passphrase: None,
+                sudo_password: Some(sudo_password.to_owned()),
+                token: None,
+                secret_text: None,
+                use_ssh_agent: false,
+            },
+        )?;
+        fixture
+            .repositories
+            .credentials
+            .upsert(&StoredCredential {
+                metadata: existing_credential.metadata,
+                encrypted_blob_json: serde_json::to_value(blob)?,
+            })
+            .await?;
+
+        let backend = CapturingPtyBackend::new();
+        let inputs = Arc::clone(&backend.inputs);
+        let sudo_provider: Arc<dyn SshCredentialProvider> = Arc::new(
+            VaultSshCredentialProvider::new(fixture.repositories.clone(), master),
+        );
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        )
+        .with_sudo_credential_provider(sudo_provider);
+        let opened = manager
+            .open(
+                fixture.workspace_id,
+                fixture.session_id,
+                Some("/tmp".to_owned()),
+            )
+            .await?;
+        let now = now_utc();
+        let mut pty = fixture
+            .repositories
+            .pty_sessions
+            .get(opened.pty_session.pty_session_id)
+            .await?
+            .ok_or("opened pty should exist")?;
+        pty.state = WorkspaceState::Working;
+        pty.interaction = Some(PtyInteraction {
+            kind: PtyInteractionKind::SudoPassword,
+            confidence: 100,
+            observed_at: now,
+        });
+        fixture.repositories.pty_sessions.upsert(&pty).await?;
+        fixture
+            .repositories
+            .workspaces
+            .update_state(fixture.workspace_id, WorkspaceState::Blocked, now)
+            .await?;
+        let event = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: pty.pty_session_id,
+            workspace_id: fixture.workspace_id,
+            connector_id: fixture.connector_id,
+            host_id: fixture.host_id,
+            agent_session_id: Some(fixture.agent_session_id),
+            idempotency_key: Some("stored-sudo-prompt-1".to_owned()),
+            payload_kind: PtyInputPayloadKind::StoredSudoPassword,
+            input_fingerprint: Some("stored-sudo-fingerprint".to_owned()),
+            state: PtyInputEventState::Queued,
+            sequence: 0,
+            redacted_input_summary: "stored sudo password queued for pty input".to_owned(),
+            byte_len: 0,
+            requested_by: None,
+            created_at: now,
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&event, "")
+            .await?;
+
+        let outcome = manager
+            .deliver_next_queued_input(30, 3)
+            .await?
+            .ok_or("stored sudo event should be delivered")?;
+        assert_eq!(outcome.state, PtyInputEventState::Delivered);
+        assert_eq!(outcome.byte_len, 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            inputs.lock().await.as_slice(),
+            [format!("{sudo_password}\n")]
+        );
+
+        let delivered = fixture
+            .repositories
+            .pty_input_events
+            .get(event.id)
+            .await?
+            .ok_or("stored sudo event should remain visible")?;
+        let visible = serde_json::to_string(&delivered)?;
+        assert_eq!(
+            delivered.payload_kind,
+            PtyInputPayloadKind::StoredSudoPassword
+        );
+        assert_eq!(
+            delivered.redacted_input_summary,
+            event.redacted_input_summary
+        );
+        assert!(!visible.contains(sudo_password));
+        assert!(!visible.contains("ssh-password-not-used-for-sudo"));
+
+        let stale_event = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: pty.pty_session_id,
+            workspace_id: fixture.workspace_id,
+            connector_id: fixture.connector_id,
+            host_id: fixture.host_id,
+            agent_session_id: Some(fixture.agent_session_id),
+            idempotency_key: Some("stored-sudo-prompt-stale".to_owned()),
+            payload_kind: PtyInputPayloadKind::StoredSudoPassword,
+            input_fingerprint: Some("stored-sudo-stale-fingerprint".to_owned()),
+            state: PtyInputEventState::Queued,
+            sequence: 1,
+            redacted_input_summary: "stored sudo password queued for pty input".to_owned(),
+            byte_len: 0,
+            requested_by: None,
+            created_at: now_utc(),
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&stale_event, "")
+            .await?;
+        let stale_outcome = manager
+            .deliver_next_queued_input(30, 3)
+            .await?
+            .ok_or("stale stored sudo event should be terminalized")?;
+        assert_eq!(stale_outcome.state, PtyInputEventState::Failed);
+        assert_eq!(stale_outcome.byte_len, 0);
+        assert!(
+            stale_outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("live sudo password prompt"))
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            inputs.lock().await.as_slice(),
+            [format!("{sudo_password}\n")]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn connector_pty_write_lease_blocks_foreign_session_until_close_or_expiry()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
@@ -14470,6 +14801,7 @@ mod tests {
             host_id: workspace.host_id,
             agent_session_id: workspace.agent_session_id,
             idempotency_key: Some("interactive-deploy-step".to_owned()),
+            payload_kind: PtyInputPayloadKind::Text,
             input_fingerprint: Some("test-fingerprint".to_owned()),
             state: PtyInputEventState::Queued,
             sequence: 0,
@@ -14679,6 +15011,7 @@ mod tests {
             host_id: workspace.host_id,
             agent_session_id: workspace.agent_session_id,
             idempotency_key: None,
+            payload_kind: PtyInputPayloadKind::Text,
             input_fingerprint: None,
             state: PtyInputEventState::Queued,
             sequence: 0,
