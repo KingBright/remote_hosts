@@ -1,7 +1,7 @@
 //! Connector-side execution guards and transport backends.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -6100,6 +6100,7 @@ pub struct ConnectorPtyManager<B> {
     config: ConnectorPtyManagerConfig,
     sudo_credential_provider: Option<Arc<dyn SshCredentialProvider>>,
     active: Arc<Mutex<BTreeMap<PtySessionId, ActivePtyHandle>>>,
+    capacity_wait_notified: Arc<Mutex<BTreeSet<PtySessionId>>>,
 }
 
 impl<B> ConnectorPtyManager<B>
@@ -6114,6 +6115,7 @@ where
             config,
             sudo_credential_provider: None,
             active: Arc::new(Mutex::new(BTreeMap::new())),
+            capacity_wait_notified: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -6142,36 +6144,107 @@ where
             .pty_sessions
             .mark_active_backends_lost_for_connector(self.config.connector_id, observed_at)
             .await?;
-        for session in &sessions {
+        let mut reconciled = 0_u64;
+        for session in sessions {
             self.mark_connection_channel_closed(session.session_id)
                 .await?;
-            self.repositories
-                .workspaces
-                .update_state(session.workspace_id, WorkspaceState::Blocked, observed_at)
-                .await?;
-            if let Some(workspace) = self
+            let Some(workspace) = self
                 .repositories
                 .workspaces
                 .get(session.workspace_id)
                 .await?
-                && let Some(agent_session_id) = workspace.agent_session_id
-            {
-                shorten_host_write_lease(
-                    &self.repositories,
-                    workspace.host_id,
-                    &workspace.coordination_scope,
-                    agent_session_id,
-                    observed_at,
+            else {
+                reconciled = reconciled.saturating_add(1);
+                continue;
+            };
+            if workspace_keeps_pty_open(&workspace.state) {
+                self.repositories
+                    .workspaces
+                    .update_state(session.workspace_id, WorkspaceState::Blocked, observed_at)
+                    .await?;
+                if let Some(agent_session_id) = workspace.agent_session_id {
+                    shorten_host_write_lease(
+                        &self.repositories,
+                        workspace.host_id,
+                        &workspace.coordination_scope,
+                        agent_session_id,
+                        observed_at,
+                    )
+                    .await?;
+                }
+                self.append_pty_system_output(
+                    &session,
+                    "connector runtime restarted; previous PTY backend continuity was lost; open a new PTY session",
+                )
+                .await?;
+            } else {
+                let closed = PtySessionSupervisor::default().close(session, None);
+                self.repositories.pty_sessions.upsert(&closed).await?;
+                self.append_pty_system_output(
+                    &closed,
+                    "PTY closed during connector restart because its Workspace had already reached a terminal state",
                 )
                 .await?;
             }
+            reconciled = reconciled.saturating_add(1);
+        }
+        reconciled = reconciled.saturating_add(self.reconcile_terminal_pending_ptys().await?);
+        Ok(reconciled)
+    }
+
+    async fn reconcile_terminal_pending_ptys(&self) -> Result<u64, ConnectorPtyError> {
+        let closed = self
+            .repositories
+            .pty_sessions
+            .close_pending_for_terminal_workspaces(self.config.connector_id, now_utc())
+            .await?;
+        for session in &closed {
+            self.capacity_wait_notified
+                .lock()
+                .await
+                .remove(&session.pty_session_id);
             self.append_pty_system_output(
                 session,
-                "connector runtime restarted; previous PTY backend continuity was lost; open a new PTY session",
+                "PTY activation cancelled because its Workspace reached a terminal state before the remote shell started",
             )
             .await?;
         }
-        Ok(u64::try_from(sessions.len())?)
+        Ok(u64::try_from(closed.len())?)
+    }
+
+    async fn note_pending_channel_capacity_wait(
+        &self,
+        session: &mut PtySession,
+    ) -> Result<(), ConnectorPtyError> {
+        let should_notify = self
+            .capacity_wait_notified
+            .lock()
+            .await
+            .insert(session.pty_session_id);
+        session.last_activity_at = now_utc();
+        self.repositories.pty_sessions.upsert(session).await?;
+        if should_notify {
+            self.append_pty_system_output(
+                session,
+                "PTY is queued locally because this access path has no free SSH channel; the remote menu has not started and no input can be sent. Keep this PTY, wait for channel capacity, and inspect the runtime snapshot instead of reconnecting.",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn note_channel_capacity_waits(&self) -> Result<u64, ConnectorPtyError> {
+        let sessions = self
+            .repositories
+            .pty_sessions
+            .list_pending_waiting_for_channel(self.config.connector_id, 32)
+            .await?;
+        let count = u64::try_from(sessions.len())?;
+        for mut session in sessions {
+            self.note_pending_channel_capacity_wait(&mut session)
+                .await?;
+        }
+        Ok(count)
     }
 
     /// Opens a persistent PTY backend process for a workspace.
@@ -6218,7 +6291,8 @@ where
         let process = match self.spawn_backend_process(&pty_session).await {
             Ok(process) => process,
             Err(ConnectorPtyError::ChannelCapacityUnavailable) => {
-                self.repositories.pty_sessions.upsert(&pty_session).await?;
+                self.note_pending_channel_capacity_wait(&mut pty_session)
+                    .await?;
                 return Ok(ConnectorPtyOpenOutcome { pty_session });
             }
             Err(error) => {
@@ -6231,6 +6305,10 @@ where
             }
         };
         self.apply_backend_active(&mut pty_session, &process);
+        self.capacity_wait_notified
+            .lock()
+            .await
+            .remove(&pty_session.pty_session_id);
         self.persist_pty_transport_runtime(&connection, process.transport_telemetry.as_ref())
             .await;
         self.mark_connection_channel_open(connection).await?;
@@ -6253,6 +6331,7 @@ where
             .next_pending_for_connector(self.config.connector_id)
             .await?
         else {
+            self.note_channel_capacity_waits().await?;
             return Ok(None);
         };
         match self.activate_existing(session.pty_session_id).await {
@@ -6549,6 +6628,10 @@ where
         pty_session_id: PtySessionId,
         last_exit_code: Option<i32>,
     ) -> Result<PtySession, ConnectorPtyError> {
+        self.capacity_wait_notified
+            .lock()
+            .await
+            .remove(&pty_session_id);
         if let Some(mut handle) = self.active.lock().await.remove(&pty_session_id)
             && let Some(close_tx) = handle.close_tx.take()
         {
@@ -6596,7 +6679,7 @@ where
 
     async fn reconcile_runtime_state(&self) -> Result<u64, ConnectorPtyError> {
         let pty_session_ids: Vec<_> = self.active.lock().await.keys().copied().collect();
-        let mut reconciled = 0_u64;
+        let mut reconciled = self.reconcile_terminal_pending_ptys().await?;
         for pty_session_id in pty_session_ids {
             let Some(session) = self.repositories.pty_sessions.get(pty_session_id).await? else {
                 if let Some(mut handle) = self.active.lock().await.remove(&pty_session_id)
@@ -6607,12 +6690,21 @@ where
                 reconciled = reconciled.saturating_add(1);
                 continue;
             };
+            let workspace = self
+                .repositories
+                .workspaces
+                .get(session.workspace_id)
+                .await?;
+            let workspace_keeps_pty = workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace_keeps_pty_open(&workspace.state));
             let persisted_active = session.backend_state == PtyBackendState::Active
                 && session.input_allowed
                 && matches!(
                     session.state,
                     WorkspaceState::Idle | WorkspaceState::Working | WorkspaceState::Blocked
-                );
+                )
+                && workspace_keeps_pty;
             if persisted_active {
                 continue;
             }
@@ -6622,13 +6714,25 @@ where
             if let Some(close_tx) = handle.close_tx.take() {
                 let _ = close_tx.send(());
             }
+            self.capacity_wait_notified
+                .lock()
+                .await
+                .remove(&pty_session_id);
+            if workspace
+                .as_ref()
+                .is_some_and(|workspace| !workspace_keeps_pty_open(&workspace.state))
+            {
+                let closed = PtySessionSupervisor::default().close(session.clone(), None);
+                self.repositories.pty_sessions.upsert(&closed).await?;
+                self.append_pty_system_output(
+                    &closed,
+                    "PTY closed because its Workspace reached a terminal state; its SSH channel was released",
+                )
+                .await?;
+            }
             self.mark_connection_channel_closed(session.session_id)
                 .await?;
-            if let Some(workspace) = self
-                .repositories
-                .workspaces
-                .get(session.workspace_id)
-                .await?
+            if let Some(workspace) = workspace
                 && let Some(agent_session_id) = workspace.agent_session_id
             {
                 shorten_host_write_lease(
@@ -6806,6 +6910,8 @@ where
         let process = match self.spawn_backend_process(&active_session).await {
             Ok(process) => process,
             Err(ConnectorPtyError::ChannelCapacityUnavailable) => {
+                self.note_pending_channel_capacity_wait(&mut active_session)
+                    .await?;
                 return Err(ConnectorPtyError::ChannelCapacityUnavailable);
             }
             Err(error) => {
@@ -6817,6 +6923,10 @@ where
             }
         };
         self.apply_backend_active(&mut active_session, &process);
+        self.capacity_wait_notified
+            .lock()
+            .await
+            .remove(&active_session.pty_session_id);
         self.persist_pty_transport_runtime(&connection, process.transport_telemetry.as_ref())
             .await;
         self.mark_connection_channel_open(connection).await?;
@@ -7349,6 +7459,13 @@ where
             .await?;
         Ok(())
     }
+}
+
+fn workspace_keeps_pty_open(state: &WorkspaceState) -> bool {
+    matches!(
+        state,
+        WorkspaceState::Idle | WorkspaceState::Working | WorkspaceState::Blocked
+    )
 }
 
 fn append_pty_interaction_tail(tail: &mut String, text: &str) {
@@ -14070,6 +14187,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_pty_manager_explains_channel_capacity_wait_without_remote_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            OneChannelPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+
+        manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let pending = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?
+            .pty_session;
+
+        assert_eq!(pending.backend_state, PtyBackendState::Pending);
+        let chunks = fixture
+            .repositories
+            .pty_output_chunks
+            .list_for_session(pending.pty_session_id, None, 10)
+            .await?;
+        assert!(chunks.iter().any(|chunk| {
+            chunk.stream == OutputStream::System
+                && chunk.redacted_text.contains("no free SSH channel")
+                && chunk.redacted_text.contains("remote menu has not started")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_explains_database_visible_channel_saturation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        let mut access_path = fixture
+            .repositories
+            .access_paths
+            .get(workspace.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        access_path.max_concurrent_channels = 1;
+        fixture
+            .repositories
+            .access_paths
+            .upsert(&access_path)
+            .await?;
+
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            OneChannelPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let pending = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: None,
+            },
+        )?;
+        fixture.repositories.pty_sessions.upsert(&pending).await?;
+
+        assert!(manager.activate_next_pending().await?.is_none());
+        let chunks = fixture
+            .repositories
+            .pty_output_chunks
+            .list_for_session(pending.pty_session_id, None, 10)
+            .await?;
+        assert!(chunks.iter().any(|chunk| {
+            chunk.stream == OutputStream::System
+                && chunk.redacted_text.contains("no free SSH channel")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_releases_active_channel_when_workspace_becomes_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            OneChannelPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        fixture
+            .repositories
+            .workspaces
+            .update_state(fixture.workspace_id, WorkspaceState::Done, now_utc())
+            .await?;
+
+        assert_eq!(manager.reconcile_runtime_state().await?, 1);
+        let closed = fixture
+            .repositories
+            .pty_sessions
+            .get(opened.pty_session.pty_session_id)
+            .await?
+            .ok_or("PTY session should exist")?;
+        assert_eq!(closed.state, WorkspaceState::Closed);
+        assert_eq!(closed.backend_state, PtyBackendState::Closed);
+        assert!(!closed.input_allowed);
+        let chunks = fixture
+            .repositories
+            .pty_output_chunks
+            .list_for_session(closed.pty_session_id, None, 10)
+            .await?;
+        assert!(chunks.iter().any(|chunk| {
+            chunk.stream == OutputStream::System
+                && chunk.redacted_text.contains("SSH channel was released")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn expired_running_operation_can_reclaim_its_own_channel_reservation()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
@@ -14249,7 +14499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_pty_manager_skips_pending_sessions_for_terminal_workspaces()
+    async fn connector_pty_manager_closes_pending_sessions_for_terminal_workspaces()
     -> Result<(), Box<dyn std::error::Error>> {
         for terminal_state in [
             WorkspaceState::Done,
@@ -14290,14 +14540,28 @@ mod tests {
                 ConnectorPtyManagerConfig::production_default(fixture.connector_id),
             );
 
+            assert_eq!(manager.reconcile_runtime_state().await?, 1);
             assert!(manager.activate_next_pending().await?.is_none());
-            let unchanged = fixture
+            let closed = fixture
                 .repositories
                 .pty_sessions
                 .get(pending.pty_session_id)
                 .await?
                 .ok_or("PTY session should exist")?;
-            assert_eq!(unchanged.backend_state, PtyBackendState::Pending);
+            assert_eq!(closed.state, WorkspaceState::Closed);
+            assert_eq!(closed.backend_state, PtyBackendState::Closed);
+            assert!(!closed.input_allowed);
+            let chunks = fixture
+                .repositories
+                .pty_output_chunks
+                .list_for_session(pending.pty_session_id, None, 10)
+                .await?;
+            assert!(chunks.iter().any(|chunk| {
+                chunk.stream == OutputStream::System
+                    && chunk
+                        .redacted_text
+                        .contains("Workspace reached a terminal state")
+            }));
         }
         Ok(())
     }

@@ -2782,6 +2782,85 @@ impl PtySessionRepository {
         row.as_ref().map(row_to_pty_session).transpose()
     }
 
+    /// Lists pending PTYs that are blocked only by local SSH channel capacity.
+    ///
+    /// The connector uses these rows to write one agent-visible wait message rather than leaving
+    /// an unactivated terminal with no output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_pending_waiting_for_channel(
+        &self,
+        connector_id: ConnectorId,
+        limit: u32,
+    ) -> Result<Vec<PtySession>, DbError> {
+        let observed_at = OffsetDateTime::now_utc();
+        let rows = sqlx::query(
+            r"
+            SELECT ps.pty_session_id, ps.workspace_id, ps.session_id, ps.state_json,
+                   ps.foreground_process, ps.cwd, ps.recent_output_ref, ps.last_exit_code,
+                   ps.input_allowed, ps.backend_state_json, ps.backend_capabilities_json,
+                   ps.interaction_json, ps.transport_evidence_json, ps.created_at, ps.last_activity_at
+            FROM pty_sessions ps
+            JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
+            JOIN access_paths ap ON ap.id = aw.access_path_id
+            WHERE aw.connector_id = ?
+              AND ps.backend_state_json = ?
+              AND ps.input_allowed = 1
+              AND aw.state_json IN (?, ?, ?)
+              AND ps.state_json IN (?, ?)
+              AND (
+                (
+                    SELECT COUNT(*)
+                    FROM pty_sessions active_ps
+                    JOIN agent_workspaces active_aw
+                      ON active_aw.workspace_id = active_ps.workspace_id
+                    WHERE active_aw.access_path_id = aw.access_path_id
+                      AND active_ps.backend_state_json = ?
+                      AND active_ps.input_allowed = 1
+                      AND active_ps.state_json IN (?, ?)
+                      AND active_aw.state_json IN (?, ?, ?)
+                )
+                +
+                (
+                    SELECT COUNT(*)
+                    FROM operation_runs running_op
+                    WHERE running_op.access_path_id = aw.access_path_id
+                      AND running_op.state_json = ?
+                      AND running_op.lease_expires_at IS NOT NULL
+                      AND running_op.lease_expires_at > ?
+                )
+              ) >= CASE
+                    WHEN ap.max_concurrent_channels > 0
+                    THEN ap.max_concurrent_channels
+                    ELSE 1
+                  END
+            ORDER BY ps.created_at ASC, ps.pty_session_id ASC
+            LIMIT ?
+            ",
+        )
+        .bind(connector_id.to_string())
+        .bind(to_json(&PtyBackendState::Pending)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&PtyBackendState::Active)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
+        .bind(to_json(&OperationState::Running)?)
+        .bind(observed_at)
+        .bind(u32_to_i64(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_pty_session).collect()
+    }
+
     /// Counts active PTY sessions for a workspace.
     ///
     /// # Errors
@@ -2879,6 +2958,54 @@ impl PtySessionRepository {
         .bind(connector_id.to_string())
         .bind(to_json(&PtyBackendState::Active)?)
         .bind(to_json(&WorkspaceState::Closed)?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_pty_session).collect()
+    }
+
+    /// Closes pending PTYs whose workspace no longer permits a shell to start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying, serialization, or updating fails.
+    pub async fn close_pending_for_terminal_workspaces(
+        &self,
+        connector_id: ConnectorId,
+        closed_at: OffsetDateTime,
+    ) -> Result<Vec<PtySession>, DbError> {
+        let rows = sqlx::query(
+            r"
+            UPDATE pty_sessions
+            SET state_json = ?,
+                foreground_process = NULL,
+                input_allowed = 0,
+                backend_state_json = ?,
+                interaction_json = NULL,
+                last_activity_at = ?
+            WHERE pty_session_id IN (
+                SELECT ps.pty_session_id
+                FROM pty_sessions ps
+                JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
+                WHERE aw.connector_id = ?
+                  AND ps.backend_state_json = ?
+                  AND ps.state_json != ?
+                  AND aw.state_json IN (?, ?, ?, ?)
+            )
+            RETURNING pty_session_id, workspace_id, session_id, state_json, foreground_process, cwd,
+                      recent_output_ref, last_exit_code, input_allowed, backend_state_json,
+                      backend_capabilities_json, interaction_json, transport_evidence_json, created_at, last_activity_at
+            ",
+        )
+        .bind(to_json(&WorkspaceState::Closed)?)
+        .bind(to_json(&PtyBackendState::Closed)?)
+        .bind(closed_at)
+        .bind(connector_id.to_string())
+        .bind(to_json(&PtyBackendState::Pending)?)
+        .bind(to_json(&WorkspaceState::Closed)?)
+        .bind(to_json(&WorkspaceState::Done)?)
+        .bind(to_json(&WorkspaceState::Failed)?)
+        .bind(to_json(&WorkspaceState::Closed)?)
+        .bind(to_json(&WorkspaceState::Throttled)?)
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_pty_session).collect()

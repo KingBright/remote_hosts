@@ -40,7 +40,9 @@ provider; the native backend caches an authenticated `russh` session. Exec comma
 and PTYs reserve channels from the same access-path capacity budget.
 
 The default path capacity is eight channels. Connector workers skip saturated paths instead of
-occupying global worker slots while waiting. Runtime snapshot version 10 exposes configured,
+occupying global worker slots while waiting. A pending PTY blocked by local channel capacity writes
+one system output explaining that its remote menu has not started; agents keep that PTY and wait
+rather than reconnecting or queuing input. Runtime snapshot version 10 exposes configured,
 reserved, and available channels, active and pending PTYs, and current operation pressure.
 
 Logical connection sessions and physical transport runtimes are separate. Every runtime records a

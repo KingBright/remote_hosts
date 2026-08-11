@@ -5516,7 +5516,7 @@ pub struct PtySessionOutput {
 fn pty_session_output(pty_session: &PtySession) -> Result<PtySessionOutput, String> {
     let (backend_ready, recommended_action, poll_after_ms) = match pty_session.backend_state {
         PtyBackendState::Pending | PtyBackendState::Unknown => {
-            (false, "read_pty_output", Some(500))
+            (false, "wait_for_pty_activation", Some(750))
         }
         PtyBackendState::Active => (true, "read_pty_output", None),
         PtyBackendState::Failed => (false, "inspect_runtime_snapshot", None),
@@ -9530,8 +9530,11 @@ mod tests {
         assert_eq!(session.state, EntityState::Resolving);
         assert_eq!(opened["pty_session"]["backend_state"], json!("pending"));
         assert_eq!(opened["backend_ready"], json!(false));
-        assert_eq!(opened["recommended_action"], json!("read_pty_output"));
-        assert_eq!(opened["poll_after_ms"], json!(500));
+        assert_eq!(
+            opened["recommended_action"],
+            json!("wait_for_pty_activation")
+        );
+        assert_eq!(opened["poll_after_ms"], json!(750));
         Ok(())
     }
 
