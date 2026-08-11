@@ -3737,16 +3737,50 @@ impl RemoteHostsMcpServer {
                     && health.last_error_code
                         == Some(StateReasonCode::LocalHandshakeBudgetExhausted)
             });
+            let pooled_transport_recovery = access_path_health
+                .iter()
+                .find(|health| health.access_path_id == session.access_path_id)
+                .filter(|health| {
+                    health.state == EntityState::Degraded
+                        && health.last_error_code
+                            == Some(StateReasonCode::PooledTransportInvalidated)
+                });
             if !matches!(session.state, EntityState::Connected | EntityState::Healthy) {
                 if local_handshake_budget {
                     continue;
                 }
+                let (code, message, recommended_action) = if let Some(health) =
+                    pooled_transport_recovery
+                {
+                    if health
+                        .next_retry_at
+                        .is_some_and(|retry_at| retry_at > generated_at)
+                    {
+                        (
+                            "pooled_transport_reconnect_cooldown",
+                            "the connector discarded an unhealthy pooled SSH transport after a channel failure; wait for the short cooldown before one fresh connection attempt",
+                            "wait_for_pooled_transport_reconnect",
+                        )
+                    } else {
+                        (
+                            "pooled_transport_reconnect_ready",
+                            "the connector already discarded the unhealthy pooled SSH transport; prepare a fresh workspace and retry one normal connection without restarting the connector or interrupting unrelated PTYs",
+                            "prepare_fresh_workspace_and_retry_once",
+                        )
+                    }
+                } else {
+                    (
+                        "connection_unhealthy",
+                        "SSH connection session is unhealthy; inspect access-path state before retrying",
+                        "inspect_access_path",
+                    )
+                };
                 attention.push(RuntimeAttentionOutput {
-                    code: "connection_unhealthy".to_owned(),
+                    code: code.to_owned(),
                     entity_type: "connection_session".to_owned(),
                     entity_id: session.session_id.to_string(),
-                    message: format!("SSH connection session state is {:?}", session.state),
-                    recommended_action: "inspect_access_path".to_owned(),
+                    message: format!("{message}; state={:?}", session.state),
+                    recommended_action: recommended_action.to_owned(),
                 });
             }
         }
@@ -7359,6 +7393,63 @@ mod tests {
             item["code"] != json!("connection_unhealthy")
                 && item["code"] != json!("target_sshd_rate_limited")
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_snapshot_guides_pooled_transport_recovery_without_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let now = now_utc();
+        fixture
+            .repositories
+            .access_path_health
+            .upsert(&AccessPathHealth {
+                access_path_id: fixture.access_path_id,
+                state: EntityState::Degraded,
+                last_checked_at: Some(now),
+                latency_ms: None,
+                failure_count: 1,
+                last_error_code: Some(StateReasonCode::PooledTransportInvalidated),
+                next_retry_at: Some(now - time::Duration::seconds(1)),
+            })
+            .await?;
+        let mut session = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection session should exist")?;
+        session.state = EntityState::Degraded;
+        session.last_error = Some("pooled SSH session was invalidated".to_owned());
+        fixture
+            .repositories
+            .connection_sessions
+            .upsert(&session)
+            .await?;
+
+        let snapshot = call_tool(
+            fixture.server(),
+            tools::GET_HOST_RUNTIME_SNAPSHOT,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        let attention = snapshot["attention"]
+            .as_array()
+            .ok_or("attention should be an array")?;
+        let recovery = attention
+            .iter()
+            .find(|item| item["code"] == json!("pooled_transport_reconnect_ready"))
+            .ok_or("pooled transport recovery attention should exist")?;
+        assert_eq!(
+            recovery["recommended_action"],
+            json!("prepare_fresh_workspace_and_retry_once")
+        );
+        assert!(
+            recovery["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("without restarting the connector"))
+        );
         Ok(())
     }
 

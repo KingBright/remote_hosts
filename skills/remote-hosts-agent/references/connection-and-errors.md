@@ -43,6 +43,11 @@ Stop and diagnose instead of retrying when you see:
 - `rate_limited` or `throttled`: wait or reduce concurrency.
 - `local_handshake_budget_exhausted`: this is connector-local protection, not target sshd health. Respect the exact `retry_after_seconds` and `recommended_action=wait_for_local_handshake_budget`; do not create another workspace or session to bypass it.
 - `local_handshake_budget_ready`: the exact local cooldown has elapsed and target reachability is stale. Perform one normal workspace/connection attempt; do not fan out retries.
+- `pooled_transport_invalidated`: a completed SSH handshake lost a later exec or file channel, so
+  the connector already discarded its cached transport. This is neither TCP reachability nor a
+  credential failure. Wait for the short `retry_after_seconds`, then create/prepare one fresh
+  workspace and make one normal attempt. Do not restart the connector or interrupt an unrelated
+  PTY merely to clear this state.
 - `file_transfer_incompatible` or missing transfer markers after the connector's bounded stage retries: the route did not prove transfer completion. Initialization, verified chunks, and final placement may retry internally because replay is idempotent; the caller must not open parallel transfers. Once the internal budget is exhausted, stop until route capability or configuration changes.
 - `exhausted`: automatic retry budget is spent; read operation output and recovery hint.
 - `blocked`: inspect recent output and decide next action.
@@ -53,7 +58,7 @@ Stop and diagnose instead of retrying when you see:
 - `circuit_open`: do not create another session id to bypass cooldown; wait until `next_retry_at` or change the route.
 - `host_write_lease_wait`: another Agent Session holds an equal, parent, child, or broad `host` scope that overlaps this queued mutation. Inspect `write_lease.active_leases`, wait, and refresh state; do not create another PTY, route, or SSH connection. Use `wait_for_overlapping_scope_or_refine_scope` only when the Workspace scope was genuinely over-broad before side effects began, never to invent a differently spelled sibling. A foreign non-overlapping sibling lease does not block this task and does not mark the connector or target unhealthy.
 - `ssh_channel_capacity_saturated`: the selected path has no unreserved SSH channels. Follow `recommended_action=wait_for_channel_or_raise_limit`, keep the same logical task ids, and wait for an operation or PTY reservation to clear. Do not create another route or SSH connection. Increase the path limit only after verifying the target and bastion support it.
-- `tcp_unreachable` or `ssh_handshake_failed`: check network, VPN, route, port, and connector environment.
+- `tcp_unreachable` or `ssh_handshake_failed`: check network, VPN, route, port, and connector environment. If the returned cooldown has elapsed, prepare one fresh workspace before escalating; a stale failure state must not be treated as permanent reachability evidence.
 - `ssh_route_unsupported`: stop immediately. The configured route needs one or more jump hosts and was rejected before handshake; do not retry or substitute a direct connection.
 - `authorized_key_bootstrap_deferred`: keep using the stored-password pooled session and wait until `next_retry_at`; do not force another install.
 - `authorized_key_bootstrap_skipped`: keep using the stored password. Add a local key only for `no_local_public_key`; permission, read-only, shell, and exhausted states require an explicit route/host change before automatic retry.

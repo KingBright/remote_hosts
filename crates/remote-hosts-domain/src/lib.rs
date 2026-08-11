@@ -484,6 +484,8 @@ pub enum StateReasonCode {
     TcpProbeFailed,
     /// SSH handshake failed.
     SshHandshakeFailed,
+    /// A pooled SSH transport was discarded after a channel-level failure.
+    PooledTransportInvalidated,
     /// SSH authentication failed.
     SshAuthFailed,
     /// Target SSH daemon appears rate limited.

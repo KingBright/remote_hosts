@@ -10417,6 +10417,13 @@ fn connection_is_usable_for_workspace(
 
 fn classify_connection_failure(message: &str) -> (EntityState, StateReasonCode, Option<u64>) {
     let normalized = message.to_ascii_lowercase();
+    if normalized.contains("pooled ssh session was invalidated") {
+        return (
+            EntityState::Degraded,
+            StateReasonCode::PooledTransportInvalidated,
+            Some(10),
+        );
+    }
     if normalized.contains("host key") || normalized.contains("known_hosts") {
         return (
             EntityState::HostKeyChanged,
@@ -10533,6 +10540,17 @@ mod tests {
             initial_pty_cwd(Some("/srv/app".to_owned()), &HostKind::Linux, false,),
             Some("/srv/app".to_owned()),
         );
+    }
+
+    #[test]
+    fn pooled_transport_invalidation_is_not_classified_as_tcp_or_handshake_failure() {
+        let (state, reason_code, retry_after_seconds) = super::classify_connection_failure(
+            "remote POSIX exec did not return its completion frame; the pooled SSH session was invalidated",
+        );
+
+        assert_eq!(state, EntityState::Degraded);
+        assert_eq!(reason_code, StateReasonCode::PooledTransportInvalidated);
+        assert_eq!(retry_after_seconds, Some(10));
     }
 
     fn exec_transfer_test_spec() -> FileTransferSpec {

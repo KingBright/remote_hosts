@@ -102,17 +102,19 @@ fn score_candidate(
         return None;
     }
 
+    if candidate
+        .health
+        .as_ref()
+        .is_some_and(|health| pooled_transport_recovery_is_cooling_down(health, now))
+    {
+        return None;
+    }
+
     let health_state = candidate
         .health
         .as_ref()
         .map_or(EntityState::Unknown, |health| {
-            if matches!(
-                health.state,
-                EntityState::Throttled | EntityState::TargetOverloaded | EntityState::RateLimited
-            ) && health
-                .next_retry_at
-                .is_some_and(|next_retry_at| next_retry_at <= now)
-            {
+            if access_health_retry_is_ready(health, now) {
                 EntityState::Unknown
             } else {
                 health.state.clone()
@@ -197,6 +199,10 @@ fn best_failure(
         };
     }
 
+    if let Some(error) = retryable_connectivity_failure(candidates, now) {
+        return error;
+    }
+
     if candidates.iter().any(|candidate| {
         matches!(
             candidate
@@ -222,6 +228,90 @@ fn best_failure(
         human_message: "no enabled access path is currently reachable".to_owned(),
         retry_after_seconds: Some(60),
     }
+}
+
+fn retryable_connectivity_failure(
+    candidates: &[AccessCandidate],
+    now: time::OffsetDateTime,
+) -> Option<AccessResolutionError> {
+    let (state, reason_code, retry_after_seconds) = candidates
+        .iter()
+        .filter_map(|candidate| candidate.health.as_ref())
+        .filter(|health| {
+            matches!(
+                health.state,
+                EntityState::TcpUnreachable | EntityState::SshHandshakeFailed
+            ) || pooled_transport_recovery_is_cooling_down(health, now)
+        })
+        .map(|health| {
+            let retry_after_seconds = health
+                .next_retry_at
+                .filter(|retry_at| *retry_at > now)
+                .map_or(30, |retry_at| {
+                    (retry_at - now).whole_seconds().max(1).cast_unsigned()
+                });
+            let fallback_reason = match health.state {
+                EntityState::TcpUnreachable => StateReasonCode::TcpProbeFailed,
+                EntityState::Degraded => StateReasonCode::PooledTransportInvalidated,
+                _ => StateReasonCode::SshHandshakeFailed,
+            };
+            (
+                health.state.clone(),
+                health.last_error_code.clone().unwrap_or(fallback_reason),
+                retry_after_seconds,
+            )
+        })
+        .min_by_key(|(_, _, retry_after_seconds)| *retry_after_seconds)?;
+    let human_message = match reason_code {
+        StateReasonCode::PooledTransportInvalidated => {
+            "the previous pooled SSH channel was discarded; wait for its short cooldown, then retry one fresh connection".to_owned()
+        }
+        StateReasonCode::SshHandshakeFailed => {
+            "the most recent SSH handshake or channel setup failed; wait before retrying this access path".to_owned()
+        }
+        StateReasonCode::TcpProbeFailed => {
+            "the most recent TCP probe failed; wait before retrying this access path".to_owned()
+        }
+        _ => "the selected access path is temporarily unavailable; wait before retrying"
+            .to_owned(),
+    };
+    Some(AccessResolutionError {
+        state,
+        reason_code,
+        agent_hint: AgentHint::WaitBeforeRetry,
+        human_message,
+        retry_after_seconds: Some(retry_after_seconds),
+    })
+}
+
+fn access_health_retry_is_ready(health: &AccessPathHealth, now: time::OffsetDateTime) -> bool {
+    let retry_is_ready = health
+        .next_retry_at
+        .is_some_and(|next_retry_at| next_retry_at <= now);
+    retry_is_ready
+        && (matches!(
+            health.state,
+            EntityState::Throttled
+                | EntityState::TargetOverloaded
+                | EntityState::RateLimited
+                | EntityState::TcpUnreachable
+                | EntityState::SshHandshakeFailed
+        ) || pooled_transport_recovery(health))
+}
+
+fn pooled_transport_recovery_is_cooling_down(
+    health: &AccessPathHealth,
+    now: time::OffsetDateTime,
+) -> bool {
+    pooled_transport_recovery(health)
+        && health
+            .next_retry_at
+            .is_some_and(|next_retry_at| next_retry_at > now)
+}
+
+fn pooled_transport_recovery(health: &AccessPathHealth) -> bool {
+    health.state == EntityState::Degraded
+        && health.last_error_code == Some(StateReasonCode::PooledTransportInvalidated)
 }
 
 #[cfg(test)]
@@ -349,6 +439,84 @@ mod tests {
 
         assert_eq!(resolution.selected.access_path.id, p.id);
         assert!(resolution.used_cached_state);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_ssh_failure_allows_one_fresh_connection_attempt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let p = path(10);
+        let mut failed = health(&p, EntityState::SshHandshakeFailed);
+        failed.last_error_code = Some(StateReasonCode::SshHandshakeFailed);
+        failed.next_retry_at = Some(remote_hosts_domain::now_utc() - time::Duration::seconds(1));
+
+        let resolution = AccessResolver::resolve(&[AccessCandidate {
+            access_path: p.clone(),
+            connector: None,
+            health: Some(failed),
+        }])?;
+
+        assert_eq!(resolution.selected.access_path.id, p.id);
+        assert!(resolution.used_cached_state);
+        Ok(())
+    }
+
+    #[test]
+    fn active_ssh_failure_is_not_misreported_as_tcp_unreachable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let p = path(10);
+        let mut failed = health(&p, EntityState::SshHandshakeFailed);
+        failed.last_error_code = Some(StateReasonCode::SshHandshakeFailed);
+        failed.next_retry_at = Some(remote_hosts_domain::now_utc() + time::Duration::seconds(30));
+
+        let error = AccessResolver::resolve(&[AccessCandidate {
+            access_path: p,
+            connector: None,
+            health: Some(failed),
+        }])
+        .err()
+        .ok_or_else(|| std::io::Error::other("SSH failure should wait before retrying"))?;
+
+        assert_eq!(error.state, EntityState::SshHandshakeFailed);
+        assert_eq!(error.reason_code, StateReasonCode::SshHandshakeFailed);
+        assert!(
+            error
+                .retry_after_seconds
+                .is_some_and(|seconds| seconds <= 30)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pooled_transport_recovery_respects_cooldown_then_allows_one_attempt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let p = path(10);
+        let mut cooling_down = health(&p, EntityState::Degraded);
+        cooling_down.last_error_code = Some(StateReasonCode::PooledTransportInvalidated);
+        cooling_down.next_retry_at =
+            Some(remote_hosts_domain::now_utc() + time::Duration::seconds(10));
+
+        let error = AccessResolver::resolve(&[AccessCandidate {
+            access_path: p.clone(),
+            connector: None,
+            health: Some(cooling_down.clone()),
+        }])
+        .err()
+        .ok_or_else(|| std::io::Error::other("pooled transport cooldown should defer retry"))?;
+        assert_eq!(error.state, EntityState::Degraded);
+        assert_eq!(
+            error.reason_code,
+            StateReasonCode::PooledTransportInvalidated
+        );
+
+        cooling_down.next_retry_at =
+            Some(remote_hosts_domain::now_utc() - time::Duration::seconds(1));
+        let resolution = AccessResolver::resolve(&[AccessCandidate {
+            access_path: p.clone(),
+            connector: None,
+            health: Some(cooling_down),
+        }])?;
+        assert_eq!(resolution.selected.access_path.id, p.id);
         Ok(())
     }
 }
