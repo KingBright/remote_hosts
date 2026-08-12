@@ -5221,6 +5221,9 @@ impl KnowledgeItemRepository {
     ///
     /// Returns an error if querying or deserialization fails.
     pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<KnowledgeItem>, DbError> {
+        let Some(query) = compile_knowledge_fts_query(query) else {
+            return Ok(Vec::new());
+        };
         let rows = sqlx::query(
             r"
             SELECT ki.*
@@ -5236,6 +5239,16 @@ impl KnowledgeItemRepository {
         .await?;
         rows.iter().map(row_to_knowledge_item).collect()
     }
+}
+
+fn compile_knowledge_fts_query(query: &str) -> Option<String> {
+    let tokens = query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| format!(r#""{token}""#))
+        .collect::<Vec<_>>();
+
+    (!tokens.is_empty()).then(|| tokens.join(" AND "))
 }
 
 impl TopologyRepository {
@@ -6347,7 +6360,34 @@ mod tests {
     use serde_json::json;
     use sqlx::Row as _;
 
-    use super::{ClaimedOperationFinish, Repositories, connect_sqlite, migrate};
+    use super::{
+        ClaimedOperationFinish, Repositories, compile_knowledge_fts_query, connect_sqlite, migrate,
+    };
+
+    #[test]
+    fn knowledge_search_compiles_natural_language_as_literal_fts_tokens() {
+        assert_eq!(
+            compile_knowledge_fts_query("hacker-s-news deployment"),
+            Some(r#""hacker" AND "s" AND "news" AND "deployment""#.to_owned())
+        );
+        assert_eq!(
+            compile_knowledge_fts_query("NAS/家庭服务器"),
+            Some(r#""NAS" AND "家庭服务器""#.to_owned())
+        );
+        assert_eq!(
+            compile_knowledge_fts_query("C++ server"),
+            Some(r#""C" AND "server""#.to_owned())
+        );
+        assert_eq!(
+            compile_knowledge_fts_query("foo:bar"),
+            Some(r#""foo" AND "bar""#.to_owned())
+        );
+        assert_eq!(
+            compile_knowledge_fts_query(r#""quoted" value"#),
+            Some(r#""quoted" AND "value""#.to_owned())
+        );
+        assert_eq!(compile_knowledge_fts_query(r#"- / + : ""#), None);
+    }
 
     async fn apply_pre_scoped_lease_schema(
         connection: &mut sqlx::SqliteConnection,
@@ -8008,6 +8048,36 @@ mod tests {
         };
         repos.knowledge.insert(&knowledge).await?;
         assert_eq!(repos.knowledge.search("CUDA", 10).await?.len(), 1);
+        let punctuated_knowledge = KnowledgeItem {
+            id: KnowledgeItemId::new(),
+            title: "hacker-s-news deployment on NAS/家庭服务器".to_owned(),
+            body: "A C++ server exposes foo:bar routing metadata".to_owned(),
+            source: FactSource::Manual,
+            linked_host_ids: vec![host.id],
+            linked_access_path_ids: vec![path.id],
+            linked_software_ids: Vec::new(),
+            linked_operation_ids: Vec::new(),
+            tags: vec!["quoted".to_owned(), "value".to_owned()],
+            created_at: now,
+            updated_at: now,
+        };
+        repos.knowledge.insert(&punctuated_knowledge).await?;
+        for query in [
+            "hacker-s-news deployment",
+            "NAS/家庭服务器",
+            "C++ server",
+            "foo:bar",
+            r#""quoted" value"#,
+        ] {
+            let matches = repos.knowledge.search(query, 10).await?;
+            assert_eq!(
+                matches.len(),
+                1,
+                "query {query:?} should return exactly one literal match"
+            );
+            assert_eq!(matches[0].id, punctuated_knowledge.id);
+        }
+        assert!(repos.knowledge.search(r#"- / + : ""#, 10).await?.is_empty());
 
         let event = StateEvent {
             id: remote_hosts_domain::StateEventId::new(),

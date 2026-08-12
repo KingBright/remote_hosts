@@ -8769,6 +8769,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_knowledge_search_treats_punctuation_as_literal_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        call_tool(
+            fixture.server(),
+            tools::RECORD_KNOWLEDGE,
+            Some(json!({
+                "title": "hacker-s-news deployment",
+                "body": "C++ server on NAS/家庭服务器 uses foo:bar routing",
+                "linked_host_ids": [fixture.host_id.to_string()]
+            })),
+        )
+        .await?;
+
+        for query in [
+            "hacker-s-news deployment",
+            "NAS/家庭服务器",
+            "C++ server",
+            "foo:bar",
+        ] {
+            let result = call_tool(
+                fixture.server(),
+                tools::SEARCH_KNOWLEDGE,
+                Some(json!({"query": query})),
+            )
+            .await?;
+            assert_eq!(result["count"], json!(1), "query {query:?} should match");
+        }
+
+        let punctuation_only = call_tool(
+            fixture.server(),
+            tools::SEARCH_KNOWLEDGE,
+            Some(json!({"query": "- / + :"})),
+        )
+        .await?;
+        assert_eq!(punctuation_only["count"], json!(0));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mcp_create_workspace_supports_multiple_logical_workspaces()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = TestFixture::new().await?;
