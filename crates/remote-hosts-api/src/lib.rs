@@ -1,7 +1,7 @@
 //! HTTP API surface for operators and future UI.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     net::SocketAddr,
     sync::Arc,
@@ -19,14 +19,14 @@ use remote_hosts_core::{
     AccessCandidate, AccessResolutionError, AccessResolver, CommandProfileCatalog,
     ConnectorStateTracker, HostStateAggregator, HostStateInput, ProtectionDecision,
     PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionOpenCommand,
-    PtySessionSupervisor, PtySessionSupervisorError, WorkspaceCreateCommand,
+    PtySessionSupervisor, PtySessionSupervisorError, SecretRedactor, WorkspaceCreateCommand,
     WorkspaceOperationError, WorkspaceOperationSupervisor, WorkspaceRunCommand,
     WorkspaceSupervisor, WorkspaceSupervisorError,
 };
 use remote_hosts_db::{DbError, Repositories};
 use remote_hosts_domain::{
-    AccessPath, AccessPathHealth, AgentWorkspace, ConnectionSession, Connector, ConnectorId,
-    CredentialBinding, CredentialBindingId, CredentialBindingView, CredentialKind,
+    AccessPath, AccessPathHealth, AgentSession, AgentWorkspace, ConnectionSession, Connector,
+    ConnectorId, CredentialBinding, CredentialBindingId, CredentialBindingView, CredentialKind,
     CredentialMetadata, EntityState, Host, HostFact, HostId, OperationId, OperationOutputArtifact,
     OperationOutputArtifactId, OperationOutputChunk, OperationRun, OperationState, PtyInputEvent,
     PtyOutputChunk, PtySession, PtySessionId, SequencedStateEvent, SessionId, StateEvent,
@@ -99,6 +99,7 @@ pub fn router_with_state(state: ApiState) -> Router {
         )
         .route("/v1/credentials", get(list_credentials))
         .route("/v1/admin/overview", get(admin_overview))
+        .route("/v1/admin/activity", get(admin_activity))
         .route("/v1/hosts/{host_id}", get(get_host))
         .route("/v1/hosts/{host_id}/access-paths", get(list_access_paths))
         .route("/v1/hosts/{host_id}/resolve-access", get(resolve_access))
@@ -553,6 +554,215 @@ async fn admin_overview(
             vault_unlocked: state.vault_master_password.is_some(),
         }),
     ))
+}
+
+async fn admin_activity(
+    State(state): State<ApiState>,
+    Query(query): Query<AdminActivityQuery>,
+) -> Result<(HeaderMap, Json<AdminActivityResponse>), ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let operations = state.repositories.operations.list_recent(limit).await?;
+    let pty_inputs = state
+        .repositories
+        .pty_input_events
+        .list_recent(limit)
+        .await?;
+    let hosts = state
+        .repositories
+        .hosts
+        .list()
+        .await?
+        .into_iter()
+        .map(|host| (host.id, host))
+        .collect::<HashMap<_, _>>();
+    let workspace_ids = operations
+        .iter()
+        .filter_map(|operation| operation.workspace_id)
+        .chain(pty_inputs.iter().map(|input| input.workspace_id))
+        .collect::<BTreeSet<_>>();
+    let agent_session_ids = operations
+        .iter()
+        .filter_map(|operation| operation.agent_session_id)
+        .chain(pty_inputs.iter().filter_map(|input| input.agent_session_id))
+        .collect::<BTreeSet<_>>();
+    let workspaces = state
+        .repositories
+        .workspaces
+        .list_by_ids(&workspace_ids)
+        .await?
+        .into_iter()
+        .map(|workspace| (workspace.id, workspace))
+        .collect::<HashMap<_, _>>();
+    let sessions = state
+        .repositories
+        .agent_sessions
+        .list_by_ids(&agent_session_ids)
+        .await?
+        .into_iter()
+        .map(|session| (session.id, session))
+        .collect::<HashMap<_, _>>();
+    let mut items = Vec::with_capacity(operations.len() + pty_inputs.len());
+
+    for operation in operations {
+        items.push(activity_operation_item(
+            operation,
+            &hosts,
+            &workspaces,
+            &sessions,
+        ));
+    }
+
+    for input in pty_inputs {
+        items.push(activity_pty_input_item(
+            input,
+            &hosts,
+            &workspaces,
+            &sessions,
+        ));
+    }
+
+    items.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
+    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok((
+        no_store_headers(),
+        Json(AdminActivityResponse {
+            count: items.len(),
+            items,
+        }),
+    ))
+}
+
+fn activity_operation_item(
+    operation: OperationRun,
+    hosts: &HashMap<HostId, Host>,
+    workspaces: &HashMap<WorkspaceId, AgentWorkspace>,
+    sessions: &HashMap<remote_hosts_domain::AgentSessionId, AgentSession>,
+) -> AdminActivityItem {
+    let workspace = operation
+        .workspace_id
+        .and_then(|workspace_id| workspaces.get(&workspace_id));
+    let agent_session = operation
+        .agent_session_id
+        .and_then(|agent_session_id| sessions.get(&agent_session_id));
+    let duration_ms = operation.finished_at.and_then(|finished_at| {
+        i64::try_from((finished_at - operation.started_at).whole_milliseconds()).ok()
+    });
+    AdminActivityItem {
+        id: operation.id.to_string(),
+        kind: "command".to_owned(),
+        occurred_at: operation.started_at,
+        host_id: operation.host_id.to_string(),
+        host_name: hosts.get(&operation.host_id).map_or_else(
+            || operation.host_id.to_string(),
+            |host| host.display_name.clone(),
+        ),
+        workspace_id: operation.workspace_id.map(|id| id.to_string()),
+        workspace_label: workspace.map(|workspace| workspace.label.clone()),
+        pty_session_id: None,
+        agent_session: activity_agent_session(agent_session),
+        intent: Some(operation.intent.clone()),
+        command_preview: activity_operation_preview(&operation),
+        state: enum_label(&operation.state),
+        exit_code: operation.exit_code,
+        duration_ms,
+        summary: Some(activity_operation_summary(&operation)),
+        technical_summary: operation.redacted_output_summary,
+        error: operation.last_error,
+        transport: operation
+            .transport_evidence
+            .as_ref()
+            .and_then(|evidence| serde_json::to_value(evidence).ok()),
+    }
+}
+
+fn activity_pty_input_item(
+    input: PtyInputEvent,
+    hosts: &HashMap<HostId, Host>,
+    workspaces: &HashMap<WorkspaceId, AgentWorkspace>,
+    sessions: &HashMap<remote_hosts_domain::AgentSessionId, AgentSession>,
+) -> AdminActivityItem {
+    let agent_session = input
+        .agent_session_id
+        .and_then(|agent_session_id| sessions.get(&agent_session_id));
+    AdminActivityItem {
+        id: input.id.to_string(),
+        kind: "pty_input".to_owned(),
+        occurred_at: input.created_at,
+        host_id: input.host_id.to_string(),
+        host_name: hosts.get(&input.host_id).map_or_else(
+            || input.host_id.to_string(),
+            |host| host.display_name.clone(),
+        ),
+        workspace_id: Some(input.workspace_id.to_string()),
+        workspace_label: workspaces
+            .get(&input.workspace_id)
+            .map(|workspace| workspace.label.clone()),
+        pty_session_id: Some(input.pty_session_id.to_string()),
+        agent_session: activity_agent_session(agent_session),
+        intent: None,
+        command_preview: input.redacted_input_summary,
+        state: enum_label(&input.state),
+        exit_code: None,
+        duration_ms: None,
+        summary: input.delivered_at.map(|_| "input delivered".to_owned()),
+        technical_summary: None,
+        error: input.last_error,
+        transport: None,
+    }
+}
+
+fn enum_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn activity_operation_preview(operation: &OperationRun) -> String {
+    let shell_script = operation
+        .command_profile_json
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .filter(|profile| {
+            profile
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| matches!(name, "shell.posix" | "shell.powershell"))
+        })
+        .and_then(|profile| profile.get("args"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|args| args.last())
+        .and_then(serde_json::Value::as_str);
+    shell_script.map_or_else(
+        || operation.redacted_command_summary.clone(),
+        |script| SecretRedactor::default().command_preview(script),
+    )
+}
+
+fn activity_operation_summary(operation: &OperationRun) -> String {
+    let state = match operation.state {
+        OperationState::Queued => "排队中",
+        OperationState::Running => "执行中",
+        OperationState::Succeeded => "成功",
+        OperationState::Failed => "失败",
+        OperationState::TimedOut => "超时",
+        OperationState::Cancelled => "已取消",
+        OperationState::Rejected => "已拒绝",
+        OperationState::Exhausted => "重试耗尽",
+    };
+    operation.exit_code.map_or_else(
+        || state.to_owned(),
+        |exit_code| format!("{state} · exit {exit_code}"),
+    )
+}
+
+fn activity_agent_session(session: Option<&AgentSession>) -> Option<AdminActivityAgentSession> {
+    session.map(|session| AdminActivityAgentSession {
+        id: session.id.to_string(),
+        client_kind: session.client_kind.clone(),
+        project_key: session.project_key.clone(),
+        conversation_key: session.conversation_key.clone(),
+    })
 }
 
 async fn list_hosts(State(state): State<ApiState>) -> Result<Json<Vec<Host>>, ApiError> {
@@ -1936,6 +2146,76 @@ pub struct AdminOverviewResponse {
     pub vault_unlocked: bool,
 }
 
+/// Bounded management activity query.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdminActivityQuery {
+    /// Maximum command and PTY activity records. Defaults to 50 and is capped at 200.
+    pub limit: Option<u32>,
+}
+
+/// Compact Agent identity shown in the operator activity timeline.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminActivityAgentSession {
+    /// Durable Agent session id.
+    pub id: String,
+    /// Client family such as Codex or Antigravity.
+    pub client_kind: String,
+    /// Optional project isolation key.
+    pub project_key: Option<String>,
+    /// Optional conversation isolation key.
+    pub conversation_key: Option<String>,
+}
+
+/// One human-readable Agent action for the management timeline.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminActivityItem {
+    /// Operation or PTY input event id.
+    pub id: String,
+    /// `command` or `pty_input`.
+    pub kind: String,
+    /// Time the action was submitted.
+    pub occurred_at: OffsetDateTime,
+    /// Target host id.
+    pub host_id: String,
+    /// Human-readable target host name.
+    pub host_name: String,
+    /// Owning workspace id when available.
+    pub workspace_id: Option<String>,
+    /// Human-readable workspace label.
+    pub workspace_label: Option<String>,
+    /// PTY session id for interactive input.
+    pub pty_session_id: Option<String>,
+    /// Agent client and conversation identity.
+    pub agent_session: Option<AdminActivityAgentSession>,
+    /// Human or Agent intent when supplied.
+    pub intent: Option<String>,
+    /// Bounded and redacted command or input preview.
+    pub command_preview: String,
+    /// Latest action state.
+    pub state: String,
+    /// Process exit code when available.
+    pub exit_code: Option<i32>,
+    /// End-to-end duration in milliseconds when complete.
+    pub duration_ms: Option<i64>,
+    /// Redacted result summary.
+    pub summary: Option<String>,
+    /// Original redacted execution summary for expanded technical details.
+    pub technical_summary: Option<String>,
+    /// Redacted error summary.
+    pub error: Option<String>,
+    /// Optional structured SSH transport evidence for expanded technical details.
+    pub transport: Option<serde_json::Value>,
+}
+
+/// Bounded activity timeline response.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminActivityResponse {
+    /// Number of returned activity items.
+    pub count: usize,
+    /// Newest-first activity items.
+    pub items: Vec<AdminActivityItem>,
+}
+
 /// Health response.
 #[derive(Clone, Debug, Serialize)]
 pub struct HealthResponse {
@@ -2397,15 +2677,70 @@ mod tests {
         AccessPath, AccessPathHealth, AccessPathId, AgentWorkspace, ConnectionMode,
         ConnectionSession, Connector, ConnectorId, CredentialId, CredentialKind,
         CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind, Host, HostId,
-        HostKind, OutputStream, Protocol, PtyOutputChunk, PtyOutputChunkId, PtySessionId,
-        RiskLevel, RouteType, SessionId, StoredCredential, TrustLevel, WorkspaceId, WorkspaceState,
-        now_utc,
+        HostKind, OperationId, OperationRun, OperationState, OperationType, OutputStream, Protocol,
+        PtyOutputChunk, PtyOutputChunkId, PtySessionId, RiskLevel, RouteType, SessionId,
+        StoredCredential, TrustLevel, WorkspaceId, WorkspaceState, now_utc,
     };
     use secrecy::SecretString;
     use serde_json::json;
     use tower::ServiceExt;
 
-    use super::{ApiState, router_with_state};
+    use super::{ApiState, activity_operation_item, router_with_state};
+
+    #[test]
+    fn activity_item_exposes_a_redacted_script_without_private_execution_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = now_utc();
+        let operation = OperationRun {
+            id: OperationId::new(),
+            host_id: HostId::new(),
+            access_path_id: AccessPathId::new(),
+            connector_id: ConnectorId::new(),
+            session_id: None,
+            workspace_id: None,
+            agent_session_id: None,
+            idempotency_key: None,
+            requires_write_lease: false,
+            coordination_scope: "host".to_owned(),
+            operation_type: OperationType::ReadonlyExec,
+            intent: "inspect workloads".to_owned(),
+            state: OperationState::Queued,
+            started_at: now,
+            finished_at: None,
+            exit_code: None,
+            timeout_seconds: 30,
+            redacted_command_summary: "58 script bytes".to_owned(),
+            command_profile_json: Some(json!({
+                "name": "shell.posix",
+                "args": ["-lc", "PASSWORD=hunter2\nkubectl get pods -A"]
+            })),
+            transport_evidence: None,
+            redacted_output_summary: None,
+            log_ref: None,
+            attempt_count: 0,
+            claim_token: None,
+            claimed_at: None,
+            lease_expires_at: None,
+            last_error: None,
+        };
+
+        let item = activity_operation_item(
+            operation,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        let serialized = serde_json::to_value(item)?;
+        assert_eq!(
+            serialized["command_preview"],
+            "PASSWORD=<redacted>\nkubectl get pods -A"
+        );
+        let serialized = serialized.to_string();
+        assert!(!serialized.contains("hunter2"));
+        assert!(!serialized.contains("command_profile_json"));
+        assert!(!serialized.contains("\"args\""));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn list_hosts_returns_registered_hosts() -> Result<(), Box<dyn std::error::Error>> {
@@ -2817,6 +3152,27 @@ mod tests {
             .as_str()
             .ok_or("operation id should be a string")?;
 
+        let activity_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/activity?limit=10")
+                    .body(body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(activity_response.status(), axum::http::StatusCode::OK);
+        let bytes = body::to_bytes(activity_response.into_body(), usize::MAX).await?;
+        let activity_body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(activity_body["count"], 1);
+        assert_eq!(activity_body["items"][0]["kind"], "command");
+        assert_eq!(activity_body["items"][0]["host_name"], "Company 4090 B");
+        assert!(
+            activity_body["items"][0]["command_preview"]
+                .as_str()
+                .is_some_and(|preview| preview.contains("uptime"))
+        );
+        assert_eq!(activity_body["items"][0]["summary"], "排队中");
+
         let output_response = app
             .clone()
             .oneshot(
@@ -3109,11 +3465,8 @@ mod tests {
         let bytes = body::to_bytes(input_response.into_body(), usize::MAX).await?;
         let input_body: serde_json::Value = serde_json::from_slice(&bytes)?;
         assert_eq!(input_body["state"], "queued");
-        assert_eq!(
-            input_body["redacted_input_summary"],
-            "11 bytes queued for pty input"
-        );
-        assert!(!input_body.to_string().contains("echo hello"));
+        assert_eq!(input_body["redacted_input_summary"], "echo hello\n");
+        assert!(input_body.to_string().contains("echo hello"));
 
         let input_events_response = app
             .clone()
@@ -3130,7 +3483,20 @@ mod tests {
         let input_events_body: serde_json::Value = serde_json::from_slice(&bytes)?;
         assert_eq!(input_events_body["count"], 1);
         assert_eq!(input_events_body["input_events"][0]["state"], "queued");
-        assert!(!input_events_body.to_string().contains("echo hello"));
+        assert!(input_events_body.to_string().contains("echo hello"));
+
+        let activity_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/activity?limit=1")
+                    .body(body::Body::empty())?,
+            )
+            .await?;
+        let bytes = body::to_bytes(activity_response.into_body(), usize::MAX).await?;
+        let activity_body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(activity_body["items"][0]["kind"], "pty_input");
+        assert_eq!(activity_body["items"][0]["command_preview"], "echo hello\n");
 
         let heartbeat_response = app
             .clone()
@@ -3339,6 +3705,9 @@ mod tests {
         let html = String::from_utf8(bytes.to_vec())?;
         assert!(html.contains("Remote Hosts"));
         assert!(html.contains("/v1/admin/overview"));
+        assert!(html.contains("/v1/admin/activity?limit=100"));
+        assert!(html.contains("Agent 活动"));
+        assert!(html.contains("activityList"));
         Ok(())
     }
 

@@ -1052,6 +1052,10 @@ impl RemoteHostsMcpServer {
         self.tool_profile == ToolProfile::Agent
     }
 
+    fn compact_responses(&self) -> bool {
+        self.tool_profile == ToolProfile::Agent
+    }
+
     async fn workspace_for_tool(
         &self,
         workspace_id: WorkspaceId,
@@ -1375,16 +1379,28 @@ impl RemoteHostsMcpServer {
                 to_json_value(&chunk).unwrap_or(Value::Null)
             });
         Ok(QueuedOperationOutput {
-            operation: public_operation_value(&operation)?,
-            workspace: to_json_value(&workspace)?,
-            initial_output_chunk,
-            protection_decision: json!({
-                "allowed": true,
-                "state": "healthy",
-                "reason_code": "policy_allowed",
-                "agent_hint": null,
-                "retry_after_seconds": null,
-                "human_message": "existing idempotent operation returned"
+            next_action: operation_next_action(&operation.state).to_owned(),
+            retry_after_ms: operation_retry_after_ms(&operation.state),
+            operation: if self.compact_responses() {
+                compact_operation_value(&operation)
+            } else {
+                public_operation_value(&operation)?
+            },
+            workspace: if self.compact_responses() {
+                compact_workspace_value(&workspace)
+            } else {
+                to_json_value(&workspace)?
+            },
+            initial_output_chunk: (!self.compact_responses()).then_some(initial_output_chunk),
+            protection_decision: (!self.compact_responses()).then(|| {
+                json!({
+                    "allowed": true,
+                    "state": "healthy",
+                    "reason_code": "policy_allowed",
+                    "agent_hint": null,
+                    "retry_after_seconds": null,
+                    "human_message": "existing idempotent operation returned"
+                })
             }),
             idempotency_reused: true,
             completion: None,
@@ -1521,10 +1537,24 @@ impl RemoteHostsMcpServer {
             .await?;
 
         Ok(QueuedOperationOutput {
-            operation: public_operation_value(&plan.operation)?,
-            workspace: to_json_value(&workspace)?,
-            initial_output_chunk: to_json_value(&plan.initial_output_chunk)?,
-            protection_decision: to_json_value(&plan.decision)?,
+            next_action: operation_next_action(&plan.operation.state).to_owned(),
+            retry_after_ms: operation_retry_after_ms(&plan.operation.state),
+            operation: if self.compact_responses() {
+                compact_operation_value(&plan.operation)
+            } else {
+                public_operation_value(&plan.operation)?
+            },
+            workspace: if self.compact_responses() {
+                compact_workspace_value(&workspace)
+            } else {
+                to_json_value(&workspace)?
+            },
+            initial_output_chunk: (!self.compact_responses())
+                .then(|| to_json_value(&plan.initial_output_chunk))
+                .transpose()?,
+            protection_decision: (!self.compact_responses())
+                .then(|| to_json_value(&plan.decision))
+                .transpose()?,
             idempotency_reused: false,
             completion: None,
         })
@@ -1556,8 +1586,16 @@ impl RemoteHostsMcpServer {
             if is_terminal_operation_state(&operation.state) {
                 return Ok(OperationCompletionOutput {
                     completed: true,
-                    operation: public_operation_value(&operation)?,
-                    workspace: to_json_value(&workspace)?,
+                    state: operation_state_name(&operation.state).to_owned(),
+                    exit_code: operation.exit_code,
+                    summary: operation_result_summary(&operation),
+                    next_action: "none".to_owned(),
+                    operation: (!self.compact_responses())
+                        .then(|| public_operation_value(&operation))
+                        .transpose()?,
+                    workspace: (!self.compact_responses())
+                        .then(|| to_json_value(&workspace))
+                        .transpose()?,
                     elapsed_ms: elapsed_ms(started_at),
                     retry_after_ms: None,
                 });
@@ -1565,8 +1603,16 @@ impl RemoteHostsMcpServer {
             if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
                 return Ok(OperationCompletionOutput {
                     completed: false,
-                    operation: public_operation_value(&operation)?,
-                    workspace: to_json_value(&workspace)?,
+                    state: operation_state_name(&operation.state).to_owned(),
+                    exit_code: operation.exit_code,
+                    summary: operation_result_summary(&operation),
+                    next_action: "get_workspace_result".to_owned(),
+                    operation: (!self.compact_responses())
+                        .then(|| public_operation_value(&operation))
+                        .transpose()?,
+                    workspace: (!self.compact_responses())
+                        .then(|| to_json_value(&workspace))
+                        .transpose()?,
                     elapsed_ms: elapsed_ms(started_at),
                     retry_after_ms: Some(poll_interval_ms),
                 });
@@ -1651,10 +1697,24 @@ impl RemoteHostsMcpServer {
             .await?;
 
         Ok(QueuedOperationOutput {
-            operation: public_operation_value(&plan.operation)?,
-            workspace: to_json_value(&workspace)?,
-            initial_output_chunk: to_json_value(&plan.initial_output_chunk)?,
-            protection_decision: to_json_value(&plan.decision)?,
+            next_action: operation_next_action(&plan.operation.state).to_owned(),
+            retry_after_ms: operation_retry_after_ms(&plan.operation.state),
+            operation: if self.compact_responses() {
+                compact_operation_value(&plan.operation)
+            } else {
+                public_operation_value(&plan.operation)?
+            },
+            workspace: if self.compact_responses() {
+                compact_workspace_value(&workspace)
+            } else {
+                to_json_value(&workspace)?
+            },
+            initial_output_chunk: (!self.compact_responses())
+                .then(|| to_json_value(&plan.initial_output_chunk))
+                .transpose()?,
+            protection_decision: (!self.compact_responses())
+                .then(|| to_json_value(&plan.decision))
+                .transpose()?,
             idempotency_reused: false,
             completion: None,
         })
@@ -4157,7 +4217,7 @@ impl RemoteHostsMcpServer {
         });
 
         let (workspace, reused) = if let Some(workspace) = reusable {
-            (to_json_value(&workspace)?, true)
+            (workspace, true)
         } else {
             let Json(created) = self
                 .create_workspace(Parameters(CreateWorkspaceRequest {
@@ -4171,27 +4231,59 @@ impl RemoteHostsMcpServer {
                     ttl_seconds: request.ttl_seconds,
                 }))
                 .await?;
-            (created.workspace, false)
+            (
+                serde_json::from_value(created.workspace)
+                    .map_err(|error| format!("failed to decode created workspace: {error}"))?,
+                false,
+            )
         };
-        let Json(runtime_snapshot) = self
-            .get_host_runtime_snapshot(Parameters(HostIdRequest {
-                host_id: request.host_id,
-            }))
-            .await?;
-        let command_profiles = CommandProfileCatalog::list_builtin();
-        let workspace_capacity = WorkspaceCapacityOutput::new(
-            self.workspace_capacity(host_id, agent_session.id).await?,
-            expired_reaped,
-        );
+        let full_context = !self.compact_responses();
+        let runtime_snapshot = if full_context {
+            Some(
+                self.get_host_runtime_snapshot(Parameters(HostIdRequest {
+                    host_id: request.host_id,
+                }))
+                .await?
+                .0,
+            )
+        } else {
+            None
+        };
+        let command_profiles = full_context.then(CommandProfileCatalog::list_builtin);
+        let workspace_capacity = if full_context {
+            Some(WorkspaceCapacityOutput::new(
+                self.workspace_capacity(host_id, agent_session.id).await?,
+                expired_reaped,
+            ))
+        } else {
+            None
+        };
 
         Ok(Json(PreparedWorkspaceOutput {
             reused,
-            agent_session: to_json_value(&agent_session)?,
-            workspace,
+            next_action: if workspace.state == WorkspaceState::Working {
+                "run_in_workspace_or_get_workspace_result"
+            } else {
+                "run_in_workspace"
+            }
+            .to_owned(),
+            agent_session: if full_context {
+                to_json_value(&agent_session)?
+            } else {
+                compact_agent_session_value(&agent_session)
+            },
+            workspace: if full_context {
+                to_json_value(&workspace)?
+            } else {
+                compact_workspace_value(&workspace)
+            },
             workspace_capacity,
             runtime_snapshot,
-            command_profile_count: command_profiles.len(),
-            command_profiles: values(&command_profiles)?,
+            command_profile_count: command_profiles.as_ref().map(Vec::len),
+            command_profiles: command_profiles
+                .as_ref()
+                .map(|profiles| values(profiles))
+                .transpose()?,
         }))
     }
 
@@ -4298,9 +4390,17 @@ impl RemoteHostsMcpServer {
             .await
             .map_err(|error| tool_error(&error))?;
         Ok(Json(PtyOutputChunksOutput {
-            pty_session: to_json_value(&pty_session)?,
+            pty_session: if self.compact_responses() {
+                compact_pty_session_value(&pty_session)
+            } else {
+                to_json_value(&pty_session)?
+            },
             count: chunks.len(),
-            chunks: values(&chunks)?,
+            chunks: if self.compact_responses() {
+                chunks.iter().map(compact_pty_chunk_value).collect()
+            } else {
+                values(&chunks)?
+            },
         }))
     }
 
@@ -4797,7 +4897,7 @@ impl RemoteHostsMcpServer {
         if operation_id.is_none() && request.after_sequence.is_some() {
             return Err("after_sequence requires operation_id".to_owned());
         }
-        if let Some(operation_id) = operation_id {
+        let requested_operation = if let Some(operation_id) = operation_id {
             let operation = self
                 .repositories
                 .operations
@@ -4808,7 +4908,10 @@ impl RemoteHostsMcpServer {
             if operation.workspace_id != Some(workspace_id) {
                 return Err("operation does not belong to workspace".to_owned());
             }
-        }
+            Some(operation)
+        } else {
+            None
+        };
         let limit = request.limit.unwrap_or(50).clamp(1, 200);
         let chunks = self
             .repositories
@@ -4816,17 +4919,32 @@ impl RemoteHostsMcpServer {
             .list_for_workspace(workspace_id, operation_id, request.after_sequence, limit)
             .await
             .map_err(|error| tool_error(&error))?;
-        let operations = self
-            .repositories
-            .operations
-            .list_for_workspace(workspace_id, 10)
-            .await
-            .map_err(|error| tool_error(&error))?;
+        let operations = if let Some(operation) = requested_operation {
+            vec![operation]
+        } else {
+            self.repositories
+                .operations
+                .list_for_workspace(workspace_id, if self.compact_responses() { 3 } else { 10 })
+                .await
+                .map_err(|error| tool_error(&error))?
+        };
         Ok(Json(WorkspaceOutputChunksOutput {
-            workspace: to_json_value(&workspace)?,
+            workspace: if self.compact_responses() {
+                compact_workspace_status_value(&workspace)
+            } else {
+                to_json_value(&workspace)?
+            },
             count: chunks.len(),
-            chunks: values(&chunks)?,
-            recent_operations: public_operation_values(&operations)?,
+            chunks: if self.compact_responses() {
+                chunks.iter().map(compact_operation_chunk_value).collect()
+            } else {
+                values(&chunks)?
+            },
+            recent_operations: if self.compact_responses() {
+                operations.iter().map(compact_operation_value).collect()
+            } else {
+                public_operation_values(&operations)?
+            },
         }))
     }
 
@@ -4911,9 +5029,17 @@ impl RemoteHostsMcpServer {
             .await
             .map_err(|error| tool_error(&error))?;
         Ok(Json(WorkspaceOutputArtifactsOutput {
-            workspace: to_json_value(&workspace)?,
+            workspace: if self.compact_responses() {
+                compact_workspace_status_value(&workspace)
+            } else {
+                to_json_value(&workspace)?
+            },
             count: artifacts.len(),
-            artifacts: values(&artifacts)?,
+            artifacts: if self.compact_responses() {
+                artifacts.iter().map(compact_artifact_value).collect()
+            } else {
+                values(&artifacts)?
+            },
         }))
     }
 
@@ -5511,18 +5637,24 @@ impl WorkspaceCapacityOutput {
 pub struct PreparedWorkspaceOutput {
     /// Whether an existing idle or working workspace was reused.
     pub reused: bool,
+    /// Stable next action for normal agent execution.
+    pub next_action: String,
     /// Current MCP client-session identity and isolation scope.
     pub agent_session: Value,
     /// Selected workspace record as JSON.
     pub workspace: Value,
     /// Logical Workspace capacity and automatic stale-state recovery performed for this request.
-    pub workspace_capacity: WorkspaceCapacityOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_capacity: Option<WorkspaceCapacityOutput>,
     /// Fresh host runtime snapshot captured after workspace preparation.
-    pub runtime_snapshot: HostRuntimeSnapshotOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_snapshot: Option<HostRuntimeSnapshotOutput>,
     /// Number of available structured command profiles.
-    pub command_profile_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_profile_count: Option<usize>,
     /// Available structured command profiles as JSON.
-    pub command_profiles: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_profiles: Option<Vec<Value>>,
 }
 
 /// PTY sessions output.
@@ -5598,14 +5730,20 @@ pub struct PtyInputEventsOutput {
 /// Queued operation output.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct QueuedOperationOutput {
+    /// Stable next action.
+    pub next_action: String,
+    /// Suggested poll delay for non-terminal work.
+    pub retry_after_ms: Option<u64>,
     /// Queued operation record as JSON.
     pub operation: Value,
     /// Updated workspace record as JSON.
     pub workspace: Value,
     /// Initial system output chunk as JSON.
-    pub initial_output_chunk: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_output_chunk: Option<Value>,
     /// Protection decision as JSON.
-    pub protection_decision: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protection_decision: Option<Value>,
     /// Whether an earlier operation was returned for the same retry key.
     pub idempotency_reused: bool,
     /// Exact-operation completion observed during an optional atomic submit-and-wait.
@@ -5617,10 +5755,20 @@ pub struct QueuedOperationOutput {
 pub struct OperationCompletionOutput {
     /// Whether the exact operation reached a terminal state during the wait.
     pub completed: bool,
-    /// Latest operation record as JSON.
-    pub operation: Value,
-    /// Latest workspace record as JSON.
-    pub workspace: Value,
+    /// Latest operation state.
+    pub state: String,
+    /// Exit code when available.
+    pub exit_code: Option<i32>,
+    /// Redacted result or error summary.
+    pub summary: Option<String>,
+    /// Stable next action.
+    pub next_action: String,
+    /// Latest operation record as JSON for admin and full profiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Value>,
+    /// Latest workspace record as JSON for admin and full profiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Value>,
     /// Elapsed wait time in milliseconds.
     pub elapsed_ms: u64,
     /// Suggested next poll delay when the operation remains non-terminal.
@@ -6333,6 +6481,19 @@ fn is_terminal_operation_state(state: &OperationState) -> bool {
     )
 }
 
+fn operation_state_name(state: &OperationState) -> &'static str {
+    match state {
+        OperationState::Queued => "queued",
+        OperationState::Running => "running",
+        OperationState::Succeeded => "succeeded",
+        OperationState::Failed => "failed",
+        OperationState::TimedOut => "timed_out",
+        OperationState::Cancelled => "cancelled",
+        OperationState::Rejected => "rejected",
+        OperationState::Exhausted => "exhausted",
+    }
+}
+
 fn retain_runtime_connection_sessions(
     sessions: &mut Vec<ConnectionSession>,
     access_paths: &[AccessPath],
@@ -6361,6 +6522,111 @@ fn values<T: Serialize>(items: &[T]) -> Result<Vec<Value>, String> {
 
 fn public_operation_values(items: &[OperationRun]) -> Result<Vec<Value>, String> {
     items.iter().map(public_operation_value).collect()
+}
+
+fn compact_agent_session_value(session: &AgentSession) -> Value {
+    json!({
+        "id": session.id,
+        "client_kind": session.client_kind,
+        "project_key": session.project_key,
+        "conversation_key": session.conversation_key
+    })
+}
+
+fn compact_workspace_value(workspace: &AgentWorkspace) -> Value {
+    json!({
+        "id": workspace.id,
+        "host_id": workspace.host_id,
+        "access_path_id": workspace.access_path_id,
+        "state": workspace.state,
+        "label": workspace.label,
+        "cwd": workspace.cwd,
+        "coordination_scope": workspace.coordination_scope
+    })
+}
+
+fn compact_workspace_status_value(workspace: &AgentWorkspace) -> Value {
+    json!({
+        "id": workspace.id,
+        "state": workspace.state
+    })
+}
+
+fn compact_pty_session_value(session: &PtySession) -> Value {
+    json!({
+        "pty_session_id": session.pty_session_id,
+        "workspace_id": session.workspace_id,
+        "state": session.state,
+        "backend_state": session.backend_state,
+        "foreground_process": session.foreground_process,
+        "input_allowed": session.input_allowed,
+        "interaction": session.interaction,
+        "last_exit_code": session.last_exit_code
+    })
+}
+
+fn compact_pty_chunk_value(chunk: &remote_hosts_domain::PtyOutputChunk) -> Value {
+    json!({
+        "sequence": chunk.sequence,
+        "stream": chunk.stream,
+        "text": chunk.redacted_text,
+        "truncated": chunk.truncated
+    })
+}
+
+fn compact_operation_chunk_value(chunk: &remote_hosts_domain::OperationOutputChunk) -> Value {
+    json!({
+        "sequence": chunk.sequence,
+        "stream": chunk.stream,
+        "text": chunk.redacted_text,
+        "truncated": chunk.truncated
+    })
+}
+
+fn compact_artifact_value(artifact: &remote_hosts_domain::OperationOutputArtifact) -> Value {
+    json!({
+        "id": artifact.id,
+        "operation_id": artifact.operation_id,
+        "stream": artifact.stream,
+        "byte_len": artifact.byte_len,
+        "sha256": artifact.sha256,
+        "preview": artifact.redacted_preview,
+        "truncated": artifact.truncated
+    })
+}
+
+fn compact_operation_value(operation: &OperationRun) -> Value {
+    json!({
+        "id": operation.id,
+        "workspace_id": operation.workspace_id,
+        "state": operation.state,
+        "exit_code": operation.exit_code,
+        "intent": operation.intent,
+        "command_preview": operation.redacted_command_summary,
+        "summary": operation_result_summary(operation),
+        "last_error": operation.last_error,
+        "started_at": operation.started_at,
+        "finished_at": operation.finished_at
+    })
+}
+
+fn operation_next_action(state: &OperationState) -> &'static str {
+    if is_terminal_operation_state(state) {
+        "none"
+    } else {
+        "get_workspace_result"
+    }
+}
+
+fn operation_retry_after_ms(state: &OperationState) -> Option<u64> {
+    (!is_terminal_operation_state(state)).then_some(250)
+}
+
+fn operation_result_summary(operation: &OperationRun) -> Option<String> {
+    operation
+        .last_error
+        .clone()
+        .or_else(|| operation.redacted_output_summary.clone())
 }
 
 fn write_lease_snapshot_value(
@@ -7665,18 +7931,9 @@ mod tests {
             workspace_a["agent_session"]["id"],
             workspace_b["agent_session"]["id"]
         );
-        assert_eq!(
-            workspace_a["runtime_snapshot"]["workspaces"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
-        assert_eq!(
-            workspace_b["runtime_snapshot"]["workspaces"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
+        assert!(workspace_a.get("runtime_snapshot").is_none());
+        assert!(workspace_b.get("command_profiles").is_none());
+        assert!(serde_json::to_vec(&workspace_a)?.len() < 1_200);
 
         let foreign_workspace_id = workspace_b["workspace"]["id"]
             .as_str()
@@ -7839,12 +8096,22 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(mutation_a["operation"]["requires_write_lease"], json!(true));
-        assert_eq!(mutation_b["operation"]["requires_write_lease"], json!(true));
-        assert_eq!(
-            readonly_b["operation"]["requires_write_lease"],
-            json!(false)
+        assert!(
+            mutation_a["operation"]["command_preview"]
+                .as_str()
+                .is_some_and(|preview| preview.contains("touch /tmp/remote-hosts-a"))
         );
+        assert!(
+            mutation_b["operation"]["command_preview"]
+                .as_str()
+                .is_some_and(|preview| preview.contains("touch /tmp/remote-hosts-b"))
+        );
+        assert!(
+            readonly_b["operation"]["command_preview"]
+                .as_str()
+                .is_some_and(|preview| preview.contains("hostname"))
+        );
+        assert!(mutation_a.get("protection_decision").is_none());
         assert_eq!(
             snapshot["write_lease"]["state"],
             json!("held_by_other_session")
@@ -8121,20 +8388,10 @@ mod tests {
 
         assert_eq!(prepared["reused"], json!(false));
         assert_eq!(prepared["workspace"]["state"], json!("idle"));
-        assert_eq!(prepared["workspace_capacity"]["limit"], json!(32));
-        assert_eq!(prepared["workspace_capacity"]["expired_reaped"], json!(32));
-        assert_eq!(
-            prepared["workspace_capacity"]["active_after_prepare"],
-            json!(1)
-        );
-        assert_eq!(
-            prepared["workspace_capacity"]["current_agent_session_active"],
-            json!(1)
-        );
-        assert_eq!(
-            prepared["workspace_capacity"]["other_agent_sessions_active"],
-            json!(0)
-        );
+        assert!(prepared.get("workspace_capacity").is_none());
+        assert!(prepared.get("runtime_snapshot").is_none());
+        assert!(prepared.get("command_profiles").is_none());
+        assert!(serde_json::to_vec(&prepared)?.len() < 1_200);
         assert_eq!(
             fixture
                 .repositories
@@ -8145,7 +8402,6 @@ mod tests {
                 .state,
             AgentSessionState::Expired
         );
-        assert_eq!(prepared["runtime_snapshot"]["snapshot_version"], json!(10));
         Ok(())
     }
 
@@ -9098,12 +9354,12 @@ mod tests {
             shell["operation"]["command_profile_json"]["script_redacted"],
             json!(true)
         );
-        assert!(!shell.to_string().contains("kubectl"));
+        assert!(shell.to_string().contains("kubectl get pods"));
         assert!(
             shell["operation"]["redacted_command_summary"]
                 .as_str()
                 .is_some_and(|summary| {
-                    summary.contains("shell.posix") && !summary.contains("kubectl")
+                    summary.contains("shell.posix") && summary.contains("kubectl get pods")
                 })
         );
 
@@ -9519,9 +9775,9 @@ mod tests {
         assert_eq!(queued_input["input_event"]["state"], json!("queued"));
         assert_eq!(
             queued_input["input_event"]["redacted_input_summary"],
-            json!("11 bytes queued for pty input")
+            json!("echo hello\n")
         );
-        assert!(!queued_input.to_string().contains("echo hello"));
+        assert!(queued_input.to_string().contains("echo hello"));
         let retried_input = call_tool(
             fixture.server(),
             tools::QUEUE_PTY_INPUT,
@@ -9562,7 +9818,7 @@ mod tests {
         .await?;
         assert_eq!(input_events["count"], json!(1));
         assert_eq!(input_events["input_events"][0]["state"], json!("queued"));
-        assert!(!input_events.to_string().contains("echo hello"));
+        assert!(input_events.to_string().contains("echo hello"));
 
         let heartbeat = call_tool(
             fixture.server(),

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{ProtectionDecision, ServerProtectionPolicy};
+use crate::{ProtectionDecision, SecretRedactor, ServerProtectionPolicy};
 
 /// Request to open a persistent PTY record for a workspace.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -185,6 +185,17 @@ impl PtySessionSupervisor {
 
         let now = now_utc();
         let byte_len = u64::try_from(command.input.len()).unwrap_or(u64::MAX);
+        let redacted_input_summary = if matches!(
+            session
+                .interaction
+                .as_ref()
+                .map(|interaction| &interaction.kind),
+            Some(PtyInteractionKind::Password | PtyInteractionKind::SudoPassword)
+        ) {
+            "credential-like input queued for pty".to_owned()
+        } else {
+            SecretRedactor::default().command_preview(&command.input)
+        };
         Ok(PtySessionInputPlan {
             event: PtyInputEvent {
                 id: PtyInputEventId::new(),
@@ -198,7 +209,7 @@ impl PtySessionSupervisor {
                 input_fingerprint: Some(format!("{:x}", Sha256::digest(command.input.as_bytes()))),
                 state: PtyInputEventState::Queued,
                 sequence: next_sequence,
-                redacted_input_summary: format!("{byte_len} bytes queued for pty input"),
+                redacted_input_summary,
                 byte_len,
                 requested_by: command.requested_by,
                 created_at: now,
@@ -545,11 +556,47 @@ mod tests {
         assert_eq!(plan.input_text, "echo hello\n");
         assert_eq!(plan.event.sequence, 7);
         assert_eq!(plan.event.byte_len, 11);
+        assert_eq!(plan.event.redacted_input_summary, "echo hello\n");
+        assert!(plan.event.redacted_input_summary.contains("echo hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn hides_text_queued_into_a_detected_password_prompt() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let supervisor = PtySessionSupervisor::default();
+        let workspace = workspace(WorkspaceState::Idle);
+        let connection = connection(&workspace, EntityState::Connected);
+        let mut session = supervisor.open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: connection.session_id,
+                cwd: None,
+            },
+        )?;
+        session.backend_state = remote_hosts_domain::PtyBackendState::Active;
+        session.interaction = Some(PtyInteraction {
+            kind: PtyInteractionKind::Password,
+            confidence: 100,
+            observed_at: now_utc(),
+        });
+        let plan = supervisor.queue_input(
+            &session,
+            &workspace,
+            1,
+            PtySessionInputCommand {
+                input: "hunter2\n".to_owned(),
+                requested_by: Some("agent".to_owned()),
+                idempotency_key: None,
+            },
+        )?;
         assert_eq!(
             plan.event.redacted_input_summary,
-            "11 bytes queued for pty input"
+            "credential-like input queued for pty"
         );
-        assert!(!plan.event.redacted_input_summary.contains("echo hello"));
+        assert!(!plan.event.redacted_input_summary.contains("hunter2"));
         Ok(())
     }
 

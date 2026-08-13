@@ -1,6 +1,6 @@
 //! Database access layer and migrations.
 
-use std::{io, str::FromStr, time::Duration as StdDuration};
+use std::{collections::BTreeSet, io, str::FromStr, time::Duration as StdDuration};
 
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentWorkspace,
@@ -1886,6 +1886,35 @@ impl AgentSessionRepository {
         row.as_ref().map(row_to_agent_session).transpose()
     }
 
+    /// Gets a bounded set of Agent sessions in one query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_by_ids(
+        &self,
+        ids: &BTreeSet<AgentSessionId>,
+    ) -> Result<Vec<AgentSession>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r"
+            SELECT id, client_kind, client_instance_id, project_key, conversation_key,
+                   state_json, created_at, last_seen_at, expires_at
+            FROM agent_sessions
+            WHERE id IN (
+            ",
+        );
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id.to_string());
+        }
+        separated.push_unseparated(")");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.iter().map(row_to_agent_session).collect()
+    }
+
     /// Persists expiry for a bounded number of stale active Agent Sessions.
     ///
     /// # Errors
@@ -2017,6 +2046,36 @@ impl AgentWorkspaceRepository {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(row_to_agent_workspace).transpose()
+    }
+
+    /// Gets a bounded set of Workspaces in one query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_by_ids(
+        &self,
+        ids: &BTreeSet<WorkspaceId>,
+    ) -> Result<Vec<AgentWorkspace>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r"
+            SELECT workspace_id, agent_session_id, host_id, access_path_id, connector_id, label,
+                   cwd, state_json, policy_profile, coordination_scope, created_at,
+                   last_activity_at, ttl_seconds
+            FROM agent_workspaces
+            WHERE workspace_id IN (
+            ",
+        );
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id.to_string());
+        }
+        separated.push_unseparated(")");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.iter().map(row_to_agent_workspace).collect()
     }
 
     /// Lists workspaces for a host.
@@ -3691,6 +3750,26 @@ impl PtyInputEventRepository {
         rows.iter().map(row_to_pty_input_event).collect()
     }
 
+    /// Lists recent public PTY input metadata across all sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_recent(&self, limit: u32) -> Result<Vec<PtyInputEvent>, DbError> {
+        let rows = sqlx::query(
+            r"
+            SELECT *
+            FROM pty_input_events
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            ",
+        )
+        .bind(u32_to_i64(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_pty_input_event).collect()
+    }
+
     /// Returns the next PTY input sequence number for a session.
     ///
     /// # Errors
@@ -4447,6 +4526,26 @@ impl OperationRunRepository {
             ",
         )
         .bind(host_id.to_string())
+        .bind(u32_to_i64(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_operation_run).collect()
+    }
+
+    /// Lists recent operations across all hosts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_recent(&self, limit: u32) -> Result<Vec<OperationRun>, DbError> {
+        let rows = sqlx::query(
+            r"
+            SELECT *
+            FROM operation_runs
+            ORDER BY started_at DESC, id DESC
+            LIMIT ?
+            ",
+        )
         .bind(u32_to_i64(limit))
         .fetch_all(&self.pool)
         .await?;

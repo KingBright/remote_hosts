@@ -77,6 +77,14 @@ reported conversations is intentional. Neither command replaces MCP stdio childr
 already-loaded Skill context owned by an existing Codex or Antigravity task; those processes
 keep the old binary, tool schema, and instructions until the client reloads them.
 
+For a planned upgrade, first run the restart-readiness check and map each reported live PTY,
+operation, input, or write lease to its owning Agent Session and client conversation. Notify only
+those conversations. Ask them to finish the current atomic step, close their PTY/Workspace, stop
+submitting new work, and reload MCP after the upgrade. Include the compact response rules: follow
+`next_action` and `retry_after_ms`, preserve ids and sequence cursors, consume only new chunks, and
+request runtime snapshots only for diagnostics. Wait until the normal drain gate passes; do not use
+`--force` as a substitute for notification and orderly release.
+
 Windows uses the same Rust `restart-readiness` query and `-Force` spelling. Its versioned release
 directories avoid overwriting an executable that is still in use. Neither macOS nor Windows service
 management depends on an external SQLite CLI.

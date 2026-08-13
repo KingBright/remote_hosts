@@ -131,10 +131,15 @@ impl WorkspaceOperationSupervisor {
         let now = now_utc();
         let operation_id = OperationId::new();
         let command_summary = if matches!(command.command_profile.class, CommandClass::Sensitive) {
-            let script_bytes = command.command_profile.args.last().map_or(0, String::len);
+            let script = command
+                .command_profile
+                .args
+                .last()
+                .map_or("", String::as_str);
             format!(
-                "{} via pooled workspace ({script_bytes} script bytes)",
-                command.command_profile.name
+                "{} via pooled workspace:\n{}",
+                command.command_profile.name,
+                self.redactor.command_preview(script)
             )
         } else {
             self.redactor.redact(&format!(
@@ -467,6 +472,41 @@ mod tests {
             plan.initial_output_chunk.stream,
             remote_hosts_domain::OutputStream::System
         );
+        Ok(())
+    }
+
+    #[test]
+    fn shell_operation_keeps_a_bounded_redacted_command_preview()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = ServerProtectionPolicy::default();
+        let profile = CommandProfileCatalog::resolve_builtin(
+            "shell.posix",
+            vec!["set -e\nPASSWORD=hunter2\nkubectl get pods".to_owned()],
+            &policy,
+        )?;
+        let plan =
+            WorkspaceOperationSupervisor::new(policy).queue_operation(&WorkspaceRunCommand {
+                workspace: workspace(WorkspaceState::Idle),
+                command_profile: profile,
+                intent: None,
+                idempotency_key: None,
+                queued_operations: 0,
+                active_exec_channels: 0,
+                active_probe_jobs: 0,
+                overload_cooldown_active: false,
+            })?;
+
+        assert!(
+            plan.operation
+                .redacted_command_summary
+                .contains("kubectl get pods")
+        );
+        assert!(
+            plan.operation
+                .redacted_command_summary
+                .contains("PASSWORD=<redacted>")
+        );
+        assert!(!plan.operation.redacted_command_summary.contains("hunter2"));
         Ok(())
     }
 

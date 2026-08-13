@@ -232,7 +232,7 @@ Hidden tools are removed from discovery and dispatch.
 
 The loopback API groups its endpoints by responsibility:
 
-- Management: `/`, `/admin`, `/v1/admin/overview`
+- Management: `/`, `/admin`, `/v1/admin/overview`, `/v1/admin/activity`
 - Registry and state: `/v1/hosts`, host access paths, access resolution, and host state
 - Topology and credentials: `/v1/topology`, topology sync, credential bindings, and credentials
 - Connector runtime: connector heartbeat/events and `/v1/runtime-events/wait`
@@ -242,6 +242,22 @@ The loopback API groups its endpoints by responsibility:
 
 The source routes and request schemas in `remote-hosts-api` are authoritative; this grouped list
 avoids duplicating every route signature in overview documentation.
+
+## Compact Agent Responses and Operator Activity
+
+MCP remains structured JSON at the transport boundary, but the normal `agent` profile returns
+task-oriented compact views. Workspace preparation omits the repeated runtime snapshot and command
+catalog; command submission omits full policy, Workspace, and output objects; result and PTY reads
+return incremental chunks without repeated foreign keys and timestamps. Stable `workspace.id`,
+`operation.id`, state, next action, retry delay, command preview, exit code, and summaries remain.
+The `admin` and `full` profiles retain detailed records for maintenance and debugging.
+
+Command visibility is stored as a bounded preview after secret redaction. Managed shell scripts and
+normal PTY input are readable in audit records, while detected password/sudo input and encrypted
+credential injection remain type-only. The admin page's `Agent 活动` view combines command runs and
+PTY input into a newest-first timeline linked to host, Workspace, Agent session, project, result,
+duration, and optional transport evidence. `/v1/admin/activity` is bounded to 200 records and never
+returns raw private input payloads or secret material.
 
 ## Security Boundaries
 

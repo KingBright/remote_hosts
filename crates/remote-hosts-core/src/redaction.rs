@@ -2,6 +2,11 @@
 
 use regex::Regex;
 
+/// Maximum characters retained in one human-readable command preview.
+pub const COMMAND_PREVIEW_MAX_CHARS: usize = 1_200;
+/// Maximum lines retained in one human-readable command preview.
+pub const COMMAND_PREVIEW_MAX_LINES: usize = 12;
+
 /// Secret redactor for logs and agent-visible summaries.
 #[derive(Debug)]
 pub struct SecretRedactor {
@@ -45,6 +50,51 @@ impl SecretRedactor {
                 regex.replace_all(&current, *replacement).to_string()
             })
     }
+
+    /// Produces a bounded, redacted preview suitable for activity feeds and agent responses.
+    #[must_use]
+    pub fn command_preview(&self, input: &str) -> String {
+        bounded_preview(
+            &self.redact(input),
+            COMMAND_PREVIEW_MAX_CHARS,
+            COMMAND_PREVIEW_MAX_LINES,
+        )
+    }
+}
+
+fn bounded_preview(input: &str, max_chars: usize, max_lines: usize) -> String {
+    let mut output = String::new();
+    let mut chars = 0_usize;
+    let mut truncated = false;
+
+    for (line_index, line) in input.lines().enumerate() {
+        if line_index == max_lines {
+            truncated = true;
+            break;
+        }
+        if line_index > 0 {
+            output.push('\n');
+            chars += 1;
+        }
+        for character in line.chars() {
+            if chars == max_chars {
+                truncated = true;
+                break;
+            }
+            output.push(character);
+            chars += 1;
+        }
+        if truncated {
+            break;
+        }
+    }
+    if input.ends_with('\n') && !truncated && chars < max_chars {
+        output.push('\n');
+    }
+    if truncated {
+        output.push_str("\n... <truncated>");
+    }
+    output
 }
 
 impl Default for SecretRedactor {
@@ -100,6 +150,22 @@ mod tests {
         let output = redactor
             .redact("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----");
         assert!(output.contains("<redacted>"));
+        Ok(())
+    }
+
+    #[test]
+    fn command_preview_is_readable_redacted_and_bounded() -> Result<(), regex::Error> {
+        let redactor = SecretRedactor::new()?;
+        let input = format!(
+            "set -e\nPASSWORD=hunter2\nkubectl get pods\n{}",
+            "echo line\n".repeat(40)
+        );
+        let preview = redactor.command_preview(&input);
+        assert!(preview.contains("kubectl get pods"));
+        assert!(preview.contains("PASSWORD=<redacted>"));
+        assert!(!preview.contains("hunter2"));
+        assert!(preview.contains("<truncated>"));
+        assert!(preview.lines().count() <= super::COMMAND_PREVIEW_MAX_LINES + 1);
         Ok(())
     }
 }

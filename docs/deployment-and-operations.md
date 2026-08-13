@@ -67,8 +67,20 @@ scripts/remote-hosts-service stop
 - `ui` atomically replaces only the external administration page; the API and connector do not
   restart.
 
+Before a planned restart, run `restart-readiness` and identify the Agent Sessions that own every
+reported operation, PTY, queued input, and write lease. Notify only those active Codex or
+Antigravity conversations, ask them to finish their current atomic step, close their PTY/Workspace,
+and stop creating new Remote Hosts work. The notice must also tell them to reload MCP after the
+upgrade and follow the compact Agent response contract. Wait for the normal drain gate to pass;
+never use `--force` merely because notification or draining takes time.
+
 The API reads `REMOTE_HOSTS_ADMIN_HTML_PATH` on every `/admin` request and falls back to its embedded
 page. After a UI-only update, reload the browser.
+
+The admin page separates infrastructure topology from `Agent 活动`. The activity view reads the
+bounded `/v1/admin/activity` feed and shows target host, Agent/project identity, redacted command or
+PTY input preview, status, exit code, duration, result, and expandable transport details. It is the
+operator-facing audit surface; raw MCP JSON is not intended for routine human inspection.
 
 ## Configuration
 
@@ -236,4 +248,5 @@ scripts/remote-hosts-service logs
 ```
 
 For a fresh MCP smoke test, start a new MCP stdio child and verify that the Agent profile exposes 18
-tools, including upload and download, and that a read-only runtime snapshot reports version 8.
+tools, including upload and download, that `prepare_workspace` returns compact identity plus
+`next_action`, and that a read-only runtime snapshot reports version 10.

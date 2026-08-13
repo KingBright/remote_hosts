@@ -101,7 +101,7 @@ track output sequence; do not probe by opening a new SSH transport for every com
 
 ## Transport Runtime Evidence
 
-Snapshot version 8 separates the real connector-local SSH runtime from logical sessions and workspaces, exposes privacy-aware Agent Session ownership and all active scoped write leases, and reports scheduler-visible channel pressure.
+Snapshot version 10 separates the real connector-local SSH runtime from logical sessions and workspaces, exposes privacy-aware Agent Session ownership and all active scoped write leases, and reports scheduler-visible channel pressure, proactive PTY state, and explicit interaction requests.
 
 Interpret access-path `channel_capacity`:
 

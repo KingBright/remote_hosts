@@ -53,6 +53,9 @@
     h1 { margin: 0; font-size: 15px; letter-spacing: 0; }
     .eyebrow { margin-top: 1px; color: var(--muted); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
     .header-actions { display: flex; align-items: center; justify-content: flex-end; min-width: 0; gap: 7px; }
+    .view-switch { display: flex; padding: 2px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+    .view-tab { min-height: 28px; padding: 0 10px; border: 0; border-radius: 5px; color: var(--muted); background: transparent; font-size: 11px; }
+    .view-tab.active { color: var(--text); background: var(--surface-3); }
     .status { display: flex; align-items: center; gap: 7px; margin-right: 5px; color: var(--muted); font-size: 11px; white-space: nowrap; }
     .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 10px rgba(120, 230, 187, .55); }
     .btn {
@@ -98,6 +101,11 @@
     .state-pill.degraded { background: var(--amber); }
     .host-meta { margin-top: 4px; color: var(--muted); font-size: 10px; }
     main { display: grid; grid-template-rows: auto 1fr; }
+    .main-view { min-width: 0; min-height: 0; }
+    .main-view[hidden] { display: none !important; }
+    #topologyView { display: grid; grid-template-rows: auto 1fr; }
+    .shell.activity-mode .workspace { grid-template-columns: 0 minmax(0, 1fr) 0; }
+    .shell.activity-mode aside { visibility: hidden; overflow: hidden; }
     .topbar { padding: 12px 14px; border-bottom: 1px solid var(--line); background: #0d110f; }
     .metrics { display: grid; grid-template-columns: repeat(4, minmax(105px, 1fr)); gap: 8px; }
     .metric {
@@ -158,6 +166,40 @@
     .credential strong { display: block; font-size: 11px; }
     .credential small { color: var(--muted); font-size: 10px; }
     .muted { color: var(--muted); }
+    .activity-view { overflow: auto; background: #0b0f0d; }
+    .activity-head {
+      position: sticky; z-index: 5; top: 0; display: flex; align-items: center; justify-content: space-between;
+      min-width: 760px; gap: 16px; padding: 15px 18px; border-bottom: 1px solid var(--line); background: rgba(13,17,15,.98);
+    }
+    .activity-head h2 { margin: 0; font-size: 14px; }
+    .activity-head p { margin: 3px 0 0; color: var(--muted); font-size: 10px; }
+    .activity-tools { display: flex; align-items: center; gap: 8px; }
+    .activity-tools .search { width: 280px; }
+    .activity-table { min-width: 920px; }
+    .activity-grid {
+      display: grid; grid-template-columns: 132px 124px minmax(260px, 1fr) 104px 84px;
+      align-items: start; gap: 12px;
+    }
+    .activity-columns { position: sticky; z-index: 3; top: 70px; padding: 8px 18px; border-bottom: 1px solid var(--line); color: var(--muted); background: #0d110f; font-size: 9px; text-transform: uppercase; }
+    .activity-row { padding: 13px 18px; border-bottom: 1px solid var(--line-soft); }
+    .activity-row:hover { background: var(--surface); }
+    .activity-time { color: var(--muted); font-size: 10px; }
+    .activity-host { overflow: hidden; font-size: 11px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+    .activity-source { margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+    .command-preview { margin: 0; overflow: hidden; color: #d9e5df; font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .activity-intent { margin-bottom: 5px; color: var(--muted); font-size: 10px; }
+    .activity-state { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; }
+    .activity-state::before { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); content: ""; }
+    .activity-state.succeeded::before, .activity-state.delivered::before { background: var(--mint); }
+    .activity-state.running::before, .activity-state.queued::before, .activity-state.claimed::before { background: var(--blue); }
+    .activity-state.failed::before, .activity-state.rejected::before, .activity-state.timed_out::before, .activity-state.exhausted::before { background: var(--red); }
+    .activity-result { color: var(--muted); font-size: 10px; }
+    .activity-result.error { color: var(--red); }
+    .activity-details { margin: 9px 0 0 268px; color: var(--muted); font-size: 10px; }
+    .activity-details summary { cursor: pointer; user-select: none; }
+    .activity-detail-grid { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 5px 10px; margin-top: 8px; }
+    .activity-detail-grid code { overflow-wrap: anywhere; color: #c7d4ce; }
+    .activity-empty { padding: 80px 18px; color: var(--muted); text-align: center; }
     dialog {
       width: min(680px, calc(100vw - 40px)); padding: 0; border: 1px solid var(--line); border-radius: 8px;
       color: var(--text); background: var(--surface-2); box-shadow: var(--shadow);
@@ -184,6 +226,7 @@
       .status { display: none; }
       .header-actions { gap: 5px; }
       .btn { padding: 0 9px; }
+      .activity-grid { grid-template-columns: 118px 112px minmax(220px, 1fr) 92px 72px; }
     }
   </style>
 </head>
@@ -196,6 +239,10 @@
     </div>
     <div class="header-actions">
       <div class="status"><span class="status-dot"></span><span id="connectionStatus">正在读取本地状态</span></div>
+      <div class="view-switch" role="tablist" aria-label="管理视图">
+        <button class="view-tab active" id="topologyTab" role="tab" aria-selected="true">拓扑</button>
+        <button class="view-tab" id="activityTab" role="tab" aria-selected="false">Agent 活动</button>
+      </div>
       <button class="btn" id="focusButton" title="隐藏两侧面板，扩大拓扑工作区">专注拓扑</button>
       <button class="btn" id="refreshButton">刷新</button>
       <button class="btn" id="syncButton">同步快照</button>
@@ -213,6 +260,7 @@
     </aside>
 
     <main>
+      <section class="main-view" id="topologyView">
       <div class="topbar">
         <div class="metrics">
           <div class="metric"><div class="metric-value" id="hostMetric">0</div><div class="metric-label">受管服务器</div></div>
@@ -246,6 +294,17 @@
         <svg id="topology" role="img" aria-label="分组基础设施拓扑图" data-layout-version="grouped-v2"></svg>
         <div class="empty" id="emptyState"><div><strong>还没有拓扑数据</strong>点击“同步快照”导入服务器或集群拓扑。</div></div>
       </div>
+      </section>
+      <section class="main-view activity-view" id="activityView" hidden>
+        <div class="activity-head">
+          <div><h2>Agent 活动</h2><p id="activitySummary">最近的远程命令与交互式终端输入</p></div>
+          <div class="activity-tools"><input class="search" id="activitySearch" placeholder="筛选主机、项目、命令或结果"></div>
+        </div>
+        <div class="activity-table">
+          <div class="activity-columns activity-grid"><span>时间</span><span>目标 / Agent</span><span>执行内容</span><span>状态</span><span>结果</span></div>
+          <div id="activityList"></div>
+        </div>
+      </section>
     </main>
 
     <aside class="detail">
@@ -287,6 +346,8 @@
   const api = "/v1/admin/overview";
   const state = {
     data: null,
+    activity: [],
+    activeView: "topology",
     selectedNodeId: null,
     family: "all",
     graphQuery: "",
@@ -342,6 +403,13 @@
     byId("connectionStatus").textContent = "正在同步本地状态";
     try {
       state.data = await jsonRequest(api);
+      try {
+        const activity = await jsonRequest("/v1/admin/activity?limit=100");
+        state.activity = activity.items || [];
+      } catch (activityError) {
+        state.activity = [];
+        showToast(`Agent 活动暂不可用：${activityError.message}`, true);
+      }
       byId("connectionStatus").textContent = "本地控制面在线";
       render();
     } catch (error) {
@@ -362,6 +430,91 @@
     renderGraph();
     renderCredentialOptions();
     renderDetail();
+    renderActivity();
+  }
+
+  function setView(view) {
+    state.activeView = view;
+    const activity = view === "activity";
+    byId("topologyView").hidden = activity;
+    byId("activityView").hidden = !activity;
+    byId("topologyTab").classList.toggle("active", !activity);
+    byId("activityTab").classList.toggle("active", activity);
+    byId("topologyTab").setAttribute("aria-selected", String(!activity));
+    byId("activityTab").setAttribute("aria-selected", String(activity));
+    byId("focusButton").hidden = activity;
+    byId("appShell").classList.toggle("activity-mode", activity);
+    if (!activity) window.requestAnimationFrame(renderGraph);
+  }
+
+  function formatDuration(value) {
+    if (value === null || value === undefined) return "—";
+    if (value < 1000) return `${value} ms`;
+    if (value < 60000) return `${(value / 1000).toFixed(1)} s`;
+    return `${Math.floor(value / 60000)}m ${Math.round((value % 60000) / 1000)}s`;
+  }
+
+  function renderActivity() {
+    const list = byId("activityList");
+    list.replaceChildren();
+    const query = byId("activitySearch").value.trim().toLowerCase();
+    const items = state.activity.filter(item => [
+      item.host_name,
+      item.workspace_label,
+      item.intent,
+      item.command_preview,
+      item.summary,
+      item.error,
+      item.agent_session?.client_kind,
+      item.agent_session?.project_key,
+      item.agent_session?.conversation_key
+    ].filter(Boolean).join(" ").toLowerCase().includes(query));
+    byId("activitySummary").textContent = `最近 ${items.length} 条远程命令与交互式终端输入`;
+    if (!items.length) {
+      list.append(create("div", "activity-empty", query ? "没有匹配的 Agent 活动。" : "还没有 Agent 远程操作记录。"));
+      return;
+    }
+    items.forEach(item => {
+      const row = create("article", "activity-row");
+      const grid = create("div", "activity-grid");
+      const time = create("div", "activity-time", formatTimestamp(item.occurred_at));
+      const target = create("div");
+      target.append(create("div", "activity-host", item.host_name));
+      const source = item.agent_session
+        ? `${item.agent_session.client_kind}${item.agent_session.project_key ? ` · ${item.agent_session.project_key}` : ""}`
+        : "未关联 Agent 会话";
+      target.append(create("div", "activity-source", source));
+      const command = create("div");
+      if (item.intent) command.append(create("div", "activity-intent", item.intent));
+      command.append(create("pre", "command-preview", item.command_preview || "—"));
+      const status = create("div");
+      status.append(create("span", `activity-state ${item.state}`, label(item.state)));
+      const resultText = item.error || item.summary || (item.exit_code !== null ? `exit ${item.exit_code}` : "—");
+      const result = create("div", `activity-result${item.error ? " error" : ""}`, resultText);
+      if (item.duration_ms !== null) result.title = `耗时 ${formatDuration(item.duration_ms)}`;
+      grid.append(time, target, command, status, result);
+      row.append(grid);
+
+      const details = create("details", "activity-details");
+      const summary = create("summary", "", "技术详情");
+      const detailGrid = create("div", "activity-detail-grid");
+      const detailValues = [
+        ["类型", item.kind === "pty_input" ? "PTY 输入" : "命令执行"],
+        ["工作区", item.workspace_label || item.workspace_id || "—"],
+        ["会话", item.agent_session?.conversation_key || item.agent_session?.id || "—"],
+        ["耗时", formatDuration(item.duration_ms)],
+        ["执行摘要", item.technical_summary || "—"],
+        ["操作 ID", item.id],
+        ["PTY", item.pty_session_id || "—"],
+        ["连接复用", item.transport?.connection_use ? label(item.transport.connection_use) : "—"]
+      ];
+      detailValues.forEach(([key, value]) => {
+        detailGrid.append(create("span", "", key), create("code", "", value));
+      });
+      details.append(summary, detailGrid);
+      row.append(details);
+      list.append(row);
+    });
   }
 
   function renderHosts() {
@@ -877,6 +1030,9 @@
   }
 
   byId("refreshButton").addEventListener("click", refresh);
+  byId("topologyTab").addEventListener("click", () => setView("topology"));
+  byId("activityTab").addEventListener("click", () => setView("activity"));
+  byId("activitySearch").addEventListener("input", renderActivity);
   byId("hostSearch").addEventListener("input", renderHosts);
   document.querySelectorAll(".chip[data-family]").forEach(button => button.addEventListener("click", () => {
     state.family = button.dataset.family;

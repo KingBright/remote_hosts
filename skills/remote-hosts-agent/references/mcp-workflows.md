@@ -27,17 +27,27 @@ The `agent` profile intentionally exposes only 18 task-level tools:
 
 The `admin` profile adds host deduplication/upsert, environments, credential references, access paths, facts, and operational maintenance. The `full` profile is reserved for development and debugging.
 
+Agent-profile responses are compact by default. High-frequency calls preserve stable nested paths
+such as `workspace.id` and `operation.id`, while omitting repeated runtime snapshots, command
+catalogs, protection decisions, full Workspace records, and unrelated recent operations. Follow
+`next_action` and `retry_after_ms`; call the explicit runtime snapshot or admin/full profile only
+for diagnostics and maintenance.
+
+Shell and PTY audit records contain bounded, secret-redacted command previews. Incremental output
+chunks contain sequence, stream, text, and truncation state without repeating Workspace and
+operation ids in every chunk. Password-like PTY interactions remain type-only.
+
 ## Standard Remote Check
 
 1. List hosts and identify exactly one target. If multiple records may be the same machine, stop and follow `host-registry.md`.
 2. For state-only work, read `remote_hosts_get_host_runtime_snapshot` and inspect `attention`, `authorized_key_bootstrap`, and `transport_runtime` for each access path.
-3. For execution, choose a stable `coordination_scope` and call `remote_hosts_prepare_workspace`. Omit it for the conservative `host` default. The tool reuses only an `idle` or `working` workspace owned by the current Agent Session with the same scope before creating one and returns a fresh runtime snapshot plus command profiles.
+3. For execution, choose a stable `coordination_scope` and call `remote_hosts_prepare_workspace`. Omit it for the conservative `host` default. The tool reuses only an `idle` or `working` workspace owned by the current Agent Session with the same scope before creating one and returns compact Agent-session and Workspace identity plus the next action. Request a runtime snapshot explicitly only when state or connection diagnosis needs it.
 4. Do not execute if snapshot attention reports `auth_failed`, `host_key_changed`, `connector_offline`, `rate_limited`, `throttled`, `circuit_open`, `ssh_route_unsupported`, overload, `pty_runtime_lost`, or `connection_unhealthy` without a recovery action. `local_handshake_budget_ready` allows exactly one normal connection attempt after cooldown. Bootstrap deferred/skipped state does not block password-backed execution unless route attention also blocks it.
 5. For normal remote work, use `shell.posix` or `shell.powershell` with exactly one arbitrary script argument. Include explicit `intent` and a stable semantic `idempotency_key`; set `timeout_seconds` up to 7200 and `output_limit_bytes` up to 8 MiB when defaults are insufficient. Use `wait_timeout_ms` (up to 60000) for short commands so queueing and observing the exact operation are one agent-visible action. Do not put passwords, tokens, or private keys in the script.
    `remote_hosts_run_in_workspace` intentionally rejects access paths marked `requires_tty=true`; use the Interactive Session workflow for those routes.
 6. Use a narrow profile only as a shortcut when it exactly matches a read-only check. Do not request or implement a Kubernetes, Harbor, database, GPU, package-manager, or deployment-specific MCP tool when the existing remote CLI can run through the generic shell or PTY.
-7. When `remote_hosts_run_in_workspace.completion.completed=true`, use its exact operation result directly. Otherwise wait for `done`, `failed`, `blocked`, `throttled`, or timeout with `remote_hosts_wait_workspace_state`; preserve the operation id and idempotency key.
-8. Read bounded chunks, recent operations, and artifact metadata together with `remote_hosts_get_workspace_result`. Inspect the operation's `transport_evidence` to prove whether the channel reused an authenticated transport or opened a new handshake.
+7. When `remote_hosts_run_in_workspace.completion.completed=true`, use its exact compact operation result directly. Otherwise follow `next_action` and `retry_after_ms`; preserve the operation id and idempotency key.
+8. Read bounded incremental chunks, the requested operation, and artifact metadata with `remote_hosts_get_workspace_result`. Request a runtime snapshot when transport evidence is needed to prove reuse or diagnose reconnection.
 
 ## Managed File Transfer
 
