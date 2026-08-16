@@ -3184,6 +3184,89 @@ impl PtySessionRepository {
         .await?;
         rows.iter().map(row_to_pty_session).collect()
     }
+
+    /// Atomically closes idle connector-owned PTYs while preserving active work and queued input.
+    ///
+    /// PTYs with a declared foreground process receive the longer busy TTL. A zero TTL disables
+    /// the corresponding class. The returned rows are already closed so the connector can release
+    /// matching in-memory backend handles without racing a newly queued input event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying, serialization, or updating fails.
+    pub async fn close_idle_for_connector(
+        &self,
+        connector_id: ConnectorId,
+        now: OffsetDateTime,
+        idle_ttl_seconds: u64,
+        busy_ttl_seconds: u64,
+        limit: u32,
+    ) -> Result<Vec<PtySession>, DbError> {
+        if idle_ttl_seconds == 0 && busy_ttl_seconds == 0 {
+            return Ok(Vec::new());
+        }
+        let idle_cutoff = now - time::Duration::seconds(i64::try_from(idle_ttl_seconds.max(1))?);
+        let busy_cutoff = now - time::Duration::seconds(i64::try_from(busy_ttl_seconds.max(1))?);
+        let rows = sqlx::query(
+            r"
+            UPDATE pty_sessions
+            SET state_json = ?,
+                foreground_process = NULL,
+                input_allowed = 0,
+                backend_state_json = ?,
+                interaction_json = NULL,
+                last_activity_at = ?
+            WHERE pty_session_id IN (
+                SELECT ps.pty_session_id
+                FROM pty_sessions ps
+                JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
+                WHERE aw.connector_id = ?
+                  AND ps.input_allowed = 1
+                  AND ps.backend_state_json IN (?, ?)
+                  AND ps.state_json IN (?, ?, ?)
+                  AND aw.state_json IN (?, ?, ?)
+                  AND (
+                    (? > 0 AND ps.foreground_process IS NULL AND ps.last_activity_at <= ?)
+                    OR
+                    (? > 0 AND ps.foreground_process IS NOT NULL AND ps.last_activity_at <= ?)
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM pty_input_events pie
+                    WHERE pie.pty_session_id = ps.pty_session_id
+                      AND pie.state_json IN (?, ?)
+                  )
+                ORDER BY ps.last_activity_at ASC, ps.pty_session_id ASC
+                LIMIT ?
+            )
+            RETURNING pty_session_id, workspace_id, session_id, state_json, foreground_process, cwd,
+                      recent_output_ref, last_exit_code, input_allowed, backend_state_json,
+                      backend_capabilities_json, interaction_json, transport_evidence_json, created_at, last_activity_at
+            ",
+        )
+        .bind(to_json(&WorkspaceState::Closed)?)
+        .bind(to_json(&PtyBackendState::Closed)?)
+        .bind(now)
+        .bind(connector_id.to_string())
+        .bind(to_json(&PtyBackendState::Active)?)
+        .bind(to_json(&PtyBackendState::Pending)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
+        .bind(to_json(&WorkspaceState::Idle)?)
+        .bind(to_json(&WorkspaceState::Working)?)
+        .bind(to_json(&WorkspaceState::Blocked)?)
+        .bind(i64::from(idle_ttl_seconds > 0))
+        .bind(idle_cutoff)
+        .bind(i64::from(busy_ttl_seconds > 0))
+        .bind(busy_cutoff)
+        .bind(to_json(&PtyInputEventState::Queued)?)
+        .bind(to_json(&PtyInputEventState::Claimed)?)
+        .bind(u32_to_i64(limit.max(1)))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_pty_session).collect()
+    }
 }
 
 const PTY_OUTPUT_SEGMENT_ENCODING: &str = "postcard+zstd-v1";

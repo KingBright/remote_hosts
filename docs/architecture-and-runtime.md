@@ -58,6 +58,12 @@ and reuse count. Each command, transfer, and PTY persists transport evidence tha
 Connector startup marks persisted runtimes as lost and resets logical open-channel counts. Historical
 telemetry remains inspectable but cannot masquerade as a live SSH transport.
 
+Completed exec and transfer channels close immediately. OpenSSH ControlMaster and native `russh`
+keep the authenticated transport only while its access path idle TTL permits. Native transport
+eviction requires every channel permit to be free; keepalive probes do not refresh business
+activity. Intentional eviction persists `state=idle`, which is a normal cold boundary rather than
+a route, credential, or target-server failure.
+
 Replacement handshakes use independent access-path and connector-wide sliding-window budgets. Local
 budget exhaustion returns the original `retry_after_seconds`; it does not mark the target SSH server
 as rate limited or inflate target failure counters.
@@ -132,6 +138,14 @@ Runtime snapshots emit `pty_input_required` rather than treating that case as a 
 Backend exit, explicit close, or connector restart clears the interaction and converges PTY,
 Workspace, lease, and channel state. A lost runtime is marked `blocked/failed` rather than silently
 replaced with a fresh shell that has different context.
+
+The daemon also performs PTY lifecycle maintenance without an external cron or API caller. An
+ordinary PTY is closed after one hour without output, accepted input, or heartbeat. A truthful
+non-empty `foreground_process` heartbeat protects quiet work with the longer one-day busy TTL.
+Queued or claimed input prevents reaping. Internal polling while a pending PTY waits for SSH
+channel capacity does not refresh business activity, so an abandoned queue entry still expires.
+Closing an expired PTY terminates the local backend, releases its SSH channel, shortens its scoped
+write lease, and then allows Workspace expiry.
 
 ## File Transfer
 

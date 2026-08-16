@@ -115,6 +115,8 @@ function New-DefaultConfig {
         AdminHtmlPath = Join-Path (Join-Path $Script:DataDir 'ui') 'admin.html'
         KnownHostsPath = ''
         RusshInactivityTimeoutSeconds = 30
+        PtyIdleTtlSeconds = 3600
+        PtyBusyTtlSeconds = 86400
         MaxConcurrentOperations = 16
         RustLog = 'remote_hosts=info,remote_hosts_cli=info'
         BinaryPath = ''
@@ -423,6 +425,8 @@ function Run-ConnectorService {
         '--pty-backend-mode', 'auto',
         '--vault-master-password-file', [string]$config['VaultMasterPasswordFile'],
         '--russh-inactivity-timeout-seconds', [string]$config['RusshInactivityTimeoutSeconds'],
+        '--pty-idle-ttl-seconds', [string]$config['PtyIdleTtlSeconds'],
+        '--pty-busy-ttl-seconds', [string]$config['PtyBusyTtlSeconds'],
         '--max-concurrent-operations', [string]$config['MaxConcurrentOperations'],
         '--artifact-root', [string]$config['ArtifactRoot']
     )

@@ -125,6 +125,7 @@ Interpret `transport_runtime.telemetry`:
 - `state=cold`: a runtime object exists but has not attempted a connection.
 - `state=connecting`: one budget-approved connection attempt is currently in progress.
 - `state=ready`: the last observed connector-local transport was reusable.
+- `state=idle`: the connector intentionally released a healthy zero-channel transport after the access path's idle TTL; the next real operation may perform one budgeted handshake. This is not a network or credential failure.
 - `state=disconnected`: the runtime observed that its last connection is unusable; one later channel may reconnect subject to handshake budgets.
 - `state=runtime_lost`: the owning connector restarted; counters remain historical.
 
@@ -138,6 +139,16 @@ Interpret operation and PTY `transport_evidence`:
 - `runtime_replaced=true`: a route change or connector restart created another runtime id.
 
 Do not use logical `session_id`, `open_channels`, or `reused_count` alone as proof of transport reuse.
+
+## Idle Lifecycle
+
+- Completed exec and transfer channels close immediately; only the authenticated transport remains pooled.
+- Native `russh` releases that cached transport only when every channel permit is free and the access path `idle_ttl_seconds` has elapsed. Server keepalive packets do not refresh this business-idle clock.
+- The connector closes an ordinary PTY after `REMOTE_HOSTS_PTY_IDLE_TTL_SECONDS` without output, accepted input, or heartbeat. The default is 3600 seconds.
+- A PTY heartbeat with a non-empty `foreground_process` uses `REMOTE_HOSTS_PTY_BUSY_TTL_SECONDS`, default 86400 seconds. Heartbeat it truthfully while quiet work continues; output also refreshes activity automatically.
+- Queued or claimed PTY input prevents idle reaping. A PTY close releases its channel and shortens its scoped write lease before expired Workspace reconciliation runs.
+- Connector polling while a pending PTY waits for channel capacity is not business activity. Keep the same PTY while actively waiting, but abandoned pending entries still expire normally.
+- Zero disables the corresponding PTY expiry class. Do not disable expiry globally merely to preserve one long task.
 
 ## Retry Discipline
 

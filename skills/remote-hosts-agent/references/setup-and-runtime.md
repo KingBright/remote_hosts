@@ -161,7 +161,7 @@ Expected `~/.gemini/config/mcp_config.json` entry:
 
 Profiles:
 
-- `agent`: default 18-tool transport-first surface for arbitrary remote shell/PTY work, managed file transfer, bounded artifact reads, idempotent host registration, and encrypted credential updates.
+- `agent`: default 19-tool transport-first surface for arbitrary remote shell/PTY work, PTY long-task heartbeats, managed file transfer, bounded artifact reads, idempotent host registration, and encrypted credential updates.
 - `admin`: adds registry and operational maintenance tools.
 - `full`: all tools for development and debugging.
 

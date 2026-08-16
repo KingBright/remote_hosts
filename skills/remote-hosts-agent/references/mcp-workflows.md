@@ -134,7 +134,8 @@ Process:
    The connector does not send an initial `cd` command on any `requires_tty=true` route, including when the logical target is recorded as a Linux host rather than a jump host.
 6. Queue input in small chunks with one semantic `idempotency_key` per intentional input; include trailing newline only when the user intended Enter. When the live `interaction.kind` is `sudo_password`, do not provide `input`. Instead call `remote_hosts_queue_pty_input` with `use_stored_sudo_password=true` and a stable idempotency key. The connector rechecks the same active PTY prompt, decrypts the access path's dedicated sudo field only in connector memory, sends it with Enter, and records only `stored_sudo_password` metadata. This also recognizes the bare `Password:` prompt used by macOS sudo, but use that form only immediately after this Agent Session sent an explicit `sudo` command to that same PTY, with no intervening input. If the event fails as unavailable, do not paste a password into PTY input; record or rotate the dedicated sudo field through the credential tool only when the user explicitly provides it.
 7. Poll output incrementally and remember the last seen sequence.
-8. Close the PTY when the task is complete, unless the user asked to keep it alive.
+8. For a quiet command expected to exceed the ordinary PTY idle TTL, call `remote_hosts_heartbeat_pty_session` with a truthful `foreground_process` and refresh it before the configured busy TTL. Output and accepted input already refresh activity; do not send dummy terminal input as keepalive.
+9. Close the PTY when the task is complete, unless the user asked to keep it alive.
 
 When snapshot `attention` contains `pty_input_required`, the PTY is still live: require
 `backend_state=active`, `input_allowed=true`, and a non-null `interaction`, then read its latest

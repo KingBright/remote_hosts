@@ -164,6 +164,7 @@ const AGENT_TOOL_NAMES: &[&str] = &[
     tools::GET_WORKSPACE_RESULT,
     tools::READ_OUTPUT_ARTIFACT_CONTENT,
     tools::OPEN_WORKSPACE_PTY_SESSION,
+    tools::HEARTBEAT_PTY_SESSION,
     tools::QUEUE_PTY_INPUT,
     tools::READ_PTY_OUTPUT,
     tools::CLOSE_PTY_SESSION,
@@ -6852,7 +6853,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(agent_names.len(), 18);
+        assert_eq!(agent_names.len(), 19);
         assert!(agent_names.contains("remote_hosts_ensure_host"));
         assert!(agent_names.contains(tools::STORE_HOST_CREDENTIAL));
         assert!(agent_names.contains(tools::PREPARE_WORKSPACE));
@@ -6860,6 +6861,7 @@ mod tests {
         assert!(agent_names.contains(tools::UPLOAD_FILE));
         assert!(agent_names.contains(tools::DOWNLOAD_FILE));
         assert!(agent_names.contains(tools::READ_OUTPUT_ARTIFACT_CONTENT));
+        assert!(agent_names.contains(tools::HEARTBEAT_PTY_SESSION));
         assert!(!agent_names.contains(tools::UPSERT_HOST));
         assert!(admin_names.is_superset(&agent_names));
         assert!(admin_names.contains(tools::UPSERT_HOST));

@@ -1250,6 +1250,8 @@ pub enum SshTransportRuntimeState {
     Connecting,
     /// The cached SSH connection is available for additional channels.
     Ready,
+    /// The cached SSH connection was intentionally released after its idle TTL elapsed.
+    Idle,
     /// The cached SSH connection failed validation or a handshake failed.
     Disconnected,
     /// The owning connector process restarted and destroyed the in-memory runtime.

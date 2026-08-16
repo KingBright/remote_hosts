@@ -86,19 +86,21 @@ const AUTHORIZED_KEY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHORIZED_KEY_BOOTSTRAP_MAX_FAILURES: u32 = 3;
 const EXEC_INLINE_UPLOAD_MAX_BYTES: u64 = 8 * 1024;
 const EXEC_UPLOAD_CHUNK_BYTES: usize = 24 * 1024;
-const PTY_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+const PTY_UPLOAD_CHUNK_BYTES: usize = 16 * 1024;
 const PTY_DOWNLOAD_CHUNK_BYTES: usize = 48 * 1024;
 const EXEC_UPLOAD_CHUNKS_PER_SESSION: u64 = 256;
 const EXEC_TRANSFER_MAX_STAGE_ATTEMPTS: u32 = 3;
 const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const PTY_TRANSFER_CAPTURE_LIMIT_BYTES: usize = 128 * 1024;
 const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
-const PTY_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(180);
+const PTY_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(600);
 const PTY_OUTPUT_BATCH_TARGET_BYTES: usize = 64 * 1024;
 const PTY_OUTPUT_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 const PTY_INTERACTION_TAIL_BYTES: usize = 4 * 1024;
 const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
 const PTY_WRITE_LEASE_SECONDS: i64 = 300;
+const DEFAULT_PTY_IDLE_TTL_SECONDS: u64 = 3_600;
+const DEFAULT_PTY_BUSY_TTL_SECONDS: u64 = 86_400;
 
 type SharedHandshakeBudget = Arc<StdMutex<SlidingWindowBudget>>;
 
@@ -172,6 +174,10 @@ impl TransportTelemetryTracker {
 
     fn disconnected(&self) {
         self.lock_state().state = SshTransportRuntimeState::Disconnected;
+    }
+
+    fn idled(&self) {
+        self.lock_state().state = SshTransportRuntimeState::Idle;
     }
 
     fn snapshot(&self) -> SshTransportTelemetry {
@@ -2125,6 +2131,8 @@ pub struct RusshTransportConfig {
     pub connect_timeout_seconds: u64,
     /// Inactivity timeout in seconds.
     pub inactivity_timeout_seconds: u64,
+    /// Idle lifetime after the last business use when no SSH channel remains open.
+    pub idle_ttl_seconds: u64,
     /// SSH keepalive interval in seconds.
     pub keepalive_seconds: u64,
     /// Maximum channels sharing this access-path transport.
@@ -2369,6 +2377,30 @@ where
         if guard.take().is_some() {
             self.telemetry.disconnected();
         }
+    }
+
+    async fn reap_idle_session(&self, observed_at: time::OffsetDateTime) -> bool {
+        let mut guard = self.session.lock().await;
+        let telemetry = self.telemetry.snapshot();
+        let Some(last_activity_at) = telemetry.last_validated_at.or(telemetry.last_handshake_at)
+        else {
+            return false;
+        };
+        let configured_channels = usize::from(self.config.max_concurrent_channels.max(1));
+        if !should_reap_idle_transport(
+            observed_at,
+            last_activity_at,
+            self.config.idle_ttl_seconds,
+            self.channel_semaphore.available_permits(),
+            configured_channels,
+        ) {
+            return false;
+        }
+        if guard.take().is_none() {
+            return false;
+        }
+        self.telemetry.idled();
+        true
     }
 
     async fn schedule_authorized_key_bootstrap(
@@ -4605,6 +4637,22 @@ fn russh_inactivity_timeout(
     ))
 }
 
+fn should_reap_idle_transport(
+    observed_at: time::OffsetDateTime,
+    last_activity_at: time::OffsetDateTime,
+    idle_ttl_seconds: u64,
+    available_channels: usize,
+    configured_channels: usize,
+) -> bool {
+    if idle_ttl_seconds == 0 || available_channels < configured_channels.max(1) {
+        return false;
+    }
+    let Ok(idle_ttl_seconds) = i64::try_from(idle_ttl_seconds) else {
+        return false;
+    };
+    observed_at >= last_activity_at + time::Duration::seconds(idle_ttl_seconds)
+}
+
 fn russh_file_transfer_error(context: &str, error: RusshSftpError) -> TransportError {
     let message = error.to_string();
     drop(error);
@@ -4622,6 +4670,13 @@ pub struct RusshTransportPool<C> {
     max_new_ssh_handshakes_per_10_min: u32,
     global_handshake_limiter: SharedHandshakeBudget,
     cache: Mutex<BTreeMap<AccessPathId, Arc<RusshTransport<C>>>>,
+}
+
+/// Connector-owned transport cache maintenance.
+#[async_trait]
+pub trait IdleTransportReaper: Send + Sync {
+    /// Releases cached authenticated transports that have no channels and exceeded their TTL.
+    async fn reap_idle_transports(&self) -> Result<u64, String>;
 }
 
 impl<C> RusshTransportPool<C> {
@@ -4700,6 +4755,7 @@ where
             known_hosts_path: self.known_hosts_path.clone(),
             connect_timeout_seconds: self.connect_timeout_seconds,
             inactivity_timeout_seconds: self.inactivity_timeout_seconds,
+            idle_ttl_seconds: access_path.idle_ttl_seconds,
             keepalive_seconds: access_path.keepalive_seconds,
             max_concurrent_channels: access_path.max_concurrent_channels,
             max_new_connections_per_minute: access_path.max_new_connections_per_minute,
@@ -4726,6 +4782,53 @@ where
             .entry(access_path_id)
             .or_insert_with(|| Arc::clone(&transport));
         Ok(Arc::clone(cached))
+    }
+
+    async fn reap_idle_transports_inner(&self) -> Result<u64, String> {
+        let observed_at = now_utc();
+        let transports: Vec<_> = self.cache.lock().await.values().cloned().collect();
+        let mut reaped = 0_u64;
+        for transport in transports {
+            if !transport.reap_idle_session(observed_at).await {
+                continue;
+            }
+            let access_path = self
+                .repositories
+                .access_paths
+                .get(transport.config.access_path_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "access path disappeared while reaping idle transport: {}",
+                        transport.config.access_path_id
+                    )
+                })?;
+            if let Some(connector_id) = access_path.connector_id {
+                self.repositories
+                    .ssh_transport_runtimes
+                    .upsert(&SshTransportRuntime {
+                        access_path_id: access_path.id,
+                        connector_id,
+                        telemetry: transport.telemetry.snapshot(),
+                        updated_at: observed_at,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            reaped = reaped.saturating_add(1);
+        }
+        Ok(reaped)
+    }
+}
+
+#[async_trait]
+impl<C> IdleTransportReaper for RusshTransportPool<C>
+where
+    C: SshCredentialProvider + 'static,
+{
+    async fn reap_idle_transports(&self) -> Result<u64, String> {
+        self.reap_idle_transports_inner().await
     }
 }
 
@@ -5983,6 +6086,15 @@ pub trait QueuedPtyInputPump: Send + Sync {
         Ok(0)
     }
 
+    /// Closes PTYs that exceeded their idle policy and releases their local SSH channels.
+    async fn reap_idle(
+        &self,
+        _idle_ttl_seconds: u64,
+        _busy_ttl_seconds: u64,
+    ) -> Result<u64, ConnectorPtyError> {
+        Ok(0)
+    }
+
     /// Activates one pending PTY before its first input is queued.
     async fn activate_next(&self) -> Result<Option<PtySessionId>, ConnectorPtyError> {
         Ok(None)
@@ -6214,14 +6326,13 @@ where
 
     async fn note_pending_channel_capacity_wait(
         &self,
-        session: &mut PtySession,
+        session: &PtySession,
     ) -> Result<(), ConnectorPtyError> {
         let should_notify = self
             .capacity_wait_notified
             .lock()
             .await
             .insert(session.pty_session_id);
-        session.last_activity_at = now_utc();
         self.repositories.pty_sessions.upsert(session).await?;
         if should_notify {
             self.append_pty_system_output(
@@ -6240,9 +6351,8 @@ where
             .list_pending_waiting_for_channel(self.config.connector_id, 32)
             .await?;
         let count = u64::try_from(sessions.len())?;
-        for mut session in sessions {
-            self.note_pending_channel_capacity_wait(&mut session)
-                .await?;
+        for session in sessions {
+            self.note_pending_channel_capacity_wait(&session).await?;
         }
         Ok(count)
     }
@@ -6291,7 +6401,7 @@ where
         let process = match self.spawn_backend_process(&pty_session).await {
             Ok(process) => process,
             Err(ConnectorPtyError::ChannelCapacityUnavailable) => {
-                self.note_pending_channel_capacity_wait(&mut pty_session)
+                self.note_pending_channel_capacity_wait(&pty_session)
                     .await?;
                 return Ok(ConnectorPtyOpenOutcome { pty_session });
             }
@@ -6749,6 +6859,60 @@ where
         Ok(reconciled)
     }
 
+    async fn reap_idle(
+        &self,
+        idle_ttl_seconds: u64,
+        busy_ttl_seconds: u64,
+    ) -> Result<u64, ConnectorPtyError> {
+        let closed = self
+            .repositories
+            .pty_sessions
+            .close_idle_for_connector(
+                self.config.connector_id,
+                now_utc(),
+                idle_ttl_seconds,
+                normalized_busy_ttl(idle_ttl_seconds, busy_ttl_seconds),
+                100,
+            )
+            .await?;
+        for session in &closed {
+            self.capacity_wait_notified
+                .lock()
+                .await
+                .remove(&session.pty_session_id);
+            let handle = self.active.lock().await.remove(&session.pty_session_id);
+            if let Some(mut handle) = handle {
+                if let Some(close_tx) = handle.close_tx.take() {
+                    let _ = close_tx.send(());
+                }
+                self.mark_connection_channel_closed(session.session_id)
+                    .await?;
+            }
+            if let Some(workspace) = self
+                .repositories
+                .workspaces
+                .get(session.workspace_id)
+                .await?
+                && let Some(agent_session_id) = workspace.agent_session_id
+            {
+                shorten_host_write_lease(
+                    &self.repositories,
+                    workspace.host_id,
+                    &workspace.coordination_scope,
+                    agent_session_id,
+                    session.last_activity_at,
+                )
+                .await?;
+            }
+            self.append_pty_system_output(
+                session,
+                "PTY closed automatically after its business-activity idle TTL elapsed; the SSH channel was released",
+            )
+            .await?;
+        }
+        Ok(u64::try_from(closed.len())?)
+    }
+
     async fn deliver_input_text(
         &self,
         pty_session_id: PtySessionId,
@@ -6910,7 +7074,7 @@ where
         let process = match self.spawn_backend_process(&active_session).await {
             Ok(process) => process,
             Err(ConnectorPtyError::ChannelCapacityUnavailable) => {
-                self.note_pending_channel_capacity_wait(&mut active_session)
+                self.note_pending_channel_capacity_wait(&active_session)
                     .await?;
                 return Err(ConnectorPtyError::ChannelCapacityUnavailable);
             }
@@ -7558,6 +7722,14 @@ where
 
     async fn reconcile_runtime_state(&self) -> Result<u64, ConnectorPtyError> {
         ConnectorPtyManager::reconcile_runtime_state(self).await
+    }
+
+    async fn reap_idle(
+        &self,
+        idle_ttl_seconds: u64,
+        busy_ttl_seconds: u64,
+    ) -> Result<u64, ConnectorPtyError> {
+        ConnectorPtyManager::reap_idle(self, idle_ttl_seconds, busy_ttl_seconds).await
     }
 
     async fn activate_next(&self) -> Result<Option<PtySessionId>, ConnectorPtyError> {
@@ -9706,6 +9878,10 @@ pub struct ConnectorDaemonReport {
     pub reconciled_expired_agent_sessions: u64,
     /// Number of expired logical Workspaces closed without interrupting active work.
     pub reconciled_expired_workspaces: u64,
+    /// Number of idle PTY sessions closed automatically by the connector.
+    pub reaped_idle_pty_sessions: u64,
+    /// Number of zero-channel SSH transports released after their idle TTL.
+    pub reaped_idle_transports: u64,
     /// Number of completed worker iterations with claimed operations.
     pub completed_operations: u64,
     /// Number of queued PTY input events delivered by an attached pump.
@@ -9728,6 +9904,8 @@ fn initial_connector_daemon_report() -> ConnectorDaemonReport {
         reconciled_pty_sessions: 0,
         reconciled_expired_agent_sessions: 0,
         reconciled_expired_workspaces: 0,
+        reaped_idle_pty_sessions: 0,
+        reaped_idle_transports: 0,
         completed_operations: 0,
         delivered_pty_inputs: 0,
         failed_pty_inputs: 0,
@@ -9754,6 +9932,9 @@ pub struct ConnectorDaemon<P> {
     worker: Arc<ConnectorOperationWorker<P>>,
     config: ConnectorDaemonConfig,
     pty_input_pump: Option<Arc<dyn QueuedPtyInputPump>>,
+    idle_transport_reaper: Option<Arc<dyn IdleTransportReaper>>,
+    pty_idle_ttl_seconds: u64,
+    pty_busy_ttl_seconds: u64,
 }
 
 impl<P> ConnectorDaemon<P>
@@ -9777,6 +9958,9 @@ where
             worker,
             config: config.normalized(),
             pty_input_pump: None,
+            idle_transport_reaper: None,
+            pty_idle_ttl_seconds: DEFAULT_PTY_IDLE_TTL_SECONDS,
+            pty_busy_ttl_seconds: DEFAULT_PTY_BUSY_TTL_SECONDS,
         }
     }
 
@@ -9799,6 +9983,9 @@ where
             worker,
             config: config.normalized(),
             pty_input_pump: None,
+            idle_transport_reaper: None,
+            pty_idle_ttl_seconds: DEFAULT_PTY_IDLE_TTL_SECONDS,
+            pty_busy_ttl_seconds: DEFAULT_PTY_BUSY_TTL_SECONDS,
         }
     }
 
@@ -9806,6 +9993,21 @@ where
     #[must_use]
     pub fn with_pty_input_pump(mut self, pump: Arc<dyn QueuedPtyInputPump>) -> Self {
         self.pty_input_pump = Some(pump);
+        self
+    }
+
+    /// Attaches connector-local SSH transport cache maintenance.
+    #[must_use]
+    pub fn with_idle_transport_reaper(mut self, reaper: Arc<dyn IdleTransportReaper>) -> Self {
+        self.idle_transport_reaper = Some(reaper);
+        self
+    }
+
+    /// Overrides PTY idle policy. Zero disables automatic closure for that class.
+    #[must_use]
+    pub fn with_pty_idle_policy(mut self, idle_ttl_seconds: u64, busy_ttl_seconds: u64) -> Self {
+        self.pty_idle_ttl_seconds = idle_ttl_seconds;
+        self.pty_busy_ttl_seconds = normalized_busy_ttl(idle_ttl_seconds, busy_ttl_seconds);
         self
     }
 
@@ -9858,7 +10060,7 @@ where
                     accepting_operations = changed.is_ok() && !*shutdown.borrow();
                 }
                 () = &mut heartbeat_due => {
-                    let state = self.reconcile_expired_workspaces(&mut report).await;
+                    let state = self.reconcile_lifecycle(&mut report).await;
                     self.record_connector_state(state).await?;
                     next_heartbeat = Instant::now() + heartbeat_interval;
                 }
@@ -10019,7 +10221,7 @@ where
                 }
             }
         }
-        if self.reconcile_expired_workspaces(report).await == EntityState::Degraded {
+        if self.reconcile_lifecycle(report).await == EntityState::Degraded {
             state = EntityState::Degraded;
         }
         self.record_connector_state(state).await?;
@@ -10085,6 +10287,55 @@ where
         }
     }
 
+    async fn reconcile_lifecycle(&self, report: &mut ConnectorDaemonReport) -> EntityState {
+        let mut state = EntityState::Healthy;
+        if let Some(pump) = &self.pty_input_pump {
+            match pump
+                .reap_idle(self.pty_idle_ttl_seconds, self.pty_busy_ttl_seconds)
+                .await
+            {
+                Ok(count) => {
+                    report.reaped_idle_pty_sessions =
+                        report.reaped_idle_pty_sessions.saturating_add(count);
+                    if count > 0 {
+                        tracing::info!(
+                            reaped_idle_pty_sessions = count,
+                            "closed idle PTYs and released their SSH channels"
+                        );
+                    }
+                }
+                Err(error) => {
+                    report.infrastructure_errors = report.infrastructure_errors.saturating_add(1);
+                    tracing::warn!(%error, "connector daemon PTY idle reconciliation failed");
+                    state = EntityState::Degraded;
+                }
+            }
+        }
+        if let Some(reaper) = &self.idle_transport_reaper {
+            match reaper.reap_idle_transports().await {
+                Ok(count) => {
+                    report.reaped_idle_transports =
+                        report.reaped_idle_transports.saturating_add(count);
+                    if count > 0 {
+                        tracing::info!(
+                            reaped_idle_transports = count,
+                            "released zero-channel SSH transports after their idle TTL"
+                        );
+                    }
+                }
+                Err(error) => {
+                    report.infrastructure_errors = report.infrastructure_errors.saturating_add(1);
+                    tracing::warn!(%error, "connector daemon SSH idle reconciliation failed");
+                    state = EntityState::Degraded;
+                }
+            }
+        }
+        if self.reconcile_expired_workspaces(report).await == EntityState::Degraded {
+            state = EntityState::Degraded;
+        }
+        state
+    }
+
     async fn record_connector_state(&self, state: EntityState) -> Result<(), ConnectorDaemonError> {
         let observed_at = now_utc();
         let (old_state, connector) = self
@@ -10116,6 +10367,16 @@ where
 
 fn doubled_duration(current: Duration, max: Duration) -> Duration {
     current.saturating_mul(2).min(max)
+}
+
+const fn normalized_busy_ttl(idle_ttl_seconds: u64, busy_ttl_seconds: u64) -> u64 {
+    if busy_ttl_seconds == 0 {
+        0
+    } else if busy_ttl_seconds < idle_ttl_seconds {
+        idle_ttl_seconds
+    } else {
+        busy_ttl_seconds
+    }
 }
 
 /// Request to create a file-backed output artifact.
@@ -10665,20 +10926,20 @@ mod tests {
 
     #[test]
     fn interactive_pty_upload_uses_latency_bounded_sha_verified_frames() {
-        assert_eq!(super::PTY_UPLOAD_CHUNK_BYTES, 256 * 1024);
+        assert_eq!(super::PTY_UPLOAD_CHUNK_BYTES, 16 * 1024);
         const {
-            assert!(super::PTY_UPLOAD_CHUNK_BYTES > super::EXEC_UPLOAD_CHUNK_BYTES);
+            assert!(super::PTY_UPLOAD_CHUNK_BYTES <= super::EXEC_UPLOAD_CHUNK_BYTES);
         }
         assert_eq!(
             super::PTY_TRANSFER_STAGE_TIMEOUT,
-            std::time::Duration::from_secs(180)
+            std::time::Duration::from_secs(600)
         );
         assert!(super::PTY_TRANSFER_STAGE_TIMEOUT > super::EXEC_TRANSFER_STAGE_TIMEOUT);
 
         let artifact_bytes: usize = 11 * 1024 * 1024;
         let exec_frames = artifact_bytes.div_ceil(super::EXEC_UPLOAD_CHUNK_BYTES);
         let pty_frames = artifact_bytes.div_ceil(super::PTY_UPLOAD_CHUNK_BYTES);
-        assert!(pty_frames < exec_frames);
+        assert!(pty_frames > exec_frames);
     }
 
     #[test]
@@ -10852,6 +11113,35 @@ mod tests {
 
     struct OneShotPtyInputPump {
         delivered: AtomicBool,
+    }
+
+    struct OneShotIdlePtyReaper {
+        reaped: AtomicBool,
+    }
+
+    impl OneShotIdlePtyReaper {
+        fn new() -> Self {
+            Self {
+                reaped: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl QueuedPtyInputPump for OneShotIdlePtyReaper {
+        async fn reap_idle(
+            &self,
+            _idle_ttl_seconds: u64,
+            _busy_ttl_seconds: u64,
+        ) -> Result<u64, super::ConnectorPtyError> {
+            Ok(u64::from(!self.reaped.swap(true, Ordering::SeqCst)))
+        }
+
+        async fn deliver_next(
+            &self,
+        ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, super::ConnectorPtyError> {
+            Ok(None)
+        }
     }
 
     impl OneShotPtyInputPump {
@@ -13316,6 +13606,143 @@ mod tests {
         assert_eq!(runtime.telemetry.state, SshTransportRuntimeState::Ready);
         manager
             .close(opened.pty_session.pty_session_id, Some(0))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_reaps_idle_backend_and_preserves_declared_foreground_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            OneChannelPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let channels_before_open = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?
+            .open_channels;
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let mut pty = fixture
+            .repositories
+            .pty_sessions
+            .get(opened.pty_session.pty_session_id)
+            .await?
+            .ok_or("PTY should exist")?;
+        pty.foreground_process = Some("long-running-maintenance".to_owned());
+        pty.last_activity_at = now_utc() - time::Duration::seconds(120);
+        fixture.repositories.pty_sessions.upsert(&pty).await?;
+
+        assert_eq!(manager.reap_idle(60, 3_600).await?, 0);
+        assert_eq!(manager.active.lock().await.len(), 1);
+
+        pty.foreground_process = None;
+        fixture.repositories.pty_sessions.upsert(&pty).await?;
+        let queued_input = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: pty.pty_session_id,
+            workspace_id: fixture.workspace_id,
+            connector_id: fixture.connector_id,
+            host_id: fixture.host_id,
+            agent_session_id: Some(fixture.agent_session_id),
+            idempotency_key: Some("idle-reap-race-protection".to_owned()),
+            payload_kind: PtyInputPayloadKind::Text,
+            input_fingerprint: None,
+            state: PtyInputEventState::Queued,
+            sequence: 0,
+            redacted_input_summary: "queued input".to_owned(),
+            byte_len: 5,
+            requested_by: Some("test".to_owned()),
+            created_at: now_utc(),
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&queued_input, "date\n")
+            .await?;
+        assert_eq!(manager.reap_idle(60, 3_600).await?, 0);
+        manager
+            .deliver_next_queued_input(30, 3)
+            .await?
+            .ok_or("queued input should be delivered")?;
+        pty.last_activity_at = now_utc() - time::Duration::seconds(120);
+        fixture.repositories.pty_sessions.upsert(&pty).await?;
+        assert_eq!(manager.reap_idle(60, 3_600).await?, 1);
+        assert!(manager.active.lock().await.is_empty());
+        let closed = fixture
+            .repositories
+            .pty_sessions
+            .get(pty.pty_session_id)
+            .await?
+            .ok_or("closed PTY should remain inspectable")?;
+        assert_eq!(closed.backend_state, PtyBackendState::Closed);
+        assert!(!closed.input_allowed);
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        assert_eq!(connection.open_channels, channels_before_open);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn channel_capacity_polling_does_not_keep_pending_pty_alive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            OneChannelPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let active = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        let pending = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        assert_eq!(pending.pty_session.backend_state, PtyBackendState::Pending);
+
+        let stale_activity = now_utc() - time::Duration::seconds(120);
+        let mut pending_record = fixture
+            .repositories
+            .pty_sessions
+            .get(pending.pty_session.pty_session_id)
+            .await?
+            .ok_or("pending PTY should exist")?;
+        pending_record.last_activity_at = stale_activity;
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&pending_record)
+            .await?;
+
+        manager.note_channel_capacity_waits().await?;
+        let after_poll = fixture
+            .repositories
+            .pty_sessions
+            .get(pending_record.pty_session_id)
+            .await?
+            .ok_or("pending PTY should remain inspectable")?;
+        assert_eq!(after_poll.last_activity_at, stale_activity);
+        assert_eq!(manager.reap_idle(60, 3_600).await?, 1);
+        assert_eq!(manager.active.lock().await.len(), 1);
+
+        manager
+            .close(active.pty_session.pty_session_id, Some(0))
             .await?;
         Ok(())
     }
@@ -16175,6 +16602,72 @@ mod tests {
             "heartbeat and operation polling must not cancel an in-flight PTY activation"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_daemon_runs_idle_pty_reaping_without_an_external_api_call()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let reaper = Arc::new(OneShotIdlePtyReaper::new());
+        let daemon = ConnectorDaemon::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(SlowTransport(Duration::from_millis(5))),
+            ConnectorOperationWorkerConfig::production_default(fixture.connector_id),
+            ConnectorDaemonConfig {
+                connector_id: fixture.connector_id,
+                version: "idle-reaper-test".to_owned(),
+                current_network: None,
+                max_concurrent_operations: 1,
+                heartbeat_interval_ms: 5,
+                idle_min_delay_ms: 5,
+                idle_max_delay_ms: 10,
+                error_backoff_ms: 5,
+            },
+        )
+        .with_pty_input_pump(reaper);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { daemon.run_until_stopped(stop_rx).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stop_tx.send(true)?;
+        let report = handle.await??;
+        assert_eq!(report.reaped_idle_pty_sessions, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn russh_idle_reap_requires_zero_channels_and_elapsed_ttl() {
+        let now = now_utc();
+        let last_activity_at = now - time::Duration::seconds(601);
+
+        assert!(super::should_reap_idle_transport(
+            now,
+            last_activity_at,
+            600,
+            8,
+            8,
+        ));
+        assert!(!super::should_reap_idle_transport(
+            now,
+            last_activity_at,
+            600,
+            7,
+            8,
+        ));
+        assert!(!super::should_reap_idle_transport(
+            now,
+            now - time::Duration::seconds(599),
+            600,
+            8,
+            8,
+        ));
+        assert!(!super::should_reap_idle_transport(
+            now,
+            last_activity_at,
+            0,
+            8,
+            8,
+        ));
     }
 
     async fn seed_ssh_transport_runtime(

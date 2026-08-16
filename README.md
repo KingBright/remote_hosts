@@ -15,9 +15,9 @@ one MCP tool family per product.
   paths per host.
 - Connector-owned native `russh` connection reuse on macOS, Linux, and Windows, plus an optional
   Unix OpenSSH compatibility backend, with bounded channel concurrency, keepalive, reconnect
-  control, and handshake rate protection.
+  control, handshake rate protection, and zero-channel idle eviction.
 - Arbitrary POSIX and PowerShell execution, persistent PTYs, bounded output, large-output artifacts,
-  and state visible to the calling agent.
+  automatic idle cleanup, long-task heartbeats, and state visible to the calling agent.
 - Verified upload and download over pooled SFTP, framed exec channels, or an already-selected
   interactive bastion PTY.
 - Per-conversation Workspace, PTY, operation, artifact, and idempotency isolation while sharing the
@@ -160,7 +160,7 @@ The 2026-08-03 release adds native Windows runtime and packaging support, a stab
 launcher, Rust-owned connector bootstrap and restart-readiness checks, runtime snapshot version 10,
 hierarchical Workspace coordination, capacity-aware scheduling, resumable verified transfers,
 transport evidence, grouped topology management, compact Zstandard output history, guarded storage
-reclamation, and an 18-tool Agent profile. Release-level implementation details stay in the
+reclamation, and a 19-tool Agent profile. Release-level implementation details stay in the
 architecture and operations documents.
 
 ## Security Summary

@@ -90,6 +90,13 @@ Local installation defaults to native `russh`, PTY backend mode `auto`, and a bo
 worker pool. Connector bootstrap and restart readiness are implemented by the Rust CLI, so neither
 platform needs an external `sqlite3` executable for service management.
 
+Lifecycle defaults are `REMOTE_HOSTS_PTY_IDLE_TTL_SECONDS=3600` and
+`REMOTE_HOSTS_PTY_BUSY_TTL_SECONDS=86400`. The first applies when no foreground process is
+declared; the second applies to a quiet long-running PTY that agents heartbeat truthfully through
+`remote_hosts_heartbeat_pty_session`. Output and accepted input refresh activity automatically.
+Set one value to zero only to disable that expiry class. Each access path's `idle_ttl_seconds`
+independently controls zero-channel SSH transport retention; keepalive probes do not extend it.
+
 Do not put plaintext credentials in the service config. Host passwords and private keys belong in
 the encrypted credential tools. The vault-key file unlocks those encrypted rows and remains local
 with mode `0600` on macOS or a current-user ACL on Windows.
@@ -100,8 +107,9 @@ with mode `0600` on macOS or a current-user ACL on Windows.
 2. Read runtime snapshot version 10 before reasoning about state. Treat host-level logical `workspace_capacity` and per-access-path SSH `channel_capacity` as independent limits; `pty_input_required` means an active PTY is waiting for input, not that its SSH connection failed.
 3. Prepare a Workspace with a stable coordination scope.
 4. Run `shell.posix`, `shell.powershell`, or open a persistent PTY.
-5. Reuse the Workspace and semantic idempotency key while waiting or retrying.
-6. Use the transfer tools for files and artifact tools for large command output.
+5. Heartbeat a quiet long-running PTY with its truthful foreground process; do not send dummy input as keepalive.
+6. Reuse the Workspace and semantic idempotency key while waiting or retrying.
+7. Use the transfer tools for files and artifact tools for large command output.
 
 Do not open a raw `ssh` process beside Remote Hosts. That bypasses pooling, Agent Session isolation,
 state reporting, rate protection, and audit.

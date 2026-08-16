@@ -7,9 +7,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use remote_hosts_connector::{
     ConnectorDaemon, ConnectorDaemonConfig, ConnectorOperationWorker,
     ConnectorOperationWorkerConfig, ConnectorPtyManager, ConnectorPtyManagerConfig,
-    FileOutputArtifactStore, HostKeyPolicy, InteractiveFileTransferBackend, QueuedPtyInputPump,
-    RusshPtyBackendFactory, RusshTransportPool, RusshTransportProvider, SshCredentialProvider,
-    VaultSshCredentialProvider,
+    FileOutputArtifactStore, HostKeyPolicy, IdleTransportReaper, InteractiveFileTransferBackend,
+    QueuedPtyInputPump, RusshPtyBackendFactory, RusshTransportPool, RusshTransportProvider,
+    SshCredentialProvider, VaultSshCredentialProvider,
 };
 #[cfg(unix)]
 use remote_hosts_connector::{
@@ -243,6 +243,20 @@ enum Command {
         /// Maximum attempts per queued PTY input event.
         #[arg(long, default_value_t = 3)]
         pty_input_max_attempts: u32,
+        /// Close an inactive PTY after this many seconds. Zero disables idle PTY reaping.
+        #[arg(
+            long,
+            env = "REMOTE_HOSTS_PTY_IDLE_TTL_SECONDS",
+            default_value_t = 3_600
+        )]
+        pty_idle_ttl_seconds: u64,
+        /// Maximum silence for a PTY declaring a foreground process. Zero disables this class.
+        #[arg(
+            long,
+            env = "REMOTE_HOSTS_PTY_BUSY_TTL_SECONDS",
+            default_value_t = 86_400
+        )]
+        pty_busy_ttl_seconds: u64,
         /// PTY backend mode: auto, control-master-tty, pipe-shell, or russh-native-pty.
         #[arg(long, default_value = "auto")]
         pty_backend_mode: String,
@@ -489,6 +503,8 @@ async fn main() -> anyhow::Result<()> {
             max_concurrent_operations,
             pty_input_lease_seconds,
             pty_input_max_attempts,
+            pty_idle_ttl_seconds,
+            pty_busy_ttl_seconds,
             pty_backend_mode,
             heartbeat_interval_ms,
             idle_min_delay_ms,
@@ -514,6 +530,8 @@ async fn main() -> anyhow::Result<()> {
                 max_concurrent_operations,
                 pty_input_lease_seconds,
                 pty_input_max_attempts,
+                pty_idle_ttl_seconds,
+                pty_busy_ttl_seconds,
                 pty_backend_mode,
                 heartbeat_interval_ms,
                 idle_min_delay_ms,
@@ -904,6 +922,7 @@ async fn run_worker_daemon_with_provider<P>(
     repositories: remote_hosts_db::Repositories,
     provider: P,
     pty_services: ConnectorPtyServices,
+    idle_transport_reaper: Option<Arc<dyn IdleTransportReaper>>,
     args: WorkerDaemonArgs,
     connector_id: ConnectorId,
 ) -> anyhow::Result<()>
@@ -934,7 +953,13 @@ where
     );
     let daemon = daemon
         .with_pty_input_pump(pty_services.input_pump)
+        .with_pty_idle_policy(args.pty_idle_ttl_seconds, args.pty_busy_ttl_seconds)
         .with_interactive_file_transfer(pty_services.interactive_file_transfer);
+    let daemon = if let Some(reaper) = idle_transport_reaper {
+        daemon.with_idle_transport_reaper(reaper)
+    } else {
+        daemon
+    };
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -966,6 +991,8 @@ struct WorkerDaemonArgs {
     max_concurrent_operations: usize,
     pty_input_lease_seconds: u64,
     pty_input_max_attempts: u32,
+    pty_idle_ttl_seconds: u64,
+    pty_busy_ttl_seconds: u64,
     pty_backend_mode: String,
     heartbeat_interval_ms: u64,
     idle_min_delay_ms: u64,
@@ -1016,6 +1043,7 @@ async fn run_worker_daemon(args: WorkerDaemonArgs) -> anyhow::Result<()> {
                 repositories,
                 provider,
                 pty_input_pump,
+                None,
                 args,
                 connector_id,
             )
@@ -1038,6 +1066,7 @@ async fn run_worker_daemon(args: WorkerDaemonArgs) -> anyhow::Result<()> {
             ));
             let provider =
                 RusshTransportProvider::with_pool(Arc::clone(&russh_pool), policy.clone());
+            let idle_transport_reaper: Arc<dyn IdleTransportReaper> = russh_pool.clone();
             let pty_input_pump = build_pty_input_pump(
                 repositories.clone(),
                 connector_id,
@@ -1051,6 +1080,7 @@ async fn run_worker_daemon(args: WorkerDaemonArgs) -> anyhow::Result<()> {
                 repositories,
                 provider,
                 pty_input_pump,
+                Some(idle_transport_reaper),
                 args,
                 connector_id,
             )
