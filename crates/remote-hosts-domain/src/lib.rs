@@ -1264,6 +1264,8 @@ pub enum SshTransportRuntimeState {
 pub enum SshFileTransferMode {
     /// Native SFTP subsystem over the pooled SSH connection.
     Sftp,
+    /// Native SFTP with a verified POSIX exec-channel fallback when the subsystem is unavailable.
+    SftpWithExecFallback,
     /// Framed POSIX exec-channel fallback over the pooled SSH connection.
     ExecFramed,
     /// No verified file-transfer channel is available.
@@ -1707,6 +1709,8 @@ mod tests {
         assert_eq!(value, serde_json::json!("target_overloaded"));
         let value = serde_json::to_value(OperationState::Exhausted)?;
         assert_eq!(value, serde_json::json!("exhausted"));
+        let value = serde_json::to_value(SshFileTransferMode::SftpWithExecFallback)?;
+        assert_eq!(value, serde_json::json!("sftp_with_exec_fallback"));
         Ok(())
     }
 
