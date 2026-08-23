@@ -785,13 +785,22 @@ pub struct ReadPtyOutputRequest {
 pub struct QueuePtyInputRequest {
     /// PTY session id as UUID string.
     pub pty_session_id: String,
-    /// Raw input to enqueue for connector-owned PTY delivery. Required unless
-    /// `use_stored_sudo_password` is true.
+    /// Raw input to enqueue for connector-owned PTY delivery. Exactly one of `input`,
+    /// `use_stored_sudo_password`, `use_stored_password_from_host_id`, or
+    /// `use_stored_sudo_password_from_host_id` is required.
     pub input: Option<String>,
     /// Resolve the access path's encrypted sudo password inside the connector and send it only
     /// to a live sudo prompt. This mode rejects a caller-provided `input` value.
     #[serde(default)]
     pub use_stored_sudo_password: bool,
+    /// Resolve the only enabled SSH access path for this registered host, then inject that
+    /// route's encrypted SSH password into a live nested SSH password prompt. Only the target
+    /// access-path id enters the private queue payload; the password is decrypted in connector
+    /// memory at delivery time.
+    pub use_stored_password_from_host_id: Option<String>,
+    /// Resolve the only enabled SSH access path for this registered host, then inject that
+    /// route's encrypted dedicated sudo password into a verified live nested sudo prompt.
+    pub use_stored_sudo_password_from_host_id: Option<String>,
     /// Optional requester label.
     pub requested_by: Option<String>,
     /// Stable retry key. Reusing it in this conversation returns the original input event.
@@ -4408,7 +4417,7 @@ impl RemoteHostsMcpServer {
     /// Queue input for connector-owned PTY delivery.
     #[tool(
         name = "remote_hosts_queue_pty_input",
-        description = "Queue text for a persistent PTY, or set use_stored_sudo_password=true to inject the route's encrypted sudo password only into a live sudo prompt. The password never enters MCP arguments, output, or audit records.",
+        description = "Queue text for a persistent PTY, inject the route's encrypted sudo password into a live sudo prompt, inject another registered host's encrypted SSH password into a live nested SSH prompt, or inject that host's dedicated sudo password into a connector-verified nested sudo prompt. Stored passwords never enter MCP arguments, output, or audit records.",
         annotations(
             title = "Queue PTY Input",
             read_only_hint = false,
@@ -4430,12 +4439,17 @@ impl RemoteHostsMcpServer {
             .next_sequence(pty_session_id)
             .await
             .map_err(|error| tool_error(&error))?;
+        let mode_count = usize::from(request.input.is_some())
+            + usize::from(request.use_stored_sudo_password)
+            + usize::from(request.use_stored_password_from_host_id.is_some())
+            + usize::from(request.use_stored_sudo_password_from_host_id.is_some());
+        if mode_count != 1 {
+            return Err(
+                "exactly one of input, use_stored_sudo_password, use_stored_password_from_host_id, or use_stored_sudo_password_from_host_id is required"
+                    .to_owned(),
+            );
+        }
         let plan = if request.use_stored_sudo_password {
-            if request.input.is_some() {
-                return Err(
-                    "input must be omitted when use_stored_sudo_password is true".to_owned(),
-                );
-            }
             if request.requested_by.is_some() {
                 return Err(
                     "requested_by must be omitted when use_stored_sudo_password is true".to_owned(),
@@ -4449,9 +4463,103 @@ impl RemoteHostsMcpServer {
                     idempotency_key,
                 )
                 .map_err(|error| error.to_string())?
+        } else if let Some(target_host_id) =
+            request.use_stored_sudo_password_from_host_id.as_deref()
+        {
+            if request.requested_by.is_some() {
+                return Err(
+                    "requested_by must be omitted when use_stored_sudo_password_from_host_id is set"
+                        .to_owned(),
+                );
+            }
+            let target_host_id = parse_host_id(target_host_id)?;
+            self.repositories
+                .hosts
+                .get(target_host_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .ok_or_else(|| format!("host not found: {target_host_id}"))?;
+            let target_paths = self
+                .repositories
+                .access_paths
+                .list_enabled_for_host(target_host_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .into_iter()
+                .filter(|path| path.protocol == Protocol::Ssh)
+                .collect::<Vec<_>>();
+            let target_access_path = match target_paths.as_slice() {
+                [target_access_path] => target_access_path,
+                [] => {
+                    return Err(format!(
+                        "host {target_host_id} has no enabled SSH access path"
+                    ));
+                }
+                paths => {
+                    return Err(format!(
+                        "host {target_host_id} has {} enabled SSH access paths; nested stored-sudo injection requires exactly one",
+                        paths.len()
+                    ));
+                }
+            };
+            PtySessionSupervisor::default()
+                .queue_stored_target_sudo_password(
+                    &pty_session,
+                    &workspace,
+                    next_sequence,
+                    idempotency_key,
+                    target_access_path.id,
+                )
+                .map_err(|error| error.to_string())?
+        } else if let Some(target_host_id) = request.use_stored_password_from_host_id.as_deref() {
+            if request.requested_by.is_some() {
+                return Err(
+                    "requested_by must be omitted when use_stored_password_from_host_id is set"
+                        .to_owned(),
+                );
+            }
+            let target_host_id = parse_host_id(target_host_id)?;
+            self.repositories
+                .hosts
+                .get(target_host_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .ok_or_else(|| format!("host not found: {target_host_id}"))?;
+            let target_paths = self
+                .repositories
+                .access_paths
+                .list_enabled_for_host(target_host_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .into_iter()
+                .filter(|path| path.protocol == Protocol::Ssh)
+                .collect::<Vec<_>>();
+            let target_access_path = match target_paths.as_slice() {
+                [target_access_path] => target_access_path,
+                [] => {
+                    return Err(format!(
+                        "host {target_host_id} has no enabled SSH access path"
+                    ));
+                }
+                paths => {
+                    return Err(format!(
+                        "host {target_host_id} has {} enabled SSH access paths; nested stored-password injection requires exactly one",
+                        paths.len()
+                    ));
+                }
+            };
+            PtySessionSupervisor::default()
+                .queue_stored_ssh_password(
+                    &pty_session,
+                    &workspace,
+                    next_sequence,
+                    idempotency_key,
+                    target_access_path.id,
+                )
+                .map_err(|error| error.to_string())?
         } else {
             let input = request.input.ok_or_else(|| {
-                "input is required unless use_stored_sudo_password is true".to_owned()
+                "input is required when no stored-password mode is selected".to_owned()
             })?;
             PtySessionSupervisor::default()
                 .queue_input(
@@ -9507,6 +9615,131 @@ mod tests {
             json!("stored sudo password queued for pty input")
         );
         assert!(!queued_sudo.to_string().contains("password="));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_queues_target_host_password_without_exposing_target_or_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let created = call_tool(
+            fixture.server(),
+            tools::CREATE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "access_path_id": fixture.access_path_id.to_string(),
+                "label": "nested-ssh-prompt",
+                "cwd": "/tmp"
+            })),
+        )
+        .await?;
+        let workspace_id = WorkspaceId::from(uuid::Uuid::parse_str(
+            created["workspace"]["id"]
+                .as_str()
+                .ok_or("created workspace id should be a string")?,
+        )?);
+        let now = now_utc();
+        let pty_session_id = PtySessionId::new();
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&PtySession {
+                pty_session_id,
+                workspace_id,
+                session_id: fixture.session_id,
+                state: WorkspaceState::Blocked,
+                foreground_process: Some("ssh target".to_owned()),
+                cwd: Some("/tmp".to_owned()),
+                recent_output_ref: None,
+                last_exit_code: None,
+                input_allowed: true,
+                backend_state: PtyBackendState::Active,
+                backend_capabilities: PtyBackendCapabilities::unknown(),
+                interaction: Some(PtyInteraction {
+                    kind: PtyInteractionKind::Password,
+                    confidence: 92,
+                    observed_at: now,
+                }),
+                transport_evidence: None,
+                created_at: now,
+                last_activity_at: now,
+            })
+            .await?;
+        fixture
+            .repositories
+            .workspaces
+            .update_state(workspace_id, WorkspaceState::Blocked, now)
+            .await?;
+
+        let queued_ssh = call_tool(
+            fixture.server(),
+            tools::QUEUE_PTY_INPUT,
+            Some(json!({
+                "pty_session_id": pty_session_id.to_string(),
+                "use_stored_password_from_host_id": fixture.host_id.to_string(),
+                "idempotency_key": "nested-ssh-prompt-1"
+            })),
+        )
+        .await?;
+        assert_eq!(
+            queued_ssh["input_event"]["payload_kind"],
+            json!("stored_ssh_password")
+        );
+        assert_eq!(queued_ssh["input_event"]["byte_len"], json!(0));
+        assert_eq!(
+            queued_ssh["input_event"]["redacted_input_summary"],
+            json!("stored SSH password queued for PTY input")
+        );
+        assert!(
+            !queued_ssh
+                .to_string()
+                .contains(&fixture.access_path_id.to_string())
+        );
+
+        let conflicting = call_tool_raw(
+            fixture.server(),
+            tools::QUEUE_PTY_INPUT,
+            Some(json!({
+                "pty_session_id": pty_session_id.to_string(),
+                "input": "must-not-be-queued",
+                "use_stored_password_from_host_id": fixture.host_id.to_string()
+            })),
+        )
+        .await?;
+        assert_eq!(conflicting.is_error, Some(true));
+
+        let mut sudo_pty = fixture
+            .repositories
+            .pty_sessions
+            .get(pty_session_id)
+            .await?
+            .ok_or("PTY should exist")?;
+        sudo_pty.interaction = Some(PtyInteraction {
+            kind: PtyInteractionKind::SudoPassword,
+            confidence: 100,
+            observed_at: now_utc(),
+        });
+        fixture.repositories.pty_sessions.upsert(&sudo_pty).await?;
+        let queued_target_sudo = call_tool(
+            fixture.server(),
+            tools::QUEUE_PTY_INPUT,
+            Some(json!({
+                "pty_session_id": pty_session_id.to_string(),
+                "use_stored_sudo_password_from_host_id": fixture.host_id.to_string(),
+                "idempotency_key": "nested-target-sudo-prompt-1"
+            })),
+        )
+        .await?;
+        assert_eq!(
+            queued_target_sudo["input_event"]["payload_kind"],
+            json!("stored_target_sudo_password")
+        );
+        assert_eq!(queued_target_sudo["input_event"]["byte_len"], json!(0));
+        assert!(
+            !queued_target_sudo
+                .to_string()
+                .contains(&fixture.access_path_id.to_string())
+        );
         Ok(())
     }
 

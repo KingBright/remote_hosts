@@ -182,6 +182,15 @@ are supported, but no password is injected automatically merely because a prompt
 the bare macOS form, the installed Agent skill requires an explicit `sudo` command immediately
 before the prompt on the same PTY, with no intervening input.
 
+For a registered target reachable only from the active PTY host, the caller may send the exact
+connector-verified `/usr/bin/ssh` command and then request
+`use_stored_password_from_host_id=<target-host-id>` on the resulting generic password prompt. Pin the target host key first and use `StrictHostKeyChecking=yes` so this also works with older OpenSSH clients while still failing closed on unknown or changed keys. The
+target must have one enabled SSH path. The public input event stores only
+`stored_ssh_password` metadata, while its private payload contains only the target access-path id.
+Before and after vault decryption, the connector verifies the live prompt, unchanged target path,
+same Agent Session, exact immediately preceding SSH command, and a two-minute prompt window. The SSH
+password exists only in zeroizing connector memory and fake or intervening prompts fail closed.
+
 Native SSH authentication tries a stored key, bounded SSH-agent identities, default local keys when
 the agent is empty, and then the encrypted password. After password authentication, the connector
 may perform one bounded, idempotent public-key bootstrap. Bootstrap failure never invalidates the

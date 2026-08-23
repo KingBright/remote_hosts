@@ -3833,6 +3833,40 @@ impl PtyInputEventRepository {
         rows.iter().map(row_to_pty_input_event).collect()
     }
 
+    /// Gets the metadata for the immediately preceding delivered PTY input.
+    ///
+    /// The raw input is deliberately erased after delivery. The connector can bind a later
+    /// credential response to the one-way input fingerprint without retaining command text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn get_preceding_delivered_input(
+        &self,
+        pty_session_id: PtySessionId,
+        sequence: u64,
+    ) -> Result<Option<PtyInputEvent>, DbError> {
+        let Some(previous_sequence) = sequence.checked_sub(1) else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            r"
+            SELECT *
+            FROM pty_input_events
+            WHERE pty_session_id = ?
+              AND sequence = ?
+              AND state_json = ?
+            LIMIT 1
+            ",
+        )
+        .bind(pty_session_id.to_string())
+        .bind(u64_to_i64(previous_sequence)?)
+        .bind(to_json(&PtyInputEventState::Delivered)?)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_pty_input_event).transpose()
+    }
+
     /// Lists recent public PTY input metadata across all sessions.
     ///
     /// # Errors

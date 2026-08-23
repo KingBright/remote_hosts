@@ -1,9 +1,9 @@
 //! Persistent PTY session lifecycle supervision.
 
 use remote_hosts_domain::{
-    AgentWorkspace, ConnectionSession, EntityState, PtyBackendCapabilities, PtyBackendState,
-    PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyInputPayloadKind, PtyInteractionKind,
-    PtySession, PtySessionId, SessionId, WorkspaceState, now_utc,
+    AccessPathId, AgentWorkspace, ConnectionSession, EntityState, PtyBackendCapabilities,
+    PtyBackendState, PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyInputPayloadKind,
+    PtyInteractionKind, PtySession, PtySessionId, SessionId, WorkspaceState, now_utc,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,8 +53,9 @@ pub struct PtySessionInputCommand {
 pub struct PtySessionInputPlan {
     /// Public input event metadata.
     pub event: PtyInputEvent,
-    /// Private queue payload. Stored-sudo events intentionally keep this empty because the
-    /// connector resolves the secret only at delivery time.
+    /// Private queue payload. Stored-sudo events intentionally keep this empty. Stored-SSH
+    /// events carry only the non-secret target access-path id. The connector resolves either
+    /// secret only at delivery time.
     pub input_text: String,
 }
 
@@ -88,6 +89,13 @@ pub enum PtySessionSupervisorError {
     /// A stored sudo password can be injected only for a live recognized sudo prompt.
     #[error("stored sudo password injection requires a live sudo password prompt")]
     StoredSudoPromptUnavailable,
+    /// A stored SSH password can be injected only for a live recognized password prompt.
+    #[error("stored SSH password injection requires a live password prompt")]
+    StoredSshPromptUnavailable,
+    /// A target host's stored sudo password can be injected only for a live recognized sudo
+    /// prompt.
+    #[error("target stored sudo password injection requires a live sudo password prompt")]
+    StoredTargetSudoPromptUnavailable,
     /// Requested-by label is invalid.
     #[error("pty input requester label must be at most 128 visible characters")]
     InvalidRequestedBy,
@@ -282,6 +290,139 @@ impl PtySessionSupervisor {
                 last_error: None,
             },
             input_text: String::new(),
+        })
+    }
+
+    /// Plans an injection of the SSH password stored for another registered access path.
+    ///
+    /// The private queue payload contains only the target access-path id. The connector rechecks
+    /// the live password prompt before it decrypts the target credential and writes the
+    /// newline-terminated response to the active PTY.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the PTY is active, accepting input, and currently reports a
+    /// generic password interaction.
+    pub fn queue_stored_ssh_password(
+        &self,
+        session: &PtySession,
+        workspace: &AgentWorkspace,
+        next_sequence: u64,
+        idempotency_key: Option<String>,
+        target_access_path_id: AccessPathId,
+    ) -> Result<PtySessionInputPlan, PtySessionSupervisorError> {
+        ensure_input_target(session, workspace)?;
+        if session.backend_state != PtyBackendState::Active
+            || !matches!(
+                session
+                    .interaction
+                    .as_ref()
+                    .map(|interaction| &interaction.kind),
+                Some(PtyInteractionKind::Password)
+            )
+        {
+            return Err(PtySessionSupervisorError::StoredSshPromptUnavailable);
+        }
+
+        let now = now_utc();
+        let target_access_path = target_access_path_id.to_string();
+        Ok(PtySessionInputPlan {
+            event: PtyInputEvent {
+                id: PtyInputEventId::new(),
+                pty_session_id: session.pty_session_id,
+                workspace_id: session.workspace_id,
+                connector_id: workspace.connector_id,
+                host_id: workspace.host_id,
+                agent_session_id: workspace.agent_session_id,
+                idempotency_key,
+                payload_kind: PtyInputPayloadKind::StoredSshPassword,
+                input_fingerprint: Some(format!(
+                    "{:x}",
+                    Sha256::digest(
+                        format!("remote-hosts:stored-ssh-password:{target_access_path}").as_bytes()
+                    )
+                )),
+                state: PtyInputEventState::Queued,
+                sequence: next_sequence,
+                redacted_input_summary: "stored SSH password queued for PTY input".to_owned(),
+                byte_len: 0,
+                requested_by: None,
+                created_at: now,
+                claimed_at: None,
+                lease_expires_at: None,
+                delivered_at: None,
+                failed_at: None,
+                attempt_count: 0,
+                last_error: None,
+            },
+            input_text: target_access_path,
+        })
+    }
+
+    /// Plans an injection of another registered access path's dedicated sudo password.
+    ///
+    /// The private queue payload contains only the target access-path id. The connector binds the
+    /// request to the immediately preceding verified nested sudo command before decrypting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the PTY is active, accepting input, and currently reports a sudo
+    /// password interaction.
+    pub fn queue_stored_target_sudo_password(
+        &self,
+        session: &PtySession,
+        workspace: &AgentWorkspace,
+        next_sequence: u64,
+        idempotency_key: Option<String>,
+        target_access_path_id: AccessPathId,
+    ) -> Result<PtySessionInputPlan, PtySessionSupervisorError> {
+        ensure_input_target(session, workspace)?;
+        if session.backend_state != PtyBackendState::Active
+            || !matches!(
+                session
+                    .interaction
+                    .as_ref()
+                    .map(|interaction| &interaction.kind),
+                Some(PtyInteractionKind::SudoPassword)
+            )
+        {
+            return Err(PtySessionSupervisorError::StoredTargetSudoPromptUnavailable);
+        }
+
+        let now = now_utc();
+        let target_access_path = target_access_path_id.to_string();
+        Ok(PtySessionInputPlan {
+            event: PtyInputEvent {
+                id: PtyInputEventId::new(),
+                pty_session_id: session.pty_session_id,
+                workspace_id: session.workspace_id,
+                connector_id: workspace.connector_id,
+                host_id: workspace.host_id,
+                agent_session_id: workspace.agent_session_id,
+                idempotency_key,
+                payload_kind: PtyInputPayloadKind::StoredTargetSudoPassword,
+                input_fingerprint: Some(format!(
+                    "{:x}",
+                    Sha256::digest(
+                        format!("remote-hosts:stored-target-sudo-password:{target_access_path}")
+                            .as_bytes()
+                    )
+                )),
+                state: PtyInputEventState::Queued,
+                sequence: next_sequence,
+                redacted_input_summary: "target stored sudo password queued for PTY input"
+                    .to_owned(),
+                byte_len: 0,
+                requested_by: None,
+                created_at: now,
+                claimed_at: None,
+                lease_expires_at: None,
+                delivered_at: None,
+                failed_at: None,
+                attempt_count: 0,
+                last_error: None,
+            },
+            input_text: target_access_path,
         })
     }
 
@@ -644,6 +785,119 @@ mod tests {
             return Err("stored sudo injection should require a current sudo prompt".into());
         };
         assert!(error.to_string().contains("sudo password prompt"));
+        Ok(())
+    }
+
+    #[test]
+    fn queues_stored_ssh_password_for_one_live_password_prompt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let supervisor = PtySessionSupervisor::default();
+        let mut workspace = workspace(WorkspaceState::Idle);
+        let connection = connection(&workspace, EntityState::Connected);
+        let mut session = supervisor.open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: connection.session_id,
+                cwd: Some("/tmp".to_owned()),
+            },
+        )?;
+        workspace.state = WorkspaceState::Blocked;
+        session.state = WorkspaceState::Blocked;
+        session.backend_state = remote_hosts_domain::PtyBackendState::Active;
+        session.interaction = Some(PtyInteraction {
+            kind: PtyInteractionKind::Password,
+            confidence: 92,
+            observed_at: now_utc(),
+        });
+        let target_access_path_id = AccessPathId::new();
+
+        let plan = supervisor.queue_stored_ssh_password(
+            &session,
+            &workspace,
+            8,
+            Some("nested-ssh-password-1".to_owned()),
+            target_access_path_id,
+        )?;
+
+        assert_eq!(plan.input_text, target_access_path_id.to_string());
+        assert_eq!(
+            plan.event.payload_kind,
+            PtyInputPayloadKind::StoredSshPassword
+        );
+        assert_eq!(plan.event.byte_len, 0);
+        assert_eq!(
+            plan.event.redacted_input_summary,
+            "stored SSH password queued for PTY input"
+        );
+        assert!(!serde_json::to_string(&plan.event)?.contains(&target_access_path_id.to_string()));
+
+        session.interaction = None;
+        let Err(error) = supervisor.queue_stored_ssh_password(
+            &session,
+            &workspace,
+            9,
+            None,
+            target_access_path_id,
+        ) else {
+            return Err("stored SSH injection should require a current password prompt".into());
+        };
+        assert!(error.to_string().contains("live password prompt"));
+        Ok(())
+    }
+
+    #[test]
+    fn queues_target_stored_sudo_password_for_one_live_sudo_prompt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let supervisor = PtySessionSupervisor::default();
+        let mut workspace = workspace(WorkspaceState::Idle);
+        let connection = connection(&workspace, EntityState::Connected);
+        let mut session = supervisor.open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: connection.session_id,
+                cwd: Some("/tmp".to_owned()),
+            },
+        )?;
+        workspace.state = WorkspaceState::Blocked;
+        session.state = WorkspaceState::Blocked;
+        session.backend_state = remote_hosts_domain::PtyBackendState::Active;
+        session.interaction = Some(PtyInteraction {
+            kind: PtyInteractionKind::SudoPassword,
+            confidence: 100,
+            observed_at: now_utc(),
+        });
+        let target_access_path_id = AccessPathId::new();
+
+        let plan = supervisor.queue_stored_target_sudo_password(
+            &session,
+            &workspace,
+            9,
+            Some("nested-target-sudo-1".to_owned()),
+            target_access_path_id,
+        )?;
+        assert_eq!(plan.input_text, target_access_path_id.to_string());
+        assert_eq!(
+            plan.event.payload_kind,
+            PtyInputPayloadKind::StoredTargetSudoPassword
+        );
+        assert_eq!(plan.event.byte_len, 0);
+        assert!(!serde_json::to_string(&plan.event)?.contains(&target_access_path_id.to_string()));
+
+        session.interaction = None;
+        let Err(error) = supervisor.queue_stored_target_sudo_password(
+            &session,
+            &workspace,
+            10,
+            None,
+            target_access_path_id,
+        ) else {
+            return Err("target sudo injection should require a current sudo prompt".into());
+        };
+        assert!(error.to_string().contains("live sudo password prompt"));
         Ok(())
     }
 

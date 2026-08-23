@@ -408,6 +408,12 @@ pub enum PtyInputPayloadKind {
     Text,
     /// The connector resolves a stored sudo password only when delivering the event.
     StoredSudoPassword,
+    /// The connector resolves another registered SSH route's password only when delivering the
+    /// event to a live nested SSH password prompt.
+    StoredSshPassword,
+    /// The connector resolves another registered SSH route's dedicated sudo password only when
+    /// delivering the event to a verified nested sudo prompt.
+    StoredTargetSudoPassword,
 }
 
 /// State values visible to agents.

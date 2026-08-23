@@ -1124,7 +1124,7 @@ fn build_pty_input_pump(
                 OpenSshPtyBackendFactory::with_pool(repositories.clone(), pool).with_mode(mode);
             let manager = ConnectorPtyManager::new(repositories, backend, config);
             let manager = match sudo_credential_provider {
-                Some(provider) => manager.with_sudo_credential_provider(provider),
+                Some(provider) => manager.with_credential_provider(provider),
                 None => manager,
             };
             let manager = Arc::new(manager);
@@ -1137,7 +1137,7 @@ fn build_pty_input_pump(
             let backend = RusshPtyBackendFactory::with_pool(repositories.clone(), pool);
             let manager = ConnectorPtyManager::new(repositories, backend, config);
             let manager = match sudo_credential_provider {
-                Some(provider) => manager.with_sudo_credential_provider(provider),
+                Some(provider) => manager.with_credential_provider(provider),
                 None => manager,
             };
             let manager = Arc::new(manager);
