@@ -15,7 +15,8 @@ use remote_hosts_core::{
     PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionOpenCommand,
     PtySessionSupervisor, ServerProtectionPolicy, SftpDirection, SftpOverwritePolicy,
     WorkspaceCreateCommand, WorkspaceFileTransfer, WorkspaceOperationSupervisor,
-    WorkspaceRunCommand, WorkspaceSupervisor, resolve_operation_coordination_scope,
+    WorkspaceRunCommand, WorkspaceSupervisor, common_coordination_scope,
+    resolve_operation_coordination_scopes,
 };
 use remote_hosts_db::{DbError, Repositories, WorkspaceCapacityStatus};
 use remote_hosts_domain::{
@@ -810,6 +811,8 @@ pub struct OpenPtySessionRequest {
     pub session_id: Option<String>,
     /// Optional initial current working directory.
     pub cwd: Option<String>,
+    /// Exact resource scopes coordinated by commands sent through this PTY.
+    pub coordination_scopes: Option<Vec<String>>,
 }
 
 /// PTY heartbeat request.
@@ -936,6 +939,8 @@ pub struct RunInWorkspaceRequest {
     pub coordination_mode: Option<RunCoordinationMode>,
     /// Optional operation scope within the Workspace scope. Useful for independent mutations.
     pub coordination_scope: Option<String>,
+    /// Optional exact resource scopes acquired atomically for one multi-resource operation.
+    pub coordination_scopes: Option<Vec<String>>,
     /// Optional command timeout override in seconds. Shell profiles allow up to 7200.
     pub timeout_seconds: Option<u64>,
     /// Optional captured output limit override in bytes, up to 8 MiB.
@@ -1443,7 +1448,7 @@ impl RemoteHostsMcpServer {
         workspace_id: WorkspaceId,
         expected_profile: &Value,
         expected_requires_write_lease: bool,
-        expected_coordination_scope: &str,
+        expected_coordination_scopes: &[String],
     ) -> Result<Option<OperationRun>, String> {
         let (Some(agent_session_id), Some(idempotency_key)) = (agent_session_id, idempotency_key)
         else {
@@ -1461,7 +1466,9 @@ impl RemoteHostsMcpServer {
         if existing.workspace_id != Some(workspace_id)
             || existing.command_profile_json.as_ref() != Some(expected_profile)
             || existing.requires_write_lease != expected_requires_write_lease
-            || existing.coordination_scope != expected_coordination_scope
+            || existing.coordination_scope
+                != common_coordination_scope(expected_coordination_scopes)
+            || existing.coordination_scopes != expected_coordination_scopes
         {
             return Err(format!(
                 "idempotency_key `{idempotency_key}` is already bound to a different request in this conversation"
@@ -1530,20 +1537,22 @@ impl RemoteHostsMcpServer {
             return Ok(());
         };
         let observed_at = now_utc();
+        let coordination_scopes = operation_coordination_scopes(operation);
+        let leases = coordination_scopes
+            .iter()
+            .map(|coordination_scope| HostWriteLease {
+                host_id: operation.host_id,
+                coordination_scope: coordination_scope.clone(),
+                holder_agent_session_id: agent_session_id,
+                holder_workspace_id: workspace_id,
+                acquired_at: observed_at,
+                heartbeat_at: observed_at,
+                expires_at: observed_at + time::Duration::seconds(WRITE_LEASE_SECONDS),
+            })
+            .collect::<Vec<_>>();
         self.repositories
             .host_write_leases
-            .try_acquire(
-                &HostWriteLease {
-                    host_id: operation.host_id,
-                    coordination_scope: operation.coordination_scope.clone(),
-                    holder_agent_session_id: agent_session_id,
-                    holder_workspace_id: workspace_id,
-                    acquired_at: observed_at,
-                    heartbeat_at: observed_at,
-                    expires_at: observed_at + time::Duration::seconds(WRITE_LEASE_SECONDS),
-                },
-                observed_at,
-            )
+            .try_acquire_many(&leases, observed_at)
             .await
             .map_err(|error| tool_error(&error))?;
         Ok(())
@@ -1573,9 +1582,16 @@ impl RemoteHostsMcpServer {
         let coordination_mode: OperationCoordinationMode =
             request.coordination_mode.unwrap_or_default().into();
         let requested_coordination_scope = trim_optional(request.coordination_scope);
-        let coordination_scope = resolve_operation_coordination_scope(
+        let requested_coordination_scopes = request.coordination_scopes.map(|scopes| {
+            scopes
+                .into_iter()
+                .map(|scope| scope.trim().to_owned())
+                .collect::<Vec<_>>()
+        });
+        let coordination_scopes = resolve_operation_coordination_scopes(
             &workspace,
             requested_coordination_scope.as_deref(),
+            requested_coordination_scopes.as_deref(),
         )
         .map_err(|error| error.to_string())?;
         let policy = ServerProtectionPolicy::default();
@@ -1598,7 +1614,7 @@ impl RemoteHostsMcpServer {
                 workspace_id,
                 &expected_profile,
                 requires_write_lease,
-                &coordination_scope,
+                &coordination_scopes,
             )
             .await?
         {
@@ -1624,6 +1640,7 @@ impl RemoteHostsMcpServer {
                 idempotency_key,
                 coordination_mode,
                 coordination_scope: requested_coordination_scope,
+                coordination_scopes: requested_coordination_scopes,
                 queued_operations,
                 active_exec_channels,
                 active_probe_jobs: 0,
@@ -1639,7 +1656,7 @@ impl RemoteHostsMcpServer {
                     workspace_id,
                     &expected_profile,
                     requires_write_lease,
-                    &coordination_scope,
+                    &coordination_scopes,
                 )
                 .await?
             {
@@ -1760,6 +1777,7 @@ impl RemoteHostsMcpServer {
         let expected_profile = to_json_value(&spec)?;
         let expected_requires_write_lease = matches!(spec.direction, SftpDirection::Upload);
         let expected_coordination_scope = workspace.coordination_scope.clone();
+        let expected_coordination_scopes = vec![expected_coordination_scope.clone()];
         if let Some(existing) = self
             .find_idempotent_operation(
                 workspace.agent_session_id,
@@ -1767,7 +1785,7 @@ impl RemoteHostsMcpServer {
                 workspace_id,
                 &expected_profile,
                 expected_requires_write_lease,
-                &expected_coordination_scope,
+                &expected_coordination_scopes,
             )
             .await?
         {
@@ -1805,7 +1823,7 @@ impl RemoteHostsMcpServer {
                     workspace_id,
                     &expected_profile,
                     plan.operation.requires_write_lease,
-                    &plan.operation.coordination_scope,
+                    &plan.operation.coordination_scopes,
                 )
                 .await?
             {
@@ -3926,9 +3944,13 @@ impl RemoteHostsMcpServer {
                     && operation.state == remote_hosts_domain::OperationState::Queued
                     && write_leases.iter().any(|lease| {
                         lease.holder_agent_session_id != self.agent_session.id
-                            && coordination_scopes_overlap(
-                                &lease.coordination_scope,
-                                &operation.coordination_scope,
+                            && operation_coordination_scopes(operation).iter().any(
+                                |operation_scope| {
+                                    coordination_scopes_overlap(
+                                        &lease.coordination_scope,
+                                        operation_scope,
+                                    )
+                                },
                             )
                     })
             }) {
@@ -4051,7 +4073,7 @@ impl RemoteHostsMcpServer {
         }
 
         Ok(Json(HostRuntimeSnapshotOutput {
-            snapshot_version: 10,
+            snapshot_version: 11,
             event_cursor,
             generated_at: generated_at.to_string(),
             agent_session: to_json_value(self.agent_session.as_ref())?,
@@ -4902,6 +4924,7 @@ impl RemoteHostsMcpServer {
                 PtySessionOpenCommand {
                     session_id,
                     cwd: request.cwd,
+                    coordination_scopes: request.coordination_scopes,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -6895,6 +6918,7 @@ fn compact_pty_session_value(session: &PtySession) -> Value {
         "workspace_id": session.workspace_id,
         "state": session.state,
         "backend_state": session.backend_state,
+        "coordination_scopes": session.coordination_scopes,
         "foreground_process": session.foreground_process,
         "input_allowed": session.input_allowed,
         "interaction": session.interaction,
@@ -6941,12 +6965,21 @@ fn compact_operation_value(operation: &OperationRun) -> Value {
         "intent": operation.intent,
         "requires_write_lease": operation.requires_write_lease,
         "coordination_scope": operation.coordination_scope,
+        "coordination_scopes": operation_coordination_scopes(operation),
         "command_preview": operation.redacted_command_summary,
         "summary": operation_result_summary(operation),
         "last_error": operation.last_error,
         "started_at": operation.started_at,
         "finished_at": operation.finished_at
     })
+}
+
+fn operation_coordination_scopes(operation: &OperationRun) -> Vec<String> {
+    if operation.coordination_scopes.is_empty() {
+        vec![operation.coordination_scope.clone()]
+    } else {
+        operation.coordination_scopes.clone()
+    }
 }
 
 fn operation_next_action(state: &OperationState) -> &'static str {
@@ -7740,7 +7773,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(snapshot["snapshot_version"], json!(10));
+        assert_eq!(snapshot["snapshot_version"], json!(11));
         assert_eq!(snapshot["workspace_capacity"]["limit"], json!(32));
         assert_eq!(snapshot["workspace_capacity"]["effective_active"], json!(1));
         assert_eq!(snapshot["event_cursor"], json!(0));
@@ -7815,7 +7848,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(snapshot["snapshot_version"], json!(10));
+        assert_eq!(snapshot["snapshot_version"], json!(11));
         assert_eq!(
             snapshot["access_paths"][0]["channel_capacity"],
             json!({
@@ -8529,7 +8562,7 @@ mod tests {
             snapshot["write_lease"]["state"],
             json!("held_by_other_session")
         );
-        assert_eq!(snapshot["snapshot_version"], json!(10));
+        assert_eq!(snapshot["snapshot_version"], json!(11));
         assert!(snapshot["attention"].as_array().is_some_and(|attention| {
             attention
                 .iter()
@@ -8593,7 +8626,7 @@ mod tests {
             Some(json!({"host_id": fixture.host_id.to_string()})),
         )
         .await?;
-        assert_eq!(sibling_snapshot["snapshot_version"], json!(10));
+        assert_eq!(sibling_snapshot["snapshot_version"], json!(11));
         assert_eq!(sibling_snapshot["write_lease"]["state"], json!("mixed"));
         assert_eq!(
             sibling_snapshot["write_lease"]["active_leases"]
@@ -8642,6 +8675,121 @@ mod tests {
                         && item["recommended_action"]
                             == json!("wait_for_overlapping_scope_or_refine_scope")
                 }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mcp_multi_resource_mutation_does_not_block_unrelated_production_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let cleanup_agent =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent);
+        let deployment_agent =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent);
+        let overlapping_agent =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent);
+        let arguments = Some(json!({"host_id": fixture.host_id.to_string()}));
+        let cleanup = call_tool(
+            cleanup_agent.clone(),
+            tools::PREPARE_WORKSPACE,
+            arguments.clone(),
+        )
+        .await?;
+        let deployment = call_tool(
+            deployment_agent.clone(),
+            tools::PREPARE_WORKSPACE,
+            arguments.clone(),
+        )
+        .await?;
+        let overlapping = call_tool(
+            overlapping_agent.clone(),
+            tools::PREPARE_WORKSPACE,
+            arguments,
+        )
+        .await?;
+
+        let cleanup_run = call_tool(
+            cleanup_agent,
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": cleanup["workspace"]["id"],
+                "command_profile": "shell.posix",
+                "args": ["./cleanup-rejected-data"],
+                "coordination_mode": "mutating",
+                "coordination_scopes": [
+                    "prod/datatool-dev/storage/minio/rejected-data",
+                    "prod/datatool-dev/database/mysql/rejected-data",
+                    "prod/datatool-dev/search/elasticsearch/rejected-data"
+                ],
+                "idempotency_key": "cleanup-rejected-data"
+            })),
+        )
+        .await?;
+        assert_eq!(
+            cleanup_run["operation"]["coordination_scope"],
+            json!("prod/datatool-dev")
+        );
+        assert_eq!(
+            cleanup_run["operation"]["coordination_scopes"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
+
+        call_tool(
+            deployment_agent.clone(),
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": deployment["workspace"]["id"],
+                "command_profile": "shell.posix",
+                "args": ["./deploy-lichtblick"],
+                "coordination_mode": "mutating",
+                "coordination_scope": "prod/datatool-dev/deployment/lichtblick",
+                "idempotency_key": "deploy-lichtblick"
+            })),
+        )
+        .await?;
+        let sibling_snapshot = call_tool(
+            deployment_agent,
+            tools::GET_HOST_RUNTIME_SNAPSHOT,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        assert!(
+            sibling_snapshot["attention"]
+                .as_array()
+                .is_some_and(|attention| attention
+                    .iter()
+                    .all(|item| item["code"] != json!("host_write_lease_wait")))
+        );
+
+        call_tool(
+            overlapping_agent.clone(),
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": overlapping["workspace"]["id"],
+                "command_profile": "shell.posix",
+                "args": ["rm -f one-rejected-object"],
+                "coordination_mode": "mutating",
+                "coordination_scope": "prod/datatool-dev/storage/minio/rejected-data/object-42",
+                "idempotency_key": "overlap-minio-cleanup"
+            })),
+        )
+        .await?;
+        let overlapping_snapshot = call_tool(
+            overlapping_agent,
+            tools::GET_HOST_RUNTIME_SNAPSHOT,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        assert!(
+            overlapping_snapshot["attention"]
+                .as_array()
+                .is_some_and(|attention| attention
+                    .iter()
+                    .any(|item| item["code"] == json!("host_write_lease_wait")))
         );
         Ok(())
     }
@@ -8875,6 +9023,7 @@ mod tests {
             idempotency_key: Some("protected-operation".to_owned()),
             requires_write_lease: false,
             coordination_scope: "host".to_owned(),
+            coordination_scopes: vec!["host".to_owned()],
             operation_type: OperationType::ReadonlyExec,
             intent: "preserve queued work".to_owned(),
             state: OperationState::Queued,
@@ -8901,6 +9050,7 @@ mod tests {
                 pty_session_id: PtySessionId::new(),
                 workspace_id: pty_workspace.id,
                 session_id: fixture.session_id,
+                coordination_scopes: vec!["host".to_owned()],
                 state: WorkspaceState::Idle,
                 foreground_process: None,
                 cwd: Some("/tmp".to_owned()),
@@ -9851,6 +10001,7 @@ mod tests {
                 pty_session_id,
                 workspace_id,
                 session_id: fixture.session_id,
+                coordination_scopes: vec!["host".to_owned()],
                 state: WorkspaceState::Working,
                 foreground_process: Some("sudo apt update".to_owned()),
                 cwd: Some("/tmp".to_owned()),
@@ -9948,6 +10099,7 @@ mod tests {
                 pty_session_id,
                 workspace_id,
                 session_id: fixture.session_id,
+                coordination_scopes: vec!["host".to_owned()],
                 state: WorkspaceState::Blocked,
                 foreground_process: Some("ssh target".to_owned()),
                 cwd: Some("/tmp".to_owned()),
@@ -10100,6 +10252,7 @@ mod tests {
             idempotency_key: None,
             requires_write_lease: false,
             coordination_scope: "host".to_owned(),
+            coordination_scopes: vec!["host".to_owned()],
             operation_type: OperationType::ReadonlyExec,
             intent: "capture long output".to_owned(),
             state: OperationState::Succeeded,

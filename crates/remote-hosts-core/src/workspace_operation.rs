@@ -54,6 +54,8 @@ pub struct WorkspaceRunCommand {
     pub coordination_mode: OperationCoordinationMode,
     /// Optional operation-level scope, restricted to the Workspace scope or its descendants.
     pub coordination_scope: Option<String>,
+    /// Optional exact resource scopes acquired atomically for this operation.
+    pub coordination_scopes: Option<Vec<String>>,
     /// Current queued operation count for the host.
     pub queued_operations: u32,
     /// Current active exec channel count for the host.
@@ -168,10 +170,12 @@ impl WorkspaceOperationSupervisor {
         let requires_write_lease = command
             .coordination_mode
             .requires_write_lease(&command.command_profile.class);
-        let coordination_scope = resolve_operation_coordination_scope(
+        let coordination_scopes = resolve_operation_coordination_scopes(
             &command.workspace,
             command.coordination_scope.as_deref(),
+            command.coordination_scopes.as_deref(),
         )?;
+        let coordination_scope = common_coordination_scope(&coordination_scopes);
         let command_summary = if matches!(command.command_profile.class, CommandClass::Sensitive) {
             let script = command
                 .command_profile
@@ -201,6 +205,7 @@ impl WorkspaceOperationSupervisor {
             idempotency_key: command.idempotency_key.clone(),
             requires_write_lease,
             coordination_scope,
+            coordination_scopes,
             operation_type: operation_type(&command.command_profile.class, requires_write_lease),
             intent,
             state: OperationState::Queued,
@@ -290,6 +295,7 @@ impl WorkspaceOperationSupervisor {
             idempotency_key: transfer.idempotency_key.clone(),
             requires_write_lease: matches!(transfer.spec.direction, crate::SftpDirection::Upload),
             coordination_scope: transfer.workspace.coordination_scope.clone(),
+            coordination_scopes: vec![transfer.workspace.coordination_scope.clone()],
             operation_type: OperationType::Sftp,
             intent,
             state: OperationState::Queued,
@@ -412,6 +418,73 @@ pub fn resolve_operation_coordination_scope(
     Ok(scope.to_owned())
 }
 
+/// Resolves one or more exact resource scopes inside a Workspace boundary.
+///
+/// The legacy singular field and the new plural field are mutually exclusive. Exact scopes are
+/// sorted and deduplicated, and internally overlapping parent/child entries are rejected because
+/// the parent would silently erase the requested concurrency.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceOperationError::InvalidCoordinationScope`] when the request mixes singular
+/// and plural fields, contains no scopes or more than 16, escapes the Workspace boundary, or
+/// includes overlapping parent/child resources.
+pub fn resolve_operation_coordination_scopes(
+    workspace: &AgentWorkspace,
+    requested_scope: Option<&str>,
+    requested_scopes: Option<&[String]>,
+) -> Result<Vec<String>, WorkspaceOperationError> {
+    if requested_scope.is_some() && requested_scopes.is_some() {
+        return Err(WorkspaceOperationError::InvalidCoordinationScope);
+    }
+    let mut scopes = match requested_scopes {
+        Some(scopes) if (1..=16).contains(&scopes.len()) => scopes.to_vec(),
+        Some(_) => return Err(WorkspaceOperationError::InvalidCoordinationScope),
+        None => vec![resolve_operation_coordination_scope(
+            workspace,
+            requested_scope,
+        )?],
+    };
+    for scope in &scopes {
+        resolve_operation_coordination_scope(workspace, Some(scope))?;
+    }
+    scopes.sort();
+    scopes.dedup();
+    for (index, scope) in scopes.iter().enumerate() {
+        if scopes.iter().skip(index + 1).any(|other| {
+            other
+                .strip_prefix(scope)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            return Err(WorkspaceOperationError::InvalidCoordinationScope);
+        }
+    }
+    Ok(scopes)
+}
+
+/// Returns the narrowest common parent used by legacy single-scope readers.
+#[must_use]
+pub fn common_coordination_scope(scopes: &[String]) -> String {
+    let Some(first) = scopes.first() else {
+        return "host".to_owned();
+    };
+    let mut common = first.split('/').collect::<Vec<_>>();
+    for scope in scopes.iter().skip(1) {
+        let parts = scope.split('/').collect::<Vec<_>>();
+        let shared = common
+            .iter()
+            .zip(parts.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        common.truncate(shared);
+    }
+    if common.is_empty() {
+        "host".to_owned()
+    } else {
+        common.join("/")
+    }
+}
+
 fn operation_type(class: &CommandClass, requires_write_lease: bool) -> OperationType {
     if requires_write_lease {
         match class {
@@ -437,7 +510,7 @@ mod tests {
 
     use super::{
         OperationCoordinationMode, WorkspaceFileTransfer, WorkspaceOperationError,
-        WorkspaceOperationSupervisor, WorkspaceRunCommand,
+        WorkspaceOperationSupervisor, WorkspaceRunCommand, resolve_operation_coordination_scopes,
     };
 
     fn workspace(state: WorkspaceState) -> AgentWorkspace {
@@ -531,6 +604,7 @@ mod tests {
                 idempotency_key: None,
                 coordination_mode: OperationCoordinationMode::Auto,
                 coordination_scope: None,
+                coordination_scopes: None,
                 queued_operations: 0,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -566,6 +640,7 @@ mod tests {
                 idempotency_key: None,
                 coordination_mode: OperationCoordinationMode::Auto,
                 coordination_scope: None,
+                coordination_scopes: None,
                 queued_operations: 0,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -598,6 +673,7 @@ mod tests {
                 idempotency_key: None,
                 coordination_mode: OperationCoordinationMode::Auto,
                 coordination_scope: None,
+                coordination_scopes: None,
                 queued_operations: policy.max_operation_queue_depth_per_host,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -632,6 +708,7 @@ mod tests {
                     idempotency_key: None,
                     coordination_mode: mode,
                     coordination_scope: None,
+                    coordination_scopes: None,
                     queued_operations: 0,
                     active_exec_channels: 0,
                     active_probe_jobs: 0,
@@ -661,6 +738,7 @@ mod tests {
             idempotency_key: None,
             coordination_mode: OperationCoordinationMode::Mutating,
             coordination_scope: Some("service/api/replica/one".to_owned()),
+            coordination_scopes: None,
             queued_operations: 0,
             active_exec_channels: 0,
             active_probe_jobs: 0,
@@ -679,5 +757,74 @@ mod tests {
             WorkspaceOperationError::InvalidCoordinationScope
         ));
         Ok(())
+    }
+
+    #[test]
+    fn operation_can_coordinate_multiple_disjoint_resources_atomically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = ServerProtectionPolicy::default();
+        let profile = CommandProfileCatalog::resolve_builtin(
+            "shell.posix",
+            vec!["./cleanup-rejected-data".to_owned()],
+            &policy,
+        )?;
+        let plan =
+            WorkspaceOperationSupervisor::new(policy).queue_operation(&WorkspaceRunCommand {
+                workspace: workspace(WorkspaceState::Idle),
+                command_profile: profile,
+                intent: Some("clean rejected data across durable stores".to_owned()),
+                idempotency_key: None,
+                coordination_mode: OperationCoordinationMode::Mutating,
+                coordination_scope: None,
+                coordination_scopes: Some(vec![
+                    "prod/datatool-dev/storage/minio/rejected-data".to_owned(),
+                    "prod/datatool-dev/database/mysql/rejected-data".to_owned(),
+                    "prod/datatool-dev/search/elasticsearch/rejected-data".to_owned(),
+                ]),
+                queued_operations: 0,
+                active_exec_channels: 0,
+                active_probe_jobs: 0,
+                overload_cooldown_active: false,
+            })?;
+
+        assert_eq!(plan.operation.coordination_scope, "prod/datatool-dev");
+        assert_eq!(plan.operation.coordination_scopes.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_coordination_set_rejects_ambiguous_or_overlapping_declarations() {
+        let workspace = workspace(WorkspaceState::Idle);
+        assert!(matches!(
+            resolve_operation_coordination_scopes(
+                &workspace,
+                Some("prod/datatool-dev"),
+                Some(&["prod/datatool-dev/deployment/lichtblick".to_owned()]),
+            ),
+            Err(WorkspaceOperationError::InvalidCoordinationScope)
+        ));
+        assert!(matches!(
+            resolve_operation_coordination_scopes(
+                &workspace,
+                None,
+                Some(&[
+                    "prod/datatool-dev/storage/minio".to_owned(),
+                    "prod/datatool-dev/storage/minio/rejected-data".to_owned(),
+                ]),
+            ),
+            Err(WorkspaceOperationError::InvalidCoordinationScope)
+        ));
+        assert!(matches!(
+            resolve_operation_coordination_scopes(
+                &workspace,
+                None,
+                Some(
+                    &(0..17)
+                        .map(|index| format!("prod/datatool-dev/resource/{index}"))
+                        .collect::<Vec<_>>()
+                ),
+            ),
+            Err(WorkspaceOperationError::InvalidCoordinationScope)
+        ));
     }
 }

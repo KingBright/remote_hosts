@@ -502,7 +502,7 @@ For this product, the lesson is not to depend on Herdr directly. The lesson is t
 
 An Agent Session represents one Codex/Antigravity conversation or one explicitly identified client instance. The boundary is logical: all conversations share the same connector-owned SSH transport pool for an access path, but each conversation exclusively owns its Workspaces, PTYs, queued inputs, operations, idempotency namespace, output, artifacts, and temporary context. The normal Agent profile cannot inspect or operate another Agent Session's resources; Admin/Full can inspect legacy or cross-session state for recovery.
 
-Mutations coordinate through crash-safe hierarchical write leases rather than by creating another SSH connection. Every Workspace has a stable `coordination_scope`, defaulting to `host`. Mutating shell operations, uploads, and PTY input inherit that scope; read-only operations and downloads remain eligible. `host` conflicts with every scope, equal and parent/child scopes conflict, and siblings may mutate concurrently. This lets independent resources on one management host progress without weakening protection for the same Kubernetes object, namespace, filesystem subtree, or machine-wide state. Active scoped leases expire automatically and are all visible in runtime snapshot version 8. PTY input retains its scope for 300 seconds, PTY output activity renews it, and PTY close, backend exit, or connector restart reconciliation shortens it to a bounded handoff grace. Session-scoped semantic idempotency keys return the original operation/input event on exact retry and reject key reuse with a different payload.
+Mutations coordinate through crash-safe hierarchical write leases rather than by creating another SSH connection. Every Workspace has a stable upper `coordination_scope`, defaulting to `host`. A mutating operation selects one exact subtree through `coordination_scope`, or up to 16 disjoint subtrees through `coordination_scopes`; the complete set is acquired atomically or not at all. `host` conflicts with every scope, equal and parent/child scopes conflict, and siblings may mutate concurrently. This lets one MinIO/MySQL/Elasticsearch cleanup run beside an unrelated deployment or pipeline recovery on the same management host without weakening protection for any shared resource. Read-only operations and downloads remain eligible. Active exact leases expire automatically and are visible in runtime snapshot version 11. A PTY fixes its exact resource set when opened; input retains that set for 300 seconds, output activity renews it, and PTY close, backend exit, or connector restart reconciliation shortens it to a bounded handoff grace. Session-scoped semantic idempotency keys return the original operation/input event on exact retry and reject key reuse with a different payload or resource set.
 
 The supervisor should manage three different execution shapes:
 
@@ -612,6 +612,7 @@ Host
 - `ttl_seconds`
 - `policy_profile`
 - `coordination_scope`: hierarchical mutation boundary, default `host`
+- `coordination_scopes`: optional exact disjoint resource set for one atomic multi-resource action
 
 `PtySession` fields:
 
@@ -1191,7 +1192,7 @@ Success criteria:
 - Persistent workspace model.
 - One isolated PTY/workspace per Agent Session and host when interactive continuity is needed.
 - One shared physical SSH transport per access path across Agent Sessions.
-- Session-scoped idempotency and hierarchical resource write leases for conflicting mutations.
+- Session-scoped idempotency and atomic exact-resource write leases for conflicting mutations.
 - Workspace state: idle, working, blocked, done, failed, throttled.
 - Recent output snapshots and wait tools.
 - MCP tools for workspace creation, read, wait, and close.

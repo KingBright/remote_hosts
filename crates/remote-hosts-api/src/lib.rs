@@ -1668,6 +1668,7 @@ async fn open_workspace_pty_session(
         PtySessionOpenCommand {
             session_id,
             cwd: request.cwd,
+            coordination_scopes: request.coordination_scopes,
         },
     )?;
     state.repositories.pty_sessions.upsert(&pty).await?;
@@ -1774,6 +1775,7 @@ async fn queue_workspace_operation(
         intent,
         coordination_mode,
         coordination_scope,
+        coordination_scopes,
         timeout_seconds,
         output_limit_bytes,
         wait_timeout_ms: _,
@@ -1813,6 +1815,7 @@ async fn queue_workspace_operation(
         idempotency_key: None,
         coordination_mode: coordination_mode.unwrap_or_default(),
         coordination_scope,
+        coordination_scopes,
         queued_operations,
         active_exec_channels,
         active_probe_jobs: 0,
@@ -2478,6 +2481,8 @@ pub struct OpenPtySessionRequest {
     pub session_id: Option<String>,
     /// Optional initial current working directory.
     pub cwd: Option<String>,
+    /// Exact resource scopes coordinated by commands sent through this PTY.
+    pub coordination_scopes: Option<Vec<String>>,
 }
 
 /// PTY heartbeat request.
@@ -2584,6 +2589,8 @@ pub struct RunWorkspaceOperationRequest {
     pub coordination_mode: Option<OperationCoordinationMode>,
     /// Optional operation-level scope within the Workspace coordination scope.
     pub coordination_scope: Option<String>,
+    /// Optional exact resource scopes acquired atomically for one multi-resource operation.
+    pub coordination_scopes: Option<Vec<String>>,
     /// Optional timeout override in seconds. Shell profiles allow up to 7200.
     pub timeout_seconds: Option<u64>,
     /// Optional captured output limit override in bytes, up to 8 MiB.
@@ -2827,6 +2834,7 @@ mod tests {
             idempotency_key: None,
             requires_write_lease: false,
             coordination_scope: "host".to_owned(),
+            coordination_scopes: vec!["host".to_owned()],
             operation_type: OperationType::ReadonlyExec,
             intent: "inspect workloads".to_owned(),
             state: OperationState::Queued,

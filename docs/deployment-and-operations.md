@@ -121,7 +121,7 @@ with mode `0600` on macOS or a current-user ACL on Windows.
 ## Normal Agent Operation
 
 1. Resolve or register the canonical host and intended access path.
-2. Read runtime snapshot version 10 before reasoning about state. Treat host-level logical `workspace_capacity` and per-access-path SSH `channel_capacity` as independent limits; `pty_input_required` means an active PTY is waiting for input, not that its SSH connection failed.
+2. Read runtime snapshot version 11 before reasoning about state. Treat host-level logical `workspace_capacity` and per-access-path SSH `channel_capacity` as independent limits; inspect exact `coordination_scopes`, and treat `pty_input_required` as an active PTY waiting for input rather than an SSH failure.
 3. Prepare a Workspace with a stable coordination scope.
 4. Run `shell.posix`, `shell.powershell`, or open a persistent PTY.
 5. Heartbeat a quiet long-running PTY with its truthful foreground process; do not send dummy input as keepalive.

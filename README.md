@@ -22,7 +22,7 @@ one MCP tool family per product.
   interactive bastion PTY.
 - Per-conversation Workspace, PTY, operation, artifact, and idempotency isolation while sharing the
   physical SSH transport.
-- Hierarchical mutation scopes so unrelated resources on the same host can be changed concurrently
+- Atomic exact-resource mutation sets so unrelated tasks on the same host can run concurrently
   without allowing conflicting work to overlap.
 - Local encrypted credential storage, password fallback, and bounded public-key bootstrap without
   coupling the product to an external vault service.
@@ -162,9 +162,9 @@ skills/                    Repository-owned Agent Skill
 
 ## Current Release
 
-The 2026-08-03 release adds native Windows runtime and packaging support, a stable low-overhead MCP
-launcher, Rust-owned connector bootstrap and restart-readiness checks, runtime snapshot version 10,
-hierarchical Workspace coordination, capacity-aware scheduling, resumable verified transfers,
+The 2026-08-29 release adds native Windows runtime and packaging support, a stable low-overhead MCP
+launcher, Rust-owned connector bootstrap and restart-readiness checks, runtime snapshot version 11,
+atomic exact-resource coordination for commands and PTYs, capacity-aware scheduling, resumable verified transfers,
 transport evidence, grouped topology management, compact Zstandard output history, guarded storage
 reclamation, and a 21-tool Agent profile. Release-level implementation details stay in the
 architecture and operations documents.

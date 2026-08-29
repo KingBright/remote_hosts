@@ -1192,6 +1192,9 @@ pub struct OperationRun {
     pub requires_write_lease: bool,
     /// Hierarchical write-coordination scope inherited from the owning workspace.
     pub coordination_scope: String,
+    /// Exact resource scopes that must be leased atomically.
+    #[serde(default)]
+    pub coordination_scopes: Vec<String>,
     /// Operation type.
     pub operation_type: OperationType,
     /// Human or agent intent.
@@ -1645,6 +1648,9 @@ pub struct PtySession {
     pub workspace_id: WorkspaceId,
     /// Connection session id.
     pub session_id: SessionId,
+    /// Exact resource scopes coordinated by this interactive task.
+    #[serde(default)]
+    pub coordination_scopes: Vec<String>,
     /// PTY state.
     pub state: WorkspaceState,
     /// Foreground process summary.

@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{ProtectionDecision, SecretRedactor, ServerProtectionPolicy};
+use crate::{
+    ProtectionDecision, SecretRedactor, ServerProtectionPolicy,
+    resolve_operation_coordination_scopes,
+};
 
 /// Request to open a persistent PTY record for a workspace.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -18,6 +21,8 @@ pub struct PtySessionOpenCommand {
     pub session_id: SessionId,
     /// Initial current working directory.
     pub cwd: Option<String>,
+    /// Optional exact resource scopes coordinated by this PTY task.
+    pub coordination_scopes: Option<Vec<String>>,
 }
 
 /// Request to update a PTY heartbeat.
@@ -108,6 +113,11 @@ pub enum PtySessionSupervisorError {
     /// Recent output reference is invalid.
     #[error("pty output reference must be at most 512 visible characters")]
     InvalidOutputRef,
+    /// PTY coordination scopes are malformed or escape the Workspace boundary.
+    #[error(
+        "pty coordination scopes must be valid, disjoint, and remain within the Workspace scope"
+    )]
+    InvalidCoordinationScopes,
 }
 
 /// Supervises persistent PTY session records under a server protection policy.
@@ -155,10 +165,17 @@ impl PtySessionSupervisor {
         }
 
         let now = now_utc();
+        let coordination_scopes = resolve_operation_coordination_scopes(
+            workspace,
+            None,
+            command.coordination_scopes.as_deref(),
+        )
+        .map_err(|_| PtySessionSupervisorError::InvalidCoordinationScopes)?;
         Ok(PtySession {
             pty_session_id: PtySessionId::new(),
             workspace_id: workspace.id,
             session_id: connection.session_id,
+            coordination_scopes,
             state: WorkspaceState::Idle,
             foreground_process: None,
             cwd: command.cwd.or_else(|| workspace.cwd.clone()),
@@ -637,6 +654,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: connection.session_id,
                 cwd: None,
+                coordination_scopes: None,
             },
         )?;
         assert_eq!(session.workspace_id, workspace.id);
@@ -680,6 +698,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: connection.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
 
@@ -715,6 +734,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: connection.session_id,
                 cwd: None,
+                coordination_scopes: None,
             },
         )?;
         session.backend_state = remote_hosts_domain::PtyBackendState::Active;
@@ -754,6 +774,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: connection.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
         workspace.state = WorkspaceState::Blocked;
@@ -801,6 +822,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: connection.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
         workspace.state = WorkspaceState::Blocked;
@@ -860,6 +882,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: connection.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
         workspace.state = WorkspaceState::Blocked;
@@ -915,6 +938,7 @@ mod tests {
                 PtySessionOpenCommand {
                     session_id: connection.session_id,
                     cwd: None,
+                    coordination_scopes: None,
                 },
             )
             .err()
@@ -935,6 +959,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: connection.session_id,
                 cwd: None,
+                coordination_scopes: None,
             },
         )?;
         session.last_activity_at = now_utc() - time::Duration::seconds(120);

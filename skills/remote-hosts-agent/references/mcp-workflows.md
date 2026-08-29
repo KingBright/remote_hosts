@@ -43,7 +43,7 @@ operation ids in every chunk. Password-like PTY interactions remain type-only.
 2. For state-only work, read `remote_hosts_get_host_runtime_snapshot` and inspect `attention`, `authorized_key_bootstrap`, and `transport_runtime` for each access path.
 3. Call `remote_hosts_prepare_workspace`. Its default Workspace scope is `host`, which is a safe upper boundary for later operation-level scopes. Create a narrower Workspace only when every operation in it belongs to that resource subtree. The tool reuses only an `idle` or `working` workspace owned by the current Agent Session with the same scope before creating one and returns compact Agent-session and Workspace identity plus the next action. Request a runtime snapshot explicitly only when state or connection diagnosis needs it.
 4. Do not execute if snapshot attention reports `auth_failed`, `host_key_changed`, `connector_offline`, `rate_limited`, `throttled`, `circuit_open`, `ssh_route_unsupported`, overload, `pty_runtime_lost`, or `connection_unhealthy` without a recovery action. `local_handshake_budget_ready` allows exactly one normal connection attempt after cooldown. Bootstrap deferred/skipped state does not block password-backed execution unless route attention also blocks it.
-5. For normal remote work, use `shell.posix` or `shell.powershell` with exactly one arbitrary script argument. Always set `coordination_mode=read_only` for a fully observational script or `coordination_mode=mutating` for any possible side effect. A mutating request should also set the narrowest truthful operation `coordination_scope`; omitted `auto` keeps the legacy behavior and treats arbitrary shell as mutating. Include explicit `intent` and a stable semantic `idempotency_key`; set `timeout_seconds` up to 7200 and `output_limit_bytes` up to 8 MiB when defaults are insufficient. Use `wait_timeout_ms` (up to 60000) for short commands so queueing and observing the exact operation are one agent-visible action. Do not put passwords, tokens, or private keys in the script.
+5. For normal remote work, use `shell.posix` or `shell.powershell` with exactly one arbitrary script argument. Always set `coordination_mode=read_only` for a fully observational script or `coordination_mode=mutating` for any possible side effect. A one-resource mutation sets the narrowest truthful `coordination_scope`; one indivisible action across several disjoint resources sets the complete `coordination_scopes` array instead. Omitted `auto` keeps the legacy behavior and treats arbitrary shell as mutating. Include explicit `intent` and a stable semantic `idempotency_key`; set `timeout_seconds` up to 7200 and `output_limit_bytes` up to 8 MiB when defaults are insufficient. Use `wait_timeout_ms` (up to 60000) for short commands so queueing and observing the exact operation are one agent-visible action. Do not put passwords, tokens, or private keys in the script.
    `remote_hosts_run_in_workspace` intentionally rejects access paths marked `requires_tty=true`; use the Interactive Session workflow for those routes.
 6. Use a narrow profile only as a shortcut when it exactly matches a read-only check. Do not request or implement a Kubernetes, Harbor, database, GPU, package-manager, or deployment-specific MCP tool when the existing remote CLI can run through the generic shell or PTY.
 7. When `remote_hosts_run_in_workspace.completion.completed=true`, use its exact compact operation result directly. Otherwise follow `next_action` and `retry_after_ms`; preserve the operation id and idempotency key.
@@ -76,6 +76,24 @@ Independent mutation example:
 }
 ```
 
+Atomic multi-resource mutation example:
+
+```json
+{
+  "workspace_id": "<current-conversation-workspace>",
+  "command_profile": "shell.posix",
+  "args": ["./cleanup-rejected-data"],
+  "intent": "clean rejected records from MinIO, MySQL, and Elasticsearch",
+  "coordination_mode": "mutating",
+  "coordination_scopes": [
+    "prod/datatool-dev/storage/minio/rejected-data",
+    "prod/datatool-dev/database/mysql/rejected-data",
+    "prod/datatool-dev/search/elasticsearch/rejected-data"
+  ],
+  "idempotency_key": "cleanup-rejected-data-20260829"
+}
+```
+
 ## Managed File Transfer
 
 Use file tools for deployment manifests, kubeconfig, CA material, installers, packages, and collected diagnostics:
@@ -90,7 +108,7 @@ Use file tools for deployment manifests, kubeconfig, CA material, installers, pa
 
 Direct routes open an SFTP subsystem channel on the pooled SSH transport. Uploads and downloads use a same-directory temporary file, verify both endpoints, and rename only after verification. Empty-chain POSIX bastions may use one stdin stream with a per-I/O no-progress timeout, then fall back to bounded Base64 exec-channel chunks without putting file bodies in MCP input or audit records. When the route requires an interactive asset menu, select the target once in an active Workspace PTY; both upload and download then reuse that PTY while ordinary input waits behind a transfer lock. The connector diverts raw transfer frames into memory instead of persisted PTY output. Interactive downloads use explicit chunk start/end frames, verify each decoded chunk, compare remote size and whole-file SHA-256 before and after transfer, and atomically place the verified local temporary file. Exec and PTY uploads use an artifact-stable remote temporary path, verify the retained prefix SHA-256, make duplicate chunk replay harmless, and recognize a matching already-placed destination after connector restart. Every initialization, chunk, and final placement requires an explicit marker; never accept exit status alone. The connector may retry eligible idempotent stages after transient transport failure and publishes `bytes_transferred`, `resumed_bytes`, `retry_count`, elapsed time, and a 30-second active heartbeat. A progress-record write failure does not cancel the active data channel. Successful commands and transfers retain the healthy pooled session; timeouts or missing completion frames invalidate it before reuse. Missing markers or suppressed output after the bounded retry budget ends the transfer. Stop transfer attempts on that route until capability or configuration changes. Multi-hop routes still stop at `ssh_route_unsupported`; do not work around them with recursive shell or raw SSH loops.
 
-The current runtime snapshot schema is version 10. Older snapshots do not provide the complete Agent Session ownership, hierarchical write-lease set, connector-local transport runtime, channel-capacity reservations, connection generation, handshake/reuse counters, per-channel transport evidence, or explicit live PTY interaction contract. Reload the MCP child before relying on isolation, scoped coordination, pressure, reuse, or prompt handling claims.
+The current runtime snapshot schema is version 11. Older snapshots do not provide the complete Agent Session ownership, exact multi-resource write-lease set, connector-local transport runtime, channel-capacity reservations, connection generation, handshake/reuse counters, per-channel transport evidence, or explicit live PTY interaction contract. Reload the MCP child before relying on isolation, scoped coordination, pressure, reuse, or prompt handling claims.
 
 ## Conversation Isolation and Idempotency
 
@@ -98,11 +116,11 @@ The current runtime snapshot schema is version 10. Older snapshots do not provid
 - Agent Session, Workspace, PTY, operation, input event, output, artifact, and temporary context are isolated. Never carry Workspace or PTY ids from another task into the current task.
 - The SSH transport is deliberately shared per access path. Do not interpret a new Workspace as a new SSH connection or create another route to escape logical isolation.
 - Use one semantic idempotency key per intended side effect, such as `release-1.4-upload-linux-amd64` or `db-migration-20260724-step-2`. An exact retry keeps the same key and payload. Any changed payload requires a new key.
-- A Workspace owns one immutable lowercase coordination boundary. Each mutating command may select that boundary or a descendant with its operation `coordination_scope`; a `host` Workspace can select any valid resource scope. Equal and parent/child mutations conflict; sibling mutations do not. Use a canonical hierarchy such as `k8s/<cluster>/<namespace>/<kind>/<name>`, use the real common parent when one task spans resources, and use `host` when uncertain.
+- A Workspace owns one immutable lowercase coordination boundary. Each mutating command selects one descendant with `coordination_scope` or up to 16 disjoint descendants with `coordination_scopes`; a `host` Workspace can select any valid resource set. Singular and plural fields are mutually exclusive. The complete set is acquired atomically, and a set containing both a parent and its child is rejected. Equal and parent/child resources across tasks conflict; siblings do not. Use canonical resource identity such as `k8s/<cluster>/<namespace>/<kind>/<name>`, and use singular `host` only when impact is genuinely host-wide or uncertain.
 - Declared `read_only` shell work has `requires_write_lease=false`, can proceed beside foreign mutations, and is limited only by queue and SSH channel capacity. The declaration covers the complete script; a command that creates temporary files, refreshes credentials/caches, signals a process, or otherwise changes remote state is `mutating`.
-- Inspect `write_lease.active_leases` against the queued operation's scope. `held_by_other_session` alone may describe a non-overlapping sibling. Wait on `host_write_lease_wait`; refine a scope only when it was genuinely over-broad before side effects began. Never change spelling or invent a sibling to bypass another task.
+- Inspect `write_lease.active_leases` against every queued `operation.coordination_scopes` entry. The legacy singular `operation.coordination_scope` may only be their common-ancestor summary. `held_by_other_session` alone may describe a non-overlapping sibling. Wait on `host_write_lease_wait`; refine a declaration only when it was genuinely over-broad before side effects began. Never change spelling or invent a sibling to bypass another task.
 - `channel_capacity.state=saturated|oversubscribed` is path-local queue pressure. Keep the current Workspace and operation/PTY ids, respect `wait_for_channel_or_raise_limit`, and let reservations drain. Existing active PTY input remains eligible while a new PTY waits.
-- PTY input holds the Workspace's scoped write lease for about 300 seconds; output activity renews it. Close the PTY when finished so the connector can shorten the handoff period.
+- PTY input holds the immutable exact `coordination_scopes` selected when the PTY opened, falling back to the Workspace boundary only when no exact set was declared. Output activity renews the same set. Close the PTY when finished so the connector can shorten the handoff period.
 
 ## Runtime Event Waits
 
@@ -154,7 +172,7 @@ Open a PTY only when:
 
 Process:
 
-1. Reuse an active PTY if one exists for the workspace.
+1. Reuse an active PTY only when it belongs to this Agent Session and its immutable `coordination_scopes` truthfully cover the intended mutations. Otherwise open one PTY with the complete exact set; omit the set only when the Workspace boundary itself is the truthful mutation resource.
 2. Inspect `backend_state` and `backend_capabilities`.
 3. Inspect `transport_evidence` after activation. It records the runtime id/generation and whether opening the PTY reused the authenticated SSH connection or performed a handshake.
 4. Prefer `russh_native_pty` or, on Unix only, `openssh_control_master_tty` for true terminal behavior. Windows always uses `russh_native_pty`. Omit `session_id` when opening unless you have an explicit compatible session; the service owns session reuse/creation.

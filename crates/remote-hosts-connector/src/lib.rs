@@ -6405,10 +6405,10 @@ where
                     .update_state(session.workspace_id, WorkspaceState::Blocked, observed_at)
                     .await?;
                 if let Some(agent_session_id) = workspace.agent_session_id {
-                    shorten_host_write_lease(
+                    shorten_host_write_leases(
                         &self.repositories,
                         workspace.host_id,
-                        &workspace.coordination_scope,
+                        &pty_coordination_scopes(&session, &workspace),
                         agent_session_id,
                         observed_at,
                     )
@@ -6526,7 +6526,11 @@ where
             &workspace,
             &connection,
             active_ptys,
-            PtySessionOpenCommand { session_id, cwd },
+            PtySessionOpenCommand {
+                session_id,
+                cwd,
+                coordination_scopes: None,
+            },
         )?;
         let process = match self.spawn_backend_process(&pty_session).await {
             Ok(process) => process,
@@ -6689,6 +6693,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the queue cannot be claimed or updated.
+    #[allow(clippy::too_many_lines)]
     pub async fn deliver_next_queued_input(
         &self,
         lease_seconds: u64,
@@ -6818,21 +6823,34 @@ where
                     event.workspace_id
                 ))
             })?;
+        let pty = self
+            .repositories
+            .pty_sessions
+            .get(event.pty_session_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!(
+                    "PTY session not found for input: {}",
+                    event.pty_session_id
+                ))
+            })?;
+        let coordination_scopes = pty_coordination_scopes(&pty, &workspace);
+        let leases = coordination_scopes
+            .iter()
+            .map(|coordination_scope| HostWriteLease {
+                host_id: event.host_id,
+                coordination_scope: coordination_scope.clone(),
+                holder_agent_session_id: agent_session_id,
+                holder_workspace_id: event.workspace_id,
+                acquired_at: observed_at,
+                heartbeat_at: observed_at,
+                expires_at: observed_at + time::Duration::seconds(lease_seconds),
+            })
+            .collect::<Vec<_>>();
         Ok(self
             .repositories
             .host_write_leases
-            .try_acquire(
-                &HostWriteLease {
-                    host_id: event.host_id,
-                    coordination_scope: workspace.coordination_scope,
-                    holder_agent_session_id: agent_session_id,
-                    holder_workspace_id: event.workspace_id,
-                    acquired_at: observed_at,
-                    heartbeat_at: observed_at,
-                    expires_at: observed_at + time::Duration::seconds(lease_seconds),
-                },
-                observed_at,
-            )
+            .try_acquire_many(&leases, observed_at)
             .await?
             .is_some())
     }
@@ -6855,10 +6873,21 @@ where
                     event.workspace_id
                 ))
             })?;
-        shorten_host_write_lease(
+        let pty = self
+            .repositories
+            .pty_sessions
+            .get(event.pty_session_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::Backend(format!(
+                    "PTY session not found for input: {}",
+                    event.pty_session_id
+                ))
+            })?;
+        shorten_host_write_leases(
             &self.repositories,
             event.host_id,
-            &workspace.coordination_scope,
+            &pty_coordination_scopes(&pty, &workspace),
             agent_session_id,
             now_utc(),
         )
@@ -6913,10 +6942,10 @@ where
                 .await?;
         }
         if let Some(agent_session_id) = workspace.agent_session_id {
-            shorten_host_write_lease(
+            shorten_host_write_leases(
                 &self.repositories,
                 workspace.host_id,
-                &workspace.coordination_scope,
+                &pty_coordination_scopes(&closed, &workspace),
                 agent_session_id,
                 closed.last_activity_at,
             )
@@ -6983,10 +7012,10 @@ where
             if let Some(workspace) = workspace
                 && let Some(agent_session_id) = workspace.agent_session_id
             {
-                shorten_host_write_lease(
+                shorten_host_write_leases(
                     &self.repositories,
                     workspace.host_id,
-                    &workspace.coordination_scope,
+                    &pty_coordination_scopes(&session, &workspace),
                     agent_session_id,
                     now_utc(),
                 )
@@ -7033,10 +7062,10 @@ where
                 .await?
                 && let Some(agent_session_id) = workspace.agent_session_id
             {
-                shorten_host_write_lease(
+                shorten_host_write_leases(
                     &self.repositories,
                     workspace.host_id,
-                    &workspace.coordination_scope,
+                    &pty_coordination_scopes(session, &workspace),
                     agent_session_id,
                     session.last_activity_at,
                 )
@@ -7635,7 +7664,7 @@ where
         let active = Arc::clone(&self.active);
         tokio::spawn(async move {
             let redactor = SecretRedactor::default();
-            let lease_owner = pty_lease_owner(&repositories, workspace_id).await;
+            let lease_owner = pty_lease_owner(&repositories, pty_session_id, workspace_id).await;
             let mut sequence = repositories
                 .pty_output_chunks
                 .next_sequence(pty_session_id)
@@ -7769,11 +7798,11 @@ where
                 .connection_sessions
                 .close_channel(session.session_id, session.last_activity_at)
                 .await;
-            if let Some((host_id, coordination_scope, agent_session_id)) = lease_owner
-                && let Err(error) = shorten_host_write_lease(
+            if let Some((host_id, coordination_scopes, agent_session_id)) = lease_owner
+                && let Err(error) = shorten_host_write_leases(
                     &repositories,
                     host_id,
-                    &coordination_scope,
+                    &coordination_scopes,
                     agent_session_id,
                     session.last_activity_at,
                 )
@@ -7811,10 +7840,10 @@ where
             .await?
             && let Some(agent_session_id) = workspace.agent_session_id
         {
-            shorten_host_write_lease(
+            shorten_host_write_leases(
                 &self.repositories,
                 workspace.host_id,
-                &workspace.coordination_scope,
+                &pty_coordination_scopes(&session, &workspace),
                 agent_session_id,
                 observed_at,
             )
@@ -7867,6 +7896,7 @@ where
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn record_activation_connection_failure(
         &self,
         connection: &ConnectionSession,
@@ -9306,21 +9336,23 @@ where
         };
         let observed_at = now_utc();
         let lease_seconds = i64::try_from(self.config.lease_seconds)?;
+        let coordination_scopes = operation_coordination_scopes(operation);
+        let leases = coordination_scopes
+            .iter()
+            .map(|coordination_scope| HostWriteLease {
+                host_id: operation.host_id,
+                coordination_scope: coordination_scope.clone(),
+                holder_agent_session_id: agent_session_id,
+                holder_workspace_id: workspace_id,
+                acquired_at: observed_at,
+                heartbeat_at: observed_at,
+                expires_at: observed_at + time::Duration::seconds(lease_seconds),
+            })
+            .collect::<Vec<_>>();
         let acquired = self
             .repositories
             .host_write_leases
-            .try_acquire(
-                &HostWriteLease {
-                    host_id: operation.host_id,
-                    coordination_scope: operation.coordination_scope.clone(),
-                    holder_agent_session_id: agent_session_id,
-                    holder_workspace_id: workspace_id,
-                    acquired_at: observed_at,
-                    heartbeat_at: observed_at,
-                    expires_at: observed_at + time::Duration::seconds(lease_seconds),
-                },
-                observed_at,
-            )
+            .try_acquire_many(&leases, observed_at)
             .await?;
         if acquired.is_some() {
             return Ok(None);
@@ -9677,12 +9709,13 @@ where
         };
         let heartbeat_at = now_utc();
         let lease_seconds = i64::try_from(self.config.lease_seconds)?;
+        let coordination_scopes = operation_coordination_scopes(operation);
         if !self
             .repositories
             .host_write_leases
-            .renew(
+            .renew_many(
                 operation.host_id,
-                &operation.coordination_scope,
+                &coordination_scopes,
                 agent_session_id,
                 workspace_id,
                 heartbeat_at,
@@ -10135,28 +10168,14 @@ where
         let Some(agent_session_id) = operation.agent_session_id else {
             return Ok(());
         };
-        if self
-            .repositories
-            .host_write_leases
-            .has_pending_write_work(
-                operation.host_id,
-                agent_session_id,
-                &operation.coordination_scope,
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        self.repositories
-            .host_write_leases
-            .shorten(
-                operation.host_id,
-                &operation.coordination_scope,
-                agent_session_id,
-                finished_at,
-                finished_at + time::Duration::seconds(WRITE_LEASE_HANDOFF_GRACE_SECONDS),
-            )
-            .await?;
+        shorten_host_write_leases(
+            &self.repositories,
+            operation.host_id,
+            &operation_coordination_scopes(operation),
+            agent_session_id,
+            finished_at,
+        )
+        .await?;
         Ok(())
     }
 
@@ -10978,25 +10997,35 @@ fn validate_pty_input(input: &str, max_input_bytes: usize) -> Result<(), Connect
     Ok(())
 }
 
-async fn shorten_host_write_lease(
+async fn shorten_host_write_leases(
     repositories: &Repositories,
     host_id: HostId,
-    coordination_scope: &str,
+    coordination_scopes: &[String],
     agent_session_id: AgentSessionId,
     observed_at: time::OffsetDateTime,
 ) -> Result<(), DbError> {
-    if repositories
-        .host_write_leases
-        .has_pending_write_work(host_id, agent_session_id, coordination_scope)
-        .await?
-    {
+    let mut releasable = Vec::new();
+    for coordination_scope in coordination_scopes {
+        if !repositories
+            .host_write_leases
+            .has_pending_write_work(
+                host_id,
+                agent_session_id,
+                std::slice::from_ref(coordination_scope),
+            )
+            .await?
+        {
+            releasable.push(coordination_scope.clone());
+        }
+    }
+    if releasable.is_empty() {
         return Ok(());
     }
     repositories
         .host_write_leases
-        .shorten(
+        .shorten_many(
             host_id,
-            coordination_scope,
+            &releasable,
             agent_session_id,
             observed_at,
             observed_at + time::Duration::seconds(WRITE_LEASE_HANDOFF_GRACE_SECONDS),
@@ -11009,7 +11038,7 @@ async fn record_pty_output_activity(
     repositories: &Repositories,
     pty_session_id: PtySessionId,
     workspace_id: WorkspaceId,
-    lease_owner: Option<(HostId, String, AgentSessionId)>,
+    lease_owner: Option<(HostId, Vec<String>, AgentSessionId)>,
     observed_at: time::OffsetDateTime,
 ) {
     match repositories
@@ -11018,12 +11047,12 @@ async fn record_pty_output_activity(
         .await
     {
         Ok(true) => {
-            if let Some((host_id, coordination_scope, agent_session_id)) = lease_owner
+            if let Some((host_id, coordination_scopes, agent_session_id)) = lease_owner
                 && let Err(error) = repositories
                     .host_write_leases
-                    .renew(
+                    .renew_many(
                         host_id,
-                        &coordination_scope,
+                        &coordination_scopes,
                         agent_session_id,
                         workspace_id,
                         observed_at,
@@ -11053,23 +11082,45 @@ async fn record_pty_output_activity(
 
 async fn pty_lease_owner(
     repositories: &Repositories,
+    pty_session_id: PtySessionId,
     workspace_id: WorkspaceId,
-) -> Option<(HostId, String, AgentSessionId)> {
-    repositories
+) -> Option<(HostId, Vec<String>, AgentSessionId)> {
+    let workspace = repositories
         .workspaces
         .get(workspace_id)
         .await
         .ok()
-        .flatten()
-        .and_then(|workspace| {
-            workspace.agent_session_id.map(|agent_session_id| {
-                (
-                    workspace.host_id,
-                    workspace.coordination_scope,
-                    agent_session_id,
-                )
-            })
-        })
+        .flatten()?;
+    let pty = repositories
+        .pty_sessions
+        .get(pty_session_id)
+        .await
+        .ok()
+        .flatten()?;
+    workspace.agent_session_id.map(|agent_session_id| {
+        let coordination_scopes = if pty.coordination_scopes.is_empty() {
+            vec![workspace.coordination_scope]
+        } else {
+            pty.coordination_scopes
+        };
+        (workspace.host_id, coordination_scopes, agent_session_id)
+    })
+}
+
+fn operation_coordination_scopes(operation: &OperationRun) -> Vec<String> {
+    if operation.coordination_scopes.is_empty() {
+        vec![operation.coordination_scope.clone()]
+    } else {
+        operation.coordination_scopes.clone()
+    }
+}
+
+fn pty_coordination_scopes(pty: &PtySession, workspace: &AgentWorkspace) -> Vec<String> {
+    if pty.coordination_scopes.is_empty() {
+        vec![workspace.coordination_scope.clone()]
+    } else {
+        pty.coordination_scopes.clone()
+    }
 }
 
 #[cfg(unix)]
@@ -11163,6 +11214,7 @@ fn classify_connection_failure(message: &str) -> (EntityState, StateReasonCode, 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         io::Write,
         process::Stdio,
         sync::{
@@ -13531,6 +13583,7 @@ mod tests {
                 idempotency_key: Some("write-lease-test".to_owned()),
                 coordination_mode: OperationCoordinationMode::Auto,
                 coordination_scope: None,
+                coordination_scopes: None,
                 queued_operations: 0,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -14857,6 +14910,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: fixture.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
         fixture.repositories.pty_sessions.upsert(&pending).await?;
@@ -14922,6 +14976,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: fixture.session_id,
                 cwd: None,
+                coordination_scopes: None,
             },
         )?;
         active_pty.backend_state = PtyBackendState::Active;
@@ -15025,6 +15080,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: first_connection.session_id,
                 cwd: None,
+                coordination_scopes: None,
             },
         )?;
         active_pty.backend_state = PtyBackendState::Active;
@@ -15076,6 +15132,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: second_connection.session_id,
                 cwd: None,
+                coordination_scopes: None,
             },
         )?;
         fixture
@@ -15153,6 +15210,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: fixture.session_id,
                 cwd: None,
+                coordination_scopes: None,
             },
         )?;
         pending.created_at -= time::Duration::seconds(1);
@@ -15334,6 +15392,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: fixture.session_id,
                 cwd: None,
+                coordination_scopes: None,
             },
         )?;
         fixture.repositories.pty_sessions.upsert(&pending).await?;
@@ -15465,6 +15524,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: fixture.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
         fixture.repositories.pty_sessions.upsert(&pending).await?;
@@ -15520,6 +15580,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: fixture.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
         fixture.repositories.pty_sessions.upsert(&pending).await?;
@@ -15598,6 +15659,7 @@ mod tests {
                 PtySessionOpenCommand {
                     session_id: fixture.session_id,
                     cwd: Some("/tmp".to_owned()),
+                    coordination_scopes: None,
                 },
             )?;
             fixture.repositories.pty_sessions.upsert(&pending).await?;
@@ -15661,6 +15723,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: fixture.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
         fixture.repositories.pty_sessions.upsert(&pending).await?;
@@ -15732,6 +15795,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: fixture.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
         stale.state = WorkspaceState::Working;
@@ -16863,6 +16927,234 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn connector_pty_renews_only_its_exact_multi_resource_scopes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let backend = CapturingPtyBackend::new();
+        let output_tx = backend.output_tx.clone();
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            backend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        let coordination_scopes = vec![
+            "prod/datatool-dev/storage/minio/rejected-data".to_owned(),
+            "prod/datatool-dev/database/mysql/rejected-data".to_owned(),
+        ];
+        let pending = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: None,
+                coordination_scopes: Some(coordination_scopes.clone()),
+            },
+        )?;
+        fixture.repositories.pty_sessions.upsert(&pending).await?;
+        manager.activate_existing(pending.pty_session_id).await?;
+
+        let before_input = now_utc();
+        let unrelated_session = AgentSession {
+            id: AgentSessionId::new(),
+            client_kind: "codex".to_owned(),
+            client_instance_id: "preexisting-unrelated-session".to_owned(),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("preexisting-unrelated-conversation".to_owned()),
+            state: AgentSessionState::Active,
+            created_at: before_input,
+            last_seen_at: before_input,
+            expires_at: before_input + time::Duration::hours(24),
+        };
+        fixture
+            .repositories
+            .agent_sessions
+            .upsert(&unrelated_session)
+            .await?;
+        let unrelated_workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(unrelated_session.id),
+            label: "preexisting-unrelated-agent".to_owned(),
+            ..workspace.clone()
+        };
+        fixture
+            .repositories
+            .workspaces
+            .insert(&unrelated_workspace)
+            .await?;
+        assert!(
+            fixture
+                .repositories
+                .host_write_leases
+                .try_acquire(
+                    &HostWriteLease {
+                        host_id: workspace.host_id,
+                        coordination_scope: "prod/datatool-dev/deployment/lichtblick".to_owned(),
+                        holder_agent_session_id: unrelated_session.id,
+                        holder_workspace_id: unrelated_workspace.id,
+                        acquired_at: before_input,
+                        heartbeat_at: before_input,
+                        expires_at: before_input + time::Duration::minutes(5),
+                    },
+                    before_input,
+                )
+                .await?
+                .is_some()
+        );
+
+        let event = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: pending.pty_session_id,
+            workspace_id: workspace.id,
+            connector_id: workspace.connector_id,
+            host_id: workspace.host_id,
+            agent_session_id: workspace.agent_session_id,
+            idempotency_key: Some("multi-resource-pty-input".to_owned()),
+            payload_kind: PtyInputPayloadKind::Text,
+            input_fingerprint: Some("multi-resource-fingerprint".to_owned()),
+            state: PtyInputEventState::Queued,
+            sequence: 0,
+            redacted_input_summary: "22 bytes queued for pty input".to_owned(),
+            byte_len: 22,
+            requested_by: Some("agent".to_owned()),
+            created_at: now_utc(),
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&event, "run cleanup command\n")
+            .await?;
+        manager
+            .deliver_next_queued_input(30, 3)
+            .await?
+            .ok_or("PTY input should be delivered")?;
+        let observed_at = now_utc();
+        let initial = fixture
+            .repositories
+            .host_write_leases
+            .list_active(workspace.host_id, observed_at)
+            .await?;
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|lease| lease.holder_agent_session_id == fixture.agent_session_id)
+                .map(|lease| lease.coordination_scope.clone())
+                .collect::<BTreeSet<_>>(),
+            coordination_scopes.iter().cloned().collect()
+        );
+
+        let foreign_session = AgentSession {
+            id: AgentSessionId::new(),
+            client_kind: "codex".to_owned(),
+            client_instance_id: "foreign-disjoint-pty-session".to_owned(),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("foreign-disjoint-pty-conversation".to_owned()),
+            state: AgentSessionState::Active,
+            created_at: observed_at,
+            last_seen_at: observed_at,
+            expires_at: observed_at + time::Duration::hours(24),
+        };
+        fixture
+            .repositories
+            .agent_sessions
+            .upsert(&foreign_session)
+            .await?;
+        let foreign_workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(foreign_session.id),
+            label: "foreign-disjoint-pty-agent".to_owned(),
+            ..workspace.clone()
+        };
+        fixture
+            .repositories
+            .workspaces
+            .insert(&foreign_workspace)
+            .await?;
+        let foreign_lease = |scope: &str| HostWriteLease {
+            host_id: workspace.host_id,
+            coordination_scope: scope.to_owned(),
+            holder_agent_session_id: foreign_session.id,
+            holder_workspace_id: foreign_workspace.id,
+            acquired_at: observed_at,
+            heartbeat_at: observed_at,
+            expires_at: observed_at + time::Duration::minutes(5),
+        };
+        assert!(
+            fixture
+                .repositories
+                .host_write_leases
+                .try_acquire(
+                    &foreign_lease("prod/datatool-dev/pipeline-recovery/clean"),
+                    observed_at,
+                )
+                .await?
+                .is_some()
+        );
+        assert!(
+            fixture
+                .repositories
+                .host_write_leases
+                .try_acquire(
+                    &foreign_lease("prod/datatool-dev/storage/minio/rejected-data/object-42"),
+                    observed_at,
+                )
+                .await?
+                .is_none()
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        output_tx
+            .send(PtyBackendOutput {
+                stream: OutputStream::Stdout,
+                text: "multi-resource cleanup still running\n".to_owned(),
+                truncated: false,
+            })
+            .await?;
+        wait_for_pty_output(
+            &fixture.repositories,
+            pending.pty_session_id,
+            "multi-resource cleanup still running",
+        )
+        .await?;
+        let renewed = fixture
+            .repositories
+            .host_write_leases
+            .list_active(workspace.host_id, now_utc())
+            .await?;
+        for scope in &coordination_scopes {
+            let before = initial
+                .iter()
+                .find(|lease| &lease.coordination_scope == scope)
+                .ok_or("initial exact PTY lease should exist")?;
+            let after = renewed
+                .iter()
+                .find(|lease| &lease.coordination_scope == scope)
+                .ok_or("renewed exact PTY lease should exist")?;
+            assert!(after.heartbeat_at > before.heartbeat_at);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connector_pty_manager_activates_existing_session_for_queued_input()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
@@ -16898,6 +17190,7 @@ mod tests {
             PtySessionOpenCommand {
                 session_id: fixture.session_id,
                 cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
             },
         )?;
         fixture
@@ -17548,6 +17841,7 @@ mod tests {
                 idempotency_key: None,
                 coordination_mode: OperationCoordinationMode::Auto,
                 coordination_scope: None,
+                coordination_scopes: None,
                 queued_operations: 1,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -18114,6 +18408,7 @@ mod tests {
                     idempotency_key: None,
                     coordination_mode: OperationCoordinationMode::Auto,
                     coordination_scope: None,
+                    coordination_scopes: None,
                     queued_operations: 0,
                     active_exec_channels: 0,
                     active_probe_jobs: 0,

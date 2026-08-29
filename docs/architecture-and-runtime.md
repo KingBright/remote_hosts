@@ -43,7 +43,7 @@ and PTYs reserve channels from the same access-path capacity budget.
 The default path capacity is eight channels. Connector workers skip saturated paths instead of
 occupying global worker slots while waiting. A pending PTY blocked by local channel capacity writes
 one system output explaining that its remote menu has not started; agents keep that PTY and wait
-rather than reconnecting or queuing input. Runtime snapshot version 10 exposes configured,
+rather than reconnecting or queuing input. Runtime snapshot version 11 exposes configured,
 reserved, and available channels, active and pending PTYs, and current operation pressure.
 
 Logical connection sessions and physical transport runtimes are separate. Every runtime records a
@@ -94,10 +94,13 @@ Arbitrary shell requests declare one coordination mode:
 - `auto` is the compatibility default. Narrow read-only profiles remain read-only, while arbitrary
   POSIX and PowerShell scripts remain conservatively mutating.
 
-Each mutating operation selects a stable lowercase `coordination_scope` within its Workspace
+Each mutating operation selects one or more stable lowercase resources within its Workspace
 boundary:
 
-- `host` is the compatibility default and conflicts with every mutation on that host.
+- `coordination_scope` names one resource subtree.
+- `coordination_scopes` names up to 16 disjoint resource subtrees acquired atomically.
+- `host` is the compatibility default for genuinely machine-wide or uncertain effects and conflicts
+  with every mutation on that host.
 - Equal scopes conflict.
 - A parent conflicts with every descendant.
 - Sibling scopes may run concurrently.
@@ -106,15 +109,21 @@ The default Workspace boundary is `host`, so one conversation can submit precise
 without creating a new Workspace for each resource. A narrow Workspace accepts only its own scope or
 descendants and therefore cannot jump to a sibling resource.
 
-For example, `k8s/prod/datatool-dev` conflicts with
-`k8s/prod/datatool-dev/service/file-gateway`, while that service scope can run beside
-`k8s/prod/datatool-dev/service/report-api`.
+For example, a rejected-data cleanup can atomically coordinate
+`prod/datatool-dev/storage/minio/rejected-data`,
+`prod/datatool-dev/database/mysql/rejected-data`, and
+`prod/datatool-dev/search/elasticsearch/rejected-data`. It can run beside
+`prod/datatool-dev/deployment/lichtblick` and `prod/datatool-dev/pipeline-recovery/clean`, while a
+second task touching any cleanup resource or its parent/child waits. A request cannot mix singular
+and plural fields or include a parent and its child in the same exact set.
 
 Leases are crash-safe and visible in runtime snapshot `write_lease.active_leases`; compact operation
-results expose `requires_write_lease` and the effective scope. Scope names are resource identity, not
-a mechanism for evading a legitimate conflict. A task that spans several resources uses their real
-common parent. Uploads and PTY input remain mutating; downloads only read the remote host and do not
-take its write lease.
+results expose `requires_write_lease`, exact `coordination_scopes`, and a singular common-ancestor
+summary for older clients. Scope names are resource identity, not a mechanism for evading a
+legitimate conflict. The connector acquires the complete exact set in one transaction or retains
+none. Uploads and PTY input remain mutating; downloads only read the remote host and do not take its
+write lease. A PTY fixes its exact scope set when opened, and input, output activity, close, failure,
+and idle reaping all use that immutable set rather than the broader Workspace boundary.
 
 ## Command Execution
 
@@ -219,7 +228,7 @@ configured; an empty-chain `bastion` route remains one physical SSH endpoint.
 
 ## Runtime State
 
-Runtime snapshot version 10 returns one consistent view containing:
+Runtime snapshot version 11 returns one consistent view containing:
 
 - current Agent Session identity;
 - host-level logical Workspace capacity, including recorded, effective, expired/reapable, and per-session counts;
@@ -227,7 +236,7 @@ Runtime snapshot version 10 returns one consistent view containing:
 - enabled access paths, route health, key-bootstrap state, transport runtime, and channel capacity;
 - current logical connection sessions;
 - session-owned Workspaces, PTYs (including live `interaction` state), and recent operations;
-- active scoped write leases;
+- active exact-resource write leases and multi-resource operation/PTY declarations;
 - actionable attention records and an event cursor.
 
 Workspace TTL is enforced automatically. MCP/API creation first closes expired `idle`/`working`/`blocked`
