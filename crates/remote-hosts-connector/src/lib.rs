@@ -94,6 +94,7 @@ const EXEC_TRANSFER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const PTY_TRANSFER_CAPTURE_LIMIT_BYTES: usize = 128 * 1024;
 const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const PTY_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(600);
+const DEFAULT_RUSSH_PTY_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const PTY_OUTPUT_BATCH_TARGET_BYTES: usize = 64 * 1024;
 const PTY_OUTPUT_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 const PTY_INTERACTION_TAIL_BYTES: usize = 4 * 1024;
@@ -5004,6 +5005,7 @@ pub struct RusshPtyBackendFactory<C> {
     term: String,
     columns: u32,
     rows: u32,
+    activation_timeout: Duration,
 }
 
 impl<C> RusshPtyBackendFactory<C> {
@@ -5028,6 +5030,7 @@ impl<C> RusshPtyBackendFactory<C> {
                 ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
             )),
         )
+        .with_activation_timeout(Duration::from_secs(connect_timeout_seconds.max(1)))
     }
 
     /// Creates a native `russh` PTY backend factory from an existing pool.
@@ -5038,6 +5041,7 @@ impl<C> RusshPtyBackendFactory<C> {
             term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned()),
             columns: 120,
             rows: 40,
+            activation_timeout: DEFAULT_RUSSH_PTY_ACTIVATION_TIMEOUT,
         }
     }
 
@@ -5047,6 +5051,13 @@ impl<C> RusshPtyBackendFactory<C> {
         self.term = term.into();
         self.columns = columns.max(1);
         self.rows = rows.max(1);
+        self
+    }
+
+    /// Overrides the maximum duration for opening a native SSH PTY channel and shell.
+    #[must_use]
+    pub fn with_activation_timeout(mut self, timeout: Duration) -> Self {
+        self.activation_timeout = timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -5072,6 +5083,18 @@ impl<C> RusshPtyBackendFactory<C> {
     }
 }
 
+async fn russh_pty_activation_with_timeout<T, F>(
+    timeout: Duration,
+    activation: F,
+) -> Result<T, ConnectorPtyError>
+where
+    F: Future<Output = Result<T, ConnectorPtyError>>,
+{
+    tokio::time::timeout(timeout, activation)
+        .await
+        .map_err(|_| ConnectorPtyError::ActivationTimeout)?
+}
+
 #[async_trait]
 impl<C> ManagedPtyBackend for RusshPtyBackendFactory<C>
 where
@@ -5089,7 +5112,7 @@ where
         let channel_permit = transport.try_acquire_pty_channel()?;
         let before = transport.transport_telemetry();
         let session = transport.reserve_pty_channel().await?;
-        let channel_result = async {
+        let channel_result = russh_pty_activation_with_timeout(self.activation_timeout, async {
             let channel = session
                 .channel_open_session()
                 .await
@@ -5103,7 +5126,7 @@ where
                 .await
                 .map_err(|error| ConnectorPtyError::Backend(error.to_string()))?;
             Ok(channel)
-        }
+        })
         .await;
         let channel = match channel_result {
             Ok(channel) => channel,
@@ -6201,10 +6224,13 @@ async fn poll_pty_pump(
     if pump.reconcile_runtime_state().await? > 0 {
         return Ok(Some(PtyPumpOutcome::Reconciled));
     }
+    if let Some(input) = pump.deliver_next().await? {
+        return Ok(Some(PtyPumpOutcome::Input(input)));
+    }
     if pump.activate_next().await?.is_some() {
         return Ok(Some(PtyPumpOutcome::Activated));
     }
-    Ok(pump.deliver_next().await?.map(PtyPumpOutcome::Input))
+    Ok(None)
 }
 
 /// Connector PTY manager errors.
@@ -6225,6 +6251,9 @@ pub enum ConnectorPtyError {
     /// The access path has no immediately available SSH channel.
     #[error("SSH channel capacity is currently unavailable")]
     ChannelCapacityUnavailable,
+    /// Opening the SSH channel, allocating the terminal, or starting its shell exceeded the bound.
+    #[error("SSH PTY channel activation timed out")]
+    ActivationTimeout,
     /// PTY session does not belong to this connector.
     #[error("pty session does not belong to this connector")]
     ConnectorMismatch,
@@ -7942,6 +7971,7 @@ where
             | ConnectorPtyError::Database(_)
             | ConnectorPtyError::Supervisor(_)
             | ConnectorPtyError::ChannelCapacityUnavailable
+            | ConnectorPtyError::ActivationTimeout
             | ConnectorPtyError::ConnectorMismatch
             | ConnectorPtyError::NotActive
             | ConnectorPtyError::RuntimeContinuityLost
@@ -11724,6 +11754,7 @@ mod tests {
     struct SlowOneShotPtyActivationPump {
         started: AtomicBool,
         completed: AtomicBool,
+        delivered: AtomicBool,
     }
 
     impl SlowOneShotPtyActivationPump {
@@ -11731,6 +11762,7 @@ mod tests {
             Self {
                 started: AtomicBool::new(false),
                 completed: AtomicBool::new(false),
+                delivered: AtomicBool::new(false),
             }
         }
     }
@@ -11782,7 +11814,16 @@ mod tests {
         async fn deliver_next(
             &self,
         ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, super::ConnectorPtyError> {
-            Ok(None)
+            if self.delivered.swap(true, Ordering::SeqCst) {
+                return Ok(None);
+            }
+            Ok(Some(ConnectorPtyInputDeliveryOutcome {
+                input_event_id: PtyInputEventId::new(),
+                pty_session_id: PtySessionId::new(),
+                state: PtyInputEventState::Delivered,
+                byte_len: 1,
+                error: None,
+            }))
         }
     }
 
@@ -12734,6 +12775,20 @@ mod tests {
         assert!(matches!(
             result,
             Err(super::AuthorizedKeyInstallError::Timeout)
+        ));
+    }
+
+    #[tokio::test]
+    async fn russh_pty_activation_has_a_hard_timeout() {
+        let result = super::russh_pty_activation_with_timeout(
+            Duration::from_millis(10),
+            std::future::pending::<Result<(), super::ConnectorPtyError>>(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(super::ConnectorPtyError::ActivationTimeout)
         ));
     }
 
@@ -18103,6 +18158,23 @@ mod tests {
         stop_tx.send(true)?;
         let report = handle.await??;
         assert_eq!(report.delivered_pty_inputs, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pty_pump_delivers_active_input_before_starting_pending_activation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pump = SlowOneShotPtyActivationPump::new();
+
+        let outcome = tokio::time::timeout(Duration::from_millis(20), super::poll_pty_pump(&pump))
+            .await??
+            .ok_or("PTY pump should deliver the active input")?;
+
+        assert!(matches!(outcome, super::PtyPumpOutcome::Input(_)));
+        assert!(
+            !pump.started.load(Ordering::SeqCst),
+            "a pending activation must not delay input for an already active PTY"
+        );
         Ok(())
     }
 

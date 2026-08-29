@@ -153,6 +153,10 @@ activates it proactively so an agent can read a banner or asset menu before send
 Activation uses a nonblocking channel reservation. A saturated path leaves the PTY pending without
 blocking input delivery to already-active PTYs. MCP reports `backend_ready`, `recommended_action`,
 and `poll_after_ms` so pending activation is not confused with an unsupported shell.
+The connector always services queued input for active PTYs before starting another activation.
+Native `russh` bounds the complete channel-open, terminal-allocation, and shell-start sequence by
+the configured SSH connect timeout; a stuck target therefore terminalizes only that pending PTY
+and cannot hold the connector-wide PTY pump indefinitely.
 
 PTY input is database-backed and connector-owned. The API and MCP enqueue redacted input metadata;
 the connector claims, delivers, and terminalizes each event. Redacted output-tail detection exposes

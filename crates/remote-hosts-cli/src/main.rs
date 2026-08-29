@@ -1155,7 +1155,10 @@ fn build_pty_input_pump(
             })
         }
         (PtyBackendMode::RusshNativePty, SharedPtyTransportPool::Russh(pool)) => {
-            let backend = RusshPtyBackendFactory::with_pool(repositories.clone(), pool);
+            let backend = RusshPtyBackendFactory::with_pool(repositories.clone(), pool)
+                .with_activation_timeout(std::time::Duration::from_secs(
+                    args.connect_timeout_seconds.max(1),
+                ));
             let manager = ConnectorPtyManager::new(repositories, backend, config);
             let manager = match sudo_credential_provider {
                 Some(provider) => manager.with_credential_provider(provider),
