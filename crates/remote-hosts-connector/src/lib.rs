@@ -4012,6 +4012,32 @@ fn format_sftp_progress(progress: &SftpProgress, elapsed_seconds: u64) -> String
     )
 }
 
+fn format_sftp_heartbeat(
+    direction: SftpDirection,
+    progress: Option<&SftpProgress>,
+    elapsed_seconds: u64,
+    stalled_seconds: u64,
+) -> String {
+    progress.map_or_else(
+        || format!(
+            "file transfer heartbeat: direction={direction:?}, stage=awaiting_progress, elapsed_seconds={elapsed_seconds}, no_progress_seconds={stalled_seconds}"
+        ),
+        |progress| {
+            let total_bytes = progress
+                .total_bytes
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+            format!(
+                "file transfer heartbeat: direction={direction:?}, stage={}, bytes_transferred={}, total_bytes={}, resumed_bytes={}, retry_count={}, elapsed_seconds={elapsed_seconds}, no_progress_seconds={stalled_seconds}",
+                progress.stage,
+                progress.bytes_transferred,
+                total_bytes,
+                progress.resumed_bytes,
+                progress.retry_count,
+            )
+        },
+    )
+}
+
 fn emit_sftp_progress(
     request: &SftpRequest,
     stage: &str,
@@ -9517,6 +9543,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn sftp_with_lease_renewal(
         &self,
         operation: &OperationRun,
@@ -9529,6 +9556,7 @@ where
         })?;
         let renew_delay = self.lease_renew_delay();
         let started_at = Instant::now();
+        let transfer_timeout = Duration::from_secs(request.spec.timeout_seconds);
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         request.progress_tx = Some(progress_tx);
         let direction = request.spec.direction;
@@ -9560,36 +9588,53 @@ where
         lease_interval.tick().await;
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
         heartbeat_interval.tick().await;
+        let deadline = tokio::time::sleep_until(started_at + transfer_timeout);
+        tokio::pin!(deadline);
         let mut progress_open = true;
         let mut latest_progress: Option<SftpProgress> = None;
+        let mut last_progress_at = started_at;
 
         loop {
             tokio::select! {
+                biased;
                 result = &mut transfer => return result,
+                () = &mut deadline => {
+                    let summary = format!(
+                        "file transfer deadline reached: {}",
+                        format_sftp_heartbeat(
+                            direction,
+                            latest_progress.as_ref(),
+                            started_at.elapsed().as_secs(),
+                            last_progress_at.elapsed().as_secs(),
+                        )
+                    );
+                    self.append_transfer_status_best_effort(operation, &summary)
+                        .await;
+                    return Err(TransportError::Timeout);
+                }
                 progress = progress_rx.recv(), if progress_open => {
                     match progress {
                         Some(progress) => {
-                            let summary = format_sftp_progress(
-                                &progress,
-                                started_at.elapsed().as_secs(),
-                            );
-                            self.append_transfer_status_best_effort(operation, &summary)
-                                .await;
-                            latest_progress = Some(progress);
+                            if latest_progress.as_ref() != Some(&progress) {
+                                let summary = format_sftp_progress(
+                                    &progress,
+                                    started_at.elapsed().as_secs(),
+                                );
+                                self.append_transfer_status_best_effort(operation, &summary)
+                                    .await;
+                                last_progress_at = Instant::now();
+                                latest_progress = Some(progress);
+                            }
                         }
                         None => progress_open = false,
                     }
                 }
                 _ = heartbeat_interval.tick() => {
-                    let summary = latest_progress.as_ref().map_or_else(
-                        || format!(
-                            "file transfer active: direction={direction:?}, elapsed_seconds={}",
-                            started_at.elapsed().as_secs()
-                        ),
-                        |progress| format_sftp_progress(
-                            progress,
-                            started_at.elapsed().as_secs(),
-                        ),
+                    let summary = format_sftp_heartbeat(
+                        direction,
+                        latest_progress.as_ref(),
+                        started_at.elapsed().as_secs(),
+                        last_progress_at.elapsed().as_secs(),
                     );
                     self.append_transfer_status_best_effort(operation, &summary)
                         .await;
@@ -11733,6 +11778,8 @@ mod tests {
 
     struct SlowTransport(Duration);
 
+    struct StalledProgressTransport;
+
     #[async_trait]
     impl RemoteTransport for SlowTransport {
         async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
@@ -11763,6 +11810,43 @@ mod tests {
                 remote_path: request.spec.remote_path,
                 overwrite: request.spec.overwrite,
             })
+        }
+
+        async fn open_forward(
+            &self,
+            _request: ForwardRequest,
+        ) -> Result<ForwardHandle, TransportError> {
+            Err(TransportError::Backend("not implemented".to_owned()))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteTransport for StalledProgressTransport {
+        async fn check(&self, _request: CheckRequest) -> Result<CheckResult, TransportError> {
+            Ok(CheckResult {
+                ok: true,
+                latency_ms: Some(1),
+                message: "ok".to_owned(),
+            })
+        }
+
+        async fn exec(&self, _request: ExecRequest) -> Result<ExecResult, TransportError> {
+            Err(TransportError::Backend("not implemented".to_owned()))
+        }
+
+        async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+            loop {
+                if let Some(progress_tx) = &request.progress_tx {
+                    let _ = progress_tx.send(SftpProgress {
+                        stage: "initializing".to_owned(),
+                        bytes_transferred: 0,
+                        total_bytes: Some(1024),
+                        resumed_bytes: 0,
+                        retry_count: 0,
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
         }
 
         async fn open_forward(
@@ -13714,6 +13798,129 @@ mod tests {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn connector_worker_times_out_stalled_sftp_despite_progress_heartbeats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        fixture
+            .repositories
+            .operations
+            .update_state(
+                fixture.operation_id,
+                OperationState::Succeeded,
+                Some(now_utc()),
+                Some(0),
+                Some("superseded by stalled SFTP test"),
+            )
+            .await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .update_state(fixture.workspace_id, WorkspaceState::Idle, now_utc())
+            .await?
+            .ok_or("workspace should exist")?;
+        let plan = WorkspaceOperationSupervisor::default().queue_file_transfer(
+            &WorkspaceFileTransfer {
+                workspace,
+                spec: FileTransferSpec {
+                    direction: SftpDirection::Upload,
+                    local_path: "/tmp/stalled-upload.bin".to_owned(),
+                    remote_path: "/var/tmp/stalled-upload.bin".to_owned(),
+                    overwrite: SftpOverwritePolicy::Deny,
+                    mode: Some(0o600),
+                    max_size_bytes: 1024,
+                    expected_sha256: None,
+                    timeout_seconds: 1,
+                },
+                intent: Some("prove stalled transfer deadline".to_owned()),
+                idempotency_key: None,
+                queued_operations: 0,
+                active_exec_channels: 0,
+                overload_cooldown_active: false,
+            },
+        )?;
+        fixture
+            .repositories
+            .operations
+            .insert(&plan.operation)
+            .await?;
+        fixture
+            .repositories
+            .operation_output_chunks
+            .insert(&plan.initial_output_chunk)
+            .await?;
+        fixture
+            .repositories
+            .workspaces
+            .update_state(fixture.workspace_id, plan.workspace_state, now_utc())
+            .await?;
+
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(StalledProgressTransport),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+        let outcome = tokio::time::timeout(Duration::from_millis(1_500), worker.run_once())
+            .await
+            .map_err(|_| "worker ignored the file transfer hard deadline")??
+            .ok_or("worker should claim the stalled SFTP operation")?;
+
+        assert_eq!(outcome.operation_id, plan.operation.id);
+        assert_eq!(outcome.state, OperationState::TimedOut);
+        let operation = fixture
+            .repositories
+            .operations
+            .get(plan.operation.id)
+            .await?
+            .ok_or("stalled SFTP operation should exist")?;
+        assert!(operation.finished_at.is_some());
+        assert!(
+            operation
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out"))
+        );
+        let observed_at = now_utc();
+        let lease = fixture
+            .repositories
+            .host_write_leases
+            .list_active(fixture.host_id, observed_at)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or("timed-out transfer should retain only a short handoff grace")?;
+        assert_eq!(lease.holder_agent_session_id, fixture.agent_session_id);
+        assert!(lease.expires_at <= observed_at + time::Duration::seconds(16));
+        let chunks = fixture
+            .repositories
+            .operation_output_chunks
+            .list_for_workspace(fixture.workspace_id, Some(plan.operation.id), None, 100)
+            .await?;
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.redacted_text.contains("file transfer progress:"))
+                .count(),
+            1,
+            "identical zero-byte progress events must be deduplicated"
+        );
+        assert!(chunks.iter().any(|chunk| {
+            chunk
+                .redacted_text
+                .contains("file transfer deadline reached")
+                && chunk.redacted_text.contains("file transfer heartbeat")
+                && chunk.redacted_text.contains("no_progress_seconds=")
+        }));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn connector_worker_does_not_bypass_active_connection_circuit()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -14362,6 +14569,7 @@ mod tests {
         let fixture = WorkerFixture::new().await?;
         let backend = CapturingPtyBackend::new();
         let inputs = Arc::clone(&backend.inputs);
+        let output_tx = backend.output_tx.clone();
         let manager = ConnectorPtyManager::new(
             fixture.repositories.clone(),
             backend,
@@ -14390,6 +14598,27 @@ mod tests {
             inputs.lock().await.as_slice(),
             ["printf payload-without-marker\n"]
         );
+        let recovery_marker = "REMOTE_HOSTS_RECOVERY_MARKER";
+        let recovery_output_tx = output_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = recovery_output_tx
+                .send(PtyBackendOutput {
+                    stream: OutputStream::Stdout,
+                    text: format!("{recovery_marker}\n"),
+                    truncated: false,
+                })
+                .await;
+        });
+        let recovered = manager
+            .send_pty_command_and_wait(
+                &handle,
+                "printf recovery-marker\n".to_owned(),
+                recovery_marker,
+                Duration::from_millis(100),
+            )
+            .await?;
+        assert!(recovered.contains(recovery_marker));
         let chunks = fixture
             .repositories
             .pty_output_chunks
