@@ -35,6 +35,21 @@ LaunchAgents, installs the admin UI, synchronizes the Agent Skill, and starts:
 Both services start automatically at user login. MCP stdio is not a daemon; Codex or Antigravity
 starts a child process with the shared database and vault-key path.
 
+## Instance Sync Listener
+
+The normal API remains loopback-only. To let another approved Remote Hosts installation synchronize
+with this one, set `REMOTE_HOSTS_PEER_SYNC_BIND` in `~/.config/remote-hosts/service.env` to a
+separate address such as `0.0.0.0:8788`, then apply it during the next planned service update. The
+additional listener exposes only `/healthz`, `/v1/health`, instance identity, and authenticated
+instance-sync export/receive routes. It cannot access the admin UI, credential inspection or
+management routes, topology bindings, Workspaces, PTYs, commands, files, or activity records. A
+credential selected for sync remains peer-sealed in the envelope and is re-encrypted by the
+receiver's local vault.
+
+Use a trusted LAN, VPN, or an SSH tunnel for the peer listener. Use HTTPS before exposing it through
+any routed or public network. Leave the setting empty when no direct peer needs to reach the
+instance; that remains the default on macOS and Windows.
+
 ## Windows Services
 
 The Windows package runs the same API, connector, SQLite database, encrypted vault, admin UI, and
@@ -85,7 +100,9 @@ operator-facing audit surface; raw MCP JSON is not intended for routine human in
 ## Configuration
 
 The generated macOS `service.env` or Windows `service.json` configures the database, artifact root,
-connector identity, current network, SSH backend, host-key policy, timeouts, and worker concurrency.
+connector identity, current network, SSH backend, host-key policy, timeouts, worker concurrency, and
+an optional restricted peer-sync bind. `REMOTE_HOSTS_PEER_SYNC_BIND` on macOS and `PeerSyncBind` on
+Windows are empty by default.
 Local installation defaults to native `russh`, PTY backend mode `auto`, and a bounded operation
 worker pool. Connector bootstrap and restart readiness are implemented by the Rust CLI, so neither
 platform needs an external `sqlite3` executable for service management.

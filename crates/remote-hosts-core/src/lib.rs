@@ -34,6 +34,7 @@ pub use transport::{
 };
 pub use workspace::{WorkspaceCreateCommand, WorkspaceSupervisor, WorkspaceSupervisorError};
 pub use workspace_operation::{
-    WorkspaceFileTransfer, WorkspaceOperationError, WorkspaceOperationSupervisor,
-    WorkspaceRunCommand, WorkspaceRunPlan,
+    OperationCoordinationMode, WorkspaceFileTransfer, WorkspaceOperationError,
+    WorkspaceOperationSupervisor, WorkspaceRunCommand, WorkspaceRunPlan,
+    resolve_operation_coordination_scope,
 };

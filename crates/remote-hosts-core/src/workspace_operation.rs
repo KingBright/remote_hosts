@@ -4,12 +4,40 @@ use remote_hosts_domain::{
     AgentWorkspace, OperationId, OperationOutputChunk, OperationOutputChunkId, OperationRun,
     OperationState, OperationType, OutputStream, WorkspaceState, now_utc,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
     CommandClass, CommandProfile, CommandValidationError, FileTransferSpec,
     FileTransferValidationError, ProtectionDecision, SecretRedactor, ServerProtectionPolicy,
 };
+
+use crate::workspace::validate_coordination_scope;
+
+/// Caller-declared coordination behavior for an arbitrary command.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationCoordinationMode {
+    /// Infer coordination from the command profile for backward compatibility.
+    #[default]
+    Auto,
+    /// Caller attests that the command only observes state and needs no write lease.
+    ReadOnly,
+    /// Caller declares possible mutation and requires a scoped write lease.
+    Mutating,
+}
+
+impl OperationCoordinationMode {
+    /// Resolves whether a command must acquire a write lease.
+    #[must_use]
+    pub fn requires_write_lease(self, class: &CommandClass) -> bool {
+        match self {
+            Self::Auto => !matches!(class, CommandClass::ReadOnly),
+            Self::ReadOnly => false,
+            Self::Mutating => true,
+        }
+    }
+}
 
 /// Request to queue a command profile inside an existing workspace.
 #[derive(Clone, Debug)]
@@ -22,6 +50,10 @@ pub struct WorkspaceRunCommand {
     pub intent: Option<String>,
     /// Optional retry key scoped to the workspace's agent session.
     pub idempotency_key: Option<String>,
+    /// Explicit read/write coordination behavior. Defaults to profile-based inference.
+    pub coordination_mode: OperationCoordinationMode,
+    /// Optional operation-level scope, restricted to the Workspace scope or its descendants.
+    pub coordination_scope: Option<String>,
     /// Current queued operation count for the host.
     pub queued_operations: u32,
     /// Current active exec channel count for the host.
@@ -85,6 +117,9 @@ pub enum WorkspaceOperationError {
     /// Intent is empty or too large.
     #[error("operation intent must be 1..=240 visible characters when provided")]
     InvalidIntent,
+    /// Operation-level coordination scope is malformed or escapes the Workspace boundary.
+    #[error("operation coordination scope must be valid and remain within the Workspace scope")]
+    InvalidCoordinationScope,
 }
 
 /// Creates operation records under workspace and server protection policy.
@@ -130,6 +165,13 @@ impl WorkspaceOperationSupervisor {
 
         let now = now_utc();
         let operation_id = OperationId::new();
+        let requires_write_lease = command
+            .coordination_mode
+            .requires_write_lease(&command.command_profile.class);
+        let coordination_scope = resolve_operation_coordination_scope(
+            &command.workspace,
+            command.coordination_scope.as_deref(),
+        )?;
         let command_summary = if matches!(command.command_profile.class, CommandClass::Sensitive) {
             let script = command
                 .command_profile
@@ -157,9 +199,9 @@ impl WorkspaceOperationSupervisor {
             workspace_id: Some(command.workspace.id),
             agent_session_id: command.workspace.agent_session_id,
             idempotency_key: command.idempotency_key.clone(),
-            requires_write_lease: !matches!(command.command_profile.class, CommandClass::ReadOnly),
-            coordination_scope: command.workspace.coordination_scope.clone(),
-            operation_type: operation_type(&command.command_profile.class),
+            requires_write_lease,
+            coordination_scope,
+            operation_type: operation_type(&command.command_profile.class, requires_write_lease),
             intent,
             state: OperationState::Queued,
             started_at: now,
@@ -345,10 +387,40 @@ fn ensure_workspace_available(workspace: &AgentWorkspace) -> Result<(), Workspac
     Ok(())
 }
 
-fn operation_type(class: &CommandClass) -> OperationType {
-    match class {
-        CommandClass::ReadOnly => OperationType::ReadonlyExec,
-        CommandClass::Build | CommandClass::Sensitive => OperationType::Runbook,
+/// Resolves an operation-level scope without allowing it to escape the Workspace boundary.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceOperationError::InvalidCoordinationScope`] when the requested scope is
+/// malformed or is outside the Workspace's coordination boundary.
+pub fn resolve_operation_coordination_scope(
+    workspace: &AgentWorkspace,
+    requested: Option<&str>,
+) -> Result<String, WorkspaceOperationError> {
+    let scope = requested.unwrap_or(&workspace.coordination_scope);
+    validate_coordination_scope(scope)
+        .map_err(|_| WorkspaceOperationError::InvalidCoordinationScope)?;
+    let workspace_scope = workspace.coordination_scope.as_str();
+    let within_workspace = workspace_scope == "host"
+        || scope == workspace_scope
+        || scope
+            .strip_prefix(workspace_scope)
+            .is_some_and(|suffix| suffix.starts_with('/'));
+    if !within_workspace {
+        return Err(WorkspaceOperationError::InvalidCoordinationScope);
+    }
+    Ok(scope.to_owned())
+}
+
+fn operation_type(class: &CommandClass, requires_write_lease: bool) -> OperationType {
+    if requires_write_lease {
+        match class {
+            CommandClass::ReadOnly | CommandClass::Build | CommandClass::Sensitive => {
+                OperationType::Runbook
+            }
+        }
+    } else {
+        OperationType::ReadonlyExec
     }
 }
 
@@ -364,8 +436,8 @@ mod tests {
     };
 
     use super::{
-        WorkspaceFileTransfer, WorkspaceOperationError, WorkspaceOperationSupervisor,
-        WorkspaceRunCommand,
+        OperationCoordinationMode, WorkspaceFileTransfer, WorkspaceOperationError,
+        WorkspaceOperationSupervisor, WorkspaceRunCommand,
     };
 
     fn workspace(state: WorkspaceState) -> AgentWorkspace {
@@ -457,6 +529,8 @@ mod tests {
                 command_profile: profile,
                 intent: None,
                 idempotency_key: None,
+                coordination_mode: OperationCoordinationMode::Auto,
+                coordination_scope: None,
                 queued_operations: 0,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -490,6 +564,8 @@ mod tests {
                 command_profile: profile,
                 intent: None,
                 idempotency_key: None,
+                coordination_mode: OperationCoordinationMode::Auto,
+                coordination_scope: None,
                 queued_operations: 0,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -520,6 +596,8 @@ mod tests {
                 command_profile: profile,
                 intent: None,
                 idempotency_key: None,
+                coordination_mode: OperationCoordinationMode::Auto,
+                coordination_scope: None,
                 queued_operations: policy.max_operation_queue_depth_per_host,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -529,6 +607,77 @@ mod tests {
             .ok_or("queue should be full")?;
 
         assert!(matches!(error, WorkspaceOperationError::PolicyDenied(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_coordination_mode_controls_shell_write_leases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = ServerProtectionPolicy::default();
+        for (mode, expected) in [
+            (OperationCoordinationMode::Auto, true),
+            (OperationCoordinationMode::ReadOnly, false),
+            (OperationCoordinationMode::Mutating, true),
+        ] {
+            let profile = CommandProfileCatalog::resolve_builtin(
+                "shell.posix",
+                vec!["kubectl get pods".to_owned()],
+                &policy,
+            )?;
+            let plan = WorkspaceOperationSupervisor::new(policy.clone()).queue_operation(
+                &WorkspaceRunCommand {
+                    workspace: workspace(WorkspaceState::Idle),
+                    command_profile: profile,
+                    intent: Some("inspect cluster state".to_owned()),
+                    idempotency_key: None,
+                    coordination_mode: mode,
+                    coordination_scope: None,
+                    queued_operations: 0,
+                    active_exec_channels: 0,
+                    active_probe_jobs: 0,
+                    overload_cooldown_active: false,
+                },
+            )?;
+            assert_eq!(plan.operation.requires_write_lease, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn operation_scope_can_narrow_but_not_escape_workspace_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = ServerProtectionPolicy::default();
+        let profile = CommandProfileCatalog::resolve_builtin(
+            "shell.posix",
+            vec!["touch /tmp/result".to_owned()],
+            &policy,
+        )?;
+        let mut scoped_workspace = workspace(WorkspaceState::Idle);
+        scoped_workspace.coordination_scope = "service/api".to_owned();
+        let mut command = WorkspaceRunCommand {
+            workspace: scoped_workspace,
+            command_profile: profile,
+            intent: Some("update one api replica".to_owned()),
+            idempotency_key: None,
+            coordination_mode: OperationCoordinationMode::Mutating,
+            coordination_scope: Some("service/api/replica/one".to_owned()),
+            queued_operations: 0,
+            active_exec_channels: 0,
+            active_probe_jobs: 0,
+            overload_cooldown_active: false,
+        };
+        let plan = WorkspaceOperationSupervisor::new(policy.clone()).queue_operation(&command)?;
+        assert_eq!(plan.operation.coordination_scope, "service/api/replica/one");
+
+        command.coordination_scope = Some("service/database".to_owned());
+        let error = WorkspaceOperationSupervisor::new(policy)
+            .queue_operation(&command)
+            .err()
+            .ok_or("sibling scope must not escape the Workspace boundary")?;
+        assert!(matches!(
+            error,
+            WorkspaceOperationError::InvalidCoordinationScope
+        ));
         Ok(())
     }
 }

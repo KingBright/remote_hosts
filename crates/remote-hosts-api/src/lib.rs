@@ -17,8 +17,8 @@ use axum::{
 };
 use remote_hosts_core::{
     AccessCandidate, AccessResolutionError, AccessResolver, CommandProfileCatalog,
-    ConnectorStateTracker, HostStateAggregator, HostStateInput, ProtectionDecision,
-    PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionOpenCommand,
+    ConnectorStateTracker, HostStateAggregator, HostStateInput, OperationCoordinationMode,
+    ProtectionDecision, PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionOpenCommand,
     PtySessionSupervisor, PtySessionSupervisorError, SecretRedactor, WorkspaceCreateCommand,
     WorkspaceOperationError, WorkspaceOperationSupervisor, WorkspaceRunCommand,
     WorkspaceSupervisor, WorkspaceSupervisorError,
@@ -33,6 +33,9 @@ use remote_hosts_domain::{
     StateSnapshot, StoredCredential, TopologyEdge, TopologyEdgeId, TopologyNode, TopologyNodeId,
     TopologyNodeKind, TopologyNodeStatus, TopologyRelation, TopologySyncRun, TopologySyncRunId,
     WorkspaceId, WorkspaceState, now_utc,
+};
+use remote_hosts_sync::{
+    InstanceSyncExportRequest, InstanceSyncService, PEER_TOKEN_HEADER, token_sha256,
 };
 use remote_hosts_vault::{CredentialSecret, CredentialVault};
 use secrecy::SecretString;
@@ -87,6 +90,9 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route("/healthz", get(healthz_state))
         .route("/v1/health", get(healthz_state))
         .route("/v1/hosts", get(list_hosts))
+        .route("/v1/instance-sync/identity", get(instance_sync_identity))
+        .route("/v1/instance-sync/export", post(export_instance_sync))
+        .route("/v1/instance-sync/receive", post(receive_instance_sync))
         .route("/v1/topology", get(get_topology))
         .route("/v1/topology/sync", post(sync_topology))
         .route(
@@ -176,6 +182,21 @@ pub fn router_with_state(state: ApiState) -> Router {
         .with_state(state)
 }
 
+/// Builds the restricted direct peer-sync router.
+///
+/// This route set is safe to bind separately from the local operator API because it has no
+/// credential, topology-credential, Workspace, PTY, or administration endpoints.
+pub fn peer_sync_router_with_state(state: ApiState) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz_state))
+        .route("/v1/health", get(healthz_state))
+        .route("/v1/instance-sync/identity", get(instance_sync_identity))
+        .route("/v1/instance-sync/export", post(export_instance_sync))
+        .route("/v1/instance-sync/receive", post(receive_instance_sync))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
 /// Serves the HTTP API.
 ///
 /// # Errors
@@ -186,12 +207,99 @@ pub async fn serve(addr: SocketAddr, state: ApiState) -> Result<(), std::io::Err
     axum::serve(listener, router_with_state(state)).await
 }
 
+/// Serves only the direct instance-sync endpoints.
+///
+/// # Errors
+///
+/// Returns an error if binding the listener or serving the restricted API fails.
+pub async fn serve_peer_sync(addr: SocketAddr, state: ApiState) -> Result<(), std::io::Error> {
+    let listener = TcpListener::bind(addr).await?;
+    axum::serve(listener, peer_sync_router_with_state(state)).await
+}
+
 async fn healthz() -> Json<HealthResponse> {
     Json(health_response())
 }
 
 async fn healthz_state(State(_state): State<ApiState>) -> Json<HealthResponse> {
     Json(health_response())
+}
+
+async fn instance_sync_identity(
+    State(state): State<ApiState>,
+) -> Result<Json<remote_hosts_domain::InstanceIdentity>, ApiError> {
+    let service = instance_sync_service(&state)?;
+    Ok(Json(
+        service
+            .identity()
+            .await
+            .map_err(|error| ApiError::Sync(error.to_string()))?,
+    ))
+}
+
+async fn export_instance_sync(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<InstanceSyncExportRequest>,
+) -> Result<Json<remote_hosts_domain::InstanceSyncEnvelope>, ApiError> {
+    let (service, peer) = authenticated_sync_peer(&state, &headers).await?;
+    let requested = request
+        .collections
+        .into_iter()
+        .filter(|collection| peer.allowed_collections.contains(collection))
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Err(ApiError::BadRequest(
+            "requested collections are not approved for this peer".to_owned(),
+        ));
+    }
+    Ok(Json(
+        service
+            .export_for_peer(&peer, &requested, request.recipient_instance_id)
+            .await
+            .map_err(|error| ApiError::Sync(error.to_string()))?,
+    ))
+}
+
+async fn receive_instance_sync(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(envelope): Json<remote_hosts_domain::InstanceSyncEnvelope>,
+) -> Result<Json<remote_hosts_domain::InstanceSyncResult>, ApiError> {
+    let (service, peer) = authenticated_sync_peer(&state, &headers).await?;
+    Ok(Json(
+        service
+            .receive(&peer, envelope)
+            .await
+            .map_err(|error| ApiError::Sync(error.to_string()))?,
+    ))
+}
+
+async fn authenticated_sync_peer(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> Result<(InstanceSyncService, remote_hosts_domain::InstancePeer), ApiError> {
+    let token = headers
+        .get(PEER_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError::Unauthorized)?;
+    let peer = state
+        .repositories
+        .instance_sync
+        .get_active_peer_by_inbound_token_sha256(&token_sha256(token))
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    let service = instance_sync_service(state)?;
+    Ok((service, peer))
+}
+
+fn instance_sync_service(state: &ApiState) -> Result<InstanceSyncService, ApiError> {
+    InstanceSyncService::with_vault_master_password(
+        (*state.repositories).clone(),
+        state.vault_master_password.as_deref().cloned(),
+    )
+    .map_err(|error| ApiError::Sync(error.to_string()))
 }
 
 fn health_response() -> HealthResponse {
@@ -1148,16 +1256,7 @@ async fn run_workspace_operation(
 ) -> Result<(StatusCode, Json<RunWorkspaceOperationResponse>), ApiError> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
     let wait_timeout_ms = request.wait_timeout_ms;
-    let mut response = queue_workspace_operation(
-        &state,
-        workspace_id,
-        &request.command_profile,
-        request.args,
-        request.intent,
-        request.timeout_seconds,
-        request.output_limit_bytes,
-    )
-    .await?;
+    let mut response = queue_workspace_operation(&state, workspace_id, request).await?;
     if let Some(wait_timeout_ms) = wait_timeout_ms {
         response.completion = Some(
             wait_for_workspace_operation(
@@ -1667,12 +1766,18 @@ async fn reap_expired_pty_sessions(
 async fn queue_workspace_operation(
     state: &ApiState,
     workspace_id: WorkspaceId,
-    command_profile: &str,
-    args: Vec<String>,
-    intent: Option<String>,
-    timeout_seconds: Option<u64>,
-    output_limit_bytes: Option<usize>,
+    request: RunWorkspaceOperationRequest,
 ) -> Result<RunWorkspaceOperationResponse, ApiError> {
+    let RunWorkspaceOperationRequest {
+        command_profile,
+        args,
+        intent,
+        coordination_mode,
+        coordination_scope,
+        timeout_seconds,
+        output_limit_bytes,
+        wait_timeout_ms: _,
+    } = request;
     let workspace = state
         .repositories
         .workspaces
@@ -1680,7 +1785,7 @@ async fn queue_workspace_operation(
         .await?
         .ok_or(ApiError::NotFound)?;
     let policy = remote_hosts_core::ServerProtectionPolicy::default();
-    let mut profile = CommandProfileCatalog::resolve_builtin(command_profile, args, &policy)
+    let mut profile = CommandProfileCatalog::resolve_builtin(&command_profile, args, &policy)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     if let Some(timeout_seconds) = timeout_seconds {
         profile.timeout_seconds = timeout_seconds;
@@ -1706,6 +1811,8 @@ async fn queue_workspace_operation(
         command_profile: profile,
         intent,
         idempotency_key: None,
+        coordination_mode: coordination_mode.unwrap_or_default(),
+        coordination_scope,
         queued_operations,
         active_exec_channels,
         active_probe_jobs: 0,
@@ -2473,6 +2580,10 @@ pub struct RunWorkspaceOperationRequest {
     pub args: Vec<String>,
     /// Optional operation intent.
     pub intent: Option<String>,
+    /// `read_only` skips write leasing, `mutating` requires it, and `auto` preserves legacy inference.
+    pub coordination_mode: Option<OperationCoordinationMode>,
+    /// Optional operation-level scope within the Workspace coordination scope.
+    pub coordination_scope: Option<String>,
     /// Optional timeout override in seconds. Shell profiles allow up to 7200.
     pub timeout_seconds: Option<u64>,
     /// Optional captured output limit override in bytes, up to 8 MiB.
@@ -2603,6 +2714,12 @@ pub enum ApiError {
     /// Request is invalid.
     #[error("{0}")]
     BadRequest(String),
+    /// Peer-sync authentication failed without revealing which part was invalid.
+    #[error("instance-sync peer authentication failed")]
+    Unauthorized,
+    /// Instance-sync protocol or transport processing failed.
+    #[error("{0}")]
+    Sync(String),
     /// Credential writes require a configured local vault key.
     #[error("credential vault is locked; configure --vault-master-password-file")]
     VaultUnavailable,
@@ -2632,16 +2749,19 @@ impl IntoResponse for ApiError {
         let status = match &self {
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::WorkspaceSupervisor(WorkspaceSupervisorError::PolicyDenied(_))
             | Self::WorkspaceCapacity(_)
             | Self::WorkspaceOperation(WorkspaceOperationError::PolicyDenied(_))
             | Self::PtySessionSupervisor(PtySessionSupervisorError::PolicyDenied(_)) => {
                 StatusCode::TOO_MANY_REQUESTS
             }
-            Self::InvalidId(_) | Self::BadRequest(_) | Self::WorkspaceSupervisor(_) => {
-                StatusCode::BAD_REQUEST
-            }
-            Self::WorkspaceOperation(_) | Self::PtySessionSupervisor(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidId(_)
+            | Self::BadRequest(_)
+            | Self::Sync(_)
+            | Self::WorkspaceSupervisor(_)
+            | Self::WorkspaceOperation(_)
+            | Self::PtySessionSupervisor(_) => StatusCode::BAD_REQUEST,
             Self::AccessResolution(error)
                 if matches!(
                     error.state,
@@ -2685,7 +2805,12 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
-    use super::{ApiState, activity_operation_item, router_with_state};
+    use remote_hosts_sync::InstanceSyncService;
+    use remote_hosts_vault::{CredentialSecret, CredentialVault};
+
+    use super::{
+        ApiState, activity_operation_item, peer_sync_router_with_state, router_with_state,
+    };
 
     #[test]
     fn activity_item_exposes_a_redacted_script_without_private_execution_profile()
@@ -3134,6 +3259,8 @@ mod tests {
                             "command_profile": "host.uptime",
                             "args": [],
                             "intent": "check whether the host is responsive",
+                            "coordination_mode": "mutating",
+                            "coordination_scope": "service/status",
                             "wait_timeout_ms": 0
                         })
                         .to_string(),
@@ -3144,6 +3271,11 @@ mod tests {
         let bytes = body::to_bytes(run_response.into_body(), usize::MAX).await?;
         let run_body: serde_json::Value = serde_json::from_slice(&bytes)?;
         assert_eq!(run_body["operation"]["state"], "queued");
+        assert_eq!(run_body["operation"]["requires_write_lease"], true);
+        assert_eq!(
+            run_body["operation"]["coordination_scope"],
+            "service/status"
+        );
         assert_eq!(run_body["workspace"]["state"], "working");
         assert_eq!(run_body["completion"]["completed"], false);
         assert_eq!(run_body["completion"]["operation"]["state"], "queued");
@@ -3876,6 +4008,250 @@ mod tests {
         assert_eq!(
             locked_response.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn instance_sync_receive_requires_peer_token_and_accepts_an_approved_envelope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&pool).await?;
+        let repositories = Repositories::new(pool);
+        let now = now_utc();
+        repositories
+            .hosts
+            .insert(&Host {
+                id: HostId::new(),
+                name: "instance-sync-test".to_owned(),
+                display_name: "Instance Sync Test".to_owned(),
+                kind: HostKind::Linux,
+                owner: None,
+                tags: vec!["sync".to_owned()],
+                description: None,
+                risk_level: RiskLevel::Development,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        let master = SecretString::from("instance-sync-api-test-master".to_owned());
+        let service = InstanceSyncService::with_vault_master_password(
+            repositories.clone(),
+            Some(master.clone()),
+        )?;
+        let token = "instance-sync-api-test-token";
+        service
+            .configure_peer(
+                "loopback-peer".to_owned(),
+                "http://127.0.0.1:8787".to_owned(),
+                SecretString::from(token.to_owned()),
+                vec![remote_hosts_domain::InstanceSyncCollection::Inventory],
+            )
+            .await?;
+        let envelope = service
+            .export(
+                &[remote_hosts_domain::InstanceSyncCollection::Inventory],
+                None,
+            )
+            .await?;
+        let app = peer_sync_router_with_state(ApiState::new(repositories));
+        let absent_admin = app
+            .clone()
+            .oneshot(Request::builder().uri("/admin").body(body::Body::empty())?)
+            .await?;
+        assert_eq!(absent_admin.status(), axum::http::StatusCode::NOT_FOUND);
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/instance-sync/receive")
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(serde_json::to_vec(&envelope)?))?,
+            )
+            .await?;
+        assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/instance-sync/receive")
+                    .header("content-type", "application/json")
+                    .header(remote_hosts_sync::PEER_TOKEN_HEADER, token)
+                    .body(body::Body::from(serde_json::to_vec(&envelope)?))?,
+            )
+            .await?;
+        assert_eq!(accepted.status(), axum::http::StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn instance_sync_pushes_through_the_restricted_peer_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sender_pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&sender_pool).await?;
+        let sender_repositories = Repositories::new(sender_pool);
+        let receiver_pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&receiver_pool).await?;
+        let receiver_repositories = Repositories::new(receiver_pool);
+        let sender_master = SecretString::from("instance-sync-http-sender-master".to_owned());
+        let receiver_master = SecretString::from("instance-sync-http-receiver-master".to_owned());
+        let sender = InstanceSyncService::with_vault_master_password(
+            sender_repositories.clone(),
+            Some(sender_master.clone()),
+        )?;
+        let receiver = InstanceSyncService::with_vault_master_password(
+            receiver_repositories.clone(),
+            Some(receiver_master.clone()),
+        )?;
+        let pairing_token = "instance-sync-http-test-token";
+        receiver
+            .configure_peer(
+                "sender".to_owned(),
+                "http://127.0.0.1:1".to_owned(),
+                SecretString::from(pairing_token.to_owned()),
+                vec![remote_hosts_domain::InstanceSyncCollection::Credentials],
+            )
+            .await?;
+        let source_host = Host {
+            id: HostId::new(),
+            name: "http-sync-source".to_owned(),
+            display_name: "HTTP Sync Source".to_owned(),
+            kind: HostKind::Linux,
+            owner: None,
+            tags: vec!["instance-sync".to_owned()],
+            description: Some("synchronized through the restricted listener".to_owned()),
+            risk_level: RiskLevel::Development,
+            created_at: now_utc(),
+            updated_at: now_utc(),
+        };
+        sender_repositories.hosts.insert(&source_host).await?;
+        let sender_environment = Environment {
+            id: EnvironmentId::new(),
+            name: "sender-sync-environment".to_owned(),
+            kind: EnvironmentKind::HomeLan,
+            description: None,
+            trust_level: TrustLevel::Owned,
+            notes: None,
+        };
+        sender_repositories
+            .environments
+            .insert(&sender_environment)
+            .await?;
+        let source_secret = CredentialSecret {
+            password: Some("api-sync-password".to_owned()),
+            private_key_pem: None,
+            private_key_passphrase: None,
+            sudo_password: Some("api-sync-sudo-password".to_owned()),
+            token: None,
+            secret_text: None,
+            use_ssh_agent: false,
+        };
+        let source_credential = StoredCredential {
+            metadata: CredentialMetadata {
+                id: CredentialId::new(),
+                name: "api-sync-source-credential".to_owned(),
+                kind: CredentialKind::SshPassword,
+                username_hint: Some("ops".to_owned()),
+                created_at: now_utc(),
+                updated_at: now_utc(),
+                last_used_at: None,
+            },
+            encrypted_blob_json: serde_json::to_value(CredentialVault::encrypt(
+                &sender_master,
+                &source_secret,
+            )?)?,
+        };
+        sender_repositories
+            .credentials
+            .insert(&source_credential)
+            .await?;
+        sender_repositories
+            .access_paths
+            .insert(&AccessPath {
+                id: AccessPathId::new(),
+                host_id: source_host.id,
+                environment_id: sender_environment.id,
+                connector_id: None,
+                protocol: Protocol::Ssh,
+                address: "192.0.2.10".to_owned(),
+                port: 22,
+                username: "ops".to_owned(),
+                credential_id: source_credential.metadata.id,
+                route_type: RouteType::Lan,
+                proxy_chain: Vec::new(),
+                priority: 0,
+                enabled: true,
+                connection_mode: ConnectionMode::Pooled,
+                idle_ttl_seconds: 300,
+                keepalive_seconds: 30,
+                max_concurrent_channels: 4,
+                max_new_connections_per_minute: 4,
+                requires_tty: false,
+                notes: None,
+            })
+            .await?;
+        receiver_repositories
+            .environments
+            .insert(&Environment {
+                id: EnvironmentId::new(),
+                name: "receiver-sync-environment".to_owned(),
+                kind: EnvironmentKind::HomeLan,
+                description: None,
+                trust_level: TrustLevel::Owned,
+                notes: None,
+            })
+            .await?;
+        let receiver_api_state = ApiState::with_vault_master_password(
+            receiver_repositories.clone(),
+            receiver_master.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, peer_sync_router_with_state(receiver_api_state)).await
+        });
+        let peer = sender
+            .configure_peer(
+                "receiver".to_owned(),
+                endpoint,
+                SecretString::from(pairing_token.to_owned()),
+                vec![remote_hosts_domain::InstanceSyncCollection::Credentials],
+            )
+            .await?;
+
+        let report = sender.push(peer.id).await?;
+        server.abort();
+
+        assert_eq!(report.sent, 2);
+        assert_eq!(report.result.applied, 2);
+        assert_eq!(report.result.rejected, 0);
+        let imported_host = receiver_repositories
+            .hosts
+            .get_by_name(&source_host.name)
+            .await?
+            .ok_or("synchronized host missing")?;
+        let imported_path = receiver_repositories
+            .access_paths
+            .list_for_host(imported_host.id)
+            .await?
+            .pop()
+            .ok_or("synchronized access path missing")?;
+        let imported_credential = receiver_repositories
+            .credentials
+            .get(imported_path.credential_id)
+            .await?
+            .ok_or("synchronized credential missing")?;
+        let imported_blob = serde_json::from_value(imported_credential.encrypted_blob_json)?;
+        let imported_secret = CredentialVault::decrypt(&receiver_master, &imported_blob)?;
+        assert_eq!(
+            imported_secret.password.as_deref(),
+            Some("api-sync-password")
+        );
+        assert_eq!(
+            imported_secret.sudo_password.as_deref(),
+            Some("api-sync-sudo-password")
         );
         Ok(())
     }

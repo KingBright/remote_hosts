@@ -7,13 +7,15 @@ use remote_hosts_domain::{
     AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason, AuthorizedKeyBootstrapState,
     ClaimedPtyInputEvent, ConnectionSession, Connector, ConnectorId, CredentialBinding,
     CredentialBindingView, CredentialId, CredentialKind, CredentialMetadata, EntityState,
-    Environment, EnvironmentId, Host, HostFact, HostId, HostWriteLease, KnowledgeItem, OperationId,
-    OperationOutputArtifact, OperationOutputArtifactId, OperationOutputChunk, OperationRun,
-    OperationState, PtyBackendCapabilities, PtyBackendState, PtyInputEvent, PtyInputEventId,
-    PtyInputEventState, PtyOutputChunk, PtySession, PtySessionId, SequencedStateEvent, SessionId,
-    SoftwareInstall, SshChannelTransportEvidence, SshTransportRuntime, SshTransportRuntimeId,
-    SshTransportRuntimeState, StateEvent, StateReasonCode, StoredCredential, TopologyEdge,
-    TopologyNode, TopologyNodeId, TopologySyncRun, TopologySyncRunId, WorkspaceId, WorkspaceState,
+    Environment, EnvironmentId, Host, HostFact, HostId, HostWriteLease, InstanceIdentity,
+    InstancePeer, InstancePeerId, InstancePeerState, InstanceSyncCollection, InstanceSyncConflict,
+    KnowledgeItem, OperationId, OperationOutputArtifact, OperationOutputArtifactId,
+    OperationOutputChunk, OperationRun, OperationState, PtyBackendCapabilities, PtyBackendState,
+    PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyOutputChunk, PtySession, PtySessionId,
+    SequencedStateEvent, SessionId, SoftwareInstall, SshChannelTransportEvidence,
+    SshTransportRuntime, SshTransportRuntimeId, SshTransportRuntimeState, StateEvent,
+    StateReasonCode, StoredCredential, TopologyEdge, TopologyNode, TopologyNodeId, TopologySyncRun,
+    TopologySyncRunId, WorkspaceId, WorkspaceState,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -240,6 +242,8 @@ pub struct Repositories {
     pub topology: TopologyRepository,
     /// Links topology resources to encrypted credentials.
     pub credential_bindings: CredentialBindingRepository,
+    /// Instance identity and approved peer-sync state.
+    pub instance_sync: InstanceSyncRepository,
 }
 
 impl Repositories {
@@ -269,7 +273,8 @@ impl Repositories {
             knowledge: KnowledgeItemRepository::new(pool.clone()),
             state_events: StateEventRepository::new(pool.clone()),
             topology: TopologyRepository::new(pool.clone()),
-            credential_bindings: CredentialBindingRepository::new(pool),
+            credential_bindings: CredentialBindingRepository::new(pool.clone()),
+            instance_sync: InstanceSyncRepository::new(pool),
         }
     }
 
@@ -5455,6 +5460,89 @@ impl KnowledgeItemRepository {
         .await?;
         rows.iter().map(row_to_knowledge_item).collect()
     }
+
+    /// Inserts or updates a knowledge item and rebuilds its corresponding FTS row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the database rejects the transaction.
+    pub async fn upsert(&self, item: &KnowledgeItem) -> Result<(), DbError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            r"
+            INSERT INTO knowledge_items (
+                id, title, body, source_json, linked_host_ids_json,
+                linked_access_path_ids_json, linked_software_ids_json, linked_operation_ids_json,
+                tags_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title, body = excluded.body, source_json = excluded.source_json,
+                linked_host_ids_json = excluded.linked_host_ids_json,
+                linked_access_path_ids_json = excluded.linked_access_path_ids_json,
+                linked_software_ids_json = excluded.linked_software_ids_json,
+                linked_operation_ids_json = excluded.linked_operation_ids_json,
+                tags_json = excluded.tags_json, updated_at = excluded.updated_at
+            ",
+        )
+        .bind(item.id.to_string())
+        .bind(&item.title)
+        .bind(&item.body)
+        .bind(to_json(&item.source)?)
+        .bind(to_json(&ids_to_strings(&item.linked_host_ids))?)
+        .bind(to_json(&ids_to_strings(&item.linked_access_path_ids))?)
+        .bind(to_json(&ids_to_strings(&item.linked_software_ids))?)
+        .bind(to_json(&ids_to_strings(&item.linked_operation_ids))?)
+        .bind(to_json(&item.tags)?)
+        .bind(item.created_at)
+        .bind(item.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM knowledge_items_fts WHERE rowid = (SELECT rowid FROM knowledge_items WHERE id = ?)",
+        )
+        .bind(item.id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO knowledge_items_fts(rowid, title, body, tags) VALUES ((SELECT rowid FROM knowledge_items WHERE id = ?), ?, ?, ?)",
+        )
+        .bind(item.id.to_string())
+        .bind(&item.title)
+        .bind(&item.body)
+        .bind(item.tags.join(" "))
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Gets one knowledge item by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn get(
+        &self,
+        id: remote_hosts_domain::KnowledgeItemId,
+    ) -> Result<Option<KnowledgeItem>, DbError> {
+        let row = sqlx::query("SELECT * FROM knowledge_items WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_knowledge_item).transpose()
+    }
+
+    /// Lists every knowledge item in deterministic update order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list(&self) -> Result<Vec<KnowledgeItem>, DbError> {
+        let rows = sqlx::query("SELECT * FROM knowledge_items ORDER BY updated_at ASC, id ASC")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_knowledge_item).collect()
+    }
 }
 
 fn compile_knowledge_fts_query(query: &str) -> Option<String> {
@@ -6033,6 +6121,54 @@ fn row_to_host(row: &SqliteRow) -> Result<Host, DbError> {
         risk_level: from_json_col(row, "risk_level_json")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn row_to_instance_identity(row: &SqliteRow) -> Result<InstanceIdentity, DbError> {
+    Ok(InstanceIdentity {
+        instance_id: uuid::Uuid::parse_str(row.try_get::<&str, _>("instance_id")?)?,
+        display_name: row.try_get("display_name")?,
+        protocol_version: u16::try_from(row.try_get::<i64, _>("protocol_version")?)?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn row_to_instance_peer(row: &SqliteRow) -> Result<InstancePeer, DbError> {
+    let peer_instance_id = row
+        .try_get::<Option<String>, _>("peer_instance_id")?
+        .as_deref()
+        .map(uuid::Uuid::parse_str)
+        .transpose()?;
+    Ok(InstancePeer {
+        id: parse_id(row, "id")?,
+        peer_instance_id,
+        display_name: row.try_get("display_name")?,
+        endpoint: row.try_get("endpoint")?,
+        outbound_credential_id: parse_id(row, "outbound_credential_id")?,
+        inbound_token_sha256: row.try_get("inbound_token_sha256")?,
+        allowed_collections: from_json_col(row, "allowed_collections_json")?,
+        state: from_json_col::<InstancePeerState>(row, "state_json")?,
+        last_pushed_at: row.try_get("last_pushed_at")?,
+        last_pulled_at: row.try_get("last_pulled_at")?,
+        last_error: row.try_get("last_error")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn row_to_instance_sync_conflict(row: &SqliteRow) -> Result<InstanceSyncConflict, DbError> {
+    Ok(InstanceSyncConflict {
+        id: uuid::Uuid::parse_str(row.try_get::<&str, _>("id")?)?,
+        origin_instance_id: uuid::Uuid::parse_str(row.try_get::<&str, _>("origin_instance_id")?)?,
+        collection: from_json_col(row, "collection_json")?,
+        entity_type: row.try_get("entity_type")?,
+        entity_key: row.try_get("entity_key")?,
+        local_updated_at: row.try_get("local_updated_at")?,
+        remote_updated_at: row.try_get("remote_updated_at")?,
+        local_payload_sha256: row.try_get("local_payload_sha256")?,
+        remote_payload_sha256: row.try_get("remote_payload_sha256")?,
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -8312,6 +8448,347 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].new_state, EntityState::Connected);
 
+        Ok(())
+    }
+}
+
+/// Repository for the local instance identity and direct peer-sync bookkeeping.
+#[derive(Clone)]
+pub struct InstanceSyncRepository {
+    pool: SqlitePool,
+}
+
+impl InstanceSyncRepository {
+    /// Creates a repository.
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Gets the local identity when initialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn get_identity(&self) -> Result<Option<InstanceIdentity>, DbError> {
+        let row = sqlx::query(
+            "SELECT instance_id, display_name, protocol_version, created_at, updated_at FROM instance_identity WHERE singleton = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_instance_identity).transpose()
+    }
+
+    /// Gets the identity or creates it exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the identity cannot be read or inserted.
+    pub async fn get_or_create_identity(
+        &self,
+        display_name: &str,
+        now: OffsetDateTime,
+    ) -> Result<InstanceIdentity, DbError> {
+        if let Some(identity) = self.get_identity().await? {
+            return Ok(identity);
+        }
+        let identity = InstanceIdentity {
+            instance_id: uuid::Uuid::now_v7(),
+            display_name: display_name.to_owned(),
+            protocol_version: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        sqlx::query(
+            r"
+            INSERT INTO instance_identity (
+                singleton, instance_id, display_name, protocol_version, created_at, updated_at
+            ) VALUES (1, ?, ?, ?, ?, ?)
+            ON CONFLICT(singleton) DO NOTHING
+            ",
+        )
+        .bind(identity.instance_id.to_string())
+        .bind(&identity.display_name)
+        .bind(i64::from(identity.protocol_version))
+        .bind(identity.created_at)
+        .bind(identity.updated_at)
+        .execute(&self.pool)
+        .await?;
+        self.get_identity().await?.ok_or_else(|| {
+            DbError::InvalidOutputSegment("instance identity disappeared".to_owned())
+        })
+    }
+
+    /// Lists peer records in display-name order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_peers(&self) -> Result<Vec<InstancePeer>, DbError> {
+        let rows = sqlx::query("SELECT * FROM instance_sync_peers ORDER BY display_name")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_instance_peer).collect()
+    }
+
+    /// Gets a peer by local id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn get_peer(&self, id: InstancePeerId) -> Result<Option<InstancePeer>, DbError> {
+        let row = sqlx::query("SELECT * FROM instance_sync_peers WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_instance_peer).transpose()
+    }
+
+    /// Gets a peer by its stable local display label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn get_peer_by_display_name(
+        &self,
+        display_name: &str,
+    ) -> Result<Option<InstancePeer>, DbError> {
+        let row = sqlx::query("SELECT * FROM instance_sync_peers WHERE display_name = ?")
+            .bind(display_name)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_instance_peer).transpose()
+    }
+
+    /// Gets an active peer accepting the supplied inbound token digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn get_active_peer_by_inbound_token_sha256(
+        &self,
+        token_sha256: &str,
+    ) -> Result<Option<InstancePeer>, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT * FROM instance_sync_peers
+            WHERE inbound_token_sha256 = ? AND state_json = ?
+            ",
+        )
+        .bind(token_sha256)
+        .bind(to_json(&InstancePeerState::Active)?)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_instance_peer).transpose()
+    }
+
+    /// Inserts or updates an approved peer by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the database rejects the write.
+    pub async fn upsert_peer(&self, peer: &InstancePeer) -> Result<(), DbError> {
+        sqlx::query(
+            r"
+            INSERT INTO instance_sync_peers (
+                id, peer_instance_id, display_name, endpoint, outbound_credential_id,
+                inbound_token_sha256, allowed_collections_json, state_json, last_pushed_at,
+                last_pulled_at, last_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                peer_instance_id = excluded.peer_instance_id,
+                display_name = excluded.display_name,
+                endpoint = excluded.endpoint,
+                outbound_credential_id = excluded.outbound_credential_id,
+                inbound_token_sha256 = excluded.inbound_token_sha256,
+                allowed_collections_json = excluded.allowed_collections_json,
+                state_json = excluded.state_json,
+                last_pushed_at = excluded.last_pushed_at,
+                last_pulled_at = excluded.last_pulled_at,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            ",
+        )
+        .bind(peer.id.to_string())
+        .bind(peer.peer_instance_id.map(|id| id.to_string()))
+        .bind(&peer.display_name)
+        .bind(&peer.endpoint)
+        .bind(peer.outbound_credential_id.to_string())
+        .bind(&peer.inbound_token_sha256)
+        .bind(to_json(&peer.allowed_collections)?)
+        .bind(to_json(&peer.state)?)
+        .bind(peer.last_pushed_at)
+        .bind(peer.last_pulled_at)
+        .bind(&peer.last_error)
+        .bind(peer.created_at)
+        .bind(peer.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Records an idempotency receipt. `true` means this payload was already received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying fails.
+    pub async fn has_receipt(
+        &self,
+        origin_instance_id: uuid::Uuid,
+        collection: InstanceSyncCollection,
+        entity_type: &str,
+        entity_key: &str,
+        payload_sha256: &str,
+    ) -> Result<bool, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT 1 FROM instance_sync_receipts
+            WHERE origin_instance_id = ? AND collection_json = ? AND entity_type = ?
+              AND entity_key = ? AND payload_sha256 = ?
+            ",
+        )
+        .bind(origin_instance_id.to_string())
+        .bind(to_json(&collection)?)
+        .bind(entity_type)
+        .bind(entity_key)
+        .bind(payload_sha256)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Records a successfully applied or conflict-suppressed source payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the database rejects the write.
+    pub async fn insert_receipt(
+        &self,
+        origin_instance_id: uuid::Uuid,
+        collection: InstanceSyncCollection,
+        entity_type: &str,
+        entity_key: &str,
+        payload_sha256: &str,
+        received_at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r"
+            INSERT OR IGNORE INTO instance_sync_receipts (
+                origin_instance_id, collection_json, entity_type, entity_key, payload_sha256, received_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(origin_instance_id.to_string())
+        .bind(to_json(&collection)?)
+        .bind(entity_type)
+        .bind(entity_key)
+        .bind(payload_sha256)
+        .bind(received_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Saves the local identity selected for a remote entity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the mapping cannot be persisted.
+    pub async fn upsert_entity_mapping(
+        &self,
+        origin_instance_id: uuid::Uuid,
+        entity_type: &str,
+        remote_entity_key: &str,
+        local_entity_key: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r"
+            INSERT INTO instance_sync_entity_mappings (
+                origin_instance_id, entity_type, remote_entity_key, local_entity_key, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(origin_instance_id, entity_type, remote_entity_key) DO UPDATE SET
+                local_entity_key = excluded.local_entity_key,
+                updated_at = excluded.updated_at
+            ",
+        )
+        .bind(origin_instance_id.to_string())
+        .bind(entity_type)
+        .bind(remote_entity_key)
+        .bind(local_entity_key)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Resolves one previously imported remote entity to its local identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying fails.
+    pub async fn get_entity_mapping(
+        &self,
+        origin_instance_id: uuid::Uuid,
+        entity_type: &str,
+        remote_entity_key: &str,
+    ) -> Result<Option<String>, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT local_entity_key FROM instance_sync_entity_mappings
+            WHERE origin_instance_id = ? AND entity_type = ? AND remote_entity_key = ?
+            ",
+        )
+        .bind(origin_instance_id.to_string())
+        .bind(entity_type)
+        .bind(remote_entity_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|value| value.try_get("local_entity_key"))
+            .transpose()?)
+    }
+
+    /// Lists visible conflicts, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_conflicts(&self, limit: u32) -> Result<Vec<InstanceSyncConflict>, DbError> {
+        let rows =
+            sqlx::query("SELECT * FROM instance_sync_conflicts ORDER BY created_at DESC LIMIT ?")
+                .bind(u32_to_i64(limit))
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(row_to_instance_sync_conflict).collect()
+    }
+
+    /// Persists a visible conflict record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the database rejects the write.
+    pub async fn insert_conflict(&self, conflict: &InstanceSyncConflict) -> Result<(), DbError> {
+        sqlx::query(
+            r"
+            INSERT INTO instance_sync_conflicts (
+                id, origin_instance_id, collection_json, entity_type, entity_key, local_updated_at,
+                remote_updated_at, local_payload_sha256, remote_payload_sha256, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(conflict.id.to_string())
+        .bind(conflict.origin_instance_id.to_string())
+        .bind(to_json(&conflict.collection)?)
+        .bind(&conflict.entity_type)
+        .bind(&conflict.entity_key)
+        .bind(conflict.local_updated_at)
+        .bind(conflict.remote_updated_at)
+        .bind(&conflict.local_payload_sha256)
+        .bind(&conflict.remote_payload_sha256)
+        .bind(conflict.created_at)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }

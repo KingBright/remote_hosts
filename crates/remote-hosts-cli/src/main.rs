@@ -146,6 +146,9 @@ enum Command {
         /// Bind address.
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
+        /// Optional direct peer-sync bind. It exposes only identity and authenticated instance-sync routes.
+        #[arg(long, env = "REMOTE_HOSTS_PEER_SYNC_BIND")]
+        peer_sync_bind: Option<SocketAddr>,
         /// Local vault master password file required for credential writes in the admin UI.
         #[arg(long, env = "REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE")]
         vault_master_password_file: Option<PathBuf>,
@@ -437,23 +440,37 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             database_url,
             bind,
+            peer_sync_bind,
             vault_master_password_file,
         } => {
             let repositories = connect_repositories(&database_url).await?;
             let vault_master_password =
                 read_optional_vault_master_password(vault_master_password_file.as_ref())?;
             ensure_safe_api_bind(bind, vault_master_password.is_some())?;
+            if peer_sync_bind.is_some_and(|peer_bind| peer_bind == bind) {
+                anyhow::bail!(
+                    "peer-sync bind must differ from the full local API bind; use a separate port"
+                );
+            }
             let api_state = match vault_master_password {
                 Some(master_password) => remote_hosts_api::ApiState::with_vault_master_password(
-                    repositories,
+                    repositories.clone(),
                     master_password,
                 ),
-                None => remote_hosts_api::ApiState::new(repositories),
+                None => remote_hosts_api::ApiState::new(repositories.clone()),
             };
             tracing::info!(%bind, "starting remote-hosts api");
-            remote_hosts_api::serve(bind, api_state)
-                .await
-                .context("serve api")?;
+            if let Some(peer_bind) = peer_sync_bind {
+                tracing::info!(%peer_bind, "starting restricted remote-hosts peer-sync api");
+                tokio::select! {
+                    result = remote_hosts_api::serve(bind, api_state.clone()) => result.context("serve local api")?,
+                    result = remote_hosts_api::serve_peer_sync(peer_bind, api_state.clone()) => result.context("serve peer-sync api")?,
+                }
+            } else {
+                remote_hosts_api::serve(bind, api_state)
+                    .await
+                    .context("serve api")?;
+            }
         }
         Command::WorkerOnce {
             database_url,

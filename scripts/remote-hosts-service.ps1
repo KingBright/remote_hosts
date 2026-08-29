@@ -101,6 +101,7 @@ function New-DefaultConfig {
         Root = $Script:Root
         DatabaseUrl = ConvertTo-SqliteUrl $databasePath
         Bind = '127.0.0.1:8787'
+        PeerSyncBind = ''
         ArtifactRoot = Join-Path $Script:DataDir 'artifacts'
         ConnectorId = [guid]::NewGuid().ToString().ToLowerInvariant()
         ConnectorName = 'local-windows-connector'
@@ -405,6 +406,9 @@ function Run-ApiService {
         '--bind', [string]$config['Bind'],
         '--vault-master-password-file', [string]$config['VaultMasterPasswordFile']
     )
+    if (-not [string]::IsNullOrWhiteSpace([string]$config['PeerSyncBind'])) {
+        $arguments += '--peer-sync-bind', [string]$config['PeerSyncBind']
+    }
     $stdout = Join-Path $Script:LogDir 'api.out.log'
     $stderr = Join-Path $Script:LogDir 'api.err.log'
     & ([string]$config['BinaryPath']) @arguments 1>> $stdout 2>> $stderr
@@ -490,6 +494,13 @@ function Show-Config {
     Write-Output "Artifacts:  $($config['ArtifactRoot'])"
     Write-Output "Logs:       $Script:LogDir"
     Write-Output "Admin UI:   http://$($config['Bind'])/admin"
+    $peerSyncBind = [string]$config['PeerSyncBind']
+    if ([string]::IsNullOrWhiteSpace($peerSyncBind)) {
+        Write-Output 'Peer sync:  disabled'
+    }
+    else {
+        Write-Output "Peer sync:  http://$peerSyncBind (restricted endpoints only)"
+    }
     Write-Output 'MCP command:'
     Write-Output "  `"$($config['LauncherPath'])`" -- mcp-stdio --database-url `"$($config['DatabaseUrl'])`" --tool-profile agent --vault-master-password-file `"$($config['VaultMasterPasswordFile'])`" --artifact-root `"$($config['ArtifactRoot'])`""
 }

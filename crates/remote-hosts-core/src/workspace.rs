@@ -131,7 +131,7 @@ fn validate_command(command: &WorkspaceCreateCommand) -> Result<(), WorkspaceSup
     Ok(())
 }
 
-fn validate_coordination_scope(scope: &str) -> Result<(), WorkspaceSupervisorError> {
+pub(crate) fn validate_coordination_scope(scope: &str) -> Result<(), WorkspaceSupervisorError> {
     if scope.is_empty()
         || scope.len() > 160
         || !scope.is_ascii()

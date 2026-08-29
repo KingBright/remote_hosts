@@ -11132,10 +11132,10 @@ mod tests {
     use remote_hosts_core::{
         CheckRequest, CheckResult, CommandClass, CommandProfile, CommandProfileCatalog,
         DEFAULT_SFTP_MAX_SIZE_BYTES, DEFAULT_SFTP_TIMEOUT_SECONDS, ExecRequest, ExecResult,
-        FileTransferSpec, ForwardHandle, ForwardRequest, PtySessionOpenCommand,
-        PtySessionSupervisor, RemoteTransport, SftpDirection, SftpOverwritePolicy, SftpProgress,
-        SftpRequest, SftpResult, WorkspaceFileTransfer, WorkspaceOperationSupervisor,
-        WorkspaceRunCommand, transport::TransportError,
+        FileTransferSpec, ForwardHandle, ForwardRequest, OperationCoordinationMode,
+        PtySessionOpenCommand, PtySessionSupervisor, RemoteTransport, SftpDirection,
+        SftpOverwritePolicy, SftpProgress, SftpRequest, SftpResult, WorkspaceFileTransfer,
+        WorkspaceOperationSupervisor, WorkspaceRunCommand, transport::TransportError,
     };
     use remote_hosts_db::{Repositories, connect_sqlite, migrate};
     use remote_hosts_domain::{
@@ -13445,6 +13445,8 @@ mod tests {
                 command_profile: profile,
                 intent: Some("verify host write lease".to_owned()),
                 idempotency_key: Some("write-lease-test".to_owned()),
+                coordination_mode: OperationCoordinationMode::Auto,
+                coordination_scope: None,
                 queued_operations: 0,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -17315,6 +17317,8 @@ mod tests {
                 command_profile: profile,
                 intent: Some("parallel readonly smoke".to_owned()),
                 idempotency_key: None,
+                coordination_mode: OperationCoordinationMode::Auto,
+                coordination_scope: None,
                 queued_operations: 1,
                 active_exec_channels: 0,
                 active_probe_jobs: 0,
@@ -17879,6 +17883,8 @@ mod tests {
                     command_profile: profile,
                     intent: Some("worker smoke".to_owned()),
                     idempotency_key: None,
+                    coordination_mode: OperationCoordinationMode::Auto,
+                    coordination_scope: None,
                     queued_operations: 0,
                     active_exec_channels: 0,
                     active_probe_jobs: 0,

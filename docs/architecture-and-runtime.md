@@ -31,6 +31,7 @@ alive solely because an old database row says a logical session was connected.
 | `remote-hosts-connector` | OpenSSH and `russh` transports, pooling, PTYs, and workers |
 | `remote-hosts-api` | Axum HTTP API and administration UI |
 | `remote-hosts-mcp` | MCP profiles, schemas, handlers, and Agent Session identity |
+| `remote-hosts-sync` | Direct instance-sync protocol for inventory, knowledge, and peer-sealed credentials; receipts, conflicts, and HTTP client |
 | `remote-hosts-cli` | Doctor, migration, API, MCP, and connector entry points |
 
 ## Transport Reuse and Capacity
@@ -82,23 +83,38 @@ Workspace preparation reuses only an `idle` or `working` Workspace owned by the 
 Session, on the requested access path, with the same coordination scope. It never revives a
 `throttled`, `blocked`, `failed`, `done`, or closed Workspace.
 
-## Scoped Mutation Coordination
+## Scoped Operation Coordination
 
-Mutating commands, uploads, downloads, and PTY input inherit a stable lowercase
-`coordination_scope` from their Workspace:
+Arbitrary shell requests declare one coordination mode:
+
+- `read_only` is an explicit caller attestation that the complete script only observes remote state;
+  it does not acquire a write lease and can run across conversations up to queue and SSH channel
+  capacity.
+- `mutating` acquires a hierarchical write lease.
+- `auto` is the compatibility default. Narrow read-only profiles remain read-only, while arbitrary
+  POSIX and PowerShell scripts remain conservatively mutating.
+
+Each mutating operation selects a stable lowercase `coordination_scope` within its Workspace
+boundary:
 
 - `host` is the compatibility default and conflicts with every mutation on that host.
 - Equal scopes conflict.
 - A parent conflicts with every descendant.
 - Sibling scopes may run concurrently.
 
+The default Workspace boundary is `host`, so one conversation can submit precise operation scopes
+without creating a new Workspace for each resource. A narrow Workspace accepts only its own scope or
+descendants and therefore cannot jump to a sibling resource.
+
 For example, `k8s/prod/datatool-dev` conflicts with
 `k8s/prod/datatool-dev/service/file-gateway`, while that service scope can run beside
 `k8s/prod/datatool-dev/service/report-api`.
 
-Leases are crash-safe and visible in runtime snapshot `write_lease.active_leases`. Scope names are
-resource identity, not a mechanism for evading a legitimate conflict. A task that spans several
-resources uses their real common parent.
+Leases are crash-safe and visible in runtime snapshot `write_lease.active_leases`; compact operation
+results expose `requires_write_lease` and the effective scope. Scope names are resource identity, not
+a mechanism for evading a legitimate conflict. A task that spans several resources uses their real
+common parent. Uploads and PTY input remain mutating; downloads only read the remote host and do not
+take its write lease.
 
 ## Command Execution
 
@@ -226,7 +242,7 @@ allows callers to resume from the snapshot cursor without losing transitions.
 
 ## MCP Profiles
 
-The default `agent` profile exposes 18 task-oriented tools:
+The default `agent` profile exposes 21 task-oriented tools:
 
 - `remote_hosts_list_hosts`
 - `remote_hosts_ensure_host`
@@ -246,6 +262,8 @@ The default `agent` profile exposes 18 task-oriented tools:
 - `remote_hosts_read_pty_output`
 - `remote_hosts_close_pty_session`
 - `remote_hosts_wait_runtime_events`
+- `remote_hosts_configure_instance_sync_peer`
+- `remote_hosts_sync_instance_peer`
 
 The `admin` profile adds low-level host, environment, credential-reference, access-path, fact,
 connector, and Workspace maintenance. The `full` profile exists for development and debugging.
@@ -262,6 +280,7 @@ The loopback API groups its endpoints by responsibility:
 - Workspace execution: Workspace lifecycle, operations, output, artifacts, and waits
 - PTY lifecycle: open, heartbeat, output, input, input events, close, and expiry reaping
 - Command catalog: `/v1/command-profiles`
+- Instance Sync: `/v1/instance-sync/identity`, authenticated export, and authenticated receive
 
 The source routes and request schemas in `remote-hosts-api` are authoritative; this grouped list
 avoids duplicating every route signature in overview documentation.

@@ -41,13 +41,40 @@ operation ids in every chunk. Password-like PTY interactions remain type-only.
 
 1. List hosts and identify exactly one target. If multiple records may be the same machine, stop and follow `host-registry.md`.
 2. For state-only work, read `remote_hosts_get_host_runtime_snapshot` and inspect `attention`, `authorized_key_bootstrap`, and `transport_runtime` for each access path.
-3. For execution, choose a stable `coordination_scope` and call `remote_hosts_prepare_workspace`. Omit it for the conservative `host` default. The tool reuses only an `idle` or `working` workspace owned by the current Agent Session with the same scope before creating one and returns compact Agent-session and Workspace identity plus the next action. Request a runtime snapshot explicitly only when state or connection diagnosis needs it.
+3. Call `remote_hosts_prepare_workspace`. Its default Workspace scope is `host`, which is a safe upper boundary for later operation-level scopes. Create a narrower Workspace only when every operation in it belongs to that resource subtree. The tool reuses only an `idle` or `working` workspace owned by the current Agent Session with the same scope before creating one and returns compact Agent-session and Workspace identity plus the next action. Request a runtime snapshot explicitly only when state or connection diagnosis needs it.
 4. Do not execute if snapshot attention reports `auth_failed`, `host_key_changed`, `connector_offline`, `rate_limited`, `throttled`, `circuit_open`, `ssh_route_unsupported`, overload, `pty_runtime_lost`, or `connection_unhealthy` without a recovery action. `local_handshake_budget_ready` allows exactly one normal connection attempt after cooldown. Bootstrap deferred/skipped state does not block password-backed execution unless route attention also blocks it.
-5. For normal remote work, use `shell.posix` or `shell.powershell` with exactly one arbitrary script argument. Include explicit `intent` and a stable semantic `idempotency_key`; set `timeout_seconds` up to 7200 and `output_limit_bytes` up to 8 MiB when defaults are insufficient. Use `wait_timeout_ms` (up to 60000) for short commands so queueing and observing the exact operation are one agent-visible action. Do not put passwords, tokens, or private keys in the script.
+5. For normal remote work, use `shell.posix` or `shell.powershell` with exactly one arbitrary script argument. Always set `coordination_mode=read_only` for a fully observational script or `coordination_mode=mutating` for any possible side effect. A mutating request should also set the narrowest truthful operation `coordination_scope`; omitted `auto` keeps the legacy behavior and treats arbitrary shell as mutating. Include explicit `intent` and a stable semantic `idempotency_key`; set `timeout_seconds` up to 7200 and `output_limit_bytes` up to 8 MiB when defaults are insufficient. Use `wait_timeout_ms` (up to 60000) for short commands so queueing and observing the exact operation are one agent-visible action. Do not put passwords, tokens, or private keys in the script.
    `remote_hosts_run_in_workspace` intentionally rejects access paths marked `requires_tty=true`; use the Interactive Session workflow for those routes.
 6. Use a narrow profile only as a shortcut when it exactly matches a read-only check. Do not request or implement a Kubernetes, Harbor, database, GPU, package-manager, or deployment-specific MCP tool when the existing remote CLI can run through the generic shell or PTY.
 7. When `remote_hosts_run_in_workspace.completion.completed=true`, use its exact compact operation result directly. Otherwise follow `next_action` and `retry_after_ms`; preserve the operation id and idempotency key.
 8. Read bounded incremental chunks, the requested operation, and artifact metadata with `remote_hosts_get_workspace_result`. Request a runtime snapshot when transport evidence is needed to prove reuse or diagnose reconnection.
+
+Read-only shell example:
+
+```json
+{
+  "workspace_id": "<current-conversation-workspace>",
+  "command_profile": "shell.posix",
+  "args": ["kubectl get pods -A -o wide"],
+  "intent": "inspect current pod placement",
+  "coordination_mode": "read_only",
+  "idempotency_key": "inspect-pod-placement"
+}
+```
+
+Independent mutation example:
+
+```json
+{
+  "workspace_id": "<current-conversation-workspace>",
+  "command_profile": "shell.posix",
+  "args": ["kubectl -n datatool-dev rollout restart deployment/report-worker"],
+  "intent": "restart report-worker deployment",
+  "coordination_mode": "mutating",
+  "coordination_scope": "k8s/prod/datatool-dev/deployment/report-worker",
+  "idempotency_key": "restart-report-worker-20260829"
+}
+```
 
 ## Managed File Transfer
 
@@ -71,7 +98,8 @@ The current runtime snapshot schema is version 10. Older snapshots do not provid
 - Agent Session, Workspace, PTY, operation, input event, output, artifact, and temporary context are isolated. Never carry Workspace or PTY ids from another task into the current task.
 - The SSH transport is deliberately shared per access path. Do not interpret a new Workspace as a new SSH connection or create another route to escape logical isolation.
 - Use one semantic idempotency key per intended side effect, such as `release-1.4-upload-linux-amd64` or `db-migration-20260724-step-2`. An exact retry keeps the same key and payload. Any changed payload requires a new key.
-- A Workspace owns one immutable lowercase `coordination_scope`. `host` conflicts with every mutation; equal and parent/child scopes conflict; sibling scopes do not. Use a canonical hierarchy such as `k8s/<cluster>/<namespace>/<kind>/<name>`, use the real common parent when one task spans resources, and default to `host` when uncertain.
+- A Workspace owns one immutable lowercase coordination boundary. Each mutating command may select that boundary or a descendant with its operation `coordination_scope`; a `host` Workspace can select any valid resource scope. Equal and parent/child mutations conflict; sibling mutations do not. Use a canonical hierarchy such as `k8s/<cluster>/<namespace>/<kind>/<name>`, use the real common parent when one task spans resources, and use `host` when uncertain.
+- Declared `read_only` shell work has `requires_write_lease=false`, can proceed beside foreign mutations, and is limited only by queue and SSH channel capacity. The declaration covers the complete script; a command that creates temporary files, refreshes credentials/caches, signals a process, or otherwise changes remote state is `mutating`.
 - Inspect `write_lease.active_leases` against the queued operation's scope. `held_by_other_session` alone may describe a non-overlapping sibling. Wait on `host_write_lease_wait`; refine a scope only when it was genuinely over-broad before side effects began. Never change spelling or invent a sibling to bypass another task.
 - `channel_capacity.state=saturated|oversubscribed` is path-local queue pressure. Keep the current Workspace and operation/PTY ids, respect `wait_for_channel_or_raise_limit`, and let reservations drain. Existing active PTY input remains eligible while a new PTY waits.
 - PTY input holds the Workspace's scoped write lease for about 300 seconds; output activity renews it. Close the PTY when finished so the connector can shorten the handoff period.

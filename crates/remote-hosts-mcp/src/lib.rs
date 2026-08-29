@@ -11,22 +11,24 @@ use std::{
 use remote_hosts_core::{
     AccessCandidate, AccessResolutionError, AccessResolver, CommandProfileCatalog,
     ConnectorStateTracker, DEFAULT_SFTP_MAX_SIZE_BYTES, DEFAULT_SFTP_TIMEOUT_SECONDS,
-    FileTransferSpec, HostStateAggregator, HostStateInput, PtySessionHeartbeatCommand,
-    PtySessionInputCommand, PtySessionOpenCommand, PtySessionSupervisor, ServerProtectionPolicy,
-    SftpDirection, SftpOverwritePolicy, WorkspaceCreateCommand, WorkspaceFileTransfer,
-    WorkspaceOperationSupervisor, WorkspaceRunCommand, WorkspaceSupervisor,
+    FileTransferSpec, HostStateAggregator, HostStateInput, OperationCoordinationMode,
+    PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionOpenCommand,
+    PtySessionSupervisor, ServerProtectionPolicy, SftpDirection, SftpOverwritePolicy,
+    WorkspaceCreateCommand, WorkspaceFileTransfer, WorkspaceOperationSupervisor,
+    WorkspaceRunCommand, WorkspaceSupervisor, resolve_operation_coordination_scope,
 };
 use remote_hosts_db::{DbError, Repositories, WorkspaceCapacityStatus};
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentSessionState,
     AgentWorkspace, ConnectionMode, ConnectionSession, Connector, ConnectorId, CredentialId,
     CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind,
-    FactSource, Host, HostFact, HostFactId, HostId, HostKind, HostWriteLease, KnowledgeItem,
-    KnowledgeItemId, OperationId, OperationOutputArtifactId, OperationRun, OperationState,
-    Protocol, PtyBackendState, PtyInputEvent, PtySession, PtySessionId, RiskLevel, RouteType,
-    SessionId, SoftwareInstallId, StateReasonCode, StateSnapshot, StoredCredential, TrustLevel,
-    WorkspaceId, WorkspaceState, now_utc,
+    FactSource, Host, HostFact, HostFactId, HostId, HostKind, HostWriteLease, InstancePeerId,
+    InstanceSyncCollection, KnowledgeItem, KnowledgeItemId, OperationId, OperationOutputArtifactId,
+    OperationRun, OperationState, Protocol, PtyBackendState, PtyInputEvent, PtySession,
+    PtySessionId, RiskLevel, RouteType, SessionId, SoftwareInstallId, StateReasonCode,
+    StateSnapshot, StoredCredential, TrustLevel, WorkspaceId, WorkspaceState, now_utc,
 };
+use remote_hosts_sync::InstanceSyncService;
 use rmcp::{
     Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -147,6 +149,10 @@ pub mod tools {
     pub const READ_OUTPUT_ARTIFACT_CONTENT: &str = "remote_hosts_read_output_artifact_content";
     /// Wait for workspace state.
     pub const WAIT_WORKSPACE_STATE: &str = "remote_hosts_wait_workspace_state";
+    /// Configure one approved Remote Hosts instance peer without returning its token.
+    pub const CONFIGURE_INSTANCE_SYNC_PEER: &str = "remote_hosts_configure_instance_sync_peer";
+    /// Push selected durable metadata directly to one configured peer.
+    pub const SYNC_INSTANCE_PEER: &str = "remote_hosts_sync_instance_peer";
 }
 
 const AGENT_TOOL_NAMES: &[&str] = &[
@@ -169,6 +175,8 @@ const AGENT_TOOL_NAMES: &[&str] = &[
     tools::READ_PTY_OUTPUT,
     tools::CLOSE_PTY_SESSION,
     tools::WAIT_RUNTIME_EVENTS,
+    tools::CONFIGURE_INSTANCE_SYNC_PEER,
+    tools::SYNC_INSTANCE_PEER,
 ];
 
 const ADMIN_TOOL_NAMES: &[&str] = &[
@@ -629,6 +637,60 @@ pub struct RecordKnowledgeRequest {
     pub tags: Option<Vec<String>>,
 }
 
+/// Configure a direct instance-sync peer. The token is encrypted locally and never returned.
+#[derive(Deserialize, JsonSchema, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigureInstanceSyncPeerRequest {
+    /// Human-facing stable peer label, for example `macstudio`.
+    pub display_name: String,
+    /// Direct peer API base URL, for example `https://macstudio.local:8787`.
+    pub endpoint: String,
+    /// Shared peer token. It is encrypted in the local vault and never returned.
+    pub token: String,
+    /// Durable collections to exchange. Defaults to inventory, knowledge, and authorized credentials.
+    pub collections: Option<Vec<String>>,
+}
+
+/// Push local durable metadata to one configured instance peer.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SyncInstancePeerRequest {
+    /// Configured peer id.
+    pub peer_id: String,
+}
+
+/// Compact response after configuring one peer.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ConfigureInstanceSyncPeerResponse {
+    /// Configured peer id.
+    pub peer_id: String,
+    /// Peer display name.
+    pub display_name: String,
+    /// Approved collection names.
+    pub collections: Vec<String>,
+    /// Next action for the caller.
+    pub next_action: String,
+}
+
+/// Compact response after one direct peer synchronization.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct SyncInstancePeerResponse {
+    /// Peer display name.
+    pub peer: String,
+    /// Number of records sent.
+    pub sent: u32,
+    /// Number of remote records applied.
+    pub applied: u32,
+    /// Number of remote duplicate receipts.
+    pub duplicates: u32,
+    /// Number of remote records retained as visible conflicts.
+    pub conflicts: u32,
+    /// Number of remote records rejected by validation or peer policy.
+    pub rejected: u32,
+    /// Bounded actionable details.
+    pub details: Vec<String>,
+}
+
 /// State event listing request.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListConnectorEventsRequest {
@@ -836,6 +898,29 @@ pub struct ReapExpiredPtySessionsRequest {
     pub limit: Option<u32>,
 }
 
+/// Caller-declared write coordination for an arbitrary shell command.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunCoordinationMode {
+    /// Preserve profile-based behavior for older clients.
+    #[default]
+    Auto,
+    /// The caller attests that the command only observes state.
+    ReadOnly,
+    /// The command may mutate state and must acquire a scoped write lease.
+    Mutating,
+}
+
+impl From<RunCoordinationMode> for OperationCoordinationMode {
+    fn from(value: RunCoordinationMode) -> Self {
+        match value {
+            RunCoordinationMode::Auto => Self::Auto,
+            RunCoordinationMode::ReadOnly => Self::ReadOnly,
+            RunCoordinationMode::Mutating => Self::Mutating,
+        }
+    }
+}
+
 /// Run-in-workspace request.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RunInWorkspaceRequest {
@@ -847,6 +932,10 @@ pub struct RunInWorkspaceRequest {
     pub args: Vec<String>,
     /// Human or agent intent for audit and later knowledge linking.
     pub intent: Option<String>,
+    /// `read_only` skips write leasing, `mutating` requires it, and `auto` preserves legacy inference.
+    pub coordination_mode: Option<RunCoordinationMode>,
+    /// Optional operation scope within the Workspace scope. Useful for independent mutations.
+    pub coordination_scope: Option<String>,
     /// Optional command timeout override in seconds. Shell profiles allow up to 7200.
     pub timeout_seconds: Option<u64>,
     /// Optional captured output limit override in bytes, up to 8 MiB.
@@ -1064,6 +1153,14 @@ impl RemoteHostsMcpServer {
 
     fn compact_responses(&self) -> bool {
         self.tool_profile == ToolProfile::Agent
+    }
+
+    fn instance_sync_service(&self) -> Result<InstanceSyncService, String> {
+        InstanceSyncService::with_vault_master_password(
+            (*self.repositories).clone(),
+            self.vault_master_password.as_deref().cloned(),
+        )
+        .map_err(|error| error.to_string())
     }
 
     async fn workspace_for_tool(
@@ -1345,6 +1442,8 @@ impl RemoteHostsMcpServer {
         idempotency_key: Option<&str>,
         workspace_id: WorkspaceId,
         expected_profile: &Value,
+        expected_requires_write_lease: bool,
+        expected_coordination_scope: &str,
     ) -> Result<Option<OperationRun>, String> {
         let (Some(agent_session_id), Some(idempotency_key)) = (agent_session_id, idempotency_key)
         else {
@@ -1361,6 +1460,8 @@ impl RemoteHostsMcpServer {
         };
         if existing.workspace_id != Some(workspace_id)
             || existing.command_profile_json.as_ref() != Some(expected_profile)
+            || existing.requires_write_lease != expected_requires_write_lease
+            || existing.coordination_scope != expected_coordination_scope
         {
             return Err(format!(
                 "idempotency_key `{idempotency_key}` is already bound to a different request in this conversation"
@@ -1469,6 +1570,14 @@ impl RemoteHostsMcpServer {
             );
         }
         let idempotency_key = normalize_idempotency_key(request.idempotency_key)?;
+        let coordination_mode: OperationCoordinationMode =
+            request.coordination_mode.unwrap_or_default().into();
+        let requested_coordination_scope = trim_optional(request.coordination_scope);
+        let coordination_scope = resolve_operation_coordination_scope(
+            &workspace,
+            requested_coordination_scope.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
         let policy = ServerProtectionPolicy::default();
         let mut profile =
             CommandProfileCatalog::resolve_builtin(&request.command_profile, request.args, &policy)
@@ -1481,12 +1590,15 @@ impl RemoteHostsMcpServer {
         }
         profile.validate().map_err(|error| error.to_string())?;
         let expected_profile = to_json_value(&profile)?;
+        let requires_write_lease = coordination_mode.requires_write_lease(&profile.class);
         if let Some(existing) = self
             .find_idempotent_operation(
                 workspace.agent_session_id,
                 idempotency_key.as_deref(),
                 workspace_id,
                 &expected_profile,
+                requires_write_lease,
+                &coordination_scope,
             )
             .await?
         {
@@ -1510,6 +1622,8 @@ impl RemoteHostsMcpServer {
                 command_profile: profile,
                 intent: request.intent,
                 idempotency_key,
+                coordination_mode,
+                coordination_scope: requested_coordination_scope,
                 queued_operations,
                 active_exec_channels,
                 active_probe_jobs: 0,
@@ -1524,6 +1638,8 @@ impl RemoteHostsMcpServer {
                     plan.operation.idempotency_key.as_deref(),
                     workspace_id,
                     &expected_profile,
+                    requires_write_lease,
+                    &coordination_scope,
                 )
                 .await?
             {
@@ -1642,12 +1758,16 @@ impl RemoteHostsMcpServer {
         let workspace = self.workspace_for_tool(workspace_id).await?;
         let idempotency_key = normalize_idempotency_key(idempotency_key)?;
         let expected_profile = to_json_value(&spec)?;
+        let expected_requires_write_lease = matches!(spec.direction, SftpDirection::Upload);
+        let expected_coordination_scope = workspace.coordination_scope.clone();
         if let Some(existing) = self
             .find_idempotent_operation(
                 workspace.agent_session_id,
                 idempotency_key.as_deref(),
                 workspace_id,
                 &expected_profile,
+                expected_requires_write_lease,
+                &expected_coordination_scope,
             )
             .await?
         {
@@ -1684,6 +1804,8 @@ impl RemoteHostsMcpServer {
                     plan.operation.idempotency_key.as_deref(),
                     workspace_id,
                     &expected_profile,
+                    plan.operation.requires_write_lease,
+                    &plan.operation.coordination_scope,
                 )
                 .await?
             {
@@ -3314,6 +3436,79 @@ impl RemoteHostsMcpServer {
         }))
     }
 
+    /// Configure a direct, approved instance peer. The pairing token never appears in the result.
+    #[tool(
+        name = "remote_hosts_configure_instance_sync_peer",
+        description = "Configure one approved Remote Hosts instance peer. The token is encrypted locally and credentials selected for synchronization are re-encrypted for the peer's local vault.",
+        annotations(
+            title = "Configure Instance Peer",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn configure_instance_sync_peer(
+        &self,
+        Parameters(mut request): Parameters<ConfigureInstanceSyncPeerRequest>,
+    ) -> Result<Json<ConfigureInstanceSyncPeerResponse>, String> {
+        let collections = parse_instance_sync_collections(request.collections.take())?;
+        let service = self.instance_sync_service()?;
+        let peer = service
+            .configure_peer(
+                std::mem::take(&mut request.display_name),
+                std::mem::take(&mut request.endpoint),
+                SecretString::from(std::mem::take(&mut request.token)),
+                collections,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Json(ConfigureInstanceSyncPeerResponse {
+            peer_id: peer.id.to_string(),
+            display_name: peer.display_name,
+            collections: peer
+                .allowed_collections
+                .iter()
+                .map(|collection| format!("{collection:?}").to_ascii_lowercase())
+                .collect(),
+            next_action: "use remote_hosts_sync_instance_peer with this peer id; selected SSH credentials are copied only as peer-sealed ciphertext and re-encrypted in the receiving local vault; workspaces, PTYs, queues, and runtime state are never synchronized".to_owned(),
+        }))
+    }
+
+    /// Push a bounded inventory, knowledge, and peer-sealed credential envelope to one peer.
+    #[tool(
+        name = "remote_hosts_sync_instance_peer",
+        description = "Push approved inventory, knowledge, and authorized SSH credentials directly to one configured Remote Hosts instance peer. Credential material stays encrypted in transit and is re-encrypted in the receiving local vault.",
+        annotations(
+            title = "Sync Instance Peer",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn sync_instance_peer(
+        &self,
+        Parameters(request): Parameters<SyncInstancePeerRequest>,
+    ) -> Result<Json<SyncInstancePeerResponse>, String> {
+        let peer_id = InstancePeerId::from(
+            Uuid::parse_str(&request.peer_id)
+                .map_err(|_| format!("invalid peer_id: {}", request.peer_id))?,
+        );
+        let report = self
+            .instance_sync_service()?
+            .push(peer_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Json(SyncInstancePeerResponse {
+            peer: report.peer,
+            sent: report.sent,
+            applied: report.result.applied,
+            duplicates: report.result.duplicates,
+            conflicts: report.result.conflicts,
+            rejected: report.result.rejected,
+            details: report.result.details,
+        }))
+    }
+
     /// Resolve the best current access path for a host.
     #[tool(
         name = "remote_hosts_resolve_access",
@@ -4878,7 +5073,7 @@ impl RemoteHostsMcpServer {
     /// Queue a managed command profile in a workspace.
     #[tool(
         name = "remote_hosts_run_in_workspace",
-        description = "Queue a narrow profile or managed POSIX/PowerShell script in an existing workspace; reuse the pooled SSH session.",
+        description = "Queue a narrow profile or managed POSIX/PowerShell script on pooled SSH. Declare shell coordination_mode=read_only for observation or mutating for scoped changes; auto keeps legacy conservative behavior.",
         annotations(
             title = "Run In Workspace",
             read_only_hint = false,
@@ -6439,6 +6634,39 @@ fn parse_fact_source(input: &str) -> Result<FactSource, String> {
     parse_string_enum(input, "source")
 }
 
+fn parse_instance_sync_collections(
+    collections: Option<Vec<String>>,
+) -> Result<Vec<InstanceSyncCollection>, String> {
+    let collections = collections.unwrap_or_else(|| {
+        vec![
+            "inventory".to_owned(),
+            "knowledge".to_owned(),
+            "credentials".to_owned(),
+        ]
+    });
+    let mut parsed = BTreeSet::new();
+    for collection in collections {
+        let collection = collection.trim().to_ascii_lowercase();
+        let parsed_collection = match collection.as_str() {
+            "inventory" => InstanceSyncCollection::Inventory,
+            "knowledge" => InstanceSyncCollection::Knowledge,
+            "credentials" => InstanceSyncCollection::Credentials,
+            "topology" => InstanceSyncCollection::Topology,
+            "artifacts" => InstanceSyncCollection::Artifacts,
+            _ => {
+                return Err(format!(
+                    "unknown instance sync collection `{collection}`; use inventory, knowledge, or credentials"
+                ));
+            }
+        };
+        parsed.insert(parsed_collection);
+    }
+    if parsed.is_empty() {
+        return Err("at least one instance sync collection is required".to_owned());
+    }
+    Ok(parsed.into_iter().collect())
+}
+
 fn parse_string_enum<T>(input: &str, field: &str) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
@@ -6711,6 +6939,8 @@ fn compact_operation_value(operation: &OperationRun) -> Value {
         "state": operation.state,
         "exit_code": operation.exit_code,
         "intent": operation.intent,
+        "requires_write_lease": operation.requires_write_lease,
+        "coordination_scope": operation.coordination_scope,
         "command_preview": operation.redacted_command_summary,
         "summary": operation_result_summary(operation),
         "last_error": operation.last_error,
@@ -6961,7 +7191,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(agent_names.len(), 19);
+        assert_eq!(agent_names.len(), 21);
         assert!(agent_names.contains("remote_hosts_ensure_host"));
         assert!(agent_names.contains(tools::STORE_HOST_CREDENTIAL));
         assert!(agent_names.contains(tools::PREPARE_WORKSPACE));
@@ -6970,12 +7200,14 @@ mod tests {
         assert!(agent_names.contains(tools::DOWNLOAD_FILE));
         assert!(agent_names.contains(tools::READ_OUTPUT_ARTIFACT_CONTENT));
         assert!(agent_names.contains(tools::HEARTBEAT_PTY_SESSION));
+        assert!(agent_names.contains(tools::CONFIGURE_INSTANCE_SYNC_PEER));
+        assert!(agent_names.contains(tools::SYNC_INSTANCE_PEER));
         assert!(!agent_names.contains(tools::UPSERT_HOST));
         assert!(admin_names.is_superset(&agent_names));
         assert!(admin_names.contains(tools::UPSERT_HOST));
         assert!(admin_names.contains(tools::FIND_HOST_DUPLICATES));
         assert!(admin_names.len() < full.tool_router.list_all().len());
-        assert_eq!(full.tool_router.list_all().len(), 45);
+        assert_eq!(full.tool_router.list_all().len(), 47);
         let Err(hidden_error) = call_tool_raw(agent, tools::UPSERT_HOST, None).await else {
             return Err("agent profile unexpectedly exposed an admin tool".into());
         };
@@ -8062,6 +8294,59 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn mcp_three_agent_sessions_can_queue_declared_readonly_shell_work_concurrently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let agents = [
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent),
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent),
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent),
+        ];
+
+        for (index, agent) in agents.iter().enumerate() {
+            let prepared = call_tool(
+                agent.clone(),
+                tools::PREPARE_WORKSPACE,
+                Some(json!({"host_id": fixture.host_id.to_string()})),
+            )
+            .await?;
+            let queued = call_tool(
+                agent.clone(),
+                tools::RUN_IN_WORKSPACE,
+                Some(json!({
+                    "workspace_id": prepared["workspace"]["id"],
+                    "command_profile": "shell.posix",
+                    "args": [format!("printf 'readonly-{index}\\n'")],
+                    "intent": format!("read independent state for conversation {index}"),
+                    "coordination_mode": "read_only",
+                    "idempotency_key": format!("readonly-conversation-{index}")
+                })),
+            )
+            .await?;
+            assert_eq!(queued["operation"]["requires_write_lease"], json!(false));
+        }
+
+        let snapshot = call_tool(
+            agents[0].clone(),
+            tools::GET_HOST_RUNTIME_SNAPSHOT,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        assert_eq!(
+            snapshot["write_lease"]["active_leases"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+        assert!(snapshot["attention"].as_array().is_some_and(|attention| {
+            attention
+                .iter()
+                .all(|item| item["code"] != json!("host_write_lease_wait"))
+        }));
+        Ok(())
+    }
+
     #[test]
     fn explicit_agent_conversation_context_is_stable_and_isolated() {
         let context = super::AgentSessionContext {
@@ -8129,6 +8414,8 @@ mod tests {
             "command_profile": "shell.posix",
             "args": ["printf '%s\\n' hello"],
             "intent": "apply one idempotent change",
+            "coordination_mode": "mutating",
+            "coordination_scope": "service/example",
             "idempotency_key": "deploy-step-1"
         }));
 
@@ -8139,7 +8426,7 @@ mod tests {
         assert_eq!(first["idempotency_reused"], json!(false));
         assert_eq!(retried["idempotency_reused"], json!(true));
         let mismatched_retry = call_tool_raw(
-            agent,
+            agent.clone(),
             tools::RUN_IN_WORKSPACE,
             Some(json!({
                 "workspace_id": workspace_id,
@@ -8150,6 +8437,22 @@ mod tests {
         )
         .await?;
         assert_eq!(mismatched_retry.is_error, Some(true));
+
+        let changed_coordination = call_tool_raw(
+            agent,
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": workspace_id,
+                "command_profile": "shell.posix",
+                "args": ["printf '%s\\n' hello"],
+                "intent": "apply one idempotent change",
+                "coordination_mode": "read_only",
+                "coordination_scope": "service/example",
+                "idempotency_key": "deploy-step-1"
+            })),
+        )
+        .await?;
+        assert_eq!(changed_coordination.is_error, Some(true));
         Ok(())
     }
 
@@ -8249,19 +8552,13 @@ mod tests {
         let service = call_tool(
             service_agent.clone(),
             tools::PREPARE_WORKSPACE,
-            Some(json!({
-                "host_id": fixture.host_id.to_string(),
-                "coordination_scope": "k8s/datatool-dev/service/file-gateway"
-            })),
+            Some(json!({"host_id": fixture.host_id.to_string()})),
         )
         .await?;
         let deployment = call_tool(
             deployment_agent.clone(),
             tools::PREPARE_WORKSPACE,
-            Some(json!({
-                "host_id": fixture.host_id.to_string(),
-                "coordination_scope": "k8s/datatool-dev/deployment/report-worker"
-            })),
+            Some(json!({"host_id": fixture.host_id.to_string()})),
         )
         .await?;
         call_tool(
@@ -8271,6 +8568,8 @@ mod tests {
                 "workspace_id": service["workspace"]["id"],
                 "command_profile": "shell.posix",
                 "args": ["touch /tmp/scoped-service"],
+                "coordination_mode": "mutating",
+                "coordination_scope": "k8s/datatool-dev/service/file-gateway",
                 "idempotency_key": "scoped-service"
             })),
         )
@@ -8282,6 +8581,8 @@ mod tests {
                 "workspace_id": deployment["workspace"]["id"],
                 "command_profile": "shell.posix",
                 "args": ["touch /tmp/scoped-deployment"],
+                "coordination_mode": "mutating",
+                "coordination_scope": "k8s/datatool-dev/deployment/report-worker",
                 "idempotency_key": "scoped-deployment"
             })),
         )
@@ -8311,10 +8612,7 @@ mod tests {
         let parent = call_tool(
             parent_agent.clone(),
             tools::PREPARE_WORKSPACE,
-            Some(json!({
-                "host_id": fixture.host_id.to_string(),
-                "coordination_scope": "k8s/datatool-dev"
-            })),
+            Some(json!({"host_id": fixture.host_id.to_string()})),
         )
         .await?;
         call_tool(
@@ -8324,6 +8622,8 @@ mod tests {
                 "workspace_id": parent["workspace"]["id"],
                 "command_profile": "shell.posix",
                 "args": ["touch /tmp/scoped-parent"],
+                "coordination_mode": "mutating",
+                "coordination_scope": "k8s/datatool-dev",
                 "idempotency_key": "scoped-parent"
             })),
         )
@@ -9619,6 +9919,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn mcp_queues_target_host_password_without_exposing_target_or_secret()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = TestFixture::new().await?;

@@ -85,10 +85,180 @@ id_type!(TopologyNodeId);
 id_type!(TopologyEdgeId);
 id_type!(TopologySyncRunId);
 id_type!(CredentialBindingId);
+id_type!(InstancePeerId);
 
 /// Returns the current UTC timestamp.
 pub fn now_utc() -> OffsetDateTime {
     OffsetDateTime::now_utc()
+}
+
+/// A durable collection that can be exchanged between approved Remote Hosts instances.
+///
+/// Credentials, execution queues, workspaces, PTYs, and live connection state deliberately have
+/// no collection: they stay on the instance that owns them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceSyncCollection {
+    /// Canonical host identity and non-secret inventory metadata.
+    Inventory,
+    /// Redacted, durable operational knowledge.
+    Knowledge,
+    /// SSH access paths and their locally re-encrypted credentials.
+    Credentials,
+    /// Infrastructure topology. Reserved for a later protocol-compatible expansion.
+    Topology,
+    /// Verified artifact manifests and content. Reserved for a later protocol-compatible expansion.
+    Artifacts,
+}
+
+/// Trust lifecycle for a configured Remote Hosts peer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstancePeerState {
+    /// The peer may exchange the explicitly approved collections.
+    Active,
+    /// The peer is retained but no exchange may run.
+    Paused,
+    /// The peer is permanently disabled. Its history remains auditable.
+    Revoked,
+}
+
+/// Stable identity for one independently installed Remote Hosts instance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InstanceIdentity {
+    /// Globally unique instance identifier.
+    pub instance_id: Uuid,
+    /// Human-facing label, for example `macstudio`.
+    pub display_name: String,
+    /// Compatibility protocol version.
+    pub protocol_version: u16,
+    /// Creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Last metadata update timestamp.
+    pub updated_at: OffsetDateTime,
+}
+
+/// One approved direct peer endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstancePeer {
+    /// Local peer record identifier.
+    pub id: InstancePeerId,
+    /// Peer instance id after the first successful handshake.
+    pub peer_instance_id: Option<Uuid>,
+    /// Human-facing peer label.
+    pub display_name: String,
+    /// Direct HTTPS or trusted private-network HTTP endpoint for the peer API.
+    pub endpoint: String,
+    /// Local encrypted credential containing the outbound peer token.
+    pub outbound_credential_id: CredentialId,
+    /// SHA-256 hash of the inbound token accepted from this peer.
+    pub inbound_token_sha256: String,
+    /// Collections the peer is allowed to exchange.
+    pub allowed_collections: Vec<InstanceSyncCollection>,
+    /// Peer lifecycle state.
+    pub state: InstancePeerState,
+    /// Last successful outgoing synchronization timestamp.
+    pub last_pushed_at: Option<OffsetDateTime>,
+    /// Last successful incoming synchronization timestamp.
+    pub last_pulled_at: Option<OffsetDateTime>,
+    /// Most recent non-secret error.
+    pub last_error: Option<String>,
+    /// Creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Last configuration or synchronization update timestamp.
+    pub updated_at: OffsetDateTime,
+}
+
+/// One self-contained portable metadata record in the instance-sync protocol.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstanceSyncRecord {
+    /// Globally unique id of this immutable delivery record.
+    pub event_id: Uuid,
+    /// Origin instance that owns the source entity id.
+    pub origin_instance_id: Uuid,
+    /// Scope selected by the sender.
+    pub collection: InstanceSyncCollection,
+    /// Stable entity family, for example `host` or `knowledge_item`.
+    pub entity_type: String,
+    /// Stable source entity id.
+    pub entity_key: String,
+    /// Source content timestamp used for deterministic last-write comparison.
+    pub updated_at: OffsetDateTime,
+    /// Non-secret serialized entity payload.
+    pub payload: serde_json::Value,
+    /// Lowercase SHA-256 of the canonical payload bytes.
+    pub payload_sha256: String,
+}
+
+/// A bounded transport envelope exchanged by direct instance-sync endpoints.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstanceSyncEnvelope {
+    /// Sender identity.
+    pub sender: InstanceIdentity,
+    /// Intended receiver instance id when known.
+    pub recipient_instance_id: Option<Uuid>,
+    /// Whether this batch is a dry-run request. Receivers never persist dry runs.
+    pub dry_run: bool,
+    /// Records in deterministic order.
+    pub records: Vec<InstanceSyncRecord>,
+}
+
+/// Per-record import disposition returned to a sender.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceSyncRecordDisposition {
+    /// The record changed local durable state.
+    Applied,
+    /// The identical source payload had already been received.
+    Duplicate,
+    /// A newer local value was preserved and the incoming value was retained as a conflict.
+    Conflict,
+    /// The receiver does not permit this collection or entity type.
+    Rejected,
+}
+
+/// One concise synchronization result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstanceSyncResult {
+    /// Sender instance id.
+    pub sender_instance_id: Uuid,
+    /// Instance that evaluated the envelope.
+    pub receiver_instance_id: Uuid,
+    /// Number of records applied.
+    pub applied: u32,
+    /// Number of duplicate records skipped idempotently.
+    pub duplicates: u32,
+    /// Number of records withheld due to visible conflicts.
+    pub conflicts: u32,
+    /// Number of invalid or unauthorized records rejected.
+    pub rejected: u32,
+    /// Up to ten actionable non-secret details.
+    pub details: Vec<String>,
+}
+
+/// A preserved concurrent update that needs an explicit operator decision.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstanceSyncConflict {
+    /// Conflict identifier.
+    pub id: Uuid,
+    /// Instance that supplied the competing update.
+    pub origin_instance_id: Uuid,
+    /// Scope selected by the sender.
+    pub collection: InstanceSyncCollection,
+    /// Entity family, for example `host`.
+    pub entity_type: String,
+    /// Source entity key.
+    pub entity_key: String,
+    /// Timestamp of the retained local value.
+    pub local_updated_at: OffsetDateTime,
+    /// Timestamp of the rejected remote value.
+    pub remote_updated_at: OffsetDateTime,
+    /// Hash of the retained local payload.
+    pub local_payload_sha256: String,
+    /// Hash of the rejected remote payload.
+    pub remote_payload_sha256: String,
+    /// Detection timestamp.
+    pub created_at: OffsetDateTime,
 }
 
 /// Lifecycle state of one agent-client session.

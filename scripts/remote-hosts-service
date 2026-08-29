@@ -81,10 +81,13 @@ write_default_config() {
   cat >"${CONFIG_FILE}" <<EOF
 # Remote Hosts local service config.
 # This file is sourced by local launchd wrapper scripts. Keep values shell-safe.
-REMOTE_HOSTS_CONFIG_VERSION=2
+REMOTE_HOSTS_CONFIG_VERSION=3
 REMOTE_HOSTS_BIN=${BIN_PATH}
 REMOTE_HOSTS_DATABASE_URL=sqlite://${DATA_DIR}/remote-hosts.sqlite
 REMOTE_HOSTS_BIND=127.0.0.1:8787
+# Optional restricted listener for approved Remote Hosts peer synchronization only.
+# Leave empty unless another trusted instance must reach this machine directly.
+REMOTE_HOSTS_PEER_SYNC_BIND=
 REMOTE_HOSTS_ARTIFACT_ROOT=${DATA_DIR}/artifacts
 REMOTE_HOSTS_CONNECTOR_ID=${connector_id}
 REMOTE_HOSTS_CONNECTOR_NAME=local-macos-connector
@@ -158,13 +161,16 @@ update_config_key() {
 
 migrate_config_defaults() {
   load_config
-  if (( ${REMOTE_HOSTS_CONFIG_VERSION:-1} >= 2 )); then
+  if (( ${REMOTE_HOSTS_CONFIG_VERSION:-1} >= 3 )); then
     return
   fi
-  if [[ "${REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS:-4}" == "4" ]]; then
+  if (( ${REMOTE_HOSTS_CONFIG_VERSION:-1} < 2 )) && [[ "${REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS:-4}" == "4" ]]; then
     update_config_key "REMOTE_HOSTS_MAX_CONCURRENT_OPERATIONS" "16"
   fi
-  update_config_key "REMOTE_HOSTS_CONFIG_VERSION" "2"
+  if ! rg -q '^REMOTE_HOSTS_PEER_SYNC_BIND=' "${CONFIG_FILE}"; then
+    update_config_key "REMOTE_HOSTS_PEER_SYNC_BIND" ""
+  fi
+  update_config_key "REMOTE_HOSTS_CONFIG_VERSION" "3"
   load_config
 }
 
@@ -295,6 +301,9 @@ args=(
 )
 if [[ -n "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE:-}" ]]; then
   args+=(--vault-master-password-file "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}")
+fi
+if [[ -n "\${REMOTE_HOSTS_PEER_SYNC_BIND:-}" ]]; then
+  args+=(--peer-sync-bind "\${REMOTE_HOSTS_PEER_SYNC_BIND}")
 fi
 exec "\${REMOTE_HOSTS_BIN}" "\${args[@]}"
 EOF
@@ -511,6 +520,7 @@ Worker plist:${CONNECTOR_PLIST}
 Codex skill: ${CODEX_SKILL_DIR}
 AG skill:    ${ANTIGRAVITY_SKILL_DIR}
 Admin UI:    ${ADMIN_UI_PATH}
+Peer sync:   ${REMOTE_HOSTS_PEER_SYNC_BIND:-disabled}
 EOF
 }
 

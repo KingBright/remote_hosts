@@ -82,6 +82,18 @@ inside the encrypted database and are never written into `service.json`.
 SQLx receives Windows database paths as `sqlite://C:/...`; the installer normalizes backslashes and
 does not add the Unix-only third slash used by absolute macOS paths.
 
+## Direct Instance Sync
+
+`service.json` keeps `PeerSyncBind` empty by default, so the full API stays on
+`127.0.0.1:8787`. To accept direct synchronization from one approved Remote Hosts peer, set
+`PeerSyncBind` to an otherwise unused address such as `0.0.0.0:8788`, then run `Update` during a
+drained maintenance window. This second listener exposes only health, identity, and authenticated
+instance-sync routes; it does not expose the UI, credential inspection or management routes,
+remote execution, files, PTYs, or topology administration. User-authorized SSH credentials sent
+through those routes are peer-sealed and re-encrypted by the receiving Windows vault.
+
+Use a private LAN, VPN, or SSH tunnel. A routed or public listener must be protected by HTTPS.
+
 ## Agent Integration
 
 `Install`, `Update`, and `Skills` synchronize the bundled Skill into:

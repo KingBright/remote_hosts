@@ -28,6 +28,8 @@ one MCP tool family per product.
   coupling the product to an external vault service.
 - Generic infrastructure topology for clusters, hosts, services, dependencies, inactive history,
   and encrypted resource credential bindings.
+- Direct peer-to-peer synchronization of inventory, knowledge, and user-authorized SSH
+  credentials, with per-record SHA-256 receipts, host convergence, and visible conflicts.
 - Compact MCP surface and an Agent Skill for Codex and Antigravity.
 
 ## How It Fits Together
@@ -90,7 +92,7 @@ keeps releases versioned for non-disruptive staging, and installs a stable Rust 
 
 ## Agent Integration
 
-The default `agent` MCP profile exposes 18 task-oriented tools for host registration, credentials,
+The default `agent` MCP profile exposes 21 task-oriented tools for host registration, credentials,
 knowledge, runtime snapshots, Workspaces, generic commands, file transfer, PTYs, artifacts, and
 event waits. Low-level registry repair stays in the `admin` profile.
 
@@ -122,6 +124,7 @@ Useful local entry points:
 cargo run -p remote-hosts-cli -- doctor
 cargo run -p remote-hosts-cli -- migrate --database-url sqlite://remote-hosts.sqlite
 cargo run -p remote-hosts-cli -- serve --bind 127.0.0.1:8787
+cargo run -p remote-hosts-cli -- serve --bind 127.0.0.1:8787 --peer-sync-bind 0.0.0.0:8788
 cargo run -p remote-hosts-cli -- mcp-stdio --database-url sqlite://remote-hosts.sqlite
 ```
 
@@ -136,6 +139,7 @@ crates/
   remote-hosts-connector   SSH transports, pools, PTYs, and operation workers
   remote-hosts-api         Axum HTTP API and administration console
   remote-hosts-mcp         MCP server, profiles, and request schemas
+  remote-hosts-sync        Direct peer-sync protocol, receipt, conflict, and HTTP client logic
   remote-hosts-cli         Service and administration CLI
 migrations/                Database schema migrations
 skills/                    Repository-owned Agent Skill
@@ -151,6 +155,8 @@ skills/                    Repository-owned Agent Skill
   configuration, resource reference, production routes, retry rules, and diagnosis.
 - [Infrastructure Topology](docs/infrastructure-topology.md): graph model, authoritative snapshot
   synchronization, stable identity, and credential binding.
+- [Instance Sync](docs/instance-sync.md): direct peer protocol, durable collection boundary,
+  idempotency, conflict behavior, and agent workflow.
 - [Windows Installation and Operations](docs/windows.md): native cross-compilation, Task Scheduler
   services, versioned updates, paths, MCP launcher, and troubleshooting.
 
@@ -160,11 +166,13 @@ The 2026-08-03 release adds native Windows runtime and packaging support, a stab
 launcher, Rust-owned connector bootstrap and restart-readiness checks, runtime snapshot version 10,
 hierarchical Workspace coordination, capacity-aware scheduling, resumable verified transfers,
 transport evidence, grouped topology management, compact Zstandard output history, guarded storage
-reclamation, and a 19-tool Agent profile. Release-level implementation details stay in the
+reclamation, and a 21-tool Agent profile. Release-level implementation details stay in the
 architecture and operations documents.
 
 ## Security Summary
 
 Credentials are encrypted in the local database using a generated local master key. Dedicated
-credential tools can store user-supplied secrets but never return plaintext. Remote execution stays
-inside managed Workspaces with policy checks, bounded output, redaction, runtime state, and audit.
+credential tools can store user-supplied secrets but never return plaintext. An explicitly approved
+instance peer can synchronize SSH credentials as peer-sealed ciphertext; the receiving instance
+decrypts only in memory and re-encrypts with its own local vault key. Remote execution stays inside
+managed Workspaces with policy checks, bounded output, redaction, runtime state, and audit.
