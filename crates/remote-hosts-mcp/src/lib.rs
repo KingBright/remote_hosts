@@ -4833,20 +4833,21 @@ impl RemoteHostsMcpServer {
         }
         if let Some(agent_session_id) = plan.event.agent_session_id {
             let observed_at = now_utc();
+            let leases = pty_coordination_scopes(&pty_session, &workspace)
+                .into_iter()
+                .map(|coordination_scope| HostWriteLease {
+                    host_id: plan.event.host_id,
+                    coordination_scope,
+                    holder_agent_session_id: agent_session_id,
+                    holder_workspace_id: plan.event.workspace_id,
+                    acquired_at: observed_at,
+                    heartbeat_at: observed_at,
+                    expires_at: observed_at + time::Duration::seconds(WRITE_LEASE_SECONDS),
+                })
+                .collect::<Vec<_>>();
             self.repositories
                 .host_write_leases
-                .try_acquire(
-                    &HostWriteLease {
-                        host_id: plan.event.host_id,
-                        coordination_scope: workspace.coordination_scope.clone(),
-                        holder_agent_session_id: agent_session_id,
-                        holder_workspace_id: plan.event.workspace_id,
-                        acquired_at: observed_at,
-                        heartbeat_at: observed_at,
-                        expires_at: observed_at + time::Duration::seconds(WRITE_LEASE_SECONDS),
-                    },
-                    observed_at,
-                )
+                .try_acquire_many(&leases, observed_at)
                 .await
                 .map_err(|error| tool_error(&error))?;
         }
@@ -6979,6 +6980,14 @@ fn operation_coordination_scopes(operation: &OperationRun) -> Vec<String> {
         vec![operation.coordination_scope.clone()]
     } else {
         operation.coordination_scopes.clone()
+    }
+}
+
+fn pty_coordination_scopes(pty: &PtySession, workspace: &AgentWorkspace) -> Vec<String> {
+    if pty.coordination_scopes.is_empty() {
+        vec![workspace.coordination_scope.clone()]
+    } else {
+        pty.coordination_scopes.clone()
     }
 }
 
@@ -9969,6 +9978,83 @@ mod tests {
         .await?;
         assert_eq!(waited["matched"], json!(true));
         assert_eq!(waited["workspace"]["state"], json!("idle"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_pty_input_preacquires_exact_pty_scopes_without_host_widening()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let created = call_tool(
+            fixture.server(),
+            tools::CREATE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "access_path_id": fixture.access_path_id.to_string(),
+                "label": "scoped-interactive-session",
+                "cwd": "/tmp"
+            })),
+        )
+        .await?;
+        let workspace_id = WorkspaceId::from(uuid::Uuid::parse_str(
+            created["workspace"]["id"]
+                .as_str()
+                .ok_or("created workspace id should be a string")?,
+        )?);
+        let exact_scopes = vec![
+            "k8s/prod/datatool-dev/job/maintenance-1".to_owned(),
+            "prod/datatool-dev/minio/list-diagnostic".to_owned(),
+        ];
+        let now = now_utc();
+        let pty_session_id = PtySessionId::new();
+        fixture
+            .repositories
+            .pty_sessions
+            .upsert(&PtySession {
+                pty_session_id,
+                workspace_id,
+                session_id: fixture.session_id,
+                coordination_scopes: exact_scopes.clone(),
+                state: WorkspaceState::Working,
+                foreground_process: None,
+                cwd: Some("/tmp".to_owned()),
+                recent_output_ref: None,
+                last_exit_code: None,
+                input_allowed: true,
+                backend_state: PtyBackendState::Active,
+                backend_capabilities: PtyBackendCapabilities::unknown(),
+                interaction: None,
+                transport_evidence: None,
+                created_at: now,
+                last_activity_at: now,
+            })
+            .await?;
+
+        call_tool(
+            fixture.server(),
+            tools::QUEUE_PTY_INPUT,
+            Some(json!({
+                "pty_session_id": pty_session_id.to_string(),
+                "input": "printf 'ready\\n'\n",
+                "idempotency_key": "scoped-pty-input-1"
+            })),
+        )
+        .await?;
+
+        let leases = fixture
+            .repositories
+            .host_write_leases
+            .list_active(fixture.host_id, now_utc())
+            .await?;
+        let mut acquired_scopes = leases
+            .into_iter()
+            .map(|lease| lease.coordination_scope)
+            .collect::<Vec<_>>();
+        acquired_scopes.sort();
+        let mut expected_scopes = exact_scopes;
+        expected_scopes.sort();
+        assert_eq!(acquired_scopes, expected_scopes);
+        assert!(!acquired_scopes.iter().any(|scope| scope == "host"));
         Ok(())
     }
 
