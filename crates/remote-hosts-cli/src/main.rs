@@ -147,7 +147,7 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
         /// Optional direct peer-sync bind. It exposes only identity and authenticated instance-sync routes.
-        #[arg(long, env = "REMOTE_HOSTS_PEER_SYNC_BIND")]
+        #[arg(long)]
         peer_sync_bind: Option<SocketAddr>,
         /// Local vault master password file required for credential writes in the admin UI.
         #[arg(long, env = "REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE")]
