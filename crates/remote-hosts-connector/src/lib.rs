@@ -10338,6 +10338,10 @@ pub struct ConnectorDaemonReport {
     pub reconciled_expired_agent_sessions: u64,
     /// Number of expired logical Workspaces closed without interrupting active work.
     pub reconciled_expired_workspaces: u64,
+    /// Number of stale operations cancelled after their Workspace was closed.
+    pub reconciled_closed_workspace_operations: u64,
+    /// Number of write leases released after their holder Workspace was closed.
+    pub released_closed_workspace_write_leases: u64,
     /// Number of idle PTY sessions closed automatically by the connector.
     pub reaped_idle_pty_sessions: u64,
     /// Number of zero-channel SSH transports released after their idle TTL.
@@ -10364,6 +10368,8 @@ fn initial_connector_daemon_report() -> ConnectorDaemonReport {
         reconciled_pty_sessions: 0,
         reconciled_expired_agent_sessions: 0,
         reconciled_expired_workspaces: 0,
+        reconciled_closed_workspace_operations: 0,
+        released_closed_workspace_write_leases: 0,
         reaped_idle_pty_sessions: 0,
         reaped_idle_transports: 0,
         completed_operations: 0,
@@ -10660,6 +10666,25 @@ where
                 "upgraded historical SSH channel limits before creating connector transports"
             );
         }
+        let closed_workspace_work = self
+            .repositories
+            .reconcile_closed_workspace_work(observed_at)
+            .await?;
+        report.reconciled_closed_workspace_operations = report
+            .reconciled_closed_workspace_operations
+            .saturating_add(closed_workspace_work.cancelled_operations);
+        report.released_closed_workspace_write_leases = report
+            .released_closed_workspace_write_leases
+            .saturating_add(closed_workspace_work.released_write_leases);
+        if closed_workspace_work.cancelled_operations > 0
+            || closed_workspace_work.released_write_leases > 0
+        {
+            tracing::info!(
+                cancelled_operations = closed_workspace_work.cancelled_operations,
+                released_write_leases = closed_workspace_work.released_write_leases,
+                "reconciled stale work owned by closed Workspaces"
+            );
+        }
         report.reconciled_connection_sessions = self
             .repositories
             .connection_sessions
@@ -10749,6 +10774,34 @@ where
 
     async fn reconcile_lifecycle(&self, report: &mut ConnectorDaemonReport) -> EntityState {
         let mut state = EntityState::Healthy;
+        match self
+            .repositories
+            .reconcile_closed_workspace_work(now_utc())
+            .await
+        {
+            Ok(closed_workspace_work) => {
+                report.reconciled_closed_workspace_operations = report
+                    .reconciled_closed_workspace_operations
+                    .saturating_add(closed_workspace_work.cancelled_operations);
+                report.released_closed_workspace_write_leases = report
+                    .released_closed_workspace_write_leases
+                    .saturating_add(closed_workspace_work.released_write_leases);
+                if closed_workspace_work.cancelled_operations > 0
+                    || closed_workspace_work.released_write_leases > 0
+                {
+                    tracing::info!(
+                        cancelled_operations = closed_workspace_work.cancelled_operations,
+                        released_write_leases = closed_workspace_work.released_write_leases,
+                        "reconciled stale work owned by closed Workspaces"
+                    );
+                }
+            }
+            Err(error) => {
+                report.infrastructure_errors = report.infrastructure_errors.saturating_add(1);
+                tracing::warn!(%error, "connector daemon closed Workspace reconciliation failed");
+                state = EntityState::Degraded;
+            }
+        }
         if let Some(pump) = &self.pty_input_pump {
             match pump
                 .reap_idle(self.pty_idle_ttl_seconds, self.pty_busy_ttl_seconds)

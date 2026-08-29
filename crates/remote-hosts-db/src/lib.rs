@@ -141,6 +141,15 @@ pub struct ActiveWorkSummary {
     pub unexpired_write_leases: i64,
 }
 
+/// Durable work removed after its owning Workspace was explicitly closed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClosedWorkspaceWorkReconciliation {
+    /// Queued or running operations transitioned to cancelled.
+    pub cancelled_operations: u64,
+    /// Write leases released because their holder Workspace was closed with active work.
+    pub released_write_leases: u64,
+}
+
 /// Logical workspace capacity after classifying expired, safely reapable records.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceCapacityStatus {
@@ -322,17 +331,31 @@ impl Repositories {
         let row = sqlx::query(
             r#"
             SELECT
-                (SELECT COUNT(*) FROM operation_runs
-                 WHERE state_json IN ('"queued"', '"running"')) AS operations,
+                (SELECT COUNT(*) FROM operation_runs active_operation
+                 LEFT JOIN agent_workspaces operation_workspace
+                   ON operation_workspace.workspace_id = active_operation.workspace_id
+                 WHERE active_operation.state_json IN ('"queued"', '"running"')
+                   AND (
+                     active_operation.workspace_id IS NULL
+                     OR operation_workspace.state_json != '"closed"'
+                   )) AS operations,
                 (SELECT COUNT(*) FROM pty_sessions ps
                  JOIN agent_workspaces aw ON aw.workspace_id = ps.workspace_id
-                 WHERE aw.state_json IN ('"idle"', '"working"')
+                 WHERE aw.state_json IN ('"idle"', '"working"', '"blocked"')
                    AND ps.backend_state_json IN ('"pending"', '"active"')
                    AND ps.input_allowed = 1) AS ptys,
-                (SELECT COUNT(*) FROM pty_input_events
-                 WHERE state_json IN ('"queued"', '"claimed"')) AS pty_inputs,
-                (SELECT COUNT(*) FROM host_write_leases
-                 WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) AS write_leases
+                (SELECT COUNT(*) FROM pty_input_events active_input
+                 JOIN agent_workspaces input_workspace
+                   ON input_workspace.workspace_id = active_input.workspace_id
+                 WHERE active_input.state_json IN ('"queued"', '"claimed"')
+                   AND input_workspace.state_json IN ('"idle"', '"working"', '"blocked"'))
+                  AS pty_inputs,
+                (SELECT COUNT(*) FROM host_write_leases active_lease
+                 JOIN agent_workspaces lease_workspace
+                   ON lease_workspace.workspace_id = active_lease.holder_workspace_id
+                 WHERE active_lease.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                   AND lease_workspace.state_json != '"closed"')
+                  AS write_leases
             "#,
         )
         .fetch_one(&self.operations.pool)
@@ -342,6 +365,68 @@ impl Repositories {
             pending_or_active_ptys: row.try_get("ptys")?,
             queued_or_claimed_pty_inputs: row.try_get("pty_inputs")?,
             unexpired_write_leases: row.try_get("write_leases")?,
+        })
+    }
+
+    /// Cancels operations and releases write leases owned by explicitly closed Workspaces.
+    ///
+    /// The transaction invalidates connector claim renewal before releasing coordination leases,
+    /// so a resident older connector cannot revive work after its owner closed the Workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reconciliation transaction cannot complete.
+    pub async fn reconcile_closed_workspace_work(
+        &self,
+        observed_at: OffsetDateTime,
+    ) -> Result<ClosedWorkspaceWorkReconciliation, DbError> {
+        let mut transaction = self.operations.pool.begin().await?;
+        let released_write_leases = sqlx::query(
+            r#"
+            DELETE FROM host_write_leases
+            WHERE holder_workspace_id IN (
+                SELECT closed_workspace.workspace_id
+                FROM agent_workspaces closed_workspace
+                WHERE closed_workspace.state_json = '"closed"'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM operation_runs active_operation
+                    WHERE active_operation.workspace_id = closed_workspace.workspace_id
+                      AND active_operation.state_json IN ('"queued"', '"running"')
+                  )
+              )
+            "#,
+        )
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        let cancelled_operations = sqlx::query(
+            r#"
+            UPDATE operation_runs
+            SET state_json = '"cancelled"',
+                finished_at = ?,
+                exit_code = NULL,
+                redacted_output_summary = 'cancelled because Workspace was closed',
+                last_error = 'workspace_closed',
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL
+            WHERE state_json IN ('"queued"', '"running"')
+              AND workspace_id IN (
+                SELECT workspace_id
+                FROM agent_workspaces
+                WHERE state_json = '"closed"'
+              )
+            "#,
+        )
+        .bind(observed_at)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        transaction.commit().await?;
+        Ok(ClosedWorkspaceWorkReconciliation {
+            cancelled_operations,
+            released_write_leases,
         })
     }
 
@@ -4388,9 +4473,12 @@ impl OperationRunRepository {
                 FROM operation_runs candidate
                 JOIN access_paths candidate_path
                   ON candidate_path.id = candidate.access_path_id
+                JOIN agent_workspaces candidate_workspace
+                  ON candidate_workspace.workspace_id = candidate.workspace_id
                 WHERE candidate.connector_id = ?
                   AND candidate.workspace_id IS NOT NULL
                   AND candidate.command_profile_json IS NOT NULL
+                  AND candidate_workspace.state_json != ?
                   AND candidate.attempt_count < ?
                   AND (
                     (
@@ -4516,6 +4604,7 @@ impl OperationRunRepository {
         .bind(lease_expires_at)
         .bind("claimed by connector worker")
         .bind(connector_id.to_string())
+        .bind(to_json(&WorkspaceState::Closed)?)
         .bind(u32_to_i64(max_attempts))
         .bind(to_json(&OperationState::Running)?)
         .bind(claimed_at)
@@ -4564,20 +4653,23 @@ impl OperationRunRepository {
                 lease_expires_at = NULL
             WHERE id = (
                 SELECT id
-                FROM operation_runs
-                WHERE connector_id = ?
-                  AND workspace_id IS NOT NULL
-                  AND command_profile_json IS NOT NULL
-                  AND attempt_count >= ?
+                FROM operation_runs exhausted_candidate
+                JOIN agent_workspaces exhausted_workspace
+                  ON exhausted_workspace.workspace_id = exhausted_candidate.workspace_id
+                WHERE exhausted_candidate.connector_id = ?
+                  AND exhausted_candidate.workspace_id IS NOT NULL
+                  AND exhausted_candidate.command_profile_json IS NOT NULL
+                  AND exhausted_workspace.state_json != ?
+                  AND exhausted_candidate.attempt_count >= ?
                   AND (
-                    state_json = ?
+                    exhausted_candidate.state_json = ?
                     OR (
-                        state_json = ?
-                        AND lease_expires_at IS NOT NULL
-                        AND lease_expires_at <= ?
+                        exhausted_candidate.state_json = ?
+                        AND exhausted_candidate.lease_expires_at IS NOT NULL
+                        AND exhausted_candidate.lease_expires_at <= ?
                     )
                   )
-                ORDER BY started_at ASC, id ASC
+                ORDER BY exhausted_candidate.started_at ASC, exhausted_candidate.id ASC
                 LIMIT 1
             )
             RETURNING *
@@ -4588,6 +4680,7 @@ impl OperationRunRepository {
         .bind(redacted_output_summary)
         .bind(last_error)
         .bind(connector_id.to_string())
+        .bind(to_json(&WorkspaceState::Closed)?)
         .bind(u32_to_i64(max_attempts))
         .bind(to_json(&OperationState::Queued)?)
         .bind(to_json(&OperationState::Running)?)
@@ -8789,6 +8882,336 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].new_state, EntityState::Connected);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn closed_workspace_work_is_reconciled_without_touching_active_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&pool).await?;
+        let repos = Repositories::new(pool);
+        let now = now_utc();
+
+        let host = Host {
+            id: HostId::new(),
+            name: "restart-reconciliation".to_owned(),
+            display_name: "Restart Reconciliation".to_owned(),
+            kind: HostKind::Linux,
+            owner: None,
+            tags: Vec::new(),
+            description: None,
+            risk_level: RiskLevel::Development,
+            created_at: now,
+            updated_at: now,
+        };
+        repos.hosts.insert(&host).await?;
+        let environment = Environment {
+            id: EnvironmentId::new(),
+            name: "restart-reconciliation".to_owned(),
+            kind: EnvironmentKind::HomeLan,
+            description: None,
+            trust_level: TrustLevel::Owned,
+            notes: None,
+        };
+        repos.environments.insert(&environment).await?;
+        let connector = Connector {
+            id: ConnectorId::new(),
+            name: "restart-reconciliation".to_owned(),
+            environment_id: environment.id,
+            host_id: None,
+            version: "test".to_owned(),
+            state: EntityState::Healthy,
+            last_seen_at: Some(now),
+            current_network: Some("test".to_owned()),
+        };
+        repos.connectors.upsert(&connector).await?;
+        let credential = StoredCredential {
+            metadata: CredentialMetadata {
+                id: CredentialId::new(),
+                name: "restart-reconciliation".to_owned(),
+                kind: CredentialKind::SshPassword,
+                username_hint: Some("ops".to_owned()),
+                created_at: now,
+                updated_at: now,
+                last_used_at: None,
+            },
+            encrypted_blob_json: json!({"version": 1, "ciphertext": "redacted"}),
+        };
+        repos.credentials.insert(&credential).await?;
+        let path = AccessPath {
+            id: AccessPathId::new(),
+            host_id: host.id,
+            environment_id: environment.id,
+            connector_id: Some(connector.id),
+            protocol: Protocol::Ssh,
+            address: "127.0.0.1".to_owned(),
+            port: 22,
+            username: "ops".to_owned(),
+            credential_id: credential.metadata.id,
+            route_type: RouteType::Lan,
+            proxy_chain: Vec::new(),
+            priority: 1,
+            enabled: true,
+            connection_mode: ConnectionMode::Pooled,
+            idle_ttl_seconds: 600,
+            keepalive_seconds: 30,
+            max_concurrent_channels: 8,
+            max_new_connections_per_minute: 1,
+            requires_tty: false,
+            notes: None,
+        };
+        repos.access_paths.insert(&path).await?;
+        let connection = ConnectionSession {
+            session_id: SessionId::new(),
+            access_path_id: path.id,
+            connector_id: connector.id,
+            state: EntityState::Connected,
+            created_at: now,
+            last_used_at: now,
+            open_channels: 1,
+            reused_count: 0,
+            failure_count: 0,
+            last_error: None,
+        };
+        repos.connection_sessions.upsert(&connection).await?;
+
+        let stale_agent = AgentSession {
+            id: AgentSessionId::new(),
+            client_kind: "codex".to_owned(),
+            client_instance_id: "stale-task".to_owned(),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("stale-conversation".to_owned()),
+            state: AgentSessionState::Active,
+            created_at: now,
+            last_seen_at: now,
+            expires_at: now + time::Duration::hours(1),
+        };
+        repos.agent_sessions.upsert(&stale_agent).await?;
+        let stale_workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(stale_agent.id),
+            host_id: host.id,
+            access_path_id: path.id,
+            connector_id: connector.id,
+            label: "stale-workspace".to_owned(),
+            cwd: None,
+            state: WorkspaceState::Closed,
+            policy_profile: "default".to_owned(),
+            coordination_scope: "prod/cleanup".to_owned(),
+            created_at: now,
+            last_activity_at: now,
+            ttl_seconds: 3600,
+        };
+        repos.workspaces.insert(&stale_workspace).await?;
+        let stale_operation = OperationRun {
+            id: OperationId::new(),
+            host_id: host.id,
+            access_path_id: path.id,
+            connector_id: connector.id,
+            session_id: Some(connection.session_id),
+            workspace_id: Some(stale_workspace.id),
+            agent_session_id: Some(stale_agent.id),
+            idempotency_key: Some("stale-operation".to_owned()),
+            requires_write_lease: true,
+            coordination_scope: stale_workspace.coordination_scope.clone(),
+            coordination_scopes: vec![stale_workspace.coordination_scope.clone()],
+            operation_type: OperationType::Runbook,
+            intent: "stale mutation".to_owned(),
+            state: OperationState::Running,
+            started_at: now,
+            finished_at: None,
+            exit_code: None,
+            timeout_seconds: 3600,
+            redacted_command_summary: "stale command".to_owned(),
+            command_profile_json: Some(json!({"name": "shell.posix"})),
+            transport_evidence: None,
+            redacted_output_summary: Some("claimed by connector worker".to_owned()),
+            log_ref: None,
+            attempt_count: 1,
+            claim_token: Some("stale-claim".to_owned()),
+            claimed_at: Some(now),
+            lease_expires_at: Some(now + time::Duration::minutes(5)),
+            last_error: None,
+        };
+        repos.operations.insert(&stale_operation).await?;
+        let stale_lease = HostWriteLease {
+            host_id: host.id,
+            coordination_scope: stale_workspace.coordination_scope.clone(),
+            holder_agent_session_id: stale_agent.id,
+            holder_workspace_id: stale_workspace.id,
+            acquired_at: now,
+            heartbeat_at: now,
+            expires_at: now + time::Duration::minutes(5),
+        };
+        assert!(
+            repos
+                .host_write_leases
+                .try_acquire(&stale_lease, now)
+                .await?
+                .is_some()
+        );
+
+        let active_agent = AgentSession {
+            id: AgentSessionId::new(),
+            client_instance_id: "active-task".to_owned(),
+            conversation_key: Some("active-conversation".to_owned()),
+            ..stale_agent.clone()
+        };
+        repos.agent_sessions.upsert(&active_agent).await?;
+        let active_workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(active_agent.id),
+            label: "active-workspace".to_owned(),
+            state: WorkspaceState::Blocked,
+            coordination_scope: "prod/audit".to_owned(),
+            ..stale_workspace.clone()
+        };
+        repos.workspaces.insert(&active_workspace).await?;
+        let active_pty = PtySession {
+            pty_session_id: PtySessionId::new(),
+            workspace_id: active_workspace.id,
+            session_id: connection.session_id,
+            coordination_scopes: vec![active_workspace.coordination_scope.clone()],
+            state: WorkspaceState::Blocked,
+            foreground_process: None,
+            cwd: None,
+            recent_output_ref: None,
+            last_exit_code: None,
+            input_allowed: true,
+            backend_state: PtyBackendState::Active,
+            backend_capabilities: PtyBackendCapabilities::unknown(),
+            interaction: None,
+            transport_evidence: None,
+            created_at: now,
+            last_activity_at: now,
+        };
+        repos.pty_sessions.upsert(&active_pty).await?;
+
+        let reconciled = repos.reconcile_closed_workspace_work(now).await?;
+        assert_eq!(reconciled.cancelled_operations, 1);
+        assert_eq!(reconciled.released_write_leases, 1);
+        let cancelled = repos
+            .operations
+            .get(stale_operation.id)
+            .await?
+            .ok_or_else(|| io::Error::other("cancelled operation exists"))?;
+        assert_eq!(cancelled.state, OperationState::Cancelled);
+        assert_eq!(cancelled.finished_at, Some(now));
+        assert!(cancelled.claim_token.is_none());
+        assert!(cancelled.claimed_at.is_none());
+        assert!(cancelled.lease_expires_at.is_none());
+        assert!(
+            !repos
+                .operations
+                .renew_claim(
+                    stale_operation.id,
+                    "stale-claim",
+                    now + time::Duration::minutes(10),
+                )
+                .await?
+        );
+        assert!(
+            repos
+                .host_write_leases
+                .list_active(host.id, now)
+                .await?
+                .is_empty()
+        );
+
+        let post_reconciliation_operation = OperationRun {
+            id: OperationId::new(),
+            idempotency_key: Some("terminal-workspace-race".to_owned()),
+            state: OperationState::Queued,
+            session_id: None,
+            claim_token: None,
+            claimed_at: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            ..stale_operation.clone()
+        };
+        repos
+            .operations
+            .insert(&post_reconciliation_operation)
+            .await?;
+        assert!(
+            repos
+                .operations
+                .claim_next_for_connector(
+                    connector.id,
+                    "must-not-claim-terminal-workspace",
+                    now,
+                    now + time::Duration::minutes(5),
+                    3,
+                )
+                .await?
+                .is_none(),
+            "the scheduler must never reclaim work from a terminal Workspace"
+        );
+        assert_eq!(
+            repos
+                .reconcile_closed_workspace_work(now)
+                .await?
+                .cancelled_operations,
+            1
+        );
+
+        let summary = repos.active_work_summary().await?;
+        assert_eq!(summary.queued_or_running_operations, 0);
+        assert_eq!(summary.unexpired_write_leases, 0);
+        assert_eq!(summary.pending_or_active_ptys, 1);
+        assert!(!summary.is_idle());
+        let retained_pty = repos
+            .pty_sessions
+            .get(active_pty.pty_session_id)
+            .await?
+            .ok_or_else(|| io::Error::other("active PTY remains"))?;
+        assert_eq!(retained_pty.pty_session_id, active_pty.pty_session_id);
+        assert_eq!(retained_pty.backend_state, PtyBackendState::Active);
+
+        let trigger_operation = OperationRun {
+            id: OperationId::new(),
+            workspace_id: Some(active_workspace.id),
+            agent_session_id: Some(active_agent.id),
+            coordination_scope: active_workspace.coordination_scope.clone(),
+            coordination_scopes: vec![active_workspace.coordination_scope.clone()],
+            idempotency_key: Some("terminal-workspace-trigger".to_owned()),
+            ..stale_operation
+        };
+        repos.operations.insert(&trigger_operation).await?;
+        let trigger_lease = HostWriteLease {
+            coordination_scope: active_workspace.coordination_scope.clone(),
+            holder_agent_session_id: active_agent.id,
+            holder_workspace_id: active_workspace.id,
+            ..stale_lease
+        };
+        assert!(
+            repos
+                .host_write_leases
+                .try_acquire(&trigger_lease, now)
+                .await?
+                .is_some()
+        );
+        repos
+            .workspaces
+            .update_state(active_workspace.id, WorkspaceState::Closed, now)
+            .await?;
+        let trigger_cancelled = repos
+            .operations
+            .get(trigger_operation.id)
+            .await?
+            .ok_or_else(|| io::Error::other("trigger-cancelled operation exists"))?;
+        assert_eq!(trigger_cancelled.state, OperationState::Cancelled);
+        assert!(trigger_cancelled.claim_token.is_none());
+        assert!(
+            repos
+                .host_write_leases
+                .list_active(host.id, now)
+                .await?
+                .is_empty(),
+            "the migration trigger must release the terminal Workspace lease immediately"
+        );
         Ok(())
     }
 }

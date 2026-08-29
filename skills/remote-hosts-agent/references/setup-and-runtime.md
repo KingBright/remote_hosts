@@ -85,6 +85,15 @@ submitting new work, and reload MCP after the upgrade. Include the compact respo
 request runtime snapshots only for diagnostics. Wait until the normal drain gate passes; do not use
 `--force` as a substitute for notification and orderly release.
 
+An explicitly `closed` Workspace is the cancellation boundary for its own remaining work. The
+service automatically cancels its queued/running operations, invalidates connector claims, and
+releases write leases held for that stale active work before restart-readiness and Connector
+startup. Never edit SQLite or force a restart to clear this residue. A live `idle`, `working`, or
+interactive `blocked` Workspace still participates in the drain gate, and another Workspace's PTY
+or lease must never be closed on its behalf. `done`, `failed`, and `throttled` are not equivalent to
+an explicit close because normal concurrent operations and short lease handoff can still depend on
+those states.
+
 Windows uses the same Rust `restart-readiness` query and `-Force` spelling. Its versioned release
 directories avoid overwriting an executable that is still in use. Neither macOS nor Windows service
 management depends on an external SQLite CLI.

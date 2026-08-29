@@ -71,7 +71,8 @@ scripts/remote-hosts-service skills
 ```
 
 Normal updates use a drain gate and will not interrupt active operations, PTYs, pending input, or
-write leases. The `--force` option is reserved for an intentional interruption.
+write leases. Work left behind by an explicitly closed Workspace is cancelled and released
+automatically; the `--force` option is reserved for an intentional interruption.
 
 See [Deployment and Operations](docs/deployment-and-operations.md) for paths, configuration,
 upgrade behavior, bastion guidance, retry policy, and troubleshooting.

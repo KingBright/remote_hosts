@@ -89,6 +89,14 @@ and stop creating new Remote Hosts work. The notice must also tell them to reloa
 upgrade and follow the compact Agent response contract. Wait for the normal drain gate to pass;
 never use `--force` merely because notification or draining takes time.
 
+An explicitly `closed` Workspace is an authoritative cancellation boundary. Migration `0023`, the
+restart-readiness command, and Connector lifecycle reconciliation cancel any queued/running
+operation still attached to it, clear its connector claim, and release its active-work write lease.
+The scheduler also refuses to reclaim that work. This cleanup is idempotent and does not touch PTYs,
+operations, or leases owned by another Workspace. Do not edit SQLite or use `--force` to clear a
+closed-Workspace residue. `done`, `failed`, and `throttled` are not treated as explicit closure:
+they retain existing concurrent-operation and bounded lease-handoff behavior.
+
 The API reads `REMOTE_HOSTS_ADMIN_HTML_PATH` on every `/admin` request and falls back to its embedded
 page. After a UI-only update, reload the browser.
 

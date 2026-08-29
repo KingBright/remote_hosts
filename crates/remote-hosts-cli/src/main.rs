@@ -371,6 +371,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::RestartReadiness { database_url } => {
             let repositories = connect_repositories(&database_url).await?;
+            repositories
+                .reconcile_closed_workspace_work(remote_hosts_domain::now_utc())
+                .await
+                .context("reconcile closed Workspace work before restart")?;
             let summary = repositories
                 .active_work_summary()
                 .await
