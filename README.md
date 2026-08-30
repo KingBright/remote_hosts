@@ -93,7 +93,7 @@ keeps releases versioned for non-disruptive staging, and installs a stable Rust 
 
 ## Agent Integration
 
-The default `agent` MCP profile exposes 21 task-oriented tools for host registration, credentials,
+The default `agent` MCP profile exposes 22 task-oriented tools for host registration, credentials,
 knowledge, runtime snapshots, Workspaces, generic commands, file transfer, PTYs, artifacts, and
 event waits. Low-level registry repair stays in the `admin` profile.
 
@@ -167,7 +167,7 @@ The 2026-08-29 release adds native Windows runtime and packaging support, a stab
 launcher, Rust-owned connector bootstrap and restart-readiness checks, runtime snapshot version 11,
 atomic exact-resource coordination for commands and PTYs, capacity-aware scheduling, resumable verified transfers,
 transport evidence, grouped topology management, compact Zstandard output history, guarded storage
-reclamation, and a 21-tool Agent profile. Release-level implementation details stay in the
+reclamation, and a 22-tool Agent profile. Release-level implementation details stay in the
 architecture and operations documents.
 
 ## Security Summary

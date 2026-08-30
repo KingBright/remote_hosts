@@ -124,12 +124,21 @@ The current runtime snapshot schema is version 11. Older snapshots do not provid
 
 ## Runtime Event Waits
 
+Prefer `remote_hosts_get_agent_work_context` for normal Agent recovery and waiting. Start with
+`mode=snapshot`, retain its `cursor`, then call `mode=wait` with that exact `after_cursor`. The
+response is bound to the current Agent Session and returns only active items plus terminal changes
+not yet consumed by that cursor. Follow the one `primary_action`; use entity-specific output or
+runtime tools only when it says to read a result, respond to typed interaction, or inspect runtime.
+Never interpret `changed=false` as failure and never create duplicate work merely because a wait
+timed out. A no-change wait is a compact acknowledgement with an unchanged cursor and empty items;
+retain the last changed context and wait again from that same cursor.
+
 Use `remote_hosts_wait_runtime_events` only with an explicit start mode:
 
 - `after_cursor`: pass the `event_cursor` returned by a host runtime snapshot, or `next_cursor` returned by a previous wait. This permits replay and closes the snapshot-to-subscription race.
 - `live_only`: ignore all retained events and wait only for transitions created after the call begins.
 
-A timeout is a normal structured result with `timed_out=true`; it is not evidence that SSH or the connector failed. Continue from `next_cursor`. The sequenced log currently carries connector state transitions, so keep using workspace wait and PTY/output tools for operation and interactive lifecycle changes.
+A timeout is a normal structured result with `timed_out=true`; it is not evidence that SSH or the connector failed. Continue from `next_cursor`. The low-level runtime-event tool remains useful for connector/admin diagnostics. Normal Agent operation, Workspace, PTY, input, and transfer lifecycle recovery should use Agent Work Context so session isolation, terminal-event consumption, blockers, and next-action priority stay centralized.
 
 ## Standard Registry Maintenance
 

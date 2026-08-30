@@ -15,6 +15,7 @@ axum.workspace = true
 remote-hosts-core = { path = "../remote-hosts-core" }
 remote-hosts-db = { path = "../remote-hosts-db" }
 remote-hosts-domain = { path = "../remote-hosts-domain" }
+remote-hosts-mcp = { path = "../remote-hosts-mcp" }
 remote-hosts-sync = { path = "../remote-hosts-sync" }
 remote-hosts-vault = { path = "../remote-hosts-vault" }
 secrecy.workspace = true

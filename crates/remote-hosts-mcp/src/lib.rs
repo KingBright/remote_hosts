@@ -13,21 +13,23 @@ use remote_hosts_core::{
     ConnectorStateTracker, DEFAULT_SFTP_MAX_SIZE_BYTES, DEFAULT_SFTP_TIMEOUT_SECONDS,
     FileTransferSpec, HostStateAggregator, HostStateInput, OperationCoordinationMode,
     PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionOpenCommand,
-    PtySessionSupervisor, ServerProtectionPolicy, SftpDirection, SftpOverwritePolicy,
-    WorkspaceCreateCommand, WorkspaceFileTransfer, WorkspaceOperationSupervisor,
-    WorkspaceRunCommand, WorkspaceSupervisor, common_coordination_scope,
-    resolve_operation_coordination_scopes,
+    PtySessionSupervisor, SecretRedactor, ServerProtectionPolicy, SftpDirection,
+    SftpOverwritePolicy, WorkspaceCreateCommand, WorkspaceFileTransfer,
+    WorkspaceOperationSupervisor, WorkspaceRunCommand, WorkspaceSupervisor,
+    common_coordination_scope, resolve_operation_coordination_scopes,
 };
 use remote_hosts_db::{DbError, Repositories, WorkspaceCapacityStatus, retry_sqlite_contention};
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentSessionState,
-    AgentWorkspace, ConnectionMode, ConnectionSession, Connector, ConnectorId, CredentialId,
-    CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind,
-    FactSource, Host, HostFact, HostFactId, HostId, HostKind, HostWriteLease, InstancePeerId,
-    InstanceSyncCollection, KnowledgeItem, KnowledgeItemId, OperationId, OperationOutputArtifactId,
-    OperationRun, OperationState, Protocol, PtyBackendState, PtyInputEvent, PtySession,
-    PtySessionId, RiskLevel, RouteType, SessionId, SoftwareInstallId, StateReasonCode,
-    StateSnapshot, StoredCredential, TrustLevel, WorkspaceId, WorkspaceState, now_utc,
+    AgentWorkContext, AgentWorkHost, AgentWorkItem, AgentWorkOverallState, AgentWorkPrimaryAction,
+    AgentWorkProgress, AgentWorkspace, ConnectionMode, ConnectionSession, Connector, ConnectorId,
+    CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId,
+    EnvironmentKind, FactSource, Host, HostFact, HostFactId, HostId, HostKind, HostWriteLease,
+    InstancePeerId, InstanceSyncCollection, KnowledgeItem, KnowledgeItemId, OperationId,
+    OperationOutputArtifactId, OperationOutputChunk, OperationRun, OperationState, OperationType,
+    Protocol, PtyBackendState, PtyInputEvent, PtySession, PtySessionId, RiskLevel, RouteType,
+    SessionId, SoftwareInstallId, StateReasonCode, StateSnapshot, StoredCredential, TrustLevel,
+    WorkspaceId, WorkspaceState, now_utc,
 };
 use remote_hosts_sync::InstanceSyncService;
 use rmcp::{
@@ -97,6 +99,8 @@ pub mod tools {
     pub const LIST_CONNECTOR_EVENTS: &str = "remote_hosts_list_connector_events";
     /// Wait for sequenced runtime state events.
     pub const WAIT_RUNTIME_EVENTS: &str = "remote_hosts_wait_runtime_events";
+    /// Get or wait for the current Agent Session's compact work context.
+    pub const GET_AGENT_WORK_CONTEXT: &str = "remote_hosts_get_agent_work_context";
     /// Refresh state.
     pub const REFRESH_STATE: &str = "remote_hosts_refresh_state";
     /// Get server protection state.
@@ -175,6 +179,7 @@ const AGENT_TOOL_NAMES: &[&str] = &[
     tools::QUEUE_PTY_INPUT,
     tools::READ_PTY_OUTPUT,
     tools::CLOSE_PTY_SESSION,
+    tools::GET_AGENT_WORK_CONTEXT,
     tools::WAIT_RUNTIME_EVENTS,
     tools::CONFIGURE_INSTANCE_SYNC_PEER,
     tools::SYNC_INSTANCE_PEER,
@@ -729,6 +734,32 @@ pub struct WaitRuntimeEventsRequest {
     pub limit: Option<u32>,
 }
 
+/// Agent work-context read mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkContextMode {
+    /// Return a stable current-session snapshot and establish a cursor baseline.
+    Snapshot,
+    /// Wait for a current-session lifecycle event strictly after `after_cursor`.
+    Wait,
+}
+
+/// Current-session work-context request.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWorkContextRequest {
+    /// Snapshot immediately or wait for a lifecycle change.
+    pub mode: AgentWorkContextMode,
+    /// Required for `wait` and forbidden for `snapshot`.
+    pub after_cursor: Option<u64>,
+    /// Long-poll timeout in milliseconds. Defaults to 5000 and is capped at 60000.
+    pub timeout_ms: Option<u64>,
+    /// Optional host UUID filter.
+    pub host_id: Option<String>,
+    /// Maximum returned items. Defaults to 20 and is capped at 50.
+    pub limit: Option<u32>,
+}
+
 /// State refresh depth.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1202,6 +1233,412 @@ impl RemoteHostsMcpServer {
             .ok_or_else(|| format!("pty session not found: {pty_session_id}"))?;
         self.workspace_for_tool(pty_session.workspace_id).await?;
         Ok(pty_session)
+    }
+
+    /// Materializes one bounded read-only work context for an explicitly resolved Agent Session.
+    ///
+    /// This is public so the loopback/admin HTTP surface can share the exact MCP aggregation and
+    /// redaction contract without accepting cross-session control.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when repository reads fail or referenced durable entities are missing.
+    #[allow(clippy::too_many_lines)]
+    pub async fn materialize_agent_work_context(
+        &self,
+        agent_session_id: AgentSessionId,
+        host_filter: Option<HostId>,
+        after_cursor: Option<u64>,
+        cursor: u64,
+        changed: bool,
+        limit: u32,
+    ) -> Result<AgentWorkContext, String> {
+        let lifecycle_events = if let Some(after_cursor) = after_cursor {
+            self.repositories
+                .state_events
+                .list_lifecycle_after_for_agent_session(
+                    agent_session_id,
+                    after_cursor,
+                    host_filter,
+                    limit,
+                )
+                .await
+                .map_err(|error| tool_error(&error))?
+        } else {
+            Vec::new()
+        };
+        let terminal_entities = lifecycle_events
+            .iter()
+            .filter(|event| lifecycle_state_is_terminal(&event.state))
+            .map(|event| (event.kind.clone(), event.entity_id.clone()))
+            .collect::<BTreeSet<_>>();
+        let changed_entities = lifecycle_events
+            .iter()
+            .map(|event| (event.kind.clone(), event.entity_id.clone()))
+            .collect::<BTreeSet<_>>();
+        let changed_workspaces = lifecycle_events
+            .iter()
+            .filter_map(|event| event.workspace_id)
+            .collect::<BTreeSet<_>>();
+        let workspaces = self
+            .repositories
+            .workspaces
+            .list_for_agent_session(agent_session_id, host_filter, 50)
+            .await
+            .map_err(|error| tool_error(&error))?;
+        let observed_at = now_utc();
+        let redactor = SecretRedactor::default();
+        let mut items = Vec::new();
+        let mut host_routes = BTreeSet::new();
+
+        for workspace in workspaces {
+            let access_path = self
+                .repositories
+                .access_paths
+                .get(workspace.access_path_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .ok_or_else(|| format!("access path not found: {}", workspace.access_path_id))?;
+            let channel_usage = self
+                .repositories
+                .access_paths
+                .channel_usage(access_path.id, observed_at)
+                .await
+                .map_err(|error| tool_error(&error))?;
+            let channel_capacity = RuntimeChannelCapacityOutput::new(
+                access_path.max_concurrent_channels,
+                channel_usage,
+            );
+            let leases = self
+                .repositories
+                .host_write_leases
+                .list_active(workspace.host_id, observed_at)
+                .await
+                .map_err(|error| tool_error(&error))?;
+            let operations = self
+                .repositories
+                .operations
+                .list_for_workspace(workspace.id, 50)
+                .await
+                .map_err(|error| tool_error(&error))?;
+            let ptys = self
+                .repositories
+                .pty_sessions
+                .list_for_workspace(workspace.id)
+                .await
+                .map_err(|error| tool_error(&error))?;
+            let mut has_visible_child = false;
+
+            for operation in operations {
+                let item_kind = if operation.operation_type == OperationType::Sftp {
+                    "transfer"
+                } else {
+                    "operation"
+                };
+                let entity_id = operation.id.to_string();
+                let active = matches!(
+                    operation.state,
+                    OperationState::Queued | OperationState::Running
+                );
+                let newly_terminal = terminal_entities
+                    .contains(&(item_kind.to_owned(), entity_id.clone()))
+                    || terminal_entities.contains(&("operation".to_owned(), entity_id.clone()));
+                if !active && !newly_terminal {
+                    continue;
+                }
+                has_visible_child = true;
+                let scopes = operation_coordination_scopes(&operation);
+                let foreign_scope_blocker = operation.requires_write_lease
+                    && leases.iter().any(|lease| {
+                        lease.holder_agent_session_id != agent_session_id
+                            && scopes.iter().any(|scope| {
+                                coordination_scopes_overlap(&lease.coordination_scope, scope)
+                            })
+                    });
+                let foreign_scope_retry_ms = foreign_scope_blocker.then(|| {
+                    leases
+                        .iter()
+                        .filter(|lease| {
+                            lease.holder_agent_session_id != agent_session_id
+                                && scopes.iter().any(|scope| {
+                                    coordination_scopes_overlap(&lease.coordination_scope, scope)
+                                })
+                        })
+                        .filter_map(|lease| {
+                            u64::try_from(
+                                (lease.expires_at - observed_at).whole_milliseconds().max(0),
+                            )
+                            .ok()
+                        })
+                        .min()
+                        .unwrap_or(750)
+                });
+                let (state, blocker, next_action) = match operation.state {
+                    OperationState::Queued if foreign_scope_blocker => (
+                        "waiting_scope",
+                        Some("foreign_session_holds_overlapping_scope".to_owned()),
+                        "wait",
+                    ),
+                    OperationState::Queued if channel_capacity.available_channels == 0 => (
+                        "waiting_capacity",
+                        Some("ssh_channel_capacity_saturated".to_owned()),
+                        "wait",
+                    ),
+                    OperationState::Queued => ("waiting", None, "wait"),
+                    OperationState::Running => ("running", None, "wait"),
+                    OperationState::Succeeded => ("succeeded", None, "read_result"),
+                    OperationState::Failed
+                    | OperationState::TimedOut
+                    | OperationState::Cancelled
+                    | OperationState::Rejected
+                    | OperationState::Exhausted => ("failed", None, "read_result"),
+                };
+                let next_sequence = self
+                    .repositories
+                    .operation_output_chunks
+                    .next_sequence(operation.id)
+                    .await
+                    .map_err(|error| tool_error(&error))?;
+                let progress = if operation.operation_type == OperationType::Sftp {
+                    let chunks = self
+                        .repositories
+                        .operation_output_chunks
+                        .list_for_workspace(workspace.id, Some(operation.id), None, 20)
+                        .await
+                        .map_err(|error| tool_error(&error))?;
+                    transfer_progress_from_chunks(&chunks)
+                } else {
+                    None
+                };
+                items.push(AgentWorkItem {
+                    kind: item_kind.to_owned(),
+                    workspace_id: workspace.id,
+                    entity_id,
+                    state: state.to_owned(),
+                    intent: Some(redactor.command_preview(&operation.intent)),
+                    command_preview: Some(
+                        redactor.command_preview(&operation.redacted_command_summary),
+                    ),
+                    coordination_mode: Some(if operation.requires_write_lease {
+                        "write".to_owned()
+                    } else {
+                        "read".to_owned()
+                    }),
+                    coordination_scopes: scopes,
+                    blocker,
+                    progress,
+                    interaction: None,
+                    latest_sequence: next_sequence.checked_sub(1),
+                    retry_after_ms: match state {
+                        "waiting_scope" => foreign_scope_retry_ms,
+                        "waiting" | "waiting_capacity" | "running" => Some(750),
+                        _ => None,
+                    },
+                    next_action: next_action.to_owned(),
+                });
+            }
+
+            for pty in ptys {
+                let entity_id = pty.pty_session_id.to_string();
+                let active = matches!(
+                    pty.backend_state,
+                    PtyBackendState::Pending | PtyBackendState::Active
+                ) && pty.state != WorkspaceState::Closed;
+                let newly_terminal =
+                    terminal_entities.contains(&("pty".to_owned(), entity_id.clone()));
+                if !active && !newly_terminal {
+                    continue;
+                }
+                has_visible_child = true;
+                let interaction = pty
+                    .interaction
+                    .as_ref()
+                    .map(|value| enum_label(&value.kind));
+                let (state, blocker, next_action) = if interaction.is_some()
+                    && pty.backend_state == PtyBackendState::Active
+                    && pty.input_allowed
+                {
+                    (
+                        "waiting_input",
+                        Some("typed_interaction_required".to_owned()),
+                        "respond_to_interaction",
+                    )
+                } else {
+                    match pty.backend_state {
+                        PtyBackendState::Pending | PtyBackendState::Unknown
+                            if channel_capacity.available_channels == 0 =>
+                        {
+                            (
+                                "waiting_capacity",
+                                Some("ssh_channel_capacity_saturated".to_owned()),
+                                "wait",
+                            )
+                        }
+                        PtyBackendState::Pending | PtyBackendState::Unknown => {
+                            ("waiting", None, "wait")
+                        }
+                        PtyBackendState::Active => ("running", None, "wait"),
+                        PtyBackendState::Failed => ("failed", None, "inspect_runtime"),
+                        PtyBackendState::Closed => ("complete", None, "read_result"),
+                    }
+                };
+                let next_sequence = self
+                    .repositories
+                    .pty_output_chunks
+                    .next_sequence(pty.pty_session_id)
+                    .await
+                    .map_err(|error| tool_error(&error))?;
+                items.push(AgentWorkItem {
+                    kind: "pty".to_owned(),
+                    workspace_id: workspace.id,
+                    entity_id,
+                    state: state.to_owned(),
+                    intent: pty
+                        .foreground_process
+                        .as_deref()
+                        .map(|value| redactor.command_preview(value)),
+                    command_preview: None,
+                    coordination_mode: Some("write".to_owned()),
+                    coordination_scopes: pty_coordination_scopes(&pty, &workspace),
+                    blocker,
+                    progress: None,
+                    interaction,
+                    latest_sequence: next_sequence.checked_sub(1),
+                    retry_after_ms: matches!(state, "waiting" | "waiting_capacity" | "running")
+                        .then_some(750),
+                    next_action: next_action.to_owned(),
+                });
+            }
+
+            let workspace_terminal =
+                terminal_entities.contains(&("workspace".to_owned(), workspace.id.to_string()));
+            if !has_visible_child
+                && (matches!(
+                    workspace.state,
+                    WorkspaceState::Idle
+                        | WorkspaceState::Working
+                        | WorkspaceState::Blocked
+                        | WorkspaceState::Throttled
+                ) || workspace_terminal)
+            {
+                let (state, next_action) = match workspace.state {
+                    WorkspaceState::Idle => ("idle", "none"),
+                    WorkspaceState::Working => ("running", "wait"),
+                    WorkspaceState::Blocked | WorkspaceState::Throttled => ("waiting", "wait"),
+                    WorkspaceState::Done | WorkspaceState::Closed => ("complete", "read_result"),
+                    WorkspaceState::Failed => ("failed", "read_result"),
+                };
+                items.push(AgentWorkItem {
+                    kind: "workspace".to_owned(),
+                    workspace_id: workspace.id,
+                    entity_id: workspace.id.to_string(),
+                    state: state.to_owned(),
+                    intent: Some(redactor.command_preview(&workspace.label)),
+                    command_preview: None,
+                    coordination_mode: None,
+                    coordination_scopes: vec![workspace.coordination_scope.clone()],
+                    blocker: None,
+                    progress: None,
+                    interaction: None,
+                    latest_sequence: None,
+                    retry_after_ms: matches!(state, "waiting" | "running").then_some(750),
+                    next_action: next_action.to_owned(),
+                });
+            }
+            if items.iter().any(|item| item.workspace_id == workspace.id) {
+                host_routes.insert((
+                    workspace.host_id,
+                    workspace.access_path_id,
+                    workspace.connector_id,
+                ));
+            }
+        }
+
+        let aggregate_action = agent_work_primary_action(&items);
+        items.sort_by_key(|item| {
+            (
+                !changed_entities.contains(&(item.kind.clone(), item.entity_id.clone()))
+                    && !changed_workspaces.contains(&item.workspace_id),
+                agent_work_state_rank(&item.state),
+                item.kind.clone(),
+                item.entity_id.clone(),
+            )
+        });
+        items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        let returned_workspaces = items
+            .iter()
+            .map(|item| item.workspace_id)
+            .collect::<BTreeSet<_>>();
+        let workspace_routes = self
+            .repositories
+            .workspaces
+            .list_for_agent_session(agent_session_id, host_filter, 50)
+            .await
+            .map_err(|error| tool_error(&error))?;
+        host_routes.retain(|(_, access_path_id, _)| {
+            workspace_routes.iter().any(|workspace| {
+                returned_workspaces.contains(&workspace.id)
+                    && workspace.access_path_id == *access_path_id
+            })
+        });
+        let mut hosts = Vec::with_capacity(host_routes.len());
+        for (host_id, access_path_id, connector_id) in host_routes {
+            let host = self
+                .repositories
+                .hosts
+                .get(host_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .ok_or_else(|| format!("host not found: {host_id}"))?;
+            let access_path = self
+                .repositories
+                .access_paths
+                .get(access_path_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .ok_or_else(|| format!("access path not found: {access_path_id}"))?;
+            let route_state = self
+                .repositories
+                .access_path_health
+                .get(access_path_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .map_or_else(|| "unknown".to_owned(), |health| enum_label(&health.state));
+            let transport_generation = self
+                .repositories
+                .ssh_transport_runtimes
+                .get(access_path_id, connector_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+                .map(|runtime| runtime.telemetry.generation);
+            let usage = self
+                .repositories
+                .access_paths
+                .channel_usage(access_path_id, observed_at)
+                .await
+                .map_err(|error| tool_error(&error))?;
+            let capacity =
+                RuntimeChannelCapacityOutput::new(access_path.max_concurrent_channels, usage);
+            hosts.push(AgentWorkHost {
+                id: host.id,
+                name: host.display_name,
+                access_path: access_path.id,
+                route_state,
+                transport_generation,
+                channel_available: u16::try_from(capacity.available_channels).unwrap_or(u16::MAX),
+                channel_limit: access_path.max_concurrent_channels.max(1),
+            });
+        }
+        let (overall_state, primary_action) = aggregate_action;
+        Ok(AgentWorkContext {
+            context_version: 1,
+            cursor,
+            changed,
+            overall_state,
+            primary_action,
+            hosts,
+            items,
+        })
     }
 
     async fn prepare_encrypted_credential(
@@ -4169,6 +4606,89 @@ impl RemoteHostsMcpServer {
         }))
     }
 
+    /// Get a compact snapshot or race-free wait for the current Agent Session's work.
+    #[tool(
+        name = "remote_hosts_get_agent_work_context",
+        description = "Get or wait for the current Agent Session's compact cross-host work context. Snapshot forbids after_cursor; wait requires it. The tool never accepts a session id and never executes the returned action.",
+        annotations(
+            title = "Get Agent Work Context",
+            read_only_hint = true,
+            destructive_hint = false
+        )
+    )]
+    async fn get_agent_work_context(
+        &self,
+        Parameters(request): Parameters<AgentWorkContextRequest>,
+    ) -> Result<Json<AgentWorkContextOutput>, String> {
+        let agent_session = self.ensure_agent_session().await?;
+        let host_filter = request.host_id.as_deref().map(parse_host_id).transpose()?;
+        let limit = request.limit.unwrap_or(20).clamp(1, 50);
+        match request.mode {
+            AgentWorkContextMode::Snapshot => {
+                if request.after_cursor.is_some() {
+                    return Err("after_cursor is forbidden when mode is snapshot".to_owned());
+                }
+                let cursor = self
+                    .repositories
+                    .state_events
+                    .latest_sequence()
+                    .await
+                    .map_err(|error| tool_error(&error))?;
+                let context = self
+                    .materialize_agent_work_context(
+                        agent_session.id,
+                        host_filter,
+                        None,
+                        cursor,
+                        false,
+                        limit,
+                    )
+                    .await?;
+                Ok(Json(AgentWorkContextOutput::from_context(&context)?))
+            }
+            AgentWorkContextMode::Wait => {
+                let after_cursor = request
+                    .after_cursor
+                    .ok_or_else(|| "after_cursor is required when mode is wait".to_owned())?;
+                let timeout =
+                    Duration::from_millis(request.timeout_ms.unwrap_or(5_000).min(60_000));
+                let deadline = Instant::now() + timeout;
+                loop {
+                    let events = self
+                        .repositories
+                        .state_events
+                        .list_lifecycle_after_for_agent_session(
+                            agent_session.id,
+                            after_cursor,
+                            host_filter,
+                            limit,
+                        )
+                        .await
+                        .map_err(|error| tool_error(&error))?;
+                    if !events.is_empty() {
+                        let cursor = events.last().map_or(after_cursor, |event| event.sequence);
+                        let context = self
+                            .materialize_agent_work_context(
+                                agent_session.id,
+                                host_filter,
+                                Some(after_cursor),
+                                cursor,
+                                true,
+                                limit,
+                            )
+                            .await?;
+                        return Ok(Json(AgentWorkContextOutput::from_context(&context)?));
+                    }
+                    if Instant::now() >= deadline {
+                        let context = AgentWorkContext::unchanged(after_cursor);
+                        return Ok(Json(AgentWorkContextOutput::from_context(&context)?));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     /// Wait for sequenced runtime events with explicit live or replay semantics.
     #[tool(
         name = "remote_hosts_wait_runtime_events",
@@ -5887,6 +6407,39 @@ pub struct RuntimeEventsOutput {
     pub events: Vec<Value>,
 }
 
+/// Compact, resumable decision surface for the current Agent Session.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct AgentWorkContextOutput {
+    /// Independent work-context contract version.
+    pub context_version: u8,
+    /// Global cursor for the next wait.
+    pub cursor: u64,
+    /// Whether a wait observed a current-session change.
+    pub changed: bool,
+    /// Aggregate state label.
+    pub overall_state: String,
+    /// Deterministic single primary action.
+    pub primary_action: Value,
+    /// Active-host digests only.
+    pub hosts: Vec<Value>,
+    /// Active items plus newly terminal items after the wait cursor.
+    pub items: Vec<Value>,
+}
+
+impl AgentWorkContextOutput {
+    fn from_context(context: &AgentWorkContext) -> Result<Self, String> {
+        Ok(Self {
+            context_version: context.context_version,
+            cursor: context.cursor,
+            changed: context.changed,
+            overall_state: enum_label(&context.overall_state),
+            primary_action: to_json_value(&context.primary_action)?,
+            hosts: values(&context.hosts)?,
+            items: values(&context.items)?,
+        })
+    }
+}
+
 /// Server protection output.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ServerProtectionOutput {
@@ -6998,6 +7551,118 @@ fn operation_next_action(state: &OperationState) -> &'static str {
     }
 }
 
+fn lifecycle_state_is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "succeeded"
+            | "failed"
+            | "timed_out"
+            | "cancelled"
+            | "rejected"
+            | "exhausted"
+            | "done"
+            | "closed"
+            | "delivered"
+    )
+}
+
+fn enum_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn transfer_progress_from_chunks(chunks: &[OperationOutputChunk]) -> Option<AgentWorkProgress> {
+    let message = chunks
+        .iter()
+        .rev()
+        .find(|chunk| chunk.redacted_text.starts_with("file transfer"))?
+        .redacted_text
+        .as_str();
+    let fields = message
+        .split([',', ':'])
+        .filter_map(|part| part.trim().split_once('='))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let parse_u64 = |key: &str| fields.get(key).and_then(|value| value.parse::<u64>().ok());
+    let bytes = parse_u64("bytes_transferred").or_else(|| parse_u64("bytes"));
+    let total = fields
+        .get("total_bytes")
+        .filter(|value| **value != "unknown")
+        .and_then(|value| value.parse::<u64>().ok());
+    let retry_count = fields
+        .get("retry_count")
+        .and_then(|value| value.parse::<u32>().ok());
+    let sha256 = fields.get("sha256").and_then(|value| {
+        let digest = value.trim_end_matches(|character: char| !character.is_ascii_hexdigit());
+        (digest.len() == 64
+            && digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
+        .then(|| digest.to_owned())
+    });
+    Some(AgentWorkProgress {
+        stage: fields.get("stage").map(|value| (*value).to_owned()),
+        bytes,
+        total,
+        retry_count,
+        sha256,
+    })
+}
+
+fn agent_work_primary_action(
+    items: &[AgentWorkItem],
+) -> (AgentWorkOverallState, AgentWorkPrimaryAction) {
+    let selected = items
+        .iter()
+        .min_by_key(|item| agent_work_state_rank(&item.state));
+    let Some(item) = selected else {
+        return (AgentWorkOverallState::Idle, AgentWorkPrimaryAction::none());
+    };
+    let overall_state = match item.state.as_str() {
+        "waiting_input" => AgentWorkOverallState::ActionRequired,
+        "failed" => AgentWorkOverallState::Failed,
+        "succeeded" | "complete" => AgentWorkOverallState::Complete,
+        "running" => AgentWorkOverallState::Running,
+        "waiting" | "waiting_capacity" | "waiting_scope" => AgentWorkOverallState::Waiting,
+        _ => AgentWorkOverallState::Idle,
+    };
+    let reason_code = item
+        .blocker
+        .clone()
+        .unwrap_or_else(|| match item.state.as_str() {
+            "waiting_input" => "typed_interaction_required".to_owned(),
+            "failed" => "terminal_failure".to_owned(),
+            "succeeded" | "complete" => "terminal_result".to_owned(),
+            "running" => "work_in_progress".to_owned(),
+            "waiting" => "work_queued".to_owned(),
+            _ => "no_work".to_owned(),
+        });
+    (
+        overall_state,
+        AgentWorkPrimaryAction {
+            kind: item.next_action.clone(),
+            workspace_id: Some(item.workspace_id),
+            entity_id: Some(item.entity_id.clone()),
+            after_sequence: item.latest_sequence,
+            retry_after_ms: item.retry_after_ms,
+            reason_code,
+        },
+    )
+}
+
+fn agent_work_state_rank(state: &str) -> u8 {
+    match state {
+        "waiting_input" => 0,
+        "failed" => 1,
+        "succeeded" | "complete" => 2,
+        "running" => 3,
+        "waiting" | "waiting_capacity" | "waiting_scope" => 4,
+        _ => 5,
+    }
+}
+
 fn operation_retry_after_ms(state: &OperationState) -> Option<u64> {
     (!is_terminal_operation_state(state)).then_some(250)
 }
@@ -7187,14 +7852,16 @@ mod tests {
     use remote_hosts_db::{Repositories, connect_sqlite, migrate};
     use remote_hosts_domain::{
         AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId,
-        AgentSessionState, AgentWorkspace, AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason,
-        AuthorizedKeyBootstrapState, ConnectionMode, ConnectionSession, Connector, ConnectorId,
-        CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId,
-        EnvironmentKind, Host, HostId, HostKind, OperationId, OperationOutputArtifact,
-        OperationOutputArtifactId, OperationRun, OperationState, OperationType, OutputStream,
-        Protocol, PtyBackendCapabilities, PtyBackendState, PtyInteraction, PtyInteractionKind,
-        PtyOutputChunk, PtyOutputChunkId, PtySession, PtySessionId, RiskLevel, RouteType,
-        SessionId, SshFileTransferMode, SshTransportBackend, SshTransportCapabilities,
+        AgentSessionState, AgentWorkContext, AgentWorkHost, AgentWorkItem, AgentWorkspace,
+        AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason, AuthorizedKeyBootstrapState,
+        ConnectionMode, ConnectionSession, Connector, ConnectorId, CredentialId, CredentialKind,
+        CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind, Host, HostId,
+        HostKind, OperationId, OperationOutputArtifact, OperationOutputArtifactId,
+        OperationOutputChunk, OperationOutputChunkId, OperationRun, OperationState, OperationType,
+        OutputStream, Protocol, PtyBackendCapabilities, PtyBackendState, PtyInputEvent,
+        PtyInputEventId, PtyInputEventState, PtyInputPayloadKind, PtyInteraction,
+        PtyInteractionKind, PtyOutputChunk, PtyOutputChunkId, PtySession, PtySessionId, RiskLevel,
+        RouteType, SessionId, SshFileTransferMode, SshTransportBackend, SshTransportCapabilities,
         SshTransportRuntime, SshTransportRuntimeId, SshTransportRuntimeState,
         SshTransportTelemetry, StateReasonCode, StoredCredential, TrustLevel, WorkspaceId,
         WorkspaceState, now_utc,
@@ -7207,7 +7874,526 @@ mod tests {
     use secrecy::{ExposeSecret, SecretString};
     use serde_json::{Value, json};
 
-    use super::{RemoteHostsMcpServer, ToolProfile, tools};
+    use super::{
+        AgentSessionContext, AgentWorkContextOutput, RemoteHostsMcpServer, ToolProfile, tools,
+        transfer_progress_from_chunks,
+    };
+
+    #[test]
+    fn agent_work_context_typical_ten_item_response_stays_under_eight_kib()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host_id = HostId::new();
+        let access_path_id = AccessPathId::new();
+        let items = (0..10)
+            .map(|index| AgentWorkItem {
+                kind: "operation".to_owned(),
+                workspace_id: WorkspaceId::new(),
+                entity_id: OperationId::new().to_string(),
+                state: "running".to_owned(),
+                intent: Some(format!("inspect bounded service state {index}")),
+                command_preview: Some("systemctl status managed-service".to_owned()),
+                coordination_mode: Some("read".to_owned()),
+                coordination_scopes: vec![format!("service/managed-{index}")],
+                blocker: None,
+                progress: None,
+                interaction: None,
+                latest_sequence: Some(u64::try_from(index).unwrap_or(u64::MAX)),
+                retry_after_ms: Some(750),
+                next_action: "wait".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let (overall_state, primary_action) = super::agent_work_primary_action(&items);
+        let context = AgentWorkContext {
+            context_version: 1,
+            cursor: 42,
+            changed: true,
+            overall_state,
+            primary_action,
+            hosts: vec![AgentWorkHost {
+                id: host_id,
+                name: "managed-production-host".to_owned(),
+                access_path: access_path_id,
+                route_state: "healthy".to_owned(),
+                transport_generation: Some(7),
+                channel_available: 6,
+                channel_limit: 8,
+            }],
+            items,
+        };
+        let output = AgentWorkContextOutput::from_context(&context)?;
+        let encoded = serde_json::to_vec(&output)?;
+        assert!(encoded.len() < 8 * 1024, "response bytes={}", encoded.len());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_work_context_parses_bounded_transfer_progress_and_terminal_sha()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let operation_id = OperationId::new();
+        let workspace_id = WorkspaceId::new();
+        let now = now_utc();
+        let progress_text = "file transfer progress: stage=streaming, bytes_transferred=4096, total_bytes=8192, resumed_bytes=1024, retry_count=2, elapsed_seconds=3".to_owned();
+        let progress = OperationOutputChunk {
+            id: OperationOutputChunkId::new(),
+            operation_id,
+            workspace_id,
+            stream: OutputStream::System,
+            sequence: 0,
+            byte_len: u64::try_from(progress_text.len()).unwrap_or(u64::MAX),
+            redacted_text: progress_text,
+            truncated: false,
+            created_at: now,
+        };
+        let parsed = transfer_progress_from_chunks(std::slice::from_ref(&progress))
+            .ok_or("progress should parse")?;
+        assert_eq!(parsed.stage.as_deref(), Some("streaming"));
+        assert_eq!(parsed.bytes, Some(4096));
+        assert_eq!(parsed.total, Some(8192));
+        assert_eq!(parsed.retry_count, Some(2));
+        assert_eq!(parsed.sha256, None);
+
+        let digest = "ab".repeat(32);
+        let finished_text = format!(
+            "file transfer finished: state=succeeded, direction=upload, file=release.bin, bytes=8192, sha256={digest}, overwrite=deny, pooled_session=true"
+        );
+        let finished = OperationOutputChunk {
+            id: OperationOutputChunkId::new(),
+            operation_id,
+            workspace_id,
+            stream: OutputStream::System,
+            sequence: 1,
+            byte_len: u64::try_from(finished_text.len()).unwrap_or(u64::MAX),
+            redacted_text: finished_text,
+            truncated: false,
+            created_at: now,
+        };
+        let parsed = transfer_progress_from_chunks(&[progress, finished])
+            .ok_or("terminal transfer result should parse")?;
+        assert_eq!(parsed.bytes, Some(8192));
+        assert_eq!(parsed.sha256.as_deref(), Some(digest.as_str()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_work_context_snapshot_is_idle_for_an_empty_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let server =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
+                .with_agent_session_context(AgentSessionContext {
+                    client_kind: Some("codex".to_owned()),
+                    client_instance_id: Some("work-context-empty".to_owned()),
+                    project_key: Some("remote-hosts".to_owned()),
+                    conversation_key: Some("empty".to_owned()),
+                });
+
+        let context = call_tool(
+            server,
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({"mode": "snapshot"})),
+        )
+        .await?;
+
+        assert_eq!(context["context_version"], json!(1));
+        assert_eq!(context["changed"], json!(false));
+        assert_eq!(context["overall_state"], json!("idle"));
+        assert_eq!(context["primary_action"]["kind"], json!("none"));
+        assert_eq!(context["hosts"], json!([]));
+        assert_eq!(context["items"], json!([]));
+        assert!(context["cursor"].as_u64().is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_work_context_rejects_invalid_snapshot_and_wait_cursors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let server =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent);
+
+        let snapshot_with_cursor = call_tool_raw(
+            server.clone(),
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({"mode": "snapshot", "after_cursor": 0})),
+        )
+        .await?;
+        assert_eq!(snapshot_with_cursor.is_error, Some(true));
+
+        let wait_without_cursor = call_tool_raw(
+            server,
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({"mode": "wait", "timeout_ms": 1})),
+        )
+        .await?;
+        assert_eq!(wait_without_cursor.is_error, Some(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_work_context_wait_cursor_does_not_skip_burst_events_beyond_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let context = AgentSessionContext {
+            client_kind: Some("codex".to_owned()),
+            client_instance_id: Some("work-context-burst".to_owned()),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("burst".to_owned()),
+        };
+        let session = context.clone().into_session();
+        fixture.repositories.agent_sessions.upsert(&session).await?;
+        let server =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
+                .with_agent_session_context(context);
+        let baseline = fixture.repositories.state_events.latest_sequence().await?;
+        let observed_at = now_utc();
+        for index in 0..3 {
+            fixture
+                .repositories
+                .state_events
+                .insert_lifecycle(
+                    Some(session.id),
+                    Some(fixture.host_id),
+                    None,
+                    "operation",
+                    &OperationId::new().to_string(),
+                    "succeeded",
+                    observed_at + time::Duration::milliseconds(index),
+                )
+                .await?;
+        }
+        let latest = fixture.repositories.state_events.latest_sequence().await?;
+
+        let first = call_tool(
+            server.clone(),
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({
+                "mode": "wait",
+                "after_cursor": baseline,
+                "timeout_ms": 1,
+                "limit": 1
+            })),
+        )
+        .await?;
+        let first_cursor = first["cursor"].as_u64().ok_or("first cursor")?;
+        assert_eq!(first["changed"], json!(true));
+        assert!(first_cursor > baseline);
+        assert!(first_cursor < latest);
+
+        let second = call_tool(
+            server,
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({
+                "mode": "wait",
+                "after_cursor": first_cursor,
+                "timeout_ms": 1,
+                "limit": 1
+            })),
+        )
+        .await?;
+        assert_eq!(second["changed"], json!(true));
+        assert!(
+            second["cursor"]
+                .as_u64()
+                .is_some_and(|cursor| cursor > first_cursor)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn agent_work_context_isolates_sessions_and_consumes_terminal_events_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let context_a = AgentSessionContext {
+            client_kind: Some("codex".to_owned()),
+            client_instance_id: Some("work-context-a".to_owned()),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("conversation-a".to_owned()),
+        };
+        let context_b = AgentSessionContext {
+            client_kind: Some("codex".to_owned()),
+            client_instance_id: Some("work-context-b".to_owned()),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("conversation-b".to_owned()),
+        };
+        let session_a = context_a.clone().into_session();
+        let session_b = context_b.clone().into_session();
+        fixture
+            .repositories
+            .agent_sessions
+            .upsert(&session_a)
+            .await?;
+        fixture
+            .repositories
+            .agent_sessions
+            .upsert(&session_b)
+            .await?;
+        let now = now_utc();
+        let workspace_a = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(session_a.id),
+            host_id: fixture.host_id,
+            access_path_id: fixture.access_path_id,
+            connector_id: fixture.connector_id,
+            label: "current session".to_owned(),
+            cwd: Some("/tmp".to_owned()),
+            state: WorkspaceState::Working,
+            policy_profile: "default".to_owned(),
+            coordination_scope: "service/current".to_owned(),
+            created_at: now,
+            last_activity_at: now,
+            ttl_seconds: 3600,
+        };
+        let mut workspace_b = workspace_a.clone();
+        workspace_b.id = WorkspaceId::new();
+        workspace_b.agent_session_id = Some(session_b.id);
+        workspace_b.label = "foreign session".to_owned();
+        workspace_b.coordination_scope = "service/foreign".to_owned();
+        fixture.repositories.workspaces.insert(&workspace_a).await?;
+        fixture.repositories.workspaces.insert(&workspace_b).await?;
+        let operation_a = OperationRun {
+            id: OperationId::new(),
+            host_id: fixture.host_id,
+            access_path_id: fixture.access_path_id,
+            connector_id: fixture.connector_id,
+            session_id: Some(fixture.session_id),
+            workspace_id: Some(workspace_a.id),
+            agent_session_id: Some(session_a.id),
+            idempotency_key: Some("work-context-a".to_owned()),
+            requires_write_lease: false,
+            coordination_scope: workspace_a.coordination_scope.clone(),
+            coordination_scopes: vec![workspace_a.coordination_scope.clone()],
+            operation_type: OperationType::ReadonlyExec,
+            intent: "password=hunter2 inspect current session".to_owned(),
+            state: OperationState::Queued,
+            started_at: now,
+            finished_at: None,
+            exit_code: None,
+            timeout_seconds: 30,
+            redacted_command_summary: "printf [REDACTED]".to_owned(),
+            command_profile_json: Some(json!({"name": "shell.posix", "args": ["printf secret"]})),
+            transport_evidence: None,
+            redacted_output_summary: None,
+            log_ref: None,
+            attempt_count: 0,
+            claim_token: None,
+            claimed_at: None,
+            lease_expires_at: None,
+            last_error: None,
+        };
+        let mut operation_b = operation_a.clone();
+        operation_b.id = OperationId::new();
+        operation_b.workspace_id = Some(workspace_b.id);
+        operation_b.agent_session_id = Some(session_b.id);
+        operation_b.idempotency_key = Some("work-context-b".to_owned());
+        operation_b.intent = "foreign operation".to_owned();
+        operation_b.redacted_command_summary = "foreign command".to_owned();
+        fixture.repositories.operations.insert(&operation_a).await?;
+        fixture.repositories.operations.insert(&operation_b).await?;
+        let server =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
+                .with_agent_session_context(context_a);
+
+        let snapshot = call_tool(
+            server.clone(),
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({"mode": "snapshot"})),
+        )
+        .await?;
+        assert_eq!(snapshot["overall_state"], json!("waiting"));
+        assert_eq!(snapshot["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            snapshot["items"][0]["entity_id"],
+            json!(operation_a.id.to_string())
+        );
+        assert_eq!(
+            snapshot["items"][0]["command_preview"],
+            json!("printf [REDACTED]")
+        );
+        let serialized = snapshot.to_string();
+        assert!(!serialized.contains("printf secret"));
+        assert!(!serialized.contains("hunter2"));
+        assert!(!serialized.contains("foreign operation"));
+        assert!(!serialized.contains(&operation_b.id.to_string()));
+        assert!(serialized.len() < 8 * 1024);
+        let cursor = snapshot["cursor"].as_u64().ok_or("snapshot cursor")?;
+
+        let unchanged = call_tool(
+            server.clone(),
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({
+                "mode": "wait",
+                "after_cursor": cursor,
+                "timeout_ms": 1
+            })),
+        )
+        .await?;
+        assert_eq!(unchanged["changed"], json!(false));
+        assert_eq!(unchanged["cursor"], json!(cursor));
+        assert_eq!(unchanged["items"], json!([]));
+        assert!(unchanged.to_string().len() < 1024);
+
+        fixture
+            .repositories
+            .operations
+            .update_state(
+                operation_a.id,
+                OperationState::Succeeded,
+                Some(now + time::Duration::seconds(1)),
+                Some(0),
+                Some("done"),
+            )
+            .await?;
+        fixture
+            .repositories
+            .workspaces
+            .update_state(
+                workspace_a.id,
+                WorkspaceState::Done,
+                now + time::Duration::seconds(1),
+            )
+            .await?;
+        let completed = call_tool(
+            server.clone(),
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({
+                "mode": "wait",
+                "after_cursor": cursor,
+                "timeout_ms": 100
+            })),
+        )
+        .await?;
+        assert_eq!(completed["changed"], json!(true));
+        assert_eq!(completed["overall_state"], json!("complete"));
+        assert!(
+            completed["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| {
+                    item["entity_id"] == json!(operation_a.id.to_string())
+                        && item["state"] == json!("succeeded")
+                }))
+        );
+        let completed_cursor = completed["cursor"].as_u64().ok_or("completed cursor")?;
+
+        let consumed = call_tool(
+            server,
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({
+                "mode": "wait",
+                "after_cursor": completed_cursor,
+                "timeout_ms": 1
+            })),
+        )
+        .await?;
+        assert_eq!(consumed["changed"], json!(false));
+        assert_eq!(consumed["overall_state"], json!("idle"));
+        assert_eq!(consumed["items"], json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_work_context_prioritizes_type_only_pty_interaction_without_input_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let context = AgentSessionContext {
+            client_kind: Some("codex".to_owned()),
+            client_instance_id: Some("work-context-pty".to_owned()),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("pty-interaction".to_owned()),
+        };
+        let session = context.clone().into_session();
+        fixture.repositories.agent_sessions.upsert(&session).await?;
+        let now = now_utc();
+        let workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(session.id),
+            host_id: fixture.host_id,
+            access_path_id: fixture.access_path_id,
+            connector_id: fixture.connector_id,
+            label: "interactive".to_owned(),
+            cwd: Some("/tmp".to_owned()),
+            state: WorkspaceState::Blocked,
+            policy_profile: "default".to_owned(),
+            coordination_scope: "host".to_owned(),
+            created_at: now,
+            last_activity_at: now,
+            ttl_seconds: 3600,
+        };
+        fixture.repositories.workspaces.insert(&workspace).await?;
+        let pty = PtySession {
+            pty_session_id: PtySessionId::new(),
+            workspace_id: workspace.id,
+            session_id: fixture.session_id,
+            coordination_scopes: vec!["host".to_owned()],
+            state: WorkspaceState::Blocked,
+            foreground_process: Some("sudo systemctl status example".to_owned()),
+            cwd: Some("/tmp".to_owned()),
+            recent_output_ref: None,
+            last_exit_code: None,
+            input_allowed: true,
+            backend_state: PtyBackendState::Active,
+            backend_capabilities: PtyBackendCapabilities::unknown(),
+            interaction: Some(PtyInteraction {
+                kind: PtyInteractionKind::SudoPassword,
+                confidence: 100,
+                observed_at: now,
+            }),
+            transport_evidence: None,
+            created_at: now,
+            last_activity_at: now,
+        };
+        fixture.repositories.pty_sessions.upsert(&pty).await?;
+        let input_event = PtyInputEvent {
+            id: PtyInputEventId::new(),
+            pty_session_id: pty.pty_session_id,
+            workspace_id: workspace.id,
+            connector_id: fixture.connector_id,
+            host_id: fixture.host_id,
+            agent_session_id: Some(session.id),
+            idempotency_key: Some("secret-input".to_owned()),
+            payload_kind: PtyInputPayloadKind::Text,
+            input_fingerprint: Some("one-way-fingerprint".to_owned()),
+            state: PtyInputEventState::Queued,
+            sequence: 0,
+            redacted_input_summary: "<redacted input>".to_owned(),
+            byte_len: 17,
+            requested_by: None,
+            created_at: now,
+            claimed_at: None,
+            lease_expires_at: None,
+            delivered_at: None,
+            failed_at: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        fixture
+            .repositories
+            .pty_input_events
+            .insert(&input_event, "super-secret-sudo")
+            .await?;
+        let server =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
+                .with_agent_session_context(context);
+
+        let snapshot = call_tool(
+            server,
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({"mode": "snapshot"})),
+        )
+        .await?;
+        assert_eq!(snapshot["overall_state"], json!("action_required"));
+        assert_eq!(
+            snapshot["primary_action"]["kind"],
+            json!("respond_to_interaction")
+        );
+        assert_eq!(snapshot["items"][0]["state"], json!("waiting_input"));
+        assert_eq!(snapshot["items"][0]["interaction"], json!("sudo_password"));
+        let serialized = snapshot.to_string();
+        assert!(!serialized.contains("super-secret-sudo"));
+        assert!(!serialized.contains("one-way-fingerprint"));
+        assert!(!serialized.contains("<redacted input>"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn mcp_tool_profiles_expose_bounded_task_oriented_surfaces()
@@ -7232,7 +8418,8 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(agent_names.len(), 21);
+        assert_eq!(agent_names.len(), 22);
+        assert!(agent_names.contains(tools::GET_AGENT_WORK_CONTEXT));
         assert!(agent_names.contains("remote_hosts_ensure_host"));
         assert!(agent_names.contains(tools::STORE_HOST_CREDENTIAL));
         assert!(agent_names.contains(tools::PREPARE_WORKSPACE));
@@ -7248,7 +8435,7 @@ mod tests {
         assert!(admin_names.contains(tools::UPSERT_HOST));
         assert!(admin_names.contains(tools::FIND_HOST_DUPLICATES));
         assert!(admin_names.len() < full.tool_router.list_all().len());
-        assert_eq!(full.tool_router.list_all().len(), 47);
+        assert_eq!(full.tool_router.list_all().len(), 48);
         let Err(hidden_error) = call_tool_raw(agent, tools::UPSERT_HOST, None).await else {
             return Err("agent profile unexpectedly exposed an admin tool".into());
         };
@@ -7784,7 +8971,11 @@ mod tests {
         assert_eq!(snapshot["snapshot_version"], json!(11));
         assert_eq!(snapshot["workspace_capacity"]["limit"], json!(32));
         assert_eq!(snapshot["workspace_capacity"]["effective_active"], json!(1));
-        assert_eq!(snapshot["event_cursor"], json!(0));
+        assert!(
+            snapshot["event_cursor"]
+                .as_u64()
+                .is_some_and(|cursor| cursor >= 2)
+        );
         assert_eq!(snapshot["host"]["id"], json!(fixture.host_id.to_string()));
         assert_eq!(snapshot["aggregate"]["overall"], json!("healthy"));
         assert_eq!(snapshot["access_paths"].as_array().map(Vec::len), Some(1));
@@ -9308,8 +10499,8 @@ mod tests {
             })),
         )
         .await?;
-        assert_eq!(live["start_cursor"], json!(1));
-        assert_eq!(live["next_cursor"], json!(1));
+        assert_eq!(live["start_cursor"], json!(2));
+        assert_eq!(live["next_cursor"], json!(2));
         assert_eq!(live["timed_out"], json!(true));
         assert_eq!(live["events"], json!([]));
 
@@ -9326,10 +10517,10 @@ mod tests {
         )
         .await?;
         assert_eq!(replay["start_cursor"], json!(0));
-        assert_eq!(replay["next_cursor"], json!(1));
+        assert_eq!(replay["next_cursor"], json!(2));
         assert_eq!(replay["timed_out"], json!(false));
         assert_eq!(replay["count"], json!(1));
-        assert_eq!(replay["events"][0]["sequence"], json!(1));
+        assert_eq!(replay["events"][0]["sequence"], json!(2));
         assert_eq!(replay["events"][0]["entity_type"], json!("connector"));
         Ok(())
     }
@@ -9364,8 +10555,8 @@ mod tests {
         heartbeat_result?;
         let waited = waited?;
 
-        assert_eq!(waited["start_cursor"], json!(0));
-        assert_eq!(waited["next_cursor"], json!(1));
+        assert_eq!(waited["start_cursor"], json!(1));
+        assert_eq!(waited["next_cursor"], json!(2));
         assert_eq!(waited["timed_out"], json!(false));
         assert_eq!(waited["events"][0]["new_state"], json!("degraded"));
         Ok(())

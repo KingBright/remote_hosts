@@ -25,15 +25,16 @@ use remote_hosts_core::{
 };
 use remote_hosts_db::{DbError, Repositories, retry_sqlite_contention};
 use remote_hosts_domain::{
-    AccessPath, AccessPathHealth, AgentSession, AgentWorkspace, ConnectionSession, Connector,
-    ConnectorId, CredentialBinding, CredentialBindingId, CredentialBindingView, CredentialKind,
-    CredentialMetadata, EntityState, Host, HostFact, HostId, OperationId, OperationOutputArtifact,
-    OperationOutputArtifactId, OperationOutputChunk, OperationRun, OperationState, PtyInputEvent,
-    PtyOutputChunk, PtySession, PtySessionId, SequencedStateEvent, SessionId, StateEvent,
-    StateSnapshot, StoredCredential, TopologyEdge, TopologyEdgeId, TopologyNode, TopologyNodeId,
-    TopologyNodeKind, TopologyNodeStatus, TopologyRelation, TopologySyncRun, TopologySyncRunId,
-    WorkspaceId, WorkspaceState, now_utc,
+    AccessPath, AccessPathHealth, AgentSession, AgentSessionId, AgentWorkContext, AgentWorkspace,
+    ConnectionSession, Connector, ConnectorId, CredentialBinding, CredentialBindingId,
+    CredentialBindingView, CredentialKind, CredentialMetadata, EntityState, Host, HostFact, HostId,
+    OperationId, OperationOutputArtifact, OperationOutputArtifactId, OperationOutputChunk,
+    OperationRun, OperationState, PtyInputEvent, PtyOutputChunk, PtySession, PtySessionId,
+    SequencedStateEvent, SessionId, StateEvent, StateSnapshot, StoredCredential, TopologyEdge,
+    TopologyEdgeId, TopologyNode, TopologyNodeId, TopologyNodeKind, TopologyNodeStatus,
+    TopologyRelation, TopologySyncRun, TopologySyncRunId, WorkspaceId, WorkspaceState, now_utc,
 };
+use remote_hosts_mcp::{RemoteHostsMcpServer, ToolProfile};
 use remote_hosts_sync::{
     InstanceSyncExportRequest, InstanceSyncService, PEER_TOKEN_HEADER, token_sha256,
 };
@@ -120,6 +121,7 @@ pub fn router_with_state(state: ApiState) -> Router {
             get(list_connector_events),
         )
         .route("/v1/runtime-events/wait", post(wait_runtime_events))
+        .merge(agent_work_context_routes())
         .route(
             "/v1/hosts/{host_id}/workspaces",
             get(list_workspaces).post(create_workspace),
@@ -180,6 +182,18 @@ pub fn router_with_state(state: ApiState) -> Router {
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+fn agent_work_context_routes() -> Router<ApiState> {
+    Router::new()
+        .route(
+            "/v1/agent-sessions/{agent_session_id}/work-context",
+            get(get_agent_work_context),
+        )
+        .route(
+            "/v1/agent-sessions/{agent_session_id}/work-context/wait",
+            post(wait_agent_work_context),
+        )
 }
 
 /// Builds the restricted direct peer-sync router.
@@ -1120,6 +1134,111 @@ async fn wait_runtime_events(
     }
 }
 
+async fn get_agent_work_context(
+    State(state): State<ApiState>,
+    Path(agent_session_id): Path<String>,
+    Query(query): Query<AgentWorkContextQuery>,
+) -> Result<(HeaderMap, Json<AgentWorkContext>), ApiError> {
+    let agent_session_id = parse_agent_session_id(&agent_session_id)?;
+    ensure_agent_session_exists(&state, agent_session_id).await?;
+    let host_id = query.host_id.as_deref().map(parse_host_id).transpose()?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 50);
+    let cursor = state.repositories.state_events.latest_sequence().await?;
+    let context = materialize_http_agent_work_context(
+        &state,
+        agent_session_id,
+        host_id,
+        None,
+        cursor,
+        false,
+        limit,
+    )
+    .await?;
+    Ok((no_store_headers(), Json(context)))
+}
+
+async fn wait_agent_work_context(
+    State(state): State<ApiState>,
+    Path(agent_session_id): Path<String>,
+    Json(request): Json<WaitAgentWorkContextRequest>,
+) -> Result<(HeaderMap, Json<AgentWorkContext>), ApiError> {
+    let agent_session_id = parse_agent_session_id(&agent_session_id)?;
+    ensure_agent_session_exists(&state, agent_session_id).await?;
+    let host_id = request.host_id.as_deref().map(parse_host_id).transpose()?;
+    let limit = request.limit.unwrap_or(20).clamp(1, 50);
+    let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(5_000).min(60_000));
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let events = state
+            .repositories
+            .state_events
+            .list_lifecycle_after_for_agent_session(
+                agent_session_id,
+                request.after_cursor,
+                host_id,
+                limit,
+            )
+            .await?;
+        if !events.is_empty() {
+            let cursor = events
+                .last()
+                .map_or(request.after_cursor, |event| event.sequence);
+            let context = materialize_http_agent_work_context(
+                &state,
+                agent_session_id,
+                host_id,
+                Some(request.after_cursor),
+                cursor,
+                true,
+                limit,
+            )
+            .await?;
+            return Ok((no_store_headers(), Json(context)));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            let context = AgentWorkContext::unchanged(request.after_cursor);
+            return Ok((no_store_headers(), Json(context)));
+        }
+        tokio::time::sleep(Duration::from_millis(100).min(deadline - now)).await;
+    }
+}
+
+async fn ensure_agent_session_exists(
+    state: &ApiState,
+    agent_session_id: AgentSessionId,
+) -> Result<(), ApiError> {
+    state
+        .repositories
+        .agent_sessions
+        .get(agent_session_id)
+        .await?
+        .map(|_| ())
+        .ok_or(ApiError::NotFound)
+}
+
+async fn materialize_http_agent_work_context(
+    state: &ApiState,
+    agent_session_id: AgentSessionId,
+    host_id: Option<HostId>,
+    after_cursor: Option<u64>,
+    cursor: u64,
+    changed: bool,
+    limit: u32,
+) -> Result<AgentWorkContext, ApiError> {
+    RemoteHostsMcpServer::with_profile((*state.repositories).clone(), ToolProfile::Full)
+        .materialize_agent_work_context(
+            agent_session_id,
+            host_id,
+            after_cursor,
+            cursor,
+            changed,
+            limit,
+        )
+        .await
+        .map_err(|_| ApiError::Internal("failed to materialize agent work context"))
+}
+
 async fn list_workspaces(
     State(state): State<ApiState>,
     Path(host_id): Path<String>,
@@ -1942,6 +2061,10 @@ fn parse_host_id(input: &str) -> Result<HostId, ApiError> {
     Ok(HostId::from(Uuid::parse_str(input)?))
 }
 
+fn parse_agent_session_id(input: &str) -> Result<AgentSessionId, ApiError> {
+    Ok(AgentSessionId::from(Uuid::parse_str(input)?))
+}
+
 fn parse_connector_id(input: &str) -> Result<ConnectorId, ApiError> {
     Ok(ConnectorId::from(Uuid::parse_str(input)?))
 }
@@ -2456,6 +2579,30 @@ pub struct WaitRuntimeEventsResponse {
     pub events: Vec<SequencedStateEvent>,
 }
 
+/// Optional filters for an Agent Work Context snapshot.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWorkContextQuery {
+    /// Optional host UUID filter.
+    pub host_id: Option<String>,
+    /// Maximum returned items. Defaults to 20 and is capped at 50.
+    pub limit: Option<u32>,
+}
+
+/// Cursor-aware Agent Work Context wait request.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitAgentWorkContextRequest {
+    /// Global lifecycle cursor returned by snapshot or the previous wait.
+    pub after_cursor: u64,
+    /// Long-poll timeout in milliseconds. Defaults to 5000 and is capped at 60000.
+    pub timeout_ms: Option<u64>,
+    /// Optional host UUID filter.
+    pub host_id: Option<String>,
+    /// Maximum returned items. Defaults to 20 and is capped at 50.
+    pub limit: Option<u32>,
+}
+
 /// Create workspace request.
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateWorkspaceRequest {
@@ -2809,12 +2956,13 @@ mod tests {
     use axum::{body, http::Request};
     use remote_hosts_db::{Repositories, connect_sqlite, migrate};
     use remote_hosts_domain::{
-        AccessPath, AccessPathHealth, AccessPathId, AgentWorkspace, ConnectionMode,
-        ConnectionSession, Connector, ConnectorId, CredentialId, CredentialKind,
-        CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind, Host, HostId,
-        HostKind, OperationId, OperationRun, OperationState, OperationType, OutputStream, Protocol,
-        PtyOutputChunk, PtyOutputChunkId, PtySessionId, RiskLevel, RouteType, SessionId,
-        StoredCredential, TrustLevel, WorkspaceId, WorkspaceState, now_utc,
+        AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId,
+        AgentSessionState, AgentWorkspace, ConnectionMode, ConnectionSession, Connector,
+        ConnectorId, CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment,
+        EnvironmentId, EnvironmentKind, Host, HostId, HostKind, OperationId, OperationRun,
+        OperationState, OperationType, OutputStream, Protocol, PtyOutputChunk, PtyOutputChunkId,
+        PtySessionId, RiskLevel, RouteType, SessionId, StoredCredential, TrustLevel, WorkspaceId,
+        WorkspaceState, now_utc,
     };
     use secrecy::SecretString;
     use serde_json::json;
@@ -2826,6 +2974,66 @@ mod tests {
     use super::{
         ApiState, activity_operation_item, peer_sync_router_with_state, router_with_state,
     };
+
+    #[tokio::test]
+    async fn http_agent_work_context_snapshot_is_read_only_and_session_scoped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&pool).await?;
+        let repos = Repositories::new(pool);
+        let now = now_utc();
+        let session = AgentSession {
+            id: AgentSessionId::new(),
+            client_kind: "codex".to_owned(),
+            client_instance_id: "http-work-context".to_owned(),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("http-test".to_owned()),
+            state: AgentSessionState::Active,
+            created_at: now,
+            last_seen_at: now,
+            expires_at: now + time::Duration::hours(1),
+        };
+        repos.agent_sessions.upsert(&session).await?;
+        let app = router_with_state(ApiState::new(repos));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/agent-sessions/{}/work-context?limit=20",
+                        session.id
+                    ))
+                    .body(body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, max-age=0")
+        );
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let payload: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(payload["context_version"], json!(1));
+        assert_eq!(payload["overall_state"], json!("idle"));
+        assert_eq!(payload["items"], json!([]));
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/agent-sessions/{}/work-context",
+                        AgentSessionId::new()
+                    ))
+                    .body(body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
 
     #[test]
     fn activity_item_exposes_a_redacted_script_without_private_execution_profile()

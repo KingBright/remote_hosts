@@ -253,9 +253,26 @@ transport.
 `after_cursor` behavior. This prevents retained history from being mistaken for a new event and
 allows callers to resume from the snapshot cursor without losing transitions.
 
+Agent Work Context version 1 adds a session-scoped decision surface without changing runtime
+snapshot version 11. `remote_hosts_get_agent_work_context` implicitly binds the current MCP Agent
+Session and supports either `snapshot` or cursor-based `wait`. It returns active work across hosts,
+new terminal results after the supplied cursor, type-only PTY interaction, exact coordination
+scopes, bounded transfer progress, active-host route/transport/channel digests, and one
+deterministic primary action. It never accepts a session id, executes an action, returns raw PTY
+input, or exposes foreign-session command/output identifiers. The loopback/admin HTTP equivalents
+are `GET /v1/agent-sessions/{id}/work-context` and
+`POST /v1/agent-sessions/{id}/work-context/wait`. A timed-out wait returns a compact
+`changed=false` acknowledgement with the unchanged cursor and empty host/item arrays; callers keep
+the last changed context, and the unchanged cursor makes a racing lifecycle event replayable.
+
+Workspace, operation, PTY, input, transfer-progress, and connection lifecycle hooks append
+session/host/workspace linkage to the existing monotonic event sequence after the business state is
+durable. Event publication is best effort: SQLite contention or an event-write failure cannot
+cancel, retry, restart, or rewrite remote work. Legacy event rows remain readable.
+
 ## MCP Profiles
 
-The default `agent` profile exposes 21 task-oriented tools:
+The default `agent` profile exposes 22 task-oriented tools:
 
 - `remote_hosts_list_hosts`
 - `remote_hosts_ensure_host`
@@ -263,6 +280,7 @@ The default `agent` profile exposes 21 task-oriented tools:
 - `remote_hosts_search_knowledge`
 - `remote_hosts_record_knowledge`
 - `remote_hosts_get_host_runtime_snapshot`
+- `remote_hosts_get_agent_work_context`
 - `remote_hosts_prepare_workspace`
 - `remote_hosts_run_in_workspace`
 - `remote_hosts_upload_file`

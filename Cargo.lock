@@ -2726,6 +2726,7 @@ dependencies = [
  "remote-hosts-core",
  "remote-hosts-db",
  "remote-hosts-domain",
+ "remote-hosts-mcp",
  "remote-hosts-sync",
  "remote-hosts-vault",
  "secrecy",

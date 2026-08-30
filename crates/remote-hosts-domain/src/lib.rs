@@ -1788,6 +1788,186 @@ pub struct SequencedStateEvent {
     pub event: StateEvent,
 }
 
+/// Session-scoped lifecycle metadata appended to the global state-event sequence.
+///
+/// This record intentionally contains no command output, PTY input, credential material, or
+/// foreign-session identifiers that an agent could use for control.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentLifecycleEvent {
+    /// Global monotonic replay cursor.
+    pub sequence: u64,
+    /// Agent session that owns the entity. Connection events may be unscoped.
+    pub agent_session_id: Option<AgentSessionId>,
+    /// Host affected by the lifecycle change.
+    pub host_id: Option<HostId>,
+    /// Owning workspace when one exists.
+    pub workspace_id: Option<WorkspaceId>,
+    /// Entity category such as `connection`, `workspace`, `operation`, `pty`, `input`, or
+    /// `transfer`.
+    pub kind: String,
+    /// Entity identifier. Callers must suppress this for foreign-session blockers.
+    pub entity_id: String,
+    /// Compact entity-specific state label.
+    pub state: String,
+}
+
+/// Overall state of one agent's current work context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkOverallState {
+    /// The session owns no current or newly terminal work.
+    Idle,
+    /// At least one item is actively running.
+    Running,
+    /// Work is queued behind capacity, scope, or another bounded wait.
+    Waiting,
+    /// A PTY or another typed interaction requires agent input.
+    ActionRequired,
+    /// A newly terminal item failed.
+    Failed,
+    /// A newly terminal item completed successfully.
+    Complete,
+}
+
+/// Stable action returned as the single highest-priority next step.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentWorkPrimaryAction {
+    /// Typed action such as `none`, `respond_to_interaction`, `wait`, `read_result`, or
+    /// `inspect_runtime`.
+    pub kind: String,
+    /// Workspace that owns the action, if any.
+    pub workspace_id: Option<WorkspaceId>,
+    /// Current-session entity that owns the action, if any.
+    pub entity_id: Option<String>,
+    /// Output sequence after which incremental reading should resume.
+    pub after_sequence: Option<u64>,
+    /// Suggested bounded wait before trying the same read again.
+    pub retry_after_ms: Option<u64>,
+    /// Stable explanation code.
+    pub reason_code: String,
+}
+
+impl AgentWorkPrimaryAction {
+    /// Returns the idle no-op action.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            kind: "none".to_owned(),
+            workspace_id: None,
+            entity_id: None,
+            after_sequence: None,
+            retry_after_ms: None,
+            reason_code: "no_work".to_owned(),
+        }
+    }
+}
+
+/// Compact host digest for hosts that currently contain session-owned work.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentWorkHost {
+    /// Host id.
+    pub id: HostId,
+    /// Human-facing host name.
+    pub name: String,
+    /// Access path selected by the current session's work.
+    pub access_path: AccessPathId,
+    /// Current route-health label.
+    pub route_state: String,
+    /// Current pooled transport generation when available.
+    pub transport_generation: Option<u64>,
+    /// Number of channels available on the selected access path.
+    pub channel_available: u16,
+    /// Configured channel limit on the selected access path.
+    pub channel_limit: u16,
+}
+
+/// Bounded transfer progress parsed from redacted system output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentWorkProgress {
+    /// Transfer stage.
+    pub stage: Option<String>,
+    /// Bytes copied or verified so far.
+    pub bytes: Option<u64>,
+    /// Total bytes when known.
+    pub total: Option<u64>,
+    /// Safe retry count.
+    pub retry_count: Option<u32>,
+    /// Verified terminal SHA-256 digest.
+    pub sha256: Option<String>,
+}
+
+/// One compact current-session work item.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentWorkItem {
+    /// Item category: `workspace`, `operation`, `pty`, or `transfer`.
+    pub kind: String,
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Current-session entity id.
+    pub entity_id: String,
+    /// Normalized state such as `running`, `waiting_input`, `waiting_capacity`,
+    /// `waiting_scope`, `succeeded`, or `failed`.
+    pub state: String,
+    /// Non-secret intent for operations and transfers.
+    pub intent: Option<String>,
+    /// Redacted command preview.
+    pub command_preview: Option<String>,
+    /// Coordination mode (`read` or `write`).
+    pub coordination_mode: Option<String>,
+    /// Exact coordination scopes.
+    pub coordination_scopes: Vec<String>,
+    /// Compact blocker reason. Foreign owner ids are never included.
+    pub blocker: Option<String>,
+    /// Transfer progress when this is a transfer.
+    pub progress: Option<AgentWorkProgress>,
+    /// Type-only PTY interaction kind.
+    pub interaction: Option<String>,
+    /// Latest incremental output sequence.
+    pub latest_sequence: Option<u64>,
+    /// Exact or bounded retry delay for waiting states.
+    pub retry_after_ms: Option<u64>,
+    /// Typed next action for this item.
+    pub next_action: String,
+}
+
+/// Materialized current-session work context.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentWorkContext {
+    /// Independent contract version. Runtime snapshot version remains unchanged.
+    pub context_version: u8,
+    /// Global lifecycle cursor for the next wait.
+    pub cursor: u64,
+    /// Whether a wait observed a matching lifecycle change.
+    pub changed: bool,
+    /// Aggregate state chosen with deterministic priority.
+    pub overall_state: AgentWorkOverallState,
+    /// Single highest-priority action.
+    pub primary_action: AgentWorkPrimaryAction,
+    /// Hosts containing returned items.
+    pub hosts: Vec<AgentWorkHost>,
+    /// Active items plus newly terminal items after a wait cursor.
+    pub items: Vec<AgentWorkItem>,
+}
+
+impl AgentWorkContext {
+    /// Returns a compact no-change acknowledgement for a timed-out wait.
+    ///
+    /// The unchanged cursor ensures a transition racing the timeout is replayed by the next wait.
+    /// Callers retain the last changed context instead of receiving duplicate active items.
+    #[must_use]
+    pub fn unchanged(cursor: u64) -> Self {
+        Self {
+            context_version: 1,
+            cursor,
+            changed: false,
+            overall_state: AgentWorkOverallState::Idle,
+            primary_action: AgentWorkPrimaryAction::none(),
+            hosts: Vec::new(),
+            items: Vec::new(),
+        }
+    }
+}
+
 /// Agent-facing state snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateSnapshot {

@@ -3,19 +3,19 @@
 use std::{collections::BTreeSet, future::Future, io, str::FromStr, time::Duration as StdDuration};
 
 use remote_hosts_domain::{
-    AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentWorkspace,
-    AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason, AuthorizedKeyBootstrapState,
-    ClaimedPtyInputEvent, ConnectionSession, Connector, ConnectorId, CredentialBinding,
-    CredentialBindingView, CredentialId, CredentialKind, CredentialMetadata, EntityState,
-    Environment, EnvironmentId, Host, HostFact, HostId, HostWriteLease, InstanceIdentity,
-    InstancePeer, InstancePeerId, InstancePeerState, InstanceSyncCollection, InstanceSyncConflict,
-    KnowledgeItem, OperationId, OperationOutputArtifact, OperationOutputArtifactId,
-    OperationOutputChunk, OperationRun, OperationState, PtyBackendCapabilities, PtyBackendState,
-    PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyOutputChunk, PtySession, PtySessionId,
-    SequencedStateEvent, SessionId, SoftwareInstall, SshChannelTransportEvidence,
-    SshTransportRuntime, SshTransportRuntimeId, SshTransportRuntimeState, StateEvent,
-    StateReasonCode, StoredCredential, TopologyEdge, TopologyNode, TopologyNodeId, TopologySyncRun,
-    TopologySyncRunId, WorkspaceId, WorkspaceState,
+    AccessPath, AccessPathHealth, AccessPathId, AgentLifecycleEvent, AgentSession, AgentSessionId,
+    AgentWorkspace, AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason,
+    AuthorizedKeyBootstrapState, ClaimedPtyInputEvent, ConnectionSession, Connector, ConnectorId,
+    CredentialBinding, CredentialBindingView, CredentialId, CredentialKind, CredentialMetadata,
+    EntityState, Environment, EnvironmentId, Host, HostFact, HostId, HostWriteLease,
+    InstanceIdentity, InstancePeer, InstancePeerId, InstancePeerState, InstanceSyncCollection,
+    InstanceSyncConflict, KnowledgeItem, OperationId, OperationOutputArtifact,
+    OperationOutputArtifactId, OperationOutputChunk, OperationRun, OperationState,
+    PtyBackendCapabilities, PtyBackendState, PtyInputEvent, PtyInputEventId, PtyInputEventState,
+    PtyOutputChunk, PtySession, PtySessionId, SequencedStateEvent, SessionId, SoftwareInstall,
+    SshChannelTransportEvidence, SshTransportRuntime, SshTransportRuntimeId,
+    SshTransportRuntimeState, StateEvent, StateReasonCode, StoredCredential, TopologyEdge,
+    TopologyNode, TopologyNodeId, TopologySyncRun, TopologySyncRunId, WorkspaceId, WorkspaceState,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -468,15 +468,23 @@ impl Repositories {
                 FROM agent_workspaces
                 WHERE state_json = '"closed"'
               )
+            RETURNING *
             "#,
         )
         .bind(observed_at)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected();
+        .fetch_all(&mut *transaction)
+        .await?;
+        let operations = cancelled_operations
+            .iter()
+            .map(row_to_operation_run)
+            .collect::<Result<Vec<_>, _>>()?;
         transaction.commit().await?;
+        for operation in &operations {
+            publish_operation_lifecycle_best_effort(&self.operations.pool, operation, observed_at)
+                .await;
+        }
         Ok(ClosedWorkspaceWorkReconciliation {
-            cancelled_operations,
+            cancelled_operations: u64::try_from(operations.len())?,
             released_write_leases,
         })
     }
@@ -1564,6 +1572,7 @@ impl ConnectionSessionRepository {
     ///
     /// Returns an error if serialization fails or the database rejects the upsert.
     pub async fn upsert(&self, session: &ConnectionSession) -> Result<(), DbError> {
+        let previous_state = self.get(session.session_id).await?.map(|item| item.state);
         sqlx::query(
             r"
             INSERT INTO connection_sessions (
@@ -1592,6 +1601,10 @@ impl ConnectionSessionRepository {
         .bind(&session.last_error)
         .execute(&self.pool)
         .await?;
+        if previous_state.as_ref() != Some(&session.state) {
+            publish_connection_lifecycle_best_effort(&self.pool, session, session.last_used_at)
+                .await;
+        }
         Ok(())
     }
 
@@ -1650,7 +1663,9 @@ impl ConnectionSessionRepository {
         .bind(reset_failures)
         .fetch_one(&self.pool)
         .await?;
-        row_to_connection_session(&row)
+        let session = row_to_connection_session(&row)?;
+        publish_connection_lifecycle_best_effort(&self.pool, &session, session.last_used_at).await;
+        Ok(session)
     }
 
     /// Atomically releases one open channel while preserving the session health state.
@@ -1706,7 +1721,11 @@ impl ConnectionSessionRepository {
         .bind(session_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        row.as_ref().map(row_to_connection_session).transpose()
+        let session = row.as_ref().map(row_to_connection_session).transpose()?;
+        if let Some(session) = &session {
+            publish_connection_lifecycle_best_effort(&self.pool, session, observed_at).await;
+        }
+        Ok(session)
     }
 
     /// Atomically records a connection failure and optionally releases its channel reservation.
@@ -1757,7 +1776,11 @@ impl ConnectionSessionRepository {
         .bind(session_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        row.as_ref().map(row_to_connection_session).transpose()
+        let session = row.as_ref().map(row_to_connection_session).transpose()?;
+        if let Some(session) = &session {
+            publish_connection_lifecycle_best_effort(&self.pool, session, observed_at).await;
+        }
+        Ok(session)
     }
 
     /// Gets a connection session by id.
@@ -1825,7 +1848,7 @@ impl ConnectionSessionRepository {
         connector_id: ConnectorId,
         observed_at: OffsetDateTime,
     ) -> Result<u64, DbError> {
-        let result = sqlx::query(
+        let rows = sqlx::query(
             r"
             UPDATE connection_sessions
             SET state_json = ?,
@@ -1837,6 +1860,8 @@ impl ConnectionSessionRepository {
                 state_json IN (?, ?, ?)
                 OR open_channels > 0
               )
+            RETURNING session_id, access_path_id, connector_id, state_json, created_at,
+                      last_used_at, open_channels, reused_count, failure_count, last_error
             ",
         )
         .bind(to_json(&EntityState::Unknown)?)
@@ -1846,9 +1871,16 @@ impl ConnectionSessionRepository {
         .bind(to_json(&EntityState::Resolving)?)
         .bind(to_json(&EntityState::Connected)?)
         .bind(to_json(&EntityState::Healthy)?)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(result.rows_affected())
+        let sessions = rows
+            .iter()
+            .map(row_to_connection_session)
+            .collect::<Result<Vec<_>, _>>()?;
+        for session in &sessions {
+            publish_connection_lifecycle_best_effort(&self.pool, session, observed_at).await;
+        }
+        Ok(u64::try_from(sessions.len())?)
     }
 
     /// Lists connection sessions for a host through its access paths.
@@ -2125,6 +2157,17 @@ impl AgentWorkspaceRepository {
         .bind(u64_to_i64(workspace.ttl_seconds)?)
         .execute(&self.pool)
         .await?;
+        publish_lifecycle_best_effort(
+            &self.pool,
+            workspace.agent_session_id,
+            Some(workspace.host_id),
+            Some(workspace.id),
+            "workspace",
+            &workspace.id.to_string(),
+            &enum_label(&workspace.state),
+            workspace.last_activity_at,
+        )
+        .await;
         Ok(())
     }
 
@@ -2134,6 +2177,7 @@ impl AgentWorkspaceRepository {
     ///
     /// Returns an error if serialization fails or the database rejects the upsert.
     pub async fn upsert(&self, workspace: &AgentWorkspace) -> Result<(), DbError> {
+        let previous_state = self.get(workspace.id).await?.map(|item| item.state);
         sqlx::query(
             r"
             INSERT INTO agent_workspaces (
@@ -2168,6 +2212,19 @@ impl AgentWorkspaceRepository {
         .bind(u64_to_i64(workspace.ttl_seconds)?)
         .execute(&self.pool)
         .await?;
+        if previous_state.as_ref() != Some(&workspace.state) {
+            publish_lifecycle_best_effort(
+                &self.pool,
+                workspace.agent_session_id,
+                Some(workspace.host_id),
+                Some(workspace.id),
+                "workspace",
+                &workspace.id.to_string(),
+                &enum_label(&workspace.state),
+                workspace.last_activity_at,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -2266,6 +2323,38 @@ impl AgentWorkspaceRepository {
         )
         .bind(host_id.to_string())
         .bind(agent_session_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_agent_workspace).collect()
+    }
+
+    /// Lists a bounded set of workspaces owned by one agent session across hosts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or deserialization fails.
+    pub async fn list_for_agent_session(
+        &self,
+        agent_session_id: AgentSessionId,
+        host_id: Option<HostId>,
+        limit: u32,
+    ) -> Result<Vec<AgentWorkspace>, DbError> {
+        let rows = sqlx::query(
+            r"
+            SELECT workspace_id, agent_session_id, host_id, access_path_id, connector_id, label,
+                   cwd, state_json, policy_profile, coordination_scope, created_at,
+                   last_activity_at, ttl_seconds
+            FROM agent_workspaces
+            WHERE agent_session_id = ?
+              AND (? IS NULL OR host_id = ?)
+            ORDER BY last_activity_at DESC, workspace_id ASC
+            LIMIT ?
+            ",
+        )
+        .bind(agent_session_id.to_string())
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(u32_to_i64(limit.max(1)))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_agent_workspace).collect()
@@ -2466,9 +2555,28 @@ impl AgentWorkspaceRepository {
         query.push_bind(to_json(&PtyBackendState::Active)?);
         query.push(") ) ORDER BY aw.last_activity_at ASC LIMIT ");
         query.push_bind(i64::from(limit.max(1)));
-        query.push(")");
-        let result = query.build().execute(&self.pool).await?;
-        Ok(result.rows_affected())
+        query.push(") RETURNING workspace_id, agent_session_id, host_id, access_path_id, ");
+        query.push("connector_id, label, cwd, state_json, policy_profile, coordination_scope, ");
+        query.push("created_at, last_activity_at, ttl_seconds");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let workspaces = rows
+            .iter()
+            .map(row_to_agent_workspace)
+            .collect::<Result<Vec<_>, _>>()?;
+        for workspace in &workspaces {
+            publish_lifecycle_best_effort(
+                &self.pool,
+                workspace.agent_session_id,
+                Some(workspace.host_id),
+                Some(workspace.id),
+                "workspace",
+                &workspace.id.to_string(),
+                "closed",
+                observed_at,
+            )
+            .await;
+        }
+        Ok(u64::try_from(workspaces.len())?)
     }
 
     /// Inserts a workspace only while the host remains below the logical capacity limit.
@@ -2516,7 +2624,21 @@ impl AgentWorkspaceRepository {
         .bind(i64::from(active_limit))
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let inserted = result.rows_affected() == 1;
+        if inserted {
+            publish_lifecycle_best_effort(
+                &self.pool,
+                workspace.agent_session_id,
+                Some(workspace.host_id),
+                Some(workspace.id),
+                "workspace",
+                &workspace.id.to_string(),
+                &enum_label(&workspace.state),
+                workspace.last_activity_at,
+            )
+            .await;
+        }
+        Ok(inserted)
     }
 
     /// Updates workspace state and returns the updated workspace.
@@ -2907,6 +3029,7 @@ impl PtySessionRepository {
     ///
     /// Returns an error if serialization fails or the database rejects the upsert.
     pub async fn upsert(&self, pty: &PtySession) -> Result<(), DbError> {
+        let previous = self.get(pty.pty_session_id).await?;
         sqlx::query(
             r"
             INSERT INTO pty_sessions (
@@ -2949,6 +3072,37 @@ impl PtySessionRepository {
         .bind(pty.last_activity_at)
         .execute(&self.pool)
         .await?;
+        let lifecycle_changed = previous.as_ref().is_none_or(|previous| {
+            previous.state != pty.state
+                || previous.backend_state != pty.backend_state
+                || previous.interaction != pty.interaction
+                || previous.input_allowed != pty.input_allowed
+        });
+        if lifecycle_changed
+            && let Ok(Some(workspace)) = AgentWorkspaceRepository::new(self.pool.clone())
+                .get(pty.workspace_id)
+                .await
+        {
+            let state = if pty.interaction.is_some()
+                && pty.backend_state == PtyBackendState::Active
+                && pty.input_allowed
+            {
+                "needs_input".to_owned()
+            } else {
+                enum_label(&pty.backend_state)
+            };
+            publish_lifecycle_best_effort(
+                &self.pool,
+                workspace.agent_session_id,
+                Some(workspace.host_id),
+                Some(workspace.id),
+                "pty",
+                &pty.pty_session_id.to_string(),
+                &state,
+                pty.last_activity_at,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -3285,7 +3439,14 @@ impl PtySessionRepository {
         .bind(to_json(&WorkspaceState::Closed)?)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_pty_session).collect()
+        let ptys = rows
+            .iter()
+            .map(row_to_pty_session)
+            .collect::<Result<Vec<_>, _>>()?;
+        for pty in &ptys {
+            publish_pty_lifecycle_best_effort(&self.pool, pty, observed_at).await;
+        }
+        Ok(ptys)
     }
 
     /// Closes pending PTYs whose workspace no longer permits a shell to start.
@@ -3334,7 +3495,14 @@ impl PtySessionRepository {
         .bind(to_json(&WorkspaceState::Throttled)?)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_pty_session).collect()
+        let ptys = rows
+            .iter()
+            .map(row_to_pty_session)
+            .collect::<Result<Vec<_>, _>>()?;
+        for pty in &ptys {
+            publish_pty_lifecycle_best_effort(&self.pool, pty, closed_at).await;
+        }
+        Ok(ptys)
     }
 
     /// Closes one PTY session and returns the updated row.
@@ -3371,7 +3539,11 @@ impl PtySessionRepository {
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        row.as_ref().map(row_to_pty_session).transpose()
+        let pty = row.as_ref().map(row_to_pty_session).transpose()?;
+        if let Some(pty) = &pty {
+            publish_pty_lifecycle_best_effort(&self.pool, pty, closed_at).await;
+        }
+        Ok(pty)
     }
 
     /// Closes all PTY sessions for a workspace.
@@ -3407,7 +3579,14 @@ impl PtySessionRepository {
         .bind(to_json(&WorkspaceState::Closed)?)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_pty_session).collect()
+        let ptys = rows
+            .iter()
+            .map(row_to_pty_session)
+            .collect::<Result<Vec<_>, _>>()?;
+        for pty in &ptys {
+            publish_pty_lifecycle_best_effort(&self.pool, pty, closed_at).await;
+        }
+        Ok(ptys)
     }
 
     /// Closes expired active PTY sessions.
@@ -3452,7 +3631,14 @@ impl PtySessionRepository {
         .bind(u32_to_i64(limit))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_pty_session).collect()
+        let ptys = rows
+            .iter()
+            .map(row_to_pty_session)
+            .collect::<Result<Vec<_>, _>>()?;
+        for pty in &ptys {
+            publish_pty_lifecycle_best_effort(&self.pool, pty, now).await;
+        }
+        Ok(ptys)
     }
 
     /// Atomically closes idle connector-owned PTYs while preserving active work and queued input.
@@ -3536,7 +3722,14 @@ impl PtySessionRepository {
         .bind(u32_to_i64(limit.max(1)))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_pty_session).collect()
+        let ptys = rows
+            .iter()
+            .map(row_to_pty_session)
+            .collect::<Result<Vec<_>, _>>()?;
+        for pty in &ptys {
+            publish_pty_lifecycle_best_effort(&self.pool, pty, now).await;
+        }
+        Ok(ptys)
     }
 }
 
@@ -4029,6 +4222,17 @@ impl PtyInputEventRepository {
         .bind(&event.last_error)
         .execute(&self.pool)
         .await?;
+        publish_lifecycle_best_effort(
+            &self.pool,
+            event.agent_session_id,
+            Some(event.host_id),
+            Some(event.workspace_id),
+            "input",
+            &event.id.to_string(),
+            &enum_label(&event.state),
+            event.created_at,
+        )
+        .await;
         Ok(())
     }
 
@@ -4283,7 +4487,14 @@ impl PtyInputEventRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.as_ref().map(row_to_claimed_pty_input_event).transpose()
+        let claimed = row
+            .as_ref()
+            .map(row_to_claimed_pty_input_event)
+            .transpose()?;
+        if let Some(claimed) = &claimed {
+            publish_claimed_input_lifecycle_best_effort(&self.pool, claimed, claimed_at).await;
+        }
+        Ok(claimed)
     }
 
     /// Returns a claimed PTY input to the queue without consuming a retry attempt.
@@ -4296,6 +4507,7 @@ impl PtyInputEventRepository {
         id: PtyInputEventId,
         claim_token: &str,
     ) -> Result<bool, DbError> {
+        let before = self.get(id).await?;
         let result = sqlx::query(
             r"
             UPDATE pty_input_events
@@ -4313,7 +4525,21 @@ impl PtyInputEventRepository {
         .bind(claim_token)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let deferred = result.rows_affected() == 1;
+        if deferred && let Some(event) = before {
+            publish_lifecycle_best_effort(
+                &self.pool,
+                event.agent_session_id,
+                Some(event.host_id),
+                Some(event.workspace_id),
+                "input",
+                &event.id.to_string(),
+                "queued",
+                OffsetDateTime::now_utc(),
+            )
+            .await;
+        }
+        Ok(deferred)
     }
 
     /// Marks a claimed PTY input event as delivered and clears the raw payload.
@@ -4327,6 +4553,7 @@ impl PtyInputEventRepository {
         claim_token: &str,
         delivered_at: OffsetDateTime,
     ) -> Result<bool, DbError> {
+        let before = self.get(id).await?;
         let result = sqlx::query(
             r"
             UPDATE pty_input_events
@@ -4346,7 +4573,21 @@ impl PtyInputEventRepository {
         .bind(claim_token)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let finished = result.rows_affected() == 1;
+        if finished && let Some(event) = before {
+            publish_lifecycle_best_effort(
+                &self.pool,
+                event.agent_session_id,
+                Some(event.host_id),
+                Some(event.workspace_id),
+                "input",
+                &event.id.to_string(),
+                "delivered",
+                delivered_at,
+            )
+            .await;
+        }
+        Ok(finished)
     }
 
     /// Marks a claimed PTY input event as failed and clears the raw payload.
@@ -4361,6 +4602,7 @@ impl PtyInputEventRepository {
         failed_at: OffsetDateTime,
         last_error: &str,
     ) -> Result<bool, DbError> {
+        let before = self.get(id).await?;
         let result = sqlx::query(
             r"
             UPDATE pty_input_events
@@ -4380,7 +4622,21 @@ impl PtyInputEventRepository {
         .bind(claim_token)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let failed = result.rows_affected() == 1;
+        if failed && let Some(event) = before {
+            publish_lifecycle_best_effort(
+                &self.pool,
+                event.agent_session_id,
+                Some(event.host_id),
+                Some(event.workspace_id),
+                "input",
+                &event.id.to_string(),
+                "failed",
+                failed_at,
+            )
+            .await;
+        }
+        Ok(failed)
     }
 }
 
@@ -4436,6 +4692,21 @@ impl OperationRunRepository {
         .bind(&operation.last_error)
         .execute(&self.pool)
         .await?;
+        publish_lifecycle_best_effort(
+            &self.pool,
+            operation.agent_session_id,
+            Some(operation.host_id),
+            operation.workspace_id,
+            if operation.operation_type == remote_hosts_domain::OperationType::Sftp {
+                "transfer"
+            } else {
+                "operation"
+            },
+            &operation.id.to_string(),
+            &enum_label(&operation.state),
+            operation.started_at,
+        )
+        .await;
         Ok(())
     }
 
@@ -4476,6 +4747,7 @@ impl OperationRunRepository {
         exit_code: Option<i32>,
         redacted_output_summary: Option<&str>,
     ) -> Result<(), DbError> {
+        let before = self.get(id).await?;
         sqlx::query(
             r"
             UPDATE operation_runs
@@ -4490,6 +4762,25 @@ impl OperationRunRepository {
         .bind(id.to_string())
         .execute(&self.pool)
         .await?;
+        if let Some(operation) = before
+            && operation.state != state
+        {
+            publish_lifecycle_best_effort(
+                &self.pool,
+                operation.agent_session_id,
+                Some(operation.host_id),
+                operation.workspace_id,
+                if operation.operation_type == remote_hosts_domain::OperationType::Sftp {
+                    "transfer"
+                } else {
+                    "operation"
+                },
+                &operation.id.to_string(),
+                &enum_label(&state),
+                finished_at.unwrap_or_else(OffsetDateTime::now_utc),
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -4675,7 +4966,11 @@ impl OperationRunRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.as_ref().map(row_to_operation_run).transpose()
+        let operation = row.as_ref().map(row_to_operation_run).transpose()?;
+        if let Some(operation) = &operation {
+            publish_operation_lifecycle_best_effort(&self.pool, operation, claimed_at).await;
+        }
+        Ok(operation)
     }
 
     /// Atomically marks the oldest expired operation that exhausted its claim budget.
@@ -4739,7 +5034,11 @@ impl OperationRunRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.as_ref().map(row_to_operation_run).transpose()
+        let operation = row.as_ref().map(row_to_operation_run).transpose()?;
+        if let Some(operation) = &operation {
+            publish_operation_lifecycle_best_effort(&self.pool, operation, observed_at).await;
+        }
+        Ok(operation)
     }
 
     /// Finishes an operation and clears its connector lease.
@@ -4756,6 +5055,7 @@ impl OperationRunRepository {
         redacted_output_summary: Option<&str>,
         last_error: Option<&str>,
     ) -> Result<(), DbError> {
+        let before = self.get(id).await?;
         sqlx::query(
             r"
             UPDATE operation_runs
@@ -4778,6 +5078,10 @@ impl OperationRunRepository {
         .bind(id.to_string())
         .execute(&self.pool)
         .await?;
+        if let Some(mut operation) = before {
+            operation.state = state;
+            publish_operation_lifecycle_best_effort(&self.pool, &operation, finished_at).await;
+        }
         Ok(())
     }
 
@@ -4824,6 +5128,7 @@ impl OperationRunRepository {
         claim_token: &str,
         redacted_output_summary: &str,
     ) -> Result<bool, DbError> {
+        let before = self.get(id).await?;
         let result = sqlx::query(
             r"
             UPDATE operation_runs
@@ -4843,7 +5148,17 @@ impl OperationRunRepository {
         .bind(claim_token)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let deferred = result.rows_affected() == 1;
+        if deferred && let Some(mut operation) = before {
+            operation.state = OperationState::Queued;
+            publish_operation_lifecycle_best_effort(
+                &self.pool,
+                &operation,
+                OffsetDateTime::now_utc(),
+            )
+            .await;
+        }
+        Ok(deferred)
     }
 
     /// Attaches structured SSH transport evidence while the connector still owns the claim.
@@ -4881,6 +5196,7 @@ impl OperationRunRepository {
         &self,
         finish: ClaimedOperationFinish<'_>,
     ) -> Result<bool, DbError> {
+        let before = self.get(finish.id).await?;
         let result = sqlx::query(
             r"
             UPDATE operation_runs
@@ -4904,7 +5220,25 @@ impl OperationRunRepository {
         .bind(finish.claim_token)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let finished = result.rows_affected() == 1;
+        if finished && let Some(operation) = before {
+            publish_lifecycle_best_effort(
+                &self.pool,
+                operation.agent_session_id,
+                Some(operation.host_id),
+                operation.workspace_id,
+                if operation.operation_type == remote_hosts_domain::OperationType::Sftp {
+                    "transfer"
+                } else {
+                    "operation"
+                },
+                &operation.id.to_string(),
+                &enum_label(&finish.state),
+                finish.finished_at,
+            )
+            .await;
+        }
+        Ok(finished)
     }
 
     /// Attaches a claimed operation to the logical SSH session used for execution.
@@ -5118,6 +5452,7 @@ impl OperationOutputChunkRepository {
             .bind(chunk.created_at)
             .execute(&self.pool)
             .await?;
+            publish_transfer_progress_best_effort(&self.pool, chunk).await;
             return Ok(());
         }
         let latest = sqlx::query(
@@ -5164,11 +5499,14 @@ impl OperationOutputChunkRepository {
                 .execute(&self.pool)
                 .await?;
                 if updated.rows_affected() == 1 {
+                    publish_transfer_progress_best_effort(&self.pool, chunk).await;
                     return Ok(());
                 }
             }
         }
-        self.insert_batch(std::slice::from_ref(chunk)).await
+        self.insert_batch(std::slice::from_ref(chunk)).await?;
+        publish_transfer_progress_best_effort(&self.pool, chunk).await;
+        Ok(())
     }
 
     /// Inserts one compressed command-output segment.
@@ -6302,6 +6640,101 @@ impl CredentialBindingRepository {
 }
 
 impl StateEventRepository {
+    /// Appends session and workspace linkage to the global lifecycle sequence.
+    ///
+    /// Callers that have already committed a business state transition should treat an error as
+    /// observability degradation only. They must not cancel, retry, or rewrite remote work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database rejects the append.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_lifecycle(
+        &self,
+        agent_session_id: Option<AgentSessionId>,
+        host_id: Option<HostId>,
+        workspace_id: Option<WorkspaceId>,
+        kind: &str,
+        entity_id: &str,
+        state: &str,
+        observed_at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r"
+            INSERT INTO state_events (
+                id, entity_type, entity_id, old_state_json, new_state_json,
+                reason_code_json, observed_at, agent_session_id, host_id, workspace_id,
+                lifecycle_kind, lifecycle_state
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(kind)
+        .bind(entity_id)
+        .bind(to_json(&EntityState::Unknown)?)
+        .bind(to_json(&lifecycle_entity_state(state))?)
+        .bind(to_json(&StateReasonCode::None)?)
+        .bind(observed_at)
+        .bind(agent_session_id.map(|id| id.to_string()))
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(workspace_id.map(|id| id.to_string()))
+        .bind(kind)
+        .bind(state)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Lists lifecycle changes visible to one agent session after a global cursor.
+    ///
+    /// Unscoped host lifecycle changes are included only when the current session owns a
+    /// workspace on that host. Foreign session events are never returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or converting rows fails.
+    pub async fn list_lifecycle_after_for_agent_session(
+        &self,
+        agent_session_id: AgentSessionId,
+        after_sequence: u64,
+        host_id: Option<HostId>,
+        limit: u32,
+    ) -> Result<Vec<AgentLifecycleEvent>, DbError> {
+        let rows = sqlx::query(
+            r"
+            SELECT sequence, agent_session_id, host_id, workspace_id,
+                   lifecycle_kind, entity_id, lifecycle_state
+            FROM state_events event
+            WHERE sequence > ?
+              AND lifecycle_kind IS NOT NULL
+              AND (? IS NULL OR host_id = ?)
+              AND (
+                    agent_session_id = ?
+                    OR (
+                        agent_session_id IS NULL
+                        AND host_id IN (
+                            SELECT host_id
+                            FROM agent_workspaces
+                            WHERE agent_session_id = ?
+                        )
+                    )
+              )
+            ORDER BY sequence ASC
+            LIMIT ?
+            ",
+        )
+        .bind(u64_to_i64(after_sequence)?)
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(agent_session_id.to_string())
+        .bind(agent_session_id.to_string())
+        .bind(u32_to_i64(limit.max(1)))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_agent_lifecycle_event).collect()
+    }
+
     /// Inserts a state event.
     ///
     /// # Errors
@@ -6411,6 +6844,19 @@ impl StateEventRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_sequenced_state_event).collect()
+    }
+}
+
+fn lifecycle_entity_state(state: &str) -> EntityState {
+    match state {
+        "running" | "working" | "active" | "claimed" => EntityState::Connected,
+        "queued" | "pending" => EntityState::Resolving,
+        "waiting_capacity" | "waiting_scope" | "throttled" => EntityState::Throttled,
+        "failed" | "timed_out" | "cancelled" | "rejected" | "exhausted" | "blocked" => {
+            EntityState::Degraded
+        }
+        "succeeded" | "done" | "closed" | "delivered" => EntityState::Healthy,
+        _ => EntityState::Unknown,
     }
 }
 
@@ -6904,6 +7350,18 @@ fn row_to_sequenced_state_event(row: &SqliteRow) -> Result<SequencedStateEvent, 
     })
 }
 
+fn row_to_agent_lifecycle_event(row: &SqliteRow) -> Result<AgentLifecycleEvent, DbError> {
+    Ok(AgentLifecycleEvent {
+        sequence: i64_to_u64(row.try_get("sequence")?)?,
+        agent_session_id: parse_optional_id(row, "agent_session_id")?,
+        host_id: parse_optional_id(row, "host_id")?,
+        workspace_id: parse_optional_id(row, "workspace_id")?,
+        kind: row.try_get("lifecycle_kind")?,
+        entity_id: row.try_get("entity_id")?,
+        state: row.try_get("lifecycle_state")?,
+    })
+}
+
 fn parse_id<T>(row: &SqliteRow, column: &str) -> Result<T, DbError>
 where
     T: From<uuid::Uuid>,
@@ -6945,6 +7403,165 @@ fn ids_to_strings<T: ToString>(ids: &[T]) -> Vec<String> {
 
 fn to_json<T: serde::Serialize>(value: &T) -> Result<String, DbError> {
     serde_json::to_string(value).map_err(DbError::from)
+}
+
+fn enum_label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_lifecycle_best_effort(
+    pool: &SqlitePool,
+    agent_session_id: Option<AgentSessionId>,
+    host_id: Option<HostId>,
+    workspace_id: Option<WorkspaceId>,
+    kind: &str,
+    entity_id: &str,
+    state: &str,
+    observed_at: OffsetDateTime,
+) {
+    let repository = StateEventRepository::new(pool.clone());
+    let append = repository.insert_lifecycle(
+        agent_session_id,
+        host_id,
+        workspace_id,
+        kind,
+        entity_id,
+        state,
+        observed_at,
+    );
+    let _ = tokio::time::timeout(StdDuration::from_millis(250), append).await;
+}
+
+async fn publish_claimed_input_lifecycle_best_effort(
+    pool: &SqlitePool,
+    claimed: &ClaimedPtyInputEvent,
+    observed_at: OffsetDateTime,
+) {
+    let event = &claimed.event;
+    publish_lifecycle_best_effort(
+        pool,
+        event.agent_session_id,
+        Some(event.host_id),
+        Some(event.workspace_id),
+        "input",
+        &event.id.to_string(),
+        &enum_label(&event.state),
+        observed_at,
+    )
+    .await;
+}
+
+async fn publish_operation_lifecycle_best_effort(
+    pool: &SqlitePool,
+    operation: &OperationRun,
+    observed_at: OffsetDateTime,
+) {
+    publish_lifecycle_best_effort(
+        pool,
+        operation.agent_session_id,
+        Some(operation.host_id),
+        operation.workspace_id,
+        if operation.operation_type == remote_hosts_domain::OperationType::Sftp {
+            "transfer"
+        } else {
+            "operation"
+        },
+        &operation.id.to_string(),
+        &enum_label(&operation.state),
+        observed_at,
+    )
+    .await;
+}
+
+async fn publish_pty_lifecycle_best_effort(
+    pool: &SqlitePool,
+    pty: &PtySession,
+    observed_at: OffsetDateTime,
+) {
+    let publish = async {
+        if let Ok(Some(workspace)) = AgentWorkspaceRepository::new(pool.clone())
+            .get(pty.workspace_id)
+            .await
+        {
+            let state = if pty.interaction.is_some()
+                && pty.backend_state == PtyBackendState::Active
+                && pty.input_allowed
+            {
+                "needs_input".to_owned()
+            } else {
+                enum_label(&pty.backend_state)
+            };
+            publish_lifecycle_best_effort(
+                pool,
+                workspace.agent_session_id,
+                Some(workspace.host_id),
+                Some(workspace.id),
+                "pty",
+                &pty.pty_session_id.to_string(),
+                &state,
+                observed_at,
+            )
+            .await;
+        }
+    };
+    let _ = tokio::time::timeout(StdDuration::from_millis(250), publish).await;
+}
+
+async fn publish_transfer_progress_best_effort(pool: &SqlitePool, chunk: &OperationOutputChunk) {
+    if !chunk.redacted_text.starts_with("file transfer") {
+        return;
+    }
+    let publish = async {
+        if let Ok(Some(operation)) = OperationRunRepository::new(pool.clone())
+            .get(chunk.operation_id)
+            .await
+            && operation.operation_type == remote_hosts_domain::OperationType::Sftp
+        {
+            publish_lifecycle_best_effort(
+                pool,
+                operation.agent_session_id,
+                Some(operation.host_id),
+                operation.workspace_id,
+                "transfer",
+                &operation.id.to_string(),
+                "progress",
+                chunk.created_at,
+            )
+            .await;
+        }
+    };
+    let _ = tokio::time::timeout(StdDuration::from_millis(250), publish).await;
+}
+
+async fn publish_connection_lifecycle_best_effort(
+    pool: &SqlitePool,
+    session: &ConnectionSession,
+    observed_at: OffsetDateTime,
+) {
+    let publish = async {
+        let host_id = AccessPathRepository::new(pool.clone())
+            .get(session.access_path_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|path| path.host_id);
+        publish_lifecycle_best_effort(
+            pool,
+            None,
+            host_id,
+            None,
+            "connection",
+            &session.session_id.to_string(),
+            &enum_label(&session.state),
+            observed_at,
+        )
+        .await;
+    };
+    let _ = tokio::time::timeout(StdDuration::from_millis(250), publish).await;
 }
 
 fn optional_json<T: serde::Serialize>(value: Option<&T>) -> Result<Option<String>, DbError> {
@@ -7347,9 +7964,27 @@ mod tests {
         };
         repos.state_events.insert(&unrelated).await?;
         let second_cursor = repos.state_events.latest_sequence().await?;
+        repos
+            .state_events
+            .insert_lifecycle(
+                None,
+                None,
+                None,
+                "workspace",
+                &WorkspaceId::new().to_string(),
+                "working",
+                observed_at,
+            )
+            .await?;
+        let third_cursor = repos.state_events.latest_sequence().await?;
 
         assert_eq!(first_cursor, 1);
         assert_eq!(second_cursor, 2);
+        assert_eq!(third_cursor, 3);
+        let mixed_records = repos.state_events.list_after(0, None, None, 10).await?;
+        assert_eq!(mixed_records.len(), 3);
+        assert_eq!(mixed_records[2].event.entity_type, "workspace");
+        assert_eq!(mixed_records[2].event.new_state, EntityState::Connected);
         let records = repos
             .state_events
             .list_after(0, Some("connector"), Some(connector_id.as_str()), 10)
