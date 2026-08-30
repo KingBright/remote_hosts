@@ -1974,22 +1974,15 @@ async fn queue_workspace_operation(
         overload_cooldown_active: false,
     })?;
 
-    state
-        .repositories
-        .operations
-        .insert(&plan.operation)
-        .await?;
-    state
-        .repositories
-        .operation_output_chunks
-        .insert(&plan.initial_output_chunk)
-        .await?;
     let workspace = state
         .repositories
-        .workspaces
-        .update_state(workspace_id, plan.workspace_state, now_utc())
-        .await?
-        .ok_or(ApiError::NotFound)?;
+        .publish_queued_operation(
+            &plan.operation,
+            &plan.initial_output_chunk,
+            plan.workspace_state,
+            now_utc(),
+        )
+        .await?;
 
     Ok(RunWorkspaceOperationResponse {
         operation: plan.operation,
@@ -3417,7 +3410,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let pool = connect_sqlite("sqlite::memory:").await?;
         migrate(&pool).await?;
-        let repos = Repositories::new(pool);
+        let repos = Repositories::new(pool.clone());
         let now = now_utc();
 
         let host = Host {
@@ -3519,6 +3512,106 @@ mod tests {
             .as_str()
             .ok_or("workspace id should be a string")?;
 
+        let operation_request = json!({
+            "command_profile": "host.uptime",
+            "args": [],
+            "intent": "check whether the host is responsive",
+            "coordination_mode": "mutating",
+            "coordination_scope": "service/status",
+            "wait_timeout_ms": 0
+        })
+        .to_string();
+        let outbox_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_outbox")
+            .fetch_one(&pool)
+            .await?;
+        sqlx::query(
+            r"
+            CREATE TRIGGER fail_http_initial_operation_output
+            BEFORE INSERT ON operation_output_chunks
+            WHEN NEW.sequence = 0
+            BEGIN
+                SELECT RAISE(ABORT, 'forced HTTP initial operation output failure');
+            END
+            ",
+        )
+        .execute(&pool)
+        .await?;
+        let failed_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/workspaces/{workspace_id}/operations"))
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(operation_request.clone()))?,
+            )
+            .await?;
+        assert_eq!(
+            failed_run.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let operation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_runs")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(operation_count, 0);
+        let outbox_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_outbox")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(outbox_after, outbox_before);
+        sqlx::query("DROP TRIGGER fail_http_initial_operation_output")
+            .execute(&pool)
+            .await?;
+
+        sqlx::query(
+            r"
+            CREATE TRIGGER fail_http_workspace_publish
+            BEFORE UPDATE OF state_json ON agent_workspaces
+            WHEN NEW.workspace_id = OLD.workspace_id
+              AND json_extract(NEW.state_json, '$') = 'working'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced HTTP workspace publish failure');
+            END
+            ",
+        )
+        .execute(&pool)
+        .await?;
+        let failed_workspace_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/workspaces/{workspace_id}/operations"))
+                    .header("content-type", "application/json")
+                    .body(body::Body::from(operation_request.clone()))?,
+            )
+            .await?;
+        assert_eq!(
+            failed_workspace_run.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let operation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_runs")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(operation_count, 0);
+        let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_output_chunks")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(chunk_count, 0);
+        let outbox_after_workspace_failure: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_outbox")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(outbox_after_workspace_failure, outbox_before);
+        let workspace_state: String =
+            sqlx::query_scalar("SELECT state_json FROM agent_workspaces WHERE workspace_id = ?")
+                .bind(workspace_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(workspace_state, "\"idle\"");
+        sqlx::query("DROP TRIGGER fail_http_workspace_publish")
+            .execute(&pool)
+            .await?;
+
         let run_response = app
             .clone()
             .oneshot(
@@ -3526,17 +3619,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/v1/workspaces/{workspace_id}/operations"))
                     .header("content-type", "application/json")
-                    .body(body::Body::from(
-                        json!({
-                            "command_profile": "host.uptime",
-                            "args": [],
-                            "intent": "check whether the host is responsive",
-                            "coordination_mode": "mutating",
-                            "coordination_scope": "service/status",
-                            "wait_timeout_ms": 0
-                        })
-                        .to_string(),
-                    ))?,
+                    .body(body::Body::from(operation_request))?,
             )
             .await?;
         assert_eq!(run_response.status(), axum::http::StatusCode::ACCEPTED);

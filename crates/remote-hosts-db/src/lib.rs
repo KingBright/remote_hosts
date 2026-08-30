@@ -353,6 +353,93 @@ impl Repositories {
         compressed_output_writes_enabled(&self.operations.pool).await
     }
 
+    /// Atomically publishes one queued operation, its first output, and the Workspace transition.
+    ///
+    /// The operation cannot become visible to a connector claim until sequence zero and the
+    /// Workspace's new state are durable. Trigger-created lifecycle outbox rows therefore commit
+    /// or roll back with the complete queue submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operation/chunk identities disagree, serialization fails, or the
+    /// transaction cannot be committed.
+    pub async fn publish_queued_operation(
+        &self,
+        operation: &OperationRun,
+        initial_output_chunk: &OperationOutputChunk,
+        workspace_state: WorkspaceState,
+        workspace_last_activity_at: OffsetDateTime,
+    ) -> Result<AgentWorkspace, DbError> {
+        self.publish_queued_operation_with_before_commit(
+            operation,
+            initial_output_chunk,
+            workspace_state,
+            workspace_last_activity_at,
+            || std::future::ready(()),
+        )
+        .await
+    }
+
+    async fn publish_queued_operation_with_before_commit<F, Fut>(
+        &self,
+        operation: &OperationRun,
+        initial_output_chunk: &OperationOutputChunk,
+        workspace_state: WorkspaceState,
+        workspace_last_activity_at: OffsetDateTime,
+        before_commit: F,
+    ) -> Result<AgentWorkspace, DbError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let workspace_id = operation.workspace_id.ok_or_else(|| {
+            DbError::InvalidOutputSegment("queued operation requires a workspace".to_owned())
+        })?;
+        if initial_output_chunk.operation_id != operation.id
+            || initial_output_chunk.workspace_id != workspace_id
+            || initial_output_chunk.sequence != 0
+        {
+            return Err(DbError::InvalidOutputSegment(
+                "queued operation and initial output chunk identities must match at sequence zero"
+                    .to_owned(),
+            ));
+        }
+
+        let compressed_writes = compressed_output_writes_enabled(&self.operations.pool).await?;
+        let initial_segment = compressed_writes
+            .then(|| encode_operation_output_segment(std::slice::from_ref(initial_output_chunk)))
+            .transpose()?;
+        let workspace = retry_sqlite_contention(|| async {
+            let mut transaction = self.operations.pool.begin().await?;
+            insert_operation_row(&mut *transaction, operation).await?;
+            if let Some(segment) = initial_segment.as_ref() {
+                insert_operation_output_segment_row(&mut *transaction, segment).await?;
+            } else {
+                insert_operation_output_chunk_row(&mut *transaction, initial_output_chunk).await?;
+            }
+            let workspace = update_workspace_state_row(
+                &mut *transaction,
+                workspace_id,
+                &workspace_state,
+                workspace_last_activity_at,
+            )
+            .await?;
+            before_commit().await;
+            transaction.commit().await?;
+            Ok(workspace)
+        })
+        .await?;
+
+        publish_operation_lifecycle_best_effort(
+            &self.operations.pool,
+            operation,
+            operation.started_at,
+        )
+        .await;
+        publish_transfer_progress_best_effort(&self.operations.pool, initial_output_chunk).await;
+        Ok(workspace)
+    }
+
     /// Activates compressed-only output writes after all MCP clients have been reloaded.
     ///
     /// # Errors
@@ -2662,6 +2749,33 @@ impl AgentWorkspaceRepository {
     }
 }
 
+async fn update_workspace_state_row<'e, E>(
+    executor: E,
+    id: WorkspaceId,
+    state: &WorkspaceState,
+    last_activity_at: OffsetDateTime,
+) -> Result<AgentWorkspace, DbError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query(
+        r"
+        UPDATE agent_workspaces
+        SET state_json = ?, last_activity_at = ?
+        WHERE workspace_id = ?
+        RETURNING workspace_id, agent_session_id, host_id, access_path_id, connector_id, label,
+                  cwd, state_json, policy_profile, coordination_scope, created_at,
+                  last_activity_at, ttl_seconds
+        ",
+    )
+    .bind(to_json(state)?)
+    .bind(last_activity_at)
+    .bind(id.to_string())
+    .fetch_one(executor)
+    .await?;
+    row_to_agent_workspace(&row)
+}
+
 impl HostWriteLeaseRepository {
     /// Acquires or refreshes a scoped host write lease when no foreign overlapping lease is live.
     ///
@@ -4640,6 +4754,58 @@ impl PtyInputEventRepository {
     }
 }
 
+async fn insert_operation_row<'e, E>(executor: E, operation: &OperationRun) -> Result<(), DbError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        r"
+        INSERT INTO operation_runs (
+            id, host_id, access_path_id, connector_id, session_id, workspace_id,
+            agent_session_id, idempotency_key, requires_write_lease, coordination_scope,
+            coordination_scopes_json, operation_type_json, intent, state_json, started_at,
+            finished_at, exit_code,
+            timeout_seconds, redacted_command_summary, command_profile_json,
+            transport_evidence_json,
+            redacted_output_summary, log_ref, attempt_count, claim_token, claimed_at,
+            lease_expires_at, last_error
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ",
+    )
+    .bind(operation.id.to_string())
+    .bind(operation.host_id.to_string())
+    .bind(operation.access_path_id.to_string())
+    .bind(operation.connector_id.to_string())
+    .bind(operation.session_id.map(|id| id.to_string()))
+    .bind(operation.workspace_id.map(|id| id.to_string()))
+    .bind(operation.agent_session_id.map(|id| id.to_string()))
+    .bind(&operation.idempotency_key)
+    .bind(operation.requires_write_lease)
+    .bind(&operation.coordination_scope)
+    .bind(to_json(&operation.coordination_scopes)?)
+    .bind(to_json(&operation.operation_type)?)
+    .bind(&operation.intent)
+    .bind(to_json(&operation.state)?)
+    .bind(operation.started_at)
+    .bind(operation.finished_at)
+    .bind(operation.exit_code)
+    .bind(u64_to_i64(operation.timeout_seconds)?)
+    .bind(&operation.redacted_command_summary)
+    .bind(optional_json(operation.command_profile_json.as_ref())?)
+    .bind(optional_json(operation.transport_evidence.as_ref())?)
+    .bind(&operation.redacted_output_summary)
+    .bind(&operation.log_ref)
+    .bind(u32_to_i64(operation.attempt_count))
+    .bind(&operation.claim_token)
+    .bind(operation.claimed_at)
+    .bind(operation.lease_expires_at)
+    .bind(&operation.last_error)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 impl OperationRunRepository {
     /// Inserts an operation run.
     ///
@@ -4647,51 +4813,7 @@ impl OperationRunRepository {
     ///
     /// Returns an error if serialization fails or the database rejects the insert.
     pub async fn insert(&self, operation: &OperationRun) -> Result<(), DbError> {
-        sqlx::query(
-            r"
-            INSERT INTO operation_runs (
-                id, host_id, access_path_id, connector_id, session_id, workspace_id,
-                agent_session_id, idempotency_key, requires_write_lease, coordination_scope,
-                coordination_scopes_json, operation_type_json, intent, state_json, started_at,
-                finished_at, exit_code,
-                timeout_seconds, redacted_command_summary, command_profile_json,
-                transport_evidence_json,
-                redacted_output_summary, log_ref, attempt_count, claim_token, claimed_at,
-                lease_expires_at, last_error
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ",
-        )
-        .bind(operation.id.to_string())
-        .bind(operation.host_id.to_string())
-        .bind(operation.access_path_id.to_string())
-        .bind(operation.connector_id.to_string())
-        .bind(operation.session_id.map(|id| id.to_string()))
-        .bind(operation.workspace_id.map(|id| id.to_string()))
-        .bind(operation.agent_session_id.map(|id| id.to_string()))
-        .bind(&operation.idempotency_key)
-        .bind(operation.requires_write_lease)
-        .bind(&operation.coordination_scope)
-        .bind(to_json(&operation.coordination_scopes)?)
-        .bind(to_json(&operation.operation_type)?)
-        .bind(&operation.intent)
-        .bind(to_json(&operation.state)?)
-        .bind(operation.started_at)
-        .bind(operation.finished_at)
-        .bind(operation.exit_code)
-        .bind(u64_to_i64(operation.timeout_seconds)?)
-        .bind(&operation.redacted_command_summary)
-        .bind(optional_json(operation.command_profile_json.as_ref())?)
-        .bind(optional_json(operation.transport_evidence.as_ref())?)
-        .bind(&operation.redacted_output_summary)
-        .bind(&operation.log_ref)
-        .bind(u32_to_i64(operation.attempt_count))
-        .bind(&operation.claim_token)
-        .bind(operation.claimed_at)
-        .bind(operation.lease_expires_at)
-        .bind(&operation.last_error)
-        .execute(&self.pool)
-        .await?;
+        insert_operation_row(&self.pool, operation).await?;
         publish_lifecycle_best_effort(
             &self.pool,
             operation.agent_session_id,
@@ -5425,6 +5547,67 @@ struct EncodedOperationOutputSegment {
     created_at: OffsetDateTime,
 }
 
+async fn insert_operation_output_chunk_row<'e, E>(
+    executor: E,
+    chunk: &OperationOutputChunk,
+) -> Result<(), DbError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        r"
+        INSERT INTO operation_output_chunks (
+            id, operation_id, workspace_id, stream_json, sequence, redacted_text,
+            byte_len, truncated, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ",
+    )
+    .bind(chunk.id.to_string())
+    .bind(chunk.operation_id.to_string())
+    .bind(chunk.workspace_id.to_string())
+    .bind(to_json(&chunk.stream)?)
+    .bind(u64_to_i64(chunk.sequence)?)
+    .bind(&chunk.redacted_text)
+    .bind(u64_to_i64(chunk.byte_len)?)
+    .bind(bool_to_i64(chunk.truncated))
+    .bind(chunk.created_at)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+async fn insert_operation_output_segment_row<'e, E>(
+    executor: E,
+    segment: &EncodedOperationOutputSegment,
+) -> Result<(), DbError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        r"
+        INSERT INTO operation_output_segments (
+            operation_id, workspace_id, first_sequence, last_sequence, chunk_count,
+            encoding, original_text_byte_len, uncompressed_byte_len, compressed_byte_len,
+            payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ",
+    )
+    .bind(segment.operation_id.to_string())
+    .bind(segment.workspace_id.to_string())
+    .bind(u64_to_i64(segment.first_sequence)?)
+    .bind(u64_to_i64(segment.last_sequence)?)
+    .bind(u64_to_i64(segment.chunk_count)?)
+    .bind(PTY_OUTPUT_SEGMENT_ENCODING)
+    .bind(u64_to_i64(segment.original_text_bytes)?)
+    .bind(u64_to_i64(segment.encoded_bytes)?)
+    .bind(u64_to_i64(segment.compressed_bytes)?)
+    .bind(&segment.payload)
+    .bind(segment.created_at)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 impl OperationOutputChunkRepository {
     /// Inserts an output chunk.
     ///
@@ -5433,25 +5616,7 @@ impl OperationOutputChunkRepository {
     /// Returns an error if serialization fails or the database rejects the insert.
     pub async fn insert(&self, chunk: &OperationOutputChunk) -> Result<(), DbError> {
         if !compressed_output_writes_enabled(&self.pool).await? {
-            sqlx::query(
-                r"
-                INSERT INTO operation_output_chunks (
-                    id, operation_id, workspace_id, stream_json, sequence, redacted_text,
-                    byte_len, truncated, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ",
-            )
-            .bind(chunk.id.to_string())
-            .bind(chunk.operation_id.to_string())
-            .bind(chunk.workspace_id.to_string())
-            .bind(to_json(&chunk.stream)?)
-            .bind(u64_to_i64(chunk.sequence)?)
-            .bind(&chunk.redacted_text)
-            .bind(u64_to_i64(chunk.byte_len)?)
-            .bind(bool_to_i64(chunk.truncated))
-            .bind(chunk.created_at)
-            .execute(&self.pool)
-            .await?;
+            insert_operation_output_chunk_row(&self.pool, chunk).await?;
             publish_transfer_progress_best_effort(&self.pool, chunk).await;
             return Ok(());
         }
@@ -5520,28 +5685,7 @@ impl OperationOutputChunkRepository {
             return Ok(());
         }
         let segment = encode_operation_output_segment(chunks)?;
-        sqlx::query(
-            r"
-            INSERT INTO operation_output_segments (
-                operation_id, workspace_id, first_sequence, last_sequence, chunk_count,
-                encoding, original_text_byte_len, uncompressed_byte_len, compressed_byte_len,
-                payload, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ",
-        )
-        .bind(segment.operation_id.to_string())
-        .bind(segment.workspace_id.to_string())
-        .bind(u64_to_i64(segment.first_sequence)?)
-        .bind(u64_to_i64(segment.last_sequence)?)
-        .bind(u64_to_i64(segment.chunk_count)?)
-        .bind(PTY_OUTPUT_SEGMENT_ENCODING)
-        .bind(u64_to_i64(segment.original_text_bytes)?)
-        .bind(u64_to_i64(segment.encoded_bytes)?)
-        .bind(u64_to_i64(segment.compressed_bytes)?)
-        .bind(segment.payload)
-        .bind(segment.created_at)
-        .execute(&self.pool)
-        .await?;
+        insert_operation_output_segment_row(&self.pool, &segment).await?;
         Ok(())
     }
 
@@ -7893,7 +8037,7 @@ fn i64_to_u16(value: i64) -> Result<u16, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, str::FromStr, time::Duration as StdDuration};
+    use std::{io, str::FromStr, sync::Arc, time::Duration as StdDuration};
 
     use remote_hosts_domain::{
         AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId,
@@ -7970,6 +8114,264 @@ mod tests {
             .fetch_one(&retry_pool)
             .await?;
         assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn queued_operation_is_not_claimable_before_atomic_publish_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("atomic-publish.sqlite");
+        let pool = connect_sqlite(&format!("sqlite://{}", database_path.display())).await?;
+        migrate(&pool).await?;
+        let repos = Repositories::new(pool.clone());
+        let now = now_utc();
+
+        let host = Host {
+            id: HostId::new(),
+            name: "atomic-publish-host".to_owned(),
+            display_name: "Atomic Publish Host".to_owned(),
+            kind: HostKind::Linux,
+            owner: None,
+            tags: Vec::new(),
+            description: None,
+            risk_level: RiskLevel::Development,
+            created_at: now,
+            updated_at: now,
+        };
+        repos.hosts.insert(&host).await?;
+        let environment = Environment {
+            id: EnvironmentId::new(),
+            name: "atomic-publish-env".to_owned(),
+            kind: EnvironmentKind::CompanyLan,
+            description: None,
+            trust_level: TrustLevel::Trusted,
+            notes: None,
+        };
+        repos.environments.insert(&environment).await?;
+        let connector = Connector {
+            id: ConnectorId::new(),
+            name: "atomic-publish-connector".to_owned(),
+            environment_id: environment.id,
+            host_id: None,
+            version: "test".to_owned(),
+            state: EntityState::Healthy,
+            last_seen_at: Some(now),
+            current_network: Some("test".to_owned()),
+        };
+        repos.connectors.upsert(&connector).await?;
+        let credential_id = CredentialId::new();
+        repos
+            .credentials
+            .insert(&StoredCredential {
+                metadata: CredentialMetadata {
+                    id: credential_id,
+                    name: "atomic-publish-key".to_owned(),
+                    kind: CredentialKind::SshPrivateKey,
+                    username_hint: Some("tester".to_owned()),
+                    created_at: now,
+                    updated_at: now,
+                    last_used_at: None,
+                },
+                encrypted_blob_json: json!({"version": 1}),
+            })
+            .await?;
+        let access_path = AccessPath {
+            id: AccessPathId::new(),
+            host_id: host.id,
+            environment_id: environment.id,
+            connector_id: Some(connector.id),
+            protocol: Protocol::Ssh,
+            address: "127.0.0.1".to_owned(),
+            port: 22,
+            username: "tester".to_owned(),
+            credential_id,
+            route_type: RouteType::Lan,
+            proxy_chain: Vec::new(),
+            priority: 1,
+            enabled: true,
+            connection_mode: ConnectionMode::Pooled,
+            idle_ttl_seconds: 600,
+            keepalive_seconds: 30,
+            max_concurrent_channels: 4,
+            max_new_connections_per_minute: 4,
+            requires_tty: false,
+            notes: None,
+        };
+        repos.access_paths.insert(&access_path).await?;
+        let agent_session = AgentSession {
+            id: AgentSessionId::new(),
+            client_kind: "codex".to_owned(),
+            client_instance_id: "atomic-publish-test".to_owned(),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("atomic-publish".to_owned()),
+            state: AgentSessionState::Active,
+            created_at: now,
+            last_seen_at: now,
+            expires_at: now + time::Duration::hours(1),
+        };
+        repos.agent_sessions.upsert(&agent_session).await?;
+        let workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(agent_session.id),
+            host_id: host.id,
+            access_path_id: access_path.id,
+            connector_id: connector.id,
+            label: "atomic-publish".to_owned(),
+            cwd: Some("/tmp".to_owned()),
+            state: WorkspaceState::Idle,
+            policy_profile: "default".to_owned(),
+            coordination_scope: "host".to_owned(),
+            created_at: now,
+            last_activity_at: now,
+            ttl_seconds: 3600,
+        };
+        repos.workspaces.insert(&workspace).await?;
+        let operation = OperationRun {
+            id: OperationId::new(),
+            host_id: host.id,
+            access_path_id: access_path.id,
+            connector_id: connector.id,
+            session_id: None,
+            workspace_id: Some(workspace.id),
+            agent_session_id: Some(agent_session.id),
+            idempotency_key: Some("atomic-publish-barrier".to_owned()),
+            requires_write_lease: false,
+            coordination_scope: "host".to_owned(),
+            coordination_scopes: vec!["host".to_owned()],
+            operation_type: OperationType::ReadonlyExec,
+            intent: "prove publication visibility".to_owned(),
+            state: OperationState::Queued,
+            started_at: now,
+            finished_at: None,
+            exit_code: None,
+            timeout_seconds: 30,
+            redacted_command_summary: "true".to_owned(),
+            command_profile_json: Some(json!({"name": "shell.posix"})),
+            transport_evidence: None,
+            redacted_output_summary: None,
+            log_ref: None,
+            attempt_count: 0,
+            claim_token: None,
+            claimed_at: None,
+            lease_expires_at: None,
+            last_error: None,
+        };
+        let queued_text = "operation queued".to_owned();
+        let initial_output = OperationOutputChunk {
+            id: OperationOutputChunkId::new(),
+            operation_id: operation.id,
+            workspace_id: workspace.id,
+            stream: OutputStream::System,
+            sequence: 0,
+            byte_len: u64::try_from(queued_text.len())?,
+            redacted_text: queued_text,
+            truncated: false,
+            created_at: now,
+        };
+
+        let writes_ready = Arc::new(tokio::sync::Barrier::new(2));
+        let allow_commit = Arc::new(tokio::sync::Barrier::new(2));
+        let publisher_repos = repos.clone();
+        let publisher_operation = operation.clone();
+        let publisher_output = initial_output.clone();
+        let publisher_writes_ready = Arc::clone(&writes_ready);
+        let publisher_allow_commit = Arc::clone(&allow_commit);
+        let publisher = tokio::spawn(async move {
+            publisher_repos
+                .publish_queued_operation_with_before_commit(
+                    &publisher_operation,
+                    &publisher_output,
+                    WorkspaceState::Working,
+                    now,
+                    move || {
+                        let writes_ready = Arc::clone(&publisher_writes_ready);
+                        let allow_commit = Arc::clone(&publisher_allow_commit);
+                        async move {
+                            writes_ready.wait().await;
+                            allow_commit.wait().await;
+                        }
+                    },
+                )
+                .await
+        });
+
+        writes_ready.wait().await;
+        let visible_operations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM operation_runs WHERE id = ?")
+                .bind(operation.id.to_string())
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(visible_operations, 0);
+        let visible_workspace = repos
+            .workspaces
+            .get(workspace.id)
+            .await?
+            .ok_or_else(|| io::Error::other("workspace exists"))?;
+        assert_eq!(visible_workspace.state, WorkspaceState::Idle);
+        let premature_claim = tokio::time::timeout(
+            StdDuration::from_millis(100),
+            repos.operations.claim_next_for_connector(
+                connector.id,
+                "claim-before-commit",
+                now,
+                now + time::Duration::minutes(1),
+                3,
+            ),
+        )
+        .await;
+        assert!(
+            premature_claim.is_err(),
+            "a concurrent SQLite writer must not complete a claim before publish commits"
+        );
+
+        allow_commit.wait().await;
+        let published_workspace = publisher.await??;
+        assert_eq!(published_workspace.state, WorkspaceState::Working);
+        let claimed = repos
+            .operations
+            .claim_next_for_connector(
+                connector.id,
+                "claim-after-commit",
+                now,
+                now + time::Duration::minutes(1),
+                3,
+            )
+            .await?
+            .ok_or_else(|| io::Error::other("operation is claimable after commit"))?;
+        assert_eq!(claimed.id, operation.id);
+        let claimed_text = "operation claimed by connector worker".to_owned();
+        repos
+            .operation_output_chunks
+            .insert(&OperationOutputChunk {
+                id: OperationOutputChunkId::new(),
+                operation_id: operation.id,
+                workspace_id: workspace.id,
+                stream: OutputStream::System,
+                sequence: 1,
+                byte_len: u64::try_from(claimed_text.len())?,
+                redacted_text: claimed_text,
+                truncated: false,
+                created_at: now + time::Duration::milliseconds(1),
+            })
+            .await?;
+        let chunks = repos
+            .operation_output_chunks
+            .list_for_workspace(workspace.id, Some(operation.id), None, 10)
+            .await?;
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(chunks[0].redacted_text, "operation queued");
+        assert_eq!(
+            chunks[1].redacted_text,
+            "operation claimed by connector worker"
+        );
         Ok(())
     }
 

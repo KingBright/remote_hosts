@@ -2091,6 +2091,15 @@ impl RemoteHostsMcpServer {
         Ok(())
     }
 
+    async fn warm_write_lease_best_effort(
+        &self,
+        operation: &OperationRun,
+        workspace_id: WorkspaceId,
+    ) {
+        let warmup = self.acquire_write_lease_for_operation(operation, workspace_id);
+        let _ = tokio::time::timeout(Duration::from_millis(250), warmup).await;
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn queue_workspace_operation(
         &self,
@@ -2181,36 +2190,36 @@ impl RemoteHostsMcpServer {
             })
             .map_err(|error| error.to_string())?;
 
-        if let Err(error) = self.repositories.operations.insert(&plan.operation).await {
-            if let Some(existing) = self
-                .find_idempotent_operation(
-                    plan.operation.agent_session_id,
-                    plan.operation.idempotency_key.as_deref(),
-                    workspace_id,
-                    &expected_profile,
-                    requires_write_lease,
-                    &coordination_scopes,
-                )
-                .await?
-            {
-                return self.idempotent_operation_output(existing).await;
-            }
-            return Err(tool_error(&error));
-        }
-        self.repositories
-            .operation_output_chunks
-            .insert(&plan.initial_output_chunk)
-            .await
-            .map_err(|error| tool_error(&error))?;
-        let workspace = self
+        let workspace = match self
             .repositories
-            .workspaces
-            .update_state(workspace_id, plan.workspace_state, now_utc())
+            .publish_queued_operation(
+                &plan.operation,
+                &plan.initial_output_chunk,
+                plan.workspace_state,
+                now_utc(),
+            )
             .await
-            .map_err(|error| tool_error(&error))?
-            .ok_or_else(|| format!("workspace not found after queueing: {workspace_id}"))?;
-        self.acquire_write_lease_for_operation(&plan.operation, workspace_id)
-            .await?;
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                if let Some(existing) = self
+                    .find_idempotent_operation(
+                        plan.operation.agent_session_id,
+                        plan.operation.idempotency_key.as_deref(),
+                        workspace_id,
+                        &expected_profile,
+                        requires_write_lease,
+                        &coordination_scopes,
+                    )
+                    .await?
+                {
+                    return self.idempotent_operation_output(existing).await;
+                }
+                return Err(tool_error(&error));
+            }
+        };
+        self.warm_write_lease_best_effort(&plan.operation, workspace_id)
+            .await;
 
         Ok(QueuedOperationOutput {
             next_action: operation_next_action(&plan.operation.state).to_owned(),
@@ -2348,36 +2357,36 @@ impl RemoteHostsMcpServer {
             })
             .map_err(|error| error.to_string())?;
 
-        if let Err(error) = self.repositories.operations.insert(&plan.operation).await {
-            if let Some(existing) = self
-                .find_idempotent_operation(
-                    plan.operation.agent_session_id,
-                    plan.operation.idempotency_key.as_deref(),
-                    workspace_id,
-                    &expected_profile,
-                    plan.operation.requires_write_lease,
-                    &plan.operation.coordination_scopes,
-                )
-                .await?
-            {
-                return self.idempotent_operation_output(existing).await;
-            }
-            return Err(tool_error(&error));
-        }
-        self.repositories
-            .operation_output_chunks
-            .insert(&plan.initial_output_chunk)
-            .await
-            .map_err(|error| tool_error(&error))?;
-        let workspace = self
+        let workspace = match self
             .repositories
-            .workspaces
-            .update_state(workspace_id, plan.workspace_state, now_utc())
+            .publish_queued_operation(
+                &plan.operation,
+                &plan.initial_output_chunk,
+                plan.workspace_state,
+                now_utc(),
+            )
             .await
-            .map_err(|error| tool_error(&error))?
-            .ok_or_else(|| format!("workspace not found after queueing: {workspace_id}"))?;
-        self.acquire_write_lease_for_operation(&plan.operation, workspace_id)
-            .await?;
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                if let Some(existing) = self
+                    .find_idempotent_operation(
+                        plan.operation.agent_session_id,
+                        plan.operation.idempotency_key.as_deref(),
+                        workspace_id,
+                        &expected_profile,
+                        plan.operation.requires_write_lease,
+                        &plan.operation.coordination_scopes,
+                    )
+                    .await?
+                {
+                    return self.idempotent_operation_output(existing).await;
+                }
+                return Err(tool_error(&error));
+            }
+        };
+        self.warm_write_lease_best_effort(&plan.operation, workspace_id)
+            .await;
 
         Ok(QueuedOperationOutput {
             next_action: operation_next_action(&plan.operation.state).to_owned(),
@@ -7993,6 +8002,7 @@ mod tests {
     };
     use secrecy::{ExposeSecret, SecretString};
     use serde_json::{Value, json};
+    use sqlx::Executor;
 
     use super::{
         AgentSessionContext, AgentWorkContextOutput, RemoteHostsMcpServer, ToolProfile, tools,
@@ -10027,18 +10037,22 @@ mod tests {
             RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent),
         ];
 
-        for (index, agent) in agents.iter().enumerate() {
-            let prepared = call_tool(
+        let mut prepared = Vec::new();
+        for agent in &agents {
+            let workspace = call_tool(
                 agent.clone(),
                 tools::PREPARE_WORKSPACE,
                 Some(json!({"host_id": fixture.host_id.to_string()})),
             )
             .await?;
-            let queued = call_tool(
-                agent.clone(),
+            prepared.push(workspace);
+        }
+        let queue = |index: usize| {
+            call_tool(
+                agents[index].clone(),
                 tools::RUN_IN_WORKSPACE,
                 Some(json!({
-                    "workspace_id": prepared["workspace"]["id"],
+                    "workspace_id": prepared[index]["workspace"]["id"],
                     "command_profile": "shell.posix",
                     "args": [format!("printf 'readonly-{index}\\n'")],
                     "intent": format!("read independent state for conversation {index}"),
@@ -10046,7 +10060,9 @@ mod tests {
                     "idempotency_key": format!("readonly-conversation-{index}")
                 })),
             )
-            .await?;
+        };
+        let (queued_a, queued_b, queued_c) = tokio::join!(queue(0), queue(1), queue(2));
+        for queued in [queued_a?, queued_b?, queued_c?] {
             assert_eq!(queued["operation"]["requires_write_lease"], json!(false));
         }
 
@@ -10962,6 +10978,325 @@ mod tests {
         assert_eq!(result["recent_operations"][0]["id"], json!(operation_id));
         assert_eq!(result["artifact_count"], json!(0));
         assert_eq!(result["artifacts"], json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mcp_queue_operation_rolls_back_when_atomic_publish_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let prepared = call_tool(
+            fixture.server(),
+            tools::PREPARE_WORKSPACE,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        let workspace_id = prepared["workspace"]["id"]
+            .as_str()
+            .ok_or("workspace id should be a string")?;
+        let outbox_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_outbox")
+            .fetch_one(&fixture.pool)
+            .await?;
+        fixture
+            .pool
+            .execute(
+                r"
+                CREATE TRIGGER fail_initial_operation_output
+                BEFORE INSERT ON operation_output_chunks
+                WHEN NEW.sequence = 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced initial operation output failure');
+                END
+                ",
+            )
+            .await?;
+
+        let arguments = Some(json!({
+            "workspace_id": workspace_id,
+            "command_profile": "shell.posix",
+            "args": ["true"],
+            "intent": "prove atomic operation publication",
+            "coordination_mode": "mutating",
+            "coordination_scope": "service/atomic-publish",
+            "idempotency_key": "atomic-publish-retry"
+        }));
+        let failed =
+            call_tool_raw(fixture.server(), tools::RUN_IN_WORKSPACE, arguments.clone()).await?;
+        assert_eq!(failed.is_error, Some(true));
+        let operation_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM operation_runs WHERE idempotency_key = ?")
+                .bind("atomic-publish-retry")
+                .fetch_one(&fixture.pool)
+                .await?;
+        assert_eq!(operation_count, 0);
+        let outbox_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_outbox")
+            .fetch_one(&fixture.pool)
+            .await?;
+        assert_eq!(outbox_after, outbox_before);
+        let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_output_chunks")
+            .fetch_one(&fixture.pool)
+            .await?;
+        assert_eq!(chunk_count, 0);
+        let lease_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM host_write_leases")
+            .fetch_one(&fixture.pool)
+            .await?;
+        assert_eq!(lease_count, 0);
+        assert!(
+            fixture
+                .repositories
+                .operations
+                .claim_next_for_connector(
+                    fixture.connector_id,
+                    "claim-before-atomic-commit",
+                    now_utc(),
+                    now_utc() + time::Duration::minutes(1),
+                    3,
+                )
+                .await?
+                .is_none()
+        );
+
+        fixture
+            .pool
+            .execute("DROP TRIGGER fail_initial_operation_output")
+            .await?;
+
+        fixture
+            .pool
+            .execute(
+                r"
+                CREATE TRIGGER fail_workspace_atomic_publish
+                BEFORE UPDATE OF state_json ON agent_workspaces
+                WHEN json_extract(NEW.state_json, '$') = 'working'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced workspace atomic publish failure');
+                END
+                ",
+            )
+            .await?;
+        let failed_workspace =
+            call_tool_raw(fixture.server(), tools::RUN_IN_WORKSPACE, arguments.clone()).await?;
+        assert_eq!(failed_workspace.is_error, Some(true));
+        let operation_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM operation_runs WHERE idempotency_key = ?")
+                .bind("atomic-publish-retry")
+                .fetch_one(&fixture.pool)
+                .await?;
+        assert_eq!(operation_count, 0);
+        let outbox_after_workspace_failure: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_outbox")
+                .fetch_one(&fixture.pool)
+                .await?;
+        assert_eq!(outbox_after_workspace_failure, outbox_before);
+        let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_output_chunks")
+            .fetch_one(&fixture.pool)
+            .await?;
+        assert_eq!(chunk_count, 0);
+        fixture
+            .pool
+            .execute("DROP TRIGGER fail_workspace_atomic_publish")
+            .await?;
+
+        let retried = call_tool(fixture.server(), tools::RUN_IN_WORKSPACE, arguments).await?;
+        assert_eq!(retried["idempotency_reused"], json!(false));
+        assert_eq!(retried["operation"]["state"], json!("queued"));
+        let operation_id = super::parse_operation_id(
+            retried["operation"]["id"]
+                .as_str()
+                .ok_or("operation id should be a string")?,
+        )?;
+        assert_eq!(
+            fixture
+                .repositories
+                .operation_output_chunks
+                .next_sequence(operation_id)
+                .await?,
+            1
+        );
+        let claimed = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "claim-after-atomic-commit",
+                now_utc(),
+                now_utc() + time::Duration::minutes(1),
+                3,
+            )
+            .await?
+            .ok_or("operation should be claimable after atomic commit")?;
+        assert_eq!(claimed.id, operation_id);
+        assert_eq!(
+            fixture
+                .repositories
+                .operation_output_chunks
+                .next_sequence(operation_id)
+                .await?,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_lease_warmup_failure_does_not_reverse_atomic_publish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let prepared = call_tool(
+            fixture.server(),
+            tools::PREPARE_WORKSPACE,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        let workspace_id = prepared["workspace"]["id"]
+            .as_str()
+            .ok_or("workspace id should be a string")?;
+        fixture
+            .pool
+            .execute(
+                r"
+                CREATE TRIGGER fail_write_lease_warmup
+                BEFORE INSERT ON host_write_leases
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced write lease warmup failure');
+                END
+                ",
+            )
+            .await?;
+
+        let queued = call_tool(
+            fixture.server(),
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": workspace_id,
+                "command_profile": "shell.posix",
+                "args": ["true"],
+                "intent": "prove lease warmup cannot reverse publication",
+                "coordination_mode": "mutating",
+                "coordination_scope": "service/lease-warmup",
+                "idempotency_key": "lease-warmup-best-effort"
+            })),
+        )
+        .await?;
+        assert_eq!(queued["operation"]["state"], json!("queued"));
+        assert_eq!(queued["workspace"]["state"], json!("working"));
+        let operation_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM operation_runs WHERE idempotency_key = ?")
+                .bind("lease-warmup-best-effort")
+                .fetch_one(&fixture.pool)
+                .await?;
+        assert_eq!(operation_count, 1);
+        let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_output_chunks")
+            .fetch_one(&fixture.pool)
+            .await?;
+        assert_eq!(chunk_count, 1);
+        let lease_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM host_write_leases")
+            .fetch_one(&fixture.pool)
+            .await?;
+        assert_eq!(lease_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_sftp_atomic_publish_rolls_back_in_compressed_mode_and_can_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        fixture
+            .repositories
+            .activate_compressed_output_writes()
+            .await?;
+        let prepared = call_tool(
+            fixture.server(),
+            tools::PREPARE_WORKSPACE,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        let workspace_id = prepared["workspace"]["id"]
+            .as_str()
+            .ok_or("workspace id should be a string")?;
+        let outbox_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_outbox")
+            .fetch_one(&fixture.pool)
+            .await?;
+        fixture
+            .pool
+            .execute(
+                r"
+                CREATE TRIGGER fail_initial_operation_segment
+                BEFORE INSERT ON operation_output_segments
+                WHEN NEW.first_sequence = 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced initial operation segment failure');
+                END
+                ",
+            )
+            .await?;
+
+        let cases = [
+            (
+                tools::UPLOAD_FILE,
+                json!({
+                    "workspace_id": workspace_id,
+                    "local_path": "/tmp/atomic-upload-source",
+                    "remote_path": "/tmp/atomic-upload-target",
+                    "idempotency_key": "atomic-compressed-upload"
+                }),
+            ),
+            (
+                tools::DOWNLOAD_FILE,
+                json!({
+                    "workspace_id": workspace_id,
+                    "remote_path": "/tmp/atomic-download-source",
+                    "local_path": "/tmp/atomic-download-target",
+                    "idempotency_key": "atomic-compressed-download"
+                }),
+            ),
+        ];
+        for (tool, arguments) in &cases {
+            let failed = call_tool_raw(fixture.server(), tool, Some(arguments.clone())).await?;
+            assert_eq!(failed.is_error, Some(true));
+        }
+        let operation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM operation_runs WHERE idempotency_key LIKE 'atomic-compressed-%'",
+        )
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert_eq!(operation_count, 0);
+        let segment_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM operation_output_segments")
+                .fetch_one(&fixture.pool)
+                .await?;
+        assert_eq!(segment_count, 0);
+        let outbox_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lifecycle_outbox")
+            .fetch_one(&fixture.pool)
+            .await?;
+        assert_eq!(outbox_after, outbox_before);
+        let lease_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM host_write_leases")
+            .fetch_one(&fixture.pool)
+            .await?;
+        assert_eq!(lease_count, 0);
+
+        fixture
+            .pool
+            .execute("DROP TRIGGER fail_initial_operation_segment")
+            .await?;
+        for (tool, arguments) in cases {
+            let queued = call_tool(fixture.server(), tool, Some(arguments)).await?;
+            assert_eq!(queued["idempotency_reused"], json!(false));
+            assert_eq!(queued["operation"]["operation_type"], json!("sftp"));
+            let operation_id = super::parse_operation_id(
+                queued["operation"]["id"]
+                    .as_str()
+                    .ok_or("operation id should be a string")?,
+            )?;
+            assert_eq!(
+                fixture
+                    .repositories
+                    .operation_output_chunks
+                    .next_sequence(operation_id)
+                    .await?,
+                1
+            );
+        }
         Ok(())
     }
 

@@ -29,4 +29,5 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+sqlx.workspace = true
 tower.workspace = true
