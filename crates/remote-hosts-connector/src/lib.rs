@@ -33,6 +33,7 @@ use remote_hosts_core::{
 };
 use remote_hosts_db::{
     AuthorizedKeyBootstrapRepository, ClaimedOperationFinish, DbError, Repositories,
+    retry_sqlite_contention,
 };
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentSessionId, AgentWorkspace,
@@ -96,6 +97,8 @@ const EXEC_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const PTY_TRANSFER_STAGE_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_RUSSH_PTY_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const PTY_OUTPUT_BATCH_TARGET_BYTES: usize = 64 * 1024;
+const PTY_OUTPUT_BATCH_MAX_CHUNKS: usize = 128;
+const PTY_OUTPUT_COALESCED_CHUNK_BYTES: usize = 16 * 1024;
 const PTY_OUTPUT_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 const PTY_INTERACTION_TAIL_BYTES: usize = 4 * 1024;
 const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
@@ -7711,10 +7714,20 @@ where
                 let output = tokio::select! {
                     output = output_rx.recv() => output,
                     _ = flush_interval.tick(), if !pending.is_empty() => {
-                        if flush_pty_output_batch(&repositories, &mut pending).await.is_err() {
-                            break;
+                        if let Err(error) = flush_pty_output_batch(
+                            &repositories,
+                            &mut pending,
+                            lease_owner.as_ref(),
+                        ).await {
+                            tracing::warn!(
+                                %pty_session_id,
+                                %workspace_id,
+                                %error,
+                                "deferred PTY output flush after database contention"
+                            );
+                        } else {
+                            pending_bytes = 0;
                         }
-                        pending_bytes = 0;
                         continue;
                     }
                 };
@@ -7722,26 +7735,24 @@ where
                     break;
                 };
                 let observed_at = now_utc();
-                record_pty_output_activity(
-                    &repositories,
-                    pty_session_id,
-                    workspace_id,
-                    lease_owner.clone(),
-                    observed_at,
-                )
-                .await;
                 let capture_tx = match transfer_capture.lock() {
                     Ok(capture) => capture.clone(),
                     Err(poisoned) => poisoned.into_inner().clone(),
                 };
                 if let Some(capture_tx) = capture_tx {
-                    if flush_pty_output_batch(&repositories, &mut pending)
-                        .await
-                        .is_err()
+                    if let Err(error) =
+                        flush_pty_output_batch(&repositories, &mut pending, lease_owner.as_ref())
+                            .await
                     {
-                        break;
+                        tracing::warn!(
+                            %pty_session_id,
+                            %workspace_id,
+                            %error,
+                            "deferred PTY output flush before transfer capture"
+                        );
+                    } else {
+                        pending_bytes = 0;
                     }
-                    pending_bytes = 0;
                     let _ = capture_tx.send(output).await;
                     continue;
                 }
@@ -7762,30 +7773,36 @@ where
                     )
                     .await;
                 }
-                pending_bytes = pending_bytes.saturating_add(redacted_text.len());
-                pending.push(PtyOutputChunk {
-                    id: PtyOutputChunkId::new(),
+                push_coalesced_pty_output(
+                    &mut pending,
+                    &mut pending_bytes,
+                    &mut sequence,
                     pty_session_id,
                     workspace_id,
-                    stream: output.stream,
-                    sequence,
-                    byte_len: u64::try_from(redacted_text.len()).unwrap_or(u64::MAX),
+                    output.stream,
                     redacted_text,
-                    truncated: output.truncated || truncated,
-                    created_at: observed_at,
-                });
-                sequence = sequence.saturating_add(1);
-                if pending_bytes >= PTY_OUTPUT_BATCH_TARGET_BYTES {
-                    if flush_pty_output_batch(&repositories, &mut pending)
-                        .await
-                        .is_err()
+                    output.truncated || truncated,
+                    observed_at,
+                );
+                if pending_bytes >= PTY_OUTPUT_BATCH_TARGET_BYTES
+                    || pending.len() >= PTY_OUTPUT_BATCH_MAX_CHUNKS
+                {
+                    if let Err(error) =
+                        flush_pty_output_batch(&repositories, &mut pending, lease_owner.as_ref())
+                            .await
                     {
-                        break;
+                        tracing::warn!(
+                            %pty_session_id,
+                            %workspace_id,
+                            %error,
+                            "deferred full PTY output batch after database contention"
+                        );
+                    } else {
+                        pending_bytes = 0;
                     }
-                    pending_bytes = 0;
                 }
             }
-            if flush_pty_output_batch(&repositories, &mut pending)
+            if flush_pty_output_batch(&repositories, &mut pending, lease_owner.as_ref())
                 .await
                 .is_err()
             {
@@ -8184,13 +8201,68 @@ async fn mark_pty_interaction_blocked(
 async fn flush_pty_output_batch(
     repositories: &Repositories,
     pending: &mut Vec<PtyOutputChunk>,
+    lease_owner: Option<&(HostId, Vec<String>, AgentSessionId)>,
 ) -> Result<(), DbError> {
     if pending.is_empty() {
         return Ok(());
     }
-    repositories.pty_output_chunks.insert_batch(pending).await?;
+    let pty_session_id = pending[0].pty_session_id;
+    let workspace_id = pending[0].workspace_id;
+    let observed_at = pending
+        .last()
+        .map_or_else(now_utc, |chunk| chunk.created_at);
+    retry_sqlite_contention(|| async {
+        persist_pty_output_activity(
+            repositories,
+            pty_session_id,
+            workspace_id,
+            lease_owner,
+            observed_at,
+        )
+        .await?;
+        repositories.pty_output_chunks.insert_batch(pending).await
+    })
+    .await?;
     pending.clear();
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_coalesced_pty_output(
+    pending: &mut Vec<PtyOutputChunk>,
+    pending_bytes: &mut usize,
+    sequence: &mut u64,
+    pty_session_id: PtySessionId,
+    workspace_id: WorkspaceId,
+    stream: OutputStream,
+    redacted_text: String,
+    truncated: bool,
+    observed_at: time::OffsetDateTime,
+) {
+    *pending_bytes = pending_bytes.saturating_add(redacted_text.len());
+    if let Some(last) = pending.last_mut()
+        && last.stream == stream
+        && last.redacted_text.len().saturating_add(redacted_text.len())
+            <= PTY_OUTPUT_COALESCED_CHUNK_BYTES
+    {
+        last.redacted_text.push_str(&redacted_text);
+        last.byte_len = u64::try_from(last.redacted_text.len()).unwrap_or(u64::MAX);
+        last.truncated |= truncated;
+        return;
+    }
+
+    pending.push(PtyOutputChunk {
+        id: PtyOutputChunkId::new(),
+        pty_session_id,
+        workspace_id,
+        stream,
+        sequence: *sequence,
+        byte_len: u64::try_from(redacted_text.len()).unwrap_or(u64::MAX),
+        redacted_text,
+        truncated,
+        created_at: observed_at,
+    });
+    *sequence = sequence.saturating_add(1);
 }
 
 #[async_trait]
@@ -11117,50 +11189,32 @@ async fn shorten_host_write_leases(
     Ok(())
 }
 
-async fn record_pty_output_activity(
+async fn persist_pty_output_activity(
     repositories: &Repositories,
     pty_session_id: PtySessionId,
     workspace_id: WorkspaceId,
-    lease_owner: Option<(HostId, Vec<String>, AgentSessionId)>,
+    lease_owner: Option<&(HostId, Vec<String>, AgentSessionId)>,
     observed_at: time::OffsetDateTime,
-) {
-    match repositories
+) -> Result<(), DbError> {
+    if repositories
         .pty_sessions
         .touch_activity_if_active(pty_session_id, observed_at)
-        .await
+        .await?
+        && let Some((host_id, coordination_scopes, agent_session_id)) = lease_owner
     {
-        Ok(true) => {
-            if let Some((host_id, coordination_scopes, agent_session_id)) = lease_owner
-                && let Err(error) = repositories
-                    .host_write_leases
-                    .renew_many(
-                        host_id,
-                        &coordination_scopes,
-                        agent_session_id,
-                        workspace_id,
-                        observed_at,
-                        observed_at + time::Duration::seconds(PTY_WRITE_LEASE_SECONDS),
-                    )
-                    .await
-            {
-                tracing::warn!(
-                    %pty_session_id,
-                    %workspace_id,
-                    %error,
-                    "failed to renew scoped host write lease from PTY output activity"
-                );
-            }
-        }
-        Ok(false) => {}
-        Err(error) => {
-            tracing::warn!(
-                %pty_session_id,
-                %workspace_id,
-                %error,
-                "failed to persist PTY output activity"
-            );
-        }
+        repositories
+            .host_write_leases
+            .renew_many(
+                *host_id,
+                coordination_scopes,
+                *agent_session_id,
+                workspace_id,
+                observed_at,
+                observed_at + time::Duration::seconds(PTY_WRITE_LEASE_SECONDS),
+            )
+            .await?;
     }
+    Ok(())
 }
 
 async fn pty_lease_owner(
@@ -14674,11 +14728,14 @@ mod tests {
         assert!(!chunks[0].redacted_text.contains("hunter2"));
         assert!(chunks[0].redacted_text.contains("<redacted>"));
 
-        for index in 0..10 {
+        let mut expected_rapid_output = String::new();
+        for index in 0..2_000 {
+            let text = format!("batched-output-{index}\n");
+            expected_rapid_output.push_str(&text);
             output_tx
                 .send(PtyBackendOutput {
                     stream: OutputStream::Stdout,
-                    text: format!("batched-output-{index}\n"),
+                    text,
                     truncated: false,
                 })
                 .await?;
@@ -14686,21 +14743,30 @@ mod tests {
         wait_for_pty_output(
             &fixture.repositories,
             opened.pty_session.pty_session_id,
-            "batched-output-9",
+            "batched-output-1999",
         )
         .await?;
         let chunks = fixture
             .repositories
             .pty_output_chunks
-            .list_for_session(opened.pty_session.pty_session_id, None, 20)
+            .list_for_session(opened.pty_session.pty_session_id, None, 5_000)
             .await?;
-        assert_eq!(chunks.len(), 11);
+        let rapid_output = chunks
+            .iter()
+            .skip(1)
+            .map(|chunk| chunk.redacted_text.as_str())
+            .collect::<String>();
+        assert_eq!(rapid_output, expected_rapid_output);
+        assert!(
+            chunks.len() <= 16,
+            "tiny backend frames should be coalesced before persistence"
+        );
         let storage = fixture
             .repositories
             .pty_output_chunks
             .storage_stats()
             .await?;
-        assert_eq!(storage.compressed_chunks, 11);
+        assert_eq!(storage.compressed_chunks, u64::try_from(chunks.len())?);
         assert!(
             storage.compressed_segments <= 3,
             "rapid output should be persisted in a bounded number of compressed segments"

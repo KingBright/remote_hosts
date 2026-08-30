@@ -119,6 +119,10 @@ Lifecycle defaults are `REMOTE_HOSTS_PTY_IDLE_TTL_SECONDS=3600` and
 `REMOTE_HOSTS_PTY_BUSY_TTL_SECONDS=86400`. The first applies when no foreground process is
 declared; the second applies to a quiet long-running PTY that agents heartbeat truthfully through
 `remote_hosts_heartbeat_pty_session`. Output and accepted input refresh activity automatically.
+Heartbeat updates are advisory lifecycle metadata and are retried internally on SQLite writer
+contention. A supervising client must keep observing the same PTY if a heartbeat still fails; it
+must not cancel the remote command, close the terminal, or start a duplicate solely because the
+metadata update was unavailable.
 Set one value to zero only to disable that expiry class. Each access path's `idle_ttl_seconds`
 independently controls zero-channel SSH transport retention; keepalive probes do not extend it.
 

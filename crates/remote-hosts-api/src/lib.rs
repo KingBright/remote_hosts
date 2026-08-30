@@ -23,7 +23,7 @@ use remote_hosts_core::{
     WorkspaceOperationError, WorkspaceOperationSupervisor, WorkspaceRunCommand,
     WorkspaceSupervisor, WorkspaceSupervisorError,
 };
-use remote_hosts_db::{DbError, Repositories};
+use remote_hosts_db::{DbError, Repositories, retry_sqlite_contention};
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AgentSession, AgentWorkspace, ConnectionSession, Connector,
     ConnectorId, CredentialBinding, CredentialBindingId, CredentialBindingView, CredentialKind,
@@ -1698,18 +1698,22 @@ async fn heartbeat_pty_session(
             input_allowed: request.input_allowed,
         },
     )?;
-    state.repositories.pty_sessions.upsert(&updated).await?;
-    if updated.state != WorkspaceState::Closed {
-        state
-            .repositories
-            .workspaces
-            .update_state(
-                updated.workspace_id,
-                updated.state.clone(),
-                updated.last_activity_at,
-            )
-            .await?;
-    }
+    retry_sqlite_contention(|| async {
+        state.repositories.pty_sessions.upsert(&updated).await?;
+        if updated.state != WorkspaceState::Closed {
+            state
+                .repositories
+                .workspaces
+                .update_state(
+                    updated.workspace_id,
+                    updated.state.clone(),
+                    updated.last_activity_at,
+                )
+                .await?;
+        }
+        Ok(())
+    })
+    .await?;
     Ok(Json(updated))
 }
 
@@ -1726,24 +1730,28 @@ async fn close_pty_session(
         .await?
         .ok_or(ApiError::NotFound)?;
     let closed = PtySessionSupervisor::default().close(pty, request.last_exit_code);
-    state.repositories.pty_sessions.upsert(&closed).await?;
-    if state
-        .repositories
-        .pty_sessions
-        .count_active_for_workspace(closed.workspace_id)
-        .await?
-        == 0
-    {
-        state
+    retry_sqlite_contention(|| async {
+        state.repositories.pty_sessions.upsert(&closed).await?;
+        if state
             .repositories
-            .workspaces
-            .update_state(
-                closed.workspace_id,
-                WorkspaceState::Idle,
-                closed.last_activity_at,
-            )
-            .await?;
-    }
+            .pty_sessions
+            .count_active_for_workspace(closed.workspace_id)
+            .await?
+            == 0
+        {
+            state
+                .repositories
+                .workspaces
+                .update_state(
+                    closed.workspace_id,
+                    WorkspaceState::Idle,
+                    closed.last_activity_at,
+                )
+                .await?;
+        }
+        Ok(())
+    })
+    .await?;
     Ok(Json(closed))
 }
 

@@ -18,7 +18,7 @@ use remote_hosts_core::{
     WorkspaceRunCommand, WorkspaceSupervisor, common_coordination_scope,
     resolve_operation_coordination_scopes,
 };
-use remote_hosts_db::{DbError, Repositories, WorkspaceCapacityStatus};
+use remote_hosts_db::{DbError, Repositories, WorkspaceCapacityStatus, retry_sqlite_contention};
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentSessionState,
     AgentWorkspace, ConnectionMode, ConnectionSession, Connector, ConnectorId, CredentialId,
@@ -4968,22 +4968,22 @@ impl RemoteHostsMcpServer {
                 },
             )
             .map_err(|error| error.to_string())?;
-        self.repositories
-            .pty_sessions
-            .upsert(&updated)
-            .await
-            .map_err(|error| tool_error(&error))?;
-        if updated.state != WorkspaceState::Closed {
-            self.repositories
-                .workspaces
-                .update_state(
-                    updated.workspace_id,
-                    updated.state.clone(),
-                    updated.last_activity_at,
-                )
-                .await
-                .map_err(|error| tool_error(&error))?;
-        }
+        retry_sqlite_contention(|| async {
+            self.repositories.pty_sessions.upsert(&updated).await?;
+            if updated.state != WorkspaceState::Closed {
+                self.repositories
+                    .workspaces
+                    .update_state(
+                        updated.workspace_id,
+                        updated.state.clone(),
+                        updated.last_activity_at,
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| tool_error(&error))?;
         Ok(Json(pty_session_output(&updated)?))
     }
 
@@ -5005,29 +5005,28 @@ impl RemoteHostsMcpServer {
         let pty_session_id = parse_pty_session_id(&request.pty_session_id)?;
         let pty_session = self.pty_session_for_tool(pty_session_id).await?;
         let closed = PtySessionSupervisor::default().close(pty_session, request.last_exit_code);
-        self.repositories
-            .pty_sessions
-            .upsert(&closed)
-            .await
-            .map_err(|error| tool_error(&error))?;
-        if self
-            .repositories
-            .pty_sessions
-            .count_active_for_workspace(closed.workspace_id)
-            .await
-            .map_err(|error| tool_error(&error))?
-            == 0
-        {
-            self.repositories
-                .workspaces
-                .update_state(
-                    closed.workspace_id,
-                    WorkspaceState::Idle,
-                    closed.last_activity_at,
-                )
-                .await
-                .map_err(|error| tool_error(&error))?;
-        }
+        retry_sqlite_contention(|| async {
+            self.repositories.pty_sessions.upsert(&closed).await?;
+            if self
+                .repositories
+                .pty_sessions
+                .count_active_for_workspace(closed.workspace_id)
+                .await?
+                == 0
+            {
+                self.repositories
+                    .workspaces
+                    .update_state(
+                        closed.workspace_id,
+                        WorkspaceState::Idle,
+                        closed.last_activity_at,
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| tool_error(&error))?;
         Ok(Json(pty_session_output(&closed)?))
     }
 

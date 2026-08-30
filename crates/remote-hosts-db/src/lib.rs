@@ -1,6 +1,6 @@
 //! Database access layer and migrations.
 
-use std::{collections::BTreeSet, io, str::FromStr, time::Duration as StdDuration};
+use std::{collections::BTreeSet, future::Future, io, str::FromStr, time::Duration as StdDuration};
 
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId, AgentWorkspace,
@@ -29,6 +29,11 @@ use time::OffsetDateTime;
 
 /// Embedded database migrator.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// Maximum time one `SQLite` statement waits for the current writer before returning `BUSY`.
+pub const SQLITE_BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const SQLITE_CONTENTION_RETRY_DELAYS: [StdDuration; 2] =
+    [StdDuration::from_millis(25), StdDuration::from_millis(100)];
 
 /// Database errors.
 #[derive(Debug, Error)]
@@ -60,6 +65,52 @@ pub enum DbError {
     /// A multi-resource write lease request contains inconsistent ownership metadata.
     #[error("invalid host write lease set: {0}")]
     InvalidHostWriteLeaseSet(String),
+}
+
+impl DbError {
+    /// Returns whether the error is `SQLite`'s transient single-writer contention signal.
+    pub fn is_sqlite_contention(&self) -> bool {
+        let Self::Sqlx(sqlx::Error::Database(error)) = self else {
+            return false;
+        };
+        let code = error.code();
+        if code
+            .as_deref()
+            .is_some_and(|code| matches!(code, "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED"))
+        {
+            return true;
+        }
+        let message = error.message().to_ascii_lowercase();
+        message.contains("database is locked") || message.contains("database table is locked")
+    }
+}
+
+/// Retries one idempotent database action when `SQLite` reports transient writer contention.
+///
+/// The connection-level busy timeout handles ordinary short overlap. These additional bounded
+/// yields cover `SQLITE_LOCKED` variants and contention that crosses one timeout boundary.
+///
+/// # Errors
+///
+/// Returns the operation error immediately when it is not transient `SQLite` contention, or after
+/// the bounded contention retry budget is exhausted.
+pub async fn retry_sqlite_contention<T, F, Fut>(mut operation: F) -> Result<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, DbError>>,
+{
+    let mut delays = SQLITE_CONTENTION_RETRY_DELAYS.into_iter();
+    loop {
+        match operation().await {
+            Err(error) if error.is_sqlite_contention() => {
+                let Some(delay) = delays.next() else {
+                    return Err(error);
+                };
+                tokio::time::sleep(delay).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Result of one bounded legacy PTY output compaction transaction.
@@ -185,7 +236,7 @@ pub async fn connect_sqlite(database_url: &str) -> Result<SqlitePool, DbError> {
         .create_if_missing(true)
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .busy_timeout(StdDuration::from_secs(5));
+        .busy_timeout(SQLITE_BUSY_TIMEOUT);
 
     SqlitePoolOptions::new()
         .max_connections(10)
@@ -6947,7 +6998,7 @@ fn i64_to_u16(value: i64) -> Result<u16, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{io, str::FromStr, time::Duration as StdDuration};
 
     use remote_hosts_domain::{
         AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId,
@@ -6966,11 +7017,66 @@ mod tests {
         StoredCredential, TrustLevel, WorkspaceId, WorkspaceState, now_utc,
     };
     use serde_json::json;
-    use sqlx::Row as _;
+    use sqlx::{Connection as _, Row as _, sqlite::SqliteConnectOptions};
 
     use super::{
-        ClaimedOperationFinish, Repositories, compile_knowledge_fts_query, connect_sqlite, migrate,
+        ClaimedOperationFinish, Repositories, SQLITE_BUSY_TIMEOUT, compile_knowledge_fts_query,
+        connect_sqlite, migrate, retry_sqlite_contention,
     };
+
+    #[tokio::test]
+    async fn sqlite_connections_use_a_contention_tolerant_busy_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        let busy_timeout_ms: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&pool)
+            .await?;
+
+        assert_eq!(
+            busy_timeout_ms,
+            i64::try_from(SQLITE_BUSY_TIMEOUT.as_millis())?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_contention_retry_recovers_after_writer_releases_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("contention.sqlite");
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite://{}", database_path.display()))?
+                .create_if_missing(true)
+                .busy_timeout(StdDuration::from_millis(1));
+        let mut locking_connection = sqlx::SqliteConnection::connect_with(&options).await?;
+        let retry_pool = sqlx::SqlitePool::connect_with(options).await?;
+        sqlx::query("CREATE TABLE contention_test (value INTEGER NOT NULL)")
+            .execute(&mut locking_connection)
+            .await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut locking_connection)
+            .await?;
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(40)).await;
+            sqlx::query("COMMIT").execute(&mut locking_connection).await
+        });
+        retry_sqlite_contention(|| async {
+            sqlx::query("INSERT INTO contention_test (value) VALUES (1)")
+                .execute(&retry_pool)
+                .await
+                .map(|_| ())
+                .map_err(super::DbError::from)
+        })
+        .await?;
+        release.await??;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contention_test")
+            .fetch_one(&retry_pool)
+            .await?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
 
     #[test]
     fn knowledge_search_compiles_natural_language_as_literal_fts_tokens() {
