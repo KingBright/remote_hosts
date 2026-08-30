@@ -1143,7 +1143,11 @@ async fn get_agent_work_context(
     ensure_agent_session_exists(&state, agent_session_id).await?;
     let host_id = query.host_id.as_deref().map(parse_host_id).transpose()?;
     let limit = query.limit.unwrap_or(20).clamp(1, 50);
-    let cursor = state.repositories.state_events.latest_sequence().await?;
+    let cursor = state
+        .repositories
+        .state_events
+        .latest_lifecycle_sequence()
+        .await?;
     let context = materialize_http_agent_work_context(
         &state,
         agent_session_id,
@@ -1166,6 +1170,27 @@ async fn wait_agent_work_context(
     ensure_agent_session_exists(&state, agent_session_id).await?;
     let host_id = request.host_id.as_deref().map(parse_host_id).transpose()?;
     let limit = request.limit.unwrap_or(20).clamp(1, 50);
+    let latest_cursor = state
+        .repositories
+        .state_events
+        .latest_lifecycle_sequence()
+        .await?;
+    if request.after_cursor > latest_cursor {
+        return Err(ApiError::BadRequest(format!(
+            "after_cursor {} is ahead of latest work-context cursor {latest_cursor}",
+            request.after_cursor
+        )));
+    }
+    state
+        .repositories
+        .state_events
+        .acknowledge_agent_work_context_cursor(
+            agent_session_id,
+            host_id,
+            request.after_cursor,
+            now_utc(),
+        )
+        .await?;
     let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(5_000).min(60_000));
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -3019,7 +3044,30 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&bytes)?;
         assert_eq!(payload["context_version"], json!(1));
         assert_eq!(payload["overall_state"], json!("idle"));
+        assert_eq!(payload["lifecycle_outbox"]["pending"], json!(0));
         assert_eq!(payload["items"], json!([]));
+        let cursor = payload["cursor"].as_u64().ok_or("snapshot cursor")?;
+
+        let waited = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .uri(format!(
+                        "/v1/agent-sessions/{}/work-context/wait",
+                        session.id
+                    ))
+                    .body(body::Body::from(
+                        json!({"after_cursor": cursor, "timeout_ms": 1}).to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(waited.status(), axum::http::StatusCode::OK);
+        let waited = body::to_bytes(waited.into_body(), usize::MAX).await?;
+        let waited: serde_json::Value = serde_json::from_slice(&waited)?;
+        assert_eq!(waited["changed"], json!(false));
+        assert_eq!(waited["cursor"], json!(cursor));
 
         let missing = app
             .oneshot(

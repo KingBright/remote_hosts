@@ -132,6 +132,13 @@ runtime tools only when it says to read a result, respond to typed interaction, 
 Never interpret `changed=false` as failure and never create duplicate work merely because a wait
 timed out. A no-change wait is a compact acknowledgement with an unchanged cursor and empty items;
 retain the last changed context and wait again from that same cursor.
+Passing the returned cursor to the next wait with the same `host_id` filter durably acknowledges
+all earlier lifecycle rows for that Agent Session and filter. Do not reuse a cursor after changing
+the Host filter, invent a larger cursor, or discard the returned one during recovery.
+The response's `lifecycle_outbox` block is publisher health, not business completion state. Pending
+rows remain authoritative and visible to snapshot/wait even when the secondary state-event stream
+is unavailable. Report sustained pending age or `last_publish_error`; do not restart a connector,
+retry a mutation, or discard the cursor to clear observability backlog.
 
 Use `remote_hosts_wait_runtime_events` only with an explicit start mode:
 

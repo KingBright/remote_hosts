@@ -258,17 +258,26 @@ snapshot version 11. `remote_hosts_get_agent_work_context` implicitly binds the 
 Session and supports either `snapshot` or cursor-based `wait`. It returns active work across hosts,
 new terminal results after the supplied cursor, type-only PTY interaction, exact coordination
 scopes, bounded transfer progress, active-host route/transport/channel digests, and one
-deterministic primary action. It never accepts a session id, executes an action, returns raw PTY
+deterministic primary action. It also reports `lifecycle_outbox.pending`, oldest pending age, and a
+bounded last publisher error so observability degradation is never silent. It never accepts a session id, executes an action, returns raw PTY
 input, or exposes foreign-session command/output identifiers. The loopback/admin HTTP equivalents
 are `GET /v1/agent-sessions/{id}/work-context` and
 `POST /v1/agent-sessions/{id}/work-context/wait`. A timed-out wait returns a compact
 `changed=false` acknowledgement with the unchanged cursor and empty host/item arrays; callers keep
 the last changed context, and the unchanged cursor makes a racing lifecycle event replayable.
 
-Workspace, operation, PTY, input, transfer-progress, and connection lifecycle hooks append
-session/host/workspace linkage to the existing monotonic event sequence after the business state is
-durable. Event publication is best effort: SQLite contention or an event-write failure cannot
-cancel, retry, restart, or rewrite remote work. Legacy event rows remain readable.
+SQLite triggers append minimal Workspace, operation, PTY, input, transfer-progress, and connection
+transitions to `lifecycle_outbox` in the same transaction as the durable business state. Agent Work
+Context uses that outbox sequence as its authoritative cursor and reads published and pending rows,
+so a secondary state-event publisher timeout cannot hide a terminal result. A bounded publisher
+copies rows idempotently into the general state-event stream and records backlog/error status;
+publication remains best effort and cannot cancel, retry, restart, or rewrite remote work. Recovery
+snapshots include durable terminal rows newer than the session's acknowledged cursor. Supplying a
+returned cursor to the next wait with the same `host_id` filter checkpoints that filter-scoped
+acknowledgement in `agent_work_context_cursors`, so MCP/API restarts do not re-deliver an
+acknowledged terminal row or consume another Host filter's terminal rows; events racing the wait
+remain above the cursor. Cursors must not be reused with a different Host filter. Legacy event rows
+remain readable.
 
 ## MCP Profiles
 

@@ -118,7 +118,7 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [ ] Add a real gateway/SSHD regression suite for pooled arbitrary commands, session invalidation, one bounded reconnect, cross-workspace reuse, SFTP and exec-channel file transfer, 1 GiB files, complete Artifact reads, and gateways that drop stdin/EOF/stdout/exit-status signals. The local shell regression already covers disconnect-equivalent stateless chunk continuation, duplicate chunk replies, and already-placed destination recovery.
 - [ ] Add local SSHD integration tests for `control-master-tty` and native `russh` PTY backend.
 - [ ] Add a multi-process MCP integration test that drives two Agent Sessions through one real pooled SSH transport while proving workspace/PTY isolation and write-lease handoff.
-- [x] Emit authoritative connection, workspace, operation, PTY, input, and transfer lifecycle events into the sequenced runtime event log without coupling event publication failure to remote work.
+- [x] Persist authoritative connection, workspace, operation, PTY, input, and transfer lifecycle transitions through a same-transaction durable outbox; publish them idempotently into the general runtime event log without coupling publisher failure to remote work.
 - [x] Add Agent Work Context v1 as a session-scoped snapshot/wait explain contract with one deterministic primary action.
 - [ ] Add a target-side worker mode for true PTY/process continuity across connector restarts.
 - [ ] Add HTTP/MCP control methods for native `russh` PTY resize and signal delivery.

@@ -1253,6 +1253,21 @@ impl RemoteHostsMcpServer {
         changed: bool,
         limit: u32,
     ) -> Result<AgentWorkContext, String> {
+        let observed_at = now_utc();
+        let publish = self
+            .repositories
+            .state_events
+            .publish_lifecycle_outbox(observed_at, 50);
+        let _ = tokio::time::timeout(Duration::from_millis(250), publish).await;
+        let acknowledged_cursor = if after_cursor.is_none() {
+            self.repositories
+                .state_events
+                .agent_work_context_acknowledged_sequence(agent_session_id, host_filter)
+                .await
+                .map_err(|error| tool_error(&error))?
+        } else {
+            0
+        };
         let lifecycle_events = if let Some(after_cursor) = after_cursor {
             self.repositories
                 .state_events
@@ -1265,7 +1280,26 @@ impl RemoteHostsMcpServer {
                 .await
                 .map_err(|error| tool_error(&error))?
         } else {
-            Vec::new()
+            self.repositories
+                .state_events
+                .list_terminal_after_for_agent_session(
+                    agent_session_id,
+                    acknowledged_cursor,
+                    cursor,
+                    host_filter,
+                    limit,
+                )
+                .await
+                .map_err(|error| tool_error(&error))?
+        };
+        let response_cursor = if after_cursor.is_none()
+            && lifecycle_events.len() >= usize::try_from(limit).unwrap_or(usize::MAX)
+        {
+            lifecycle_events
+                .last()
+                .map_or(cursor, |event| event.sequence)
+        } else {
+            cursor
         };
         let terminal_entities = lifecycle_events
             .iter()
@@ -1280,13 +1314,37 @@ impl RemoteHostsMcpServer {
             .iter()
             .filter_map(|event| event.workspace_id)
             .collect::<BTreeSet<_>>();
-        let workspaces = self
+        let mut workspaces = self
             .repositories
             .workspaces
             .list_for_agent_session(agent_session_id, host_filter, 50)
             .await
             .map_err(|error| tool_error(&error))?;
-        let observed_at = now_utc();
+        let mut loaded_workspace_ids = workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect::<BTreeSet<_>>();
+        for workspace_id in &changed_workspaces {
+            if loaded_workspace_ids.contains(workspace_id) {
+                continue;
+            }
+            let Some(workspace) = self
+                .repositories
+                .workspaces
+                .get(*workspace_id)
+                .await
+                .map_err(|error| tool_error(&error))?
+            else {
+                continue;
+            };
+            if workspace.agent_session_id != Some(agent_session_id)
+                || host_filter.is_some_and(|host_id| workspace.host_id != host_id)
+            {
+                continue;
+            }
+            loaded_workspace_ids.insert(workspace.id);
+            workspaces.push(workspace);
+        }
         let redactor = SecretRedactor::default();
         let mut items = Vec::new();
         let mut host_routes = BTreeSet::new();
@@ -1315,12 +1373,43 @@ impl RemoteHostsMcpServer {
                 .list_active(workspace.host_id, observed_at)
                 .await
                 .map_err(|error| tool_error(&error))?;
-            let operations = self
+            let mut operations = self
                 .repositories
                 .operations
                 .list_for_workspace(workspace.id, 50)
                 .await
                 .map_err(|error| tool_error(&error))?;
+            let mut loaded_operation_ids = operations
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<BTreeSet<_>>();
+            for event in lifecycle_events.iter().filter(|event| {
+                matches!(event.kind.as_str(), "operation" | "transfer")
+                    && event.workspace_id == Some(workspace.id)
+            }) {
+                let Ok(operation_id) = parse_operation_id(&event.entity_id) else {
+                    continue;
+                };
+                if loaded_operation_ids.contains(&operation_id) {
+                    continue;
+                }
+                let Some(operation) = self
+                    .repositories
+                    .operations
+                    .get(operation_id)
+                    .await
+                    .map_err(|error| tool_error(&error))?
+                else {
+                    continue;
+                };
+                if operation.workspace_id != Some(workspace.id)
+                    || operation.agent_session_id != Some(agent_session_id)
+                {
+                    continue;
+                }
+                loaded_operation_ids.insert(operation.id);
+                operations.push(operation);
+            }
             let ptys = self
                 .repositories
                 .pty_sessions
@@ -1630,12 +1719,19 @@ impl RemoteHostsMcpServer {
             });
         }
         let (overall_state, primary_action) = aggregate_action;
+        let lifecycle_outbox = self
+            .repositories
+            .state_events
+            .lifecycle_outbox_status_for_agent_session(agent_session_id, host_filter, observed_at)
+            .await
+            .map_err(|error| tool_error(&error))?;
         Ok(AgentWorkContext {
             context_version: 1,
-            cursor,
+            cursor: response_cursor,
             changed,
             overall_state,
             primary_action,
+            lifecycle_outbox,
             hosts,
             items,
         })
@@ -4631,7 +4727,7 @@ impl RemoteHostsMcpServer {
                 let cursor = self
                     .repositories
                     .state_events
-                    .latest_sequence()
+                    .latest_lifecycle_sequence()
                     .await
                     .map_err(|error| tool_error(&error))?;
                 let context = self
@@ -4650,6 +4746,27 @@ impl RemoteHostsMcpServer {
                 let after_cursor = request
                     .after_cursor
                     .ok_or_else(|| "after_cursor is required when mode is wait".to_owned())?;
+                let latest_cursor = self
+                    .repositories
+                    .state_events
+                    .latest_lifecycle_sequence()
+                    .await
+                    .map_err(|error| tool_error(&error))?;
+                if after_cursor > latest_cursor {
+                    return Err(format!(
+                        "after_cursor {after_cursor} is ahead of latest work-context cursor {latest_cursor}"
+                    ));
+                }
+                self.repositories
+                    .state_events
+                    .acknowledge_agent_work_context_cursor(
+                        agent_session.id,
+                        host_filter,
+                        after_cursor,
+                        now_utc(),
+                    )
+                    .await
+                    .map_err(|error| tool_error(&error))?;
                 let timeout =
                     Duration::from_millis(request.timeout_ms.unwrap_or(5_000).min(60_000));
                 let deadline = Instant::now() + timeout;
@@ -6420,6 +6537,8 @@ pub struct AgentWorkContextOutput {
     pub overall_state: String,
     /// Deterministic single primary action.
     pub primary_action: Value,
+    /// Durable lifecycle publisher backlog health.
+    pub lifecycle_outbox: Value,
     /// Active-host digests only.
     pub hosts: Vec<Value>,
     /// Active items plus newly terminal items after the wait cursor.
@@ -6434,6 +6553,7 @@ impl AgentWorkContextOutput {
             changed: context.changed,
             overall_state: enum_label(&context.overall_state),
             primary_action: to_json_value(&context.primary_action)?,
+            lifecycle_outbox: to_json_value(&context.lifecycle_outbox)?,
             hosts: values(&context.hosts)?,
             items: values(&context.items)?,
         })
@@ -7851,20 +7971,20 @@ mod tests {
 
     use remote_hosts_db::{Repositories, connect_sqlite, migrate};
     use remote_hosts_domain::{
-        AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId,
-        AgentSessionState, AgentWorkContext, AgentWorkHost, AgentWorkItem, AgentWorkspace,
-        AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason, AuthorizedKeyBootstrapState,
-        ConnectionMode, ConnectionSession, Connector, ConnectorId, CredentialId, CredentialKind,
-        CredentialMetadata, EntityState, Environment, EnvironmentId, EnvironmentKind, Host, HostId,
-        HostKind, OperationId, OperationOutputArtifact, OperationOutputArtifactId,
-        OperationOutputChunk, OperationOutputChunkId, OperationRun, OperationState, OperationType,
-        OutputStream, Protocol, PtyBackendCapabilities, PtyBackendState, PtyInputEvent,
-        PtyInputEventId, PtyInputEventState, PtyInputPayloadKind, PtyInteraction,
-        PtyInteractionKind, PtyOutputChunk, PtyOutputChunkId, PtySession, PtySessionId, RiskLevel,
-        RouteType, SessionId, SshFileTransferMode, SshTransportBackend, SshTransportCapabilities,
-        SshTransportRuntime, SshTransportRuntimeId, SshTransportRuntimeState,
-        SshTransportTelemetry, StateReasonCode, StoredCredential, TrustLevel, WorkspaceId,
-        WorkspaceState, now_utc,
+        AccessPath, AccessPathHealth, AccessPathId, AgentLifecycleOutboxStatus, AgentSession,
+        AgentSessionId, AgentSessionState, AgentWorkContext, AgentWorkHost, AgentWorkItem,
+        AgentWorkspace, AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason,
+        AuthorizedKeyBootstrapState, ConnectionMode, ConnectionSession, Connector, ConnectorId,
+        CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId,
+        EnvironmentKind, Host, HostId, HostKind, OperationId, OperationOutputArtifact,
+        OperationOutputArtifactId, OperationOutputChunk, OperationOutputChunkId, OperationRun,
+        OperationState, OperationType, OutputStream, Protocol, PtyBackendCapabilities,
+        PtyBackendState, PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyInputPayloadKind,
+        PtyInteraction, PtyInteractionKind, PtyOutputChunk, PtyOutputChunkId, PtySession,
+        PtySessionId, RiskLevel, RouteType, SessionId, SshFileTransferMode, SshTransportBackend,
+        SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
+        SshTransportRuntimeState, SshTransportTelemetry, StateReasonCode, StoredCredential,
+        TrustLevel, WorkspaceId, WorkspaceState, now_utc,
     };
     use remote_hosts_vault::{CredentialVault, EncryptedCredentialBlob};
     use rmcp::{
@@ -7909,6 +8029,7 @@ mod tests {
             changed: true,
             overall_state,
             primary_action,
+            lifecycle_outbox: AgentLifecycleOutboxStatus::empty(),
             hosts: vec![AgentWorkHost {
                 id: host_id,
                 name: "managed-production-host".to_owned(),
@@ -8020,12 +8141,75 @@ mod tests {
         assert_eq!(snapshot_with_cursor.is_error, Some(true));
 
         let wait_without_cursor = call_tool_raw(
-            server,
+            server.clone(),
             tools::GET_AGENT_WORK_CONTEXT,
             Some(json!({"mode": "wait", "timeout_ms": 1})),
         )
         .await?;
         assert_eq!(wait_without_cursor.is_error, Some(true));
+
+        let wait_ahead_of_log = call_tool_raw(
+            server,
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({
+                "mode": "wait",
+                "after_cursor": u64::MAX,
+                "timeout_ms": 1
+            })),
+        )
+        .await?;
+        assert_eq!(wait_ahead_of_log.is_error, Some(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_work_context_ack_cursor_is_scoped_by_host_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let session = AgentSessionContext {
+            client_kind: Some("codex".to_owned()),
+            client_instance_id: Some("work-context-ack-scope".to_owned()),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("ack-scope".to_owned()),
+        }
+        .into_session();
+        fixture.repositories.agent_sessions.upsert(&session).await?;
+        let other_host_id = HostId::new();
+        fixture
+            .repositories
+            .state_events
+            .acknowledge_agent_work_context_cursor(session.id, Some(fixture.host_id), 7, now_utc())
+            .await?;
+        fixture
+            .repositories
+            .state_events
+            .acknowledge_agent_work_context_cursor(session.id, None, 3, now_utc())
+            .await?;
+
+        assert_eq!(
+            fixture
+                .repositories
+                .state_events
+                .agent_work_context_acknowledged_sequence(session.id, Some(fixture.host_id))
+                .await?,
+            7
+        );
+        assert_eq!(
+            fixture
+                .repositories
+                .state_events
+                .agent_work_context_acknowledged_sequence(session.id, None)
+                .await?,
+            3
+        );
+        assert_eq!(
+            fixture
+                .repositories
+                .state_events
+                .agent_work_context_acknowledged_sequence(session.id, Some(other_host_id))
+                .await?,
+            0
+        );
         Ok(())
     }
 
@@ -8044,7 +8228,11 @@ mod tests {
         let server =
             RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
                 .with_agent_session_context(context);
-        let baseline = fixture.repositories.state_events.latest_sequence().await?;
+        let baseline = fixture
+            .repositories
+            .state_events
+            .latest_lifecycle_sequence()
+            .await?;
         let observed_at = now_utc();
         for index in 0..3 {
             fixture
@@ -8061,7 +8249,11 @@ mod tests {
                 )
                 .await?;
         }
-        let latest = fixture.repositories.state_events.latest_sequence().await?;
+        let latest = fixture
+            .repositories
+            .state_events
+            .latest_lifecycle_sequence()
+            .await?;
 
         let first = call_tool(
             server.clone(),
@@ -8096,6 +8288,305 @@ mod tests {
                 .as_u64()
                 .is_some_and(|cursor| cursor > first_cursor)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn agent_work_context_materializes_changed_terminal_beyond_recent_entity_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let context = AgentSessionContext {
+            client_kind: Some("codex".to_owned()),
+            client_instance_id: Some("work-context-window".to_owned()),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("terminal-beyond-window".to_owned()),
+        };
+        let session = context.clone().into_session();
+        fixture.repositories.agent_sessions.upsert(&session).await?;
+        let now = now_utc();
+        let workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(session.id),
+            host_id: fixture.host_id,
+            access_path_id: fixture.access_path_id,
+            connector_id: fixture.connector_id,
+            label: "terminal beyond recent window".to_owned(),
+            cwd: Some("/tmp".to_owned()),
+            state: WorkspaceState::Working,
+            policy_profile: "default".to_owned(),
+            coordination_scope: "service/terminal-window".to_owned(),
+            created_at: now,
+            last_activity_at: now,
+            ttl_seconds: 3600,
+        };
+        fixture.repositories.workspaces.insert(&workspace).await?;
+        let target = OperationRun {
+            id: OperationId::new(),
+            host_id: fixture.host_id,
+            access_path_id: fixture.access_path_id,
+            connector_id: fixture.connector_id,
+            session_id: Some(fixture.session_id),
+            workspace_id: Some(workspace.id),
+            agent_session_id: Some(session.id),
+            idempotency_key: Some("terminal-window-target".to_owned()),
+            requires_write_lease: false,
+            coordination_scope: workspace.coordination_scope.clone(),
+            coordination_scopes: vec![workspace.coordination_scope.clone()],
+            operation_type: OperationType::ReadonlyExec,
+            intent: "read old terminal result".to_owned(),
+            state: OperationState::Queued,
+            started_at: now - time::Duration::hours(1),
+            finished_at: None,
+            exit_code: None,
+            timeout_seconds: 30,
+            redacted_command_summary: "true".to_owned(),
+            command_profile_json: Some(json!({"name": "shell.posix", "args": ["true"]})),
+            transport_evidence: None,
+            redacted_output_summary: None,
+            log_ref: None,
+            attempt_count: 0,
+            claim_token: None,
+            claimed_at: None,
+            lease_expires_at: None,
+            last_error: None,
+        };
+        fixture.repositories.operations.insert(&target).await?;
+        for index in 0..50 {
+            let mut newer = target.clone();
+            newer.id = OperationId::new();
+            newer.idempotency_key = Some(format!("terminal-window-newer-{index}"));
+            newer.intent = format!("newer operation {index}");
+            newer.state = OperationState::Succeeded;
+            newer.started_at = now + time::Duration::seconds(i64::from(index));
+            newer.finished_at = Some(newer.started_at);
+            newer.exit_code = Some(0);
+            fixture.repositories.operations.insert(&newer).await?;
+        }
+        let baseline = fixture
+            .repositories
+            .state_events
+            .latest_lifecycle_sequence()
+            .await?;
+        fixture
+            .repositories
+            .operations
+            .update_state(
+                target.id,
+                OperationState::Succeeded,
+                Some(now + time::Duration::hours(1)),
+                Some(0),
+                Some("done"),
+            )
+            .await?;
+
+        let completed = call_tool(
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
+                .with_agent_session_context(context),
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({
+                "mode": "wait",
+                "after_cursor": baseline,
+                "timeout_ms": 10,
+                "limit": 1
+            })),
+        )
+        .await?;
+        assert_eq!(completed["changed"], json!(true));
+        assert!(completed["items"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["entity_id"] == json!(target.id.to_string())
+                    && item["state"] == json!("succeeded")
+            })
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn agent_work_context_recovers_terminal_outbox_after_publisher_failure_and_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let context = AgentSessionContext {
+            client_kind: Some("codex".to_owned()),
+            client_instance_id: Some("work-context-outbox".to_owned()),
+            project_key: Some("remote-hosts".to_owned()),
+            conversation_key: Some("durable-terminal".to_owned()),
+        };
+        let session = context.clone().into_session();
+        fixture.repositories.agent_sessions.upsert(&session).await?;
+        let now = now_utc();
+        let workspace = AgentWorkspace {
+            id: WorkspaceId::new(),
+            agent_session_id: Some(session.id),
+            host_id: fixture.host_id,
+            access_path_id: fixture.access_path_id,
+            connector_id: fixture.connector_id,
+            label: "durable terminal".to_owned(),
+            cwd: Some("/tmp".to_owned()),
+            state: WorkspaceState::Working,
+            policy_profile: "default".to_owned(),
+            coordination_scope: "service/durable-terminal".to_owned(),
+            created_at: now,
+            last_activity_at: now,
+            ttl_seconds: 3600,
+        };
+        fixture.repositories.workspaces.insert(&workspace).await?;
+        let operation = OperationRun {
+            id: OperationId::new(),
+            host_id: fixture.host_id,
+            access_path_id: fixture.access_path_id,
+            connector_id: fixture.connector_id,
+            session_id: Some(fixture.session_id),
+            workspace_id: Some(workspace.id),
+            agent_session_id: Some(session.id),
+            idempotency_key: Some("durable-terminal".to_owned()),
+            requires_write_lease: false,
+            coordination_scope: workspace.coordination_scope.clone(),
+            coordination_scopes: vec![workspace.coordination_scope.clone()],
+            operation_type: OperationType::ReadonlyExec,
+            intent: "inspect durable terminal".to_owned(),
+            state: OperationState::Queued,
+            started_at: now,
+            finished_at: None,
+            exit_code: None,
+            timeout_seconds: 30,
+            redacted_command_summary: "true".to_owned(),
+            command_profile_json: Some(json!({"name": "shell.posix", "args": ["true"]})),
+            transport_evidence: None,
+            redacted_output_summary: None,
+            log_ref: None,
+            attempt_count: 0,
+            claim_token: None,
+            claimed_at: None,
+            lease_expires_at: None,
+            last_error: None,
+        };
+        fixture.repositories.operations.insert(&operation).await?;
+        let server =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
+                .with_agent_session_context(context.clone());
+        let snapshot = call_tool(
+            server,
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({"mode": "snapshot"})),
+        )
+        .await?;
+        let cursor = snapshot["cursor"].as_u64().ok_or("snapshot cursor")?;
+
+        sqlx::query(
+            r"
+            CREATE TRIGGER force_lifecycle_publish_failure
+            BEFORE INSERT ON state_events
+            WHEN NEW.lifecycle_outbox_sequence IS NOT NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'forced lifecycle publish failure');
+            END
+            ",
+        )
+        .execute(&fixture.pool)
+        .await?;
+        fixture
+            .repositories
+            .operations
+            .update_state(
+                operation.id,
+                OperationState::Succeeded,
+                Some(now + time::Duration::seconds(1)),
+                Some(0),
+                Some("done"),
+            )
+            .await?;
+        assert_eq!(
+            fixture
+                .repositories
+                .operations
+                .get(operation.id)
+                .await?
+                .ok_or("operation should remain durable")?
+                .state,
+            OperationState::Succeeded
+        );
+
+        let restarted =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
+                .with_agent_session_context(context.clone());
+        let completed = call_tool(
+            restarted,
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({
+                "mode": "wait",
+                "after_cursor": cursor,
+                "timeout_ms": 10
+            })),
+        )
+        .await?;
+        assert_eq!(completed["changed"], json!(true));
+        assert!(completed["items"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["entity_id"] == json!(operation.id.to_string())
+                    && item["state"] == json!("succeeded")
+            })
+        }));
+        assert!(
+            completed["lifecycle_outbox"]["pending"]
+                .as_u64()
+                .is_some_and(|pending| pending >= 1)
+        );
+        assert!(
+            completed["lifecycle_outbox"]["last_publish_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("forced lifecycle publish failure")),
+            "outbox status={}",
+            completed["lifecycle_outbox"]
+        );
+        let completed_cursor = completed["cursor"].as_u64().ok_or("completed cursor")?;
+
+        let restarted_again =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
+                .with_agent_session_context(context.clone());
+        let consumed = call_tool(
+            restarted_again,
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({
+                "mode": "wait",
+                "after_cursor": completed_cursor,
+                "timeout_ms": 1
+            })),
+        )
+        .await?;
+        assert_eq!(consumed["changed"], json!(false));
+        assert_eq!(consumed["items"], json!([]));
+
+        sqlx::query("DROP TRIGGER force_lifecycle_publish_failure")
+            .execute(&fixture.pool)
+            .await?;
+        let recovered_snapshot = call_tool(
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent)
+                .with_agent_session_context(context),
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({"mode": "snapshot"})),
+        )
+        .await?;
+        assert_eq!(recovered_snapshot["lifecycle_outbox"]["pending"], json!(0));
+        assert!(
+            !recovered_snapshot["items"]
+                .as_array()
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| { item["entity_id"] == json!(operation.id.to_string()) }))
+        );
+        let published_count: i64 = sqlx::query_scalar(
+            r"
+            SELECT COUNT(*) FROM state_events
+            WHERE lifecycle_outbox_sequence IS NOT NULL
+              AND entity_id = ? AND lifecycle_state = 'succeeded'
+            ",
+        )
+        .bind(operation.id.to_string())
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert_eq!(published_count, 1);
         Ok(())
     }
 
@@ -11966,6 +12457,7 @@ mod tests {
     }
 
     struct TestFixture {
+        pool: sqlx::SqlitePool,
         repositories: Repositories,
         host_id: HostId,
         access_path_id: AccessPathId,
@@ -11978,7 +12470,7 @@ mod tests {
         async fn new() -> Result<Self, Box<dyn std::error::Error>> {
             let pool = connect_sqlite("sqlite::memory:").await?;
             migrate(&pool).await?;
-            let repositories = Repositories::new(pool);
+            let repositories = Repositories::new(pool.clone());
             let now = now_utc();
 
             let host = Host {
@@ -12080,6 +12572,7 @@ mod tests {
             repositories.connection_sessions.upsert(&session).await?;
 
             Ok(Self {
+                pool,
                 repositories,
                 host_id: host.id,
                 access_path_id: access_path.id,

@@ -3,17 +3,17 @@
 use std::{collections::BTreeSet, future::Future, io, str::FromStr, time::Duration as StdDuration};
 
 use remote_hosts_domain::{
-    AccessPath, AccessPathHealth, AccessPathId, AgentLifecycleEvent, AgentSession, AgentSessionId,
-    AgentWorkspace, AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason,
-    AuthorizedKeyBootstrapState, ClaimedPtyInputEvent, ConnectionSession, Connector, ConnectorId,
-    CredentialBinding, CredentialBindingView, CredentialId, CredentialKind, CredentialMetadata,
-    EntityState, Environment, EnvironmentId, Host, HostFact, HostId, HostWriteLease,
-    InstanceIdentity, InstancePeer, InstancePeerId, InstancePeerState, InstanceSyncCollection,
-    InstanceSyncConflict, KnowledgeItem, OperationId, OperationOutputArtifact,
-    OperationOutputArtifactId, OperationOutputChunk, OperationRun, OperationState,
-    PtyBackendCapabilities, PtyBackendState, PtyInputEvent, PtyInputEventId, PtyInputEventState,
-    PtyOutputChunk, PtySession, PtySessionId, SequencedStateEvent, SessionId, SoftwareInstall,
-    SshChannelTransportEvidence, SshTransportRuntime, SshTransportRuntimeId,
+    AccessPath, AccessPathHealth, AccessPathId, AgentLifecycleEvent, AgentLifecycleOutboxStatus,
+    AgentSession, AgentSessionId, AgentWorkspace, AuthorizedKeyBootstrap,
+    AuthorizedKeyBootstrapReason, AuthorizedKeyBootstrapState, ClaimedPtyInputEvent,
+    ConnectionSession, Connector, ConnectorId, CredentialBinding, CredentialBindingView,
+    CredentialId, CredentialKind, CredentialMetadata, EntityState, Environment, EnvironmentId,
+    Host, HostFact, HostId, HostWriteLease, InstanceIdentity, InstancePeer, InstancePeerId,
+    InstancePeerState, InstanceSyncCollection, InstanceSyncConflict, KnowledgeItem, OperationId,
+    OperationOutputArtifact, OperationOutputArtifactId, OperationOutputChunk, OperationRun,
+    OperationState, PtyBackendCapabilities, PtyBackendState, PtyInputEvent, PtyInputEventId,
+    PtyInputEventState, PtyOutputChunk, PtySession, PtySessionId, SequencedStateEvent, SessionId,
+    SoftwareInstall, SshChannelTransportEvidence, SshTransportRuntime, SshTransportRuntimeId,
     SshTransportRuntimeState, StateEvent, StateReasonCode, StoredCredential, TopologyEdge,
     TopologyNode, TopologyNodeId, TopologySyncRun, TopologySyncRunId, WorkspaceId, WorkspaceState,
 };
@@ -6640,14 +6640,11 @@ impl CredentialBindingRepository {
 }
 
 impl StateEventRepository {
-    /// Appends session and workspace linkage to the global lifecycle sequence.
-    ///
-    /// Callers that have already committed a business state transition should treat an error as
-    /// observability degradation only. They must not cancel, retry, or rewrite remote work.
+    /// Appends one durable lifecycle transition to the authoritative outbox.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database rejects the append.
+    /// Returns an error if the database rejects the durable append.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_lifecycle(
         &self,
@@ -6661,32 +6658,40 @@ impl StateEventRepository {
     ) -> Result<(), DbError> {
         sqlx::query(
             r"
-            INSERT INTO state_events (
-                id, entity_type, entity_id, old_state_json, new_state_json,
-                reason_code_json, observed_at, agent_session_id, host_id, workspace_id,
-                lifecycle_kind, lifecycle_state
+            INSERT INTO lifecycle_outbox (
+                event_id, agent_session_id, host_id, workspace_id, lifecycle_kind,
+                entity_id, lifecycle_state, observed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )
         .bind(uuid::Uuid::new_v4().to_string())
-        .bind(kind)
-        .bind(entity_id)
-        .bind(to_json(&EntityState::Unknown)?)
-        .bind(to_json(&lifecycle_entity_state(state))?)
-        .bind(to_json(&StateReasonCode::None)?)
-        .bind(observed_at)
         .bind(agent_session_id.map(|id| id.to_string()))
         .bind(host_id.map(|id| id.to_string()))
         .bind(workspace_id.map(|id| id.to_string()))
         .bind(kind)
+        .bind(entity_id)
         .bind(state)
+        .bind(observed_at)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Lists lifecycle changes visible to one agent session after a global cursor.
+    /// Returns the latest authoritative lifecycle-outbox cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or converting the cursor fails.
+    pub async fn latest_lifecycle_sequence(&self) -> Result<u64, DbError> {
+        let sequence: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM lifecycle_outbox")
+                .fetch_one(&self.pool)
+                .await?;
+        i64_to_u64(sequence)
+    }
+
+    /// Lists authoritative lifecycle changes visible to one agent session after a cursor.
     ///
     /// Unscoped host lifecycle changes are included only when the current session owns a
     /// workspace on that host. Foreign session events are never returned.
@@ -6705,9 +6710,8 @@ impl StateEventRepository {
             r"
             SELECT sequence, agent_session_id, host_id, workspace_id,
                    lifecycle_kind, entity_id, lifecycle_state
-            FROM state_events event
+            FROM lifecycle_outbox event
             WHERE sequence > ?
-              AND lifecycle_kind IS NOT NULL
               AND (? IS NULL OR host_id = ?)
               AND (
                     agent_session_id = ?
@@ -6733,6 +6737,295 @@ impl StateEventRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_agent_lifecycle_event).collect()
+    }
+
+    /// Returns the durable lifecycle cursor acknowledged by one Agent Session and Host filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or converting the cursor fails.
+    pub async fn agent_work_context_acknowledged_sequence(
+        &self,
+        agent_session_id: AgentSessionId,
+        host_id: Option<HostId>,
+    ) -> Result<u64, DbError> {
+        let sequence: Option<i64> = sqlx::query_scalar(
+            r"
+            SELECT acknowledged_sequence
+            FROM agent_work_context_cursors
+            WHERE agent_session_id = ? AND host_filter = ?
+            ",
+        )
+        .bind(agent_session_id.to_string())
+        .bind(agent_work_context_host_filter(host_id))
+        .fetch_optional(&self.pool)
+        .await?;
+        sequence.map_or(Ok(0), i64_to_u64)
+    }
+
+    /// Durably acknowledges a filter-scoped Work Context cursor without changing remote state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cursor checkpoint cannot be persisted.
+    pub async fn acknowledge_agent_work_context_cursor(
+        &self,
+        agent_session_id: AgentSessionId,
+        host_id: Option<HostId>,
+        sequence: u64,
+        observed_at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r"
+            INSERT INTO agent_work_context_cursors (
+                agent_session_id, host_filter, acknowledged_sequence, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(agent_session_id, host_filter) DO UPDATE SET
+                acknowledged_sequence = MAX(
+                    agent_work_context_cursors.acknowledged_sequence,
+                    excluded.acknowledged_sequence
+                ),
+                updated_at = excluded.updated_at
+            ",
+        )
+        .bind(agent_session_id.to_string())
+        .bind(agent_work_context_host_filter(host_id))
+        .bind(u64_to_i64(sequence)?)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Lists unacknowledged terminal lifecycle changes for a recovery snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or converting rows fails.
+    pub async fn list_terminal_after_for_agent_session(
+        &self,
+        agent_session_id: AgentSessionId,
+        after_sequence: u64,
+        up_to_sequence: u64,
+        host_id: Option<HostId>,
+        limit: u32,
+    ) -> Result<Vec<AgentLifecycleEvent>, DbError> {
+        let rows = sqlx::query(
+            r"
+            SELECT sequence, agent_session_id, host_id, workspace_id,
+                   lifecycle_kind, entity_id, lifecycle_state
+            FROM lifecycle_outbox event
+            WHERE sequence > ? AND sequence <= ?
+              AND lifecycle_state IN (
+                'succeeded', 'failed', 'timed_out', 'cancelled', 'rejected',
+                'exhausted', 'done', 'closed', 'delivered'
+              )
+              AND (? IS NULL OR host_id = ?)
+              AND (
+                    agent_session_id = ?
+                    OR (
+                        agent_session_id IS NULL
+                        AND host_id IN (
+                            SELECT host_id
+                            FROM agent_workspaces
+                            WHERE agent_session_id = ?
+                        )
+                    )
+              )
+            ORDER BY sequence ASC
+            LIMIT ?
+            ",
+        )
+        .bind(u64_to_i64(after_sequence)?)
+        .bind(u64_to_i64(up_to_sequence)?)
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(agent_session_id.to_string())
+        .bind(agent_session_id.to_string())
+        .bind(u32_to_i64(limit.max(1)))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_agent_lifecycle_event).collect()
+    }
+
+    /// Returns durable publisher backlog health visible to one Agent Session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying or converting the status fails.
+    pub async fn lifecycle_outbox_status_for_agent_session(
+        &self,
+        agent_session_id: AgentSessionId,
+        host_id: Option<HostId>,
+        observed_at: OffsetDateTime,
+    ) -> Result<AgentLifecycleOutboxStatus, DbError> {
+        let row = sqlx::query(
+            r"
+            SELECT COUNT(*) AS pending,
+                   CAST(MAX(0, (julianday(?) - julianday(MIN(observed_at))) * 86400)
+                        AS INTEGER) AS oldest_age_seconds,
+                   (
+                     SELECT latest.last_publish_error
+                     FROM lifecycle_outbox latest
+                     WHERE latest.published_at IS NULL
+                       AND latest.last_publish_error IS NOT NULL
+                       AND (? IS NULL OR latest.host_id = ?)
+                       AND (
+                            latest.agent_session_id = ?
+                            OR (
+                                latest.agent_session_id IS NULL
+                                AND latest.host_id IN (
+                                    SELECT host_id FROM agent_workspaces
+                                    WHERE agent_session_id = ?
+                                )
+                            )
+                       )
+                     ORDER BY latest.sequence DESC
+                     LIMIT 1
+                   ) AS last_publish_error
+            FROM lifecycle_outbox event
+            WHERE published_at IS NULL
+              AND (? IS NULL OR host_id = ?)
+              AND (
+                    agent_session_id = ?
+                    OR (
+                        agent_session_id IS NULL
+                        AND host_id IN (
+                            SELECT host_id FROM agent_workspaces
+                            WHERE agent_session_id = ?
+                        )
+                    )
+              )
+            ",
+        )
+        .bind(observed_at)
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(agent_session_id.to_string())
+        .bind(agent_session_id.to_string())
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(agent_session_id.to_string())
+        .bind(agent_session_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        let pending = i64_to_u64(row.try_get("pending")?)?;
+        let oldest_age_seconds = if pending == 0 {
+            None
+        } else {
+            row.try_get::<Option<i64>, _>("oldest_age_seconds")?
+                .map(i64_to_u64)
+                .transpose()?
+        };
+        Ok(AgentLifecycleOutboxStatus {
+            pending,
+            oldest_age_seconds,
+            last_publish_error: row.try_get("last_publish_error")?,
+        })
+    }
+
+    /// Copies a bounded pending outbox batch into the general state-event stream idempotently.
+    ///
+    /// Work Context reads the outbox directly, so publication failure degrades only the secondary
+    /// admin stream and never hides terminal Agent work.
+    ///
+    /// # Errors
+    ///
+    /// Returns the publisher error after durably recording a bounded failure summary when possible.
+    pub async fn publish_lifecycle_outbox(
+        &self,
+        published_at: OffsetDateTime,
+        limit: u32,
+    ) -> Result<u64, DbError> {
+        let rows = sqlx::query(
+            r"
+            SELECT sequence, event_id, agent_session_id, host_id, workspace_id,
+                   lifecycle_kind, entity_id, lifecycle_state, observed_at
+            FROM lifecycle_outbox
+            WHERE published_at IS NULL
+            ORDER BY sequence ASC
+            LIMIT ?
+            ",
+        )
+        .bind(u32_to_i64(limit.max(1)))
+        .fetch_all(&self.pool)
+        .await?;
+        let events = rows
+            .iter()
+            .map(row_to_lifecycle_outbox_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut published = 0_u64;
+        for event in events {
+            let result = self
+                .publish_one_lifecycle_outbox(&event, published_at)
+                .await;
+            if let Err(error) = result {
+                let summary = error.to_string().chars().take(240).collect::<String>();
+                let _ = sqlx::query(
+                    r"
+                    UPDATE lifecycle_outbox
+                    SET publish_attempt_count = publish_attempt_count + 1,
+                        last_publish_error = ?
+                    WHERE sequence = ? AND published_at IS NULL
+                    ",
+                )
+                .bind(summary)
+                .bind(u64_to_i64(event.lifecycle.sequence)?)
+                .execute(&self.pool)
+                .await;
+                return Err(error);
+            }
+            published = published.saturating_add(1);
+        }
+        Ok(published)
+    }
+
+    async fn publish_one_lifecycle_outbox(
+        &self,
+        event: &LifecycleOutboxEvent,
+        published_at: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        let lifecycle = &event.lifecycle;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            r"
+            INSERT OR IGNORE INTO state_events (
+                id, entity_type, entity_id, old_state_json, new_state_json,
+                reason_code_json, observed_at, agent_session_id, host_id, workspace_id,
+                lifecycle_kind, lifecycle_state, lifecycle_outbox_sequence
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(event.event_id.to_string())
+        .bind(&lifecycle.kind)
+        .bind(&lifecycle.entity_id)
+        .bind(to_json(&EntityState::Unknown)?)
+        .bind(to_json(&lifecycle_entity_state(&lifecycle.state))?)
+        .bind(to_json(&StateReasonCode::None)?)
+        .bind(event.observed_at)
+        .bind(lifecycle.agent_session_id.map(|id| id.to_string()))
+        .bind(lifecycle.host_id.map(|id| id.to_string()))
+        .bind(lifecycle.workspace_id.map(|id| id.to_string()))
+        .bind(&lifecycle.kind)
+        .bind(&lifecycle.state)
+        .bind(u64_to_i64(lifecycle.sequence)?)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r"
+            UPDATE lifecycle_outbox
+            SET published_at = ?, publish_attempt_count = publish_attempt_count + 1,
+                last_publish_error = NULL
+            WHERE sequence = ?
+            ",
+        )
+        .bind(published_at)
+        .bind(u64_to_i64(lifecycle.sequence)?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts a state event.
@@ -7362,6 +7655,21 @@ fn row_to_agent_lifecycle_event(row: &SqliteRow) -> Result<AgentLifecycleEvent, 
     })
 }
 
+struct LifecycleOutboxEvent {
+    event_id: uuid::Uuid,
+    lifecycle: AgentLifecycleEvent,
+    observed_at: OffsetDateTime,
+}
+
+fn row_to_lifecycle_outbox_event(row: &SqliteRow) -> Result<LifecycleOutboxEvent, DbError> {
+    let event_id: String = row.try_get("event_id")?;
+    Ok(LifecycleOutboxEvent {
+        event_id: uuid::Uuid::parse_str(&event_id)?,
+        lifecycle: row_to_agent_lifecycle_event(row)?,
+        observed_at: row.try_get("observed_at")?,
+    })
+}
+
 fn parse_id<T>(row: &SqliteRow, column: &str) -> Result<T, DbError>
 where
     T: From<uuid::Uuid>,
@@ -7412,28 +7720,24 @@ fn enum_label<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+fn agent_work_context_host_filter(host_id: Option<HostId>) -> String {
+    host_id.map_or_else(|| "*".to_owned(), |host_id| host_id.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_lifecycle_best_effort(
     pool: &SqlitePool,
-    agent_session_id: Option<AgentSessionId>,
-    host_id: Option<HostId>,
-    workspace_id: Option<WorkspaceId>,
-    kind: &str,
-    entity_id: &str,
-    state: &str,
+    _agent_session_id: Option<AgentSessionId>,
+    _host_id: Option<HostId>,
+    _workspace_id: Option<WorkspaceId>,
+    _kind: &str,
+    _entity_id: &str,
+    _state: &str,
     observed_at: OffsetDateTime,
 ) {
     let repository = StateEventRepository::new(pool.clone());
-    let append = repository.insert_lifecycle(
-        agent_session_id,
-        host_id,
-        workspace_id,
-        kind,
-        entity_id,
-        state,
-        observed_at,
-    );
-    let _ = tokio::time::timeout(StdDuration::from_millis(250), append).await;
+    let publish = repository.publish_lifecycle_outbox(observed_at, 20);
+    let _ = tokio::time::timeout(StdDuration::from_millis(250), publish).await;
 }
 
 async fn publish_claimed_input_lifecycle_best_effort(
@@ -7482,59 +7786,42 @@ async fn publish_pty_lifecycle_best_effort(
     pty: &PtySession,
     observed_at: OffsetDateTime,
 ) {
-    let publish = async {
-        if let Ok(Some(workspace)) = AgentWorkspaceRepository::new(pool.clone())
-            .get(pty.workspace_id)
-            .await
-        {
-            let state = if pty.interaction.is_some()
-                && pty.backend_state == PtyBackendState::Active
-                && pty.input_allowed
-            {
-                "needs_input".to_owned()
-            } else {
-                enum_label(&pty.backend_state)
-            };
-            publish_lifecycle_best_effort(
-                pool,
-                workspace.agent_session_id,
-                Some(workspace.host_id),
-                Some(workspace.id),
-                "pty",
-                &pty.pty_session_id.to_string(),
-                &state,
-                observed_at,
-            )
-            .await;
-        }
+    let state = if pty.interaction.is_some()
+        && pty.backend_state == PtyBackendState::Active
+        && pty.input_allowed
+    {
+        "needs_input".to_owned()
+    } else {
+        enum_label(&pty.backend_state)
     };
-    let _ = tokio::time::timeout(StdDuration::from_millis(250), publish).await;
+    publish_lifecycle_best_effort(
+        pool,
+        None,
+        None,
+        Some(pty.workspace_id),
+        "pty",
+        &pty.pty_session_id.to_string(),
+        &state,
+        observed_at,
+    )
+    .await;
 }
 
 async fn publish_transfer_progress_best_effort(pool: &SqlitePool, chunk: &OperationOutputChunk) {
     if !chunk.redacted_text.starts_with("file transfer") {
         return;
     }
-    let publish = async {
-        if let Ok(Some(operation)) = OperationRunRepository::new(pool.clone())
-            .get(chunk.operation_id)
-            .await
-            && operation.operation_type == remote_hosts_domain::OperationType::Sftp
-        {
-            publish_lifecycle_best_effort(
-                pool,
-                operation.agent_session_id,
-                Some(operation.host_id),
-                operation.workspace_id,
-                "transfer",
-                &operation.id.to_string(),
-                "progress",
-                chunk.created_at,
-            )
-            .await;
-        }
-    };
-    let _ = tokio::time::timeout(StdDuration::from_millis(250), publish).await;
+    publish_lifecycle_best_effort(
+        pool,
+        None,
+        None,
+        Some(chunk.workspace_id),
+        "transfer",
+        &chunk.operation_id.to_string(),
+        "progress",
+        chunk.created_at,
+    )
+    .await;
 }
 
 async fn publish_connection_lifecycle_best_effort(
@@ -7542,26 +7829,17 @@ async fn publish_connection_lifecycle_best_effort(
     session: &ConnectionSession,
     observed_at: OffsetDateTime,
 ) {
-    let publish = async {
-        let host_id = AccessPathRepository::new(pool.clone())
-            .get(session.access_path_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|path| path.host_id);
-        publish_lifecycle_best_effort(
-            pool,
-            None,
-            host_id,
-            None,
-            "connection",
-            &session.session_id.to_string(),
-            &enum_label(&session.state),
-            observed_at,
-        )
-        .await;
-    };
-    let _ = tokio::time::timeout(StdDuration::from_millis(250), publish).await;
+    publish_lifecycle_best_effort(
+        pool,
+        None,
+        None,
+        None,
+        "connection",
+        &session.session_id.to_string(),
+        &enum_label(&session.state),
+        observed_at,
+    )
+    .await;
 }
 
 fn optional_json<T: serde::Serialize>(value: Option<&T>) -> Result<Option<String>, DbError> {
@@ -7976,11 +8254,21 @@ mod tests {
                 observed_at,
             )
             .await?;
+        let lifecycle_cursor = repos.state_events.latest_lifecycle_sequence().await?;
+        assert_eq!(repos.state_events.latest_sequence().await?, second_cursor);
+        assert_eq!(
+            repos
+                .state_events
+                .publish_lifecycle_outbox(observed_at, 10)
+                .await?,
+            1
+        );
         let third_cursor = repos.state_events.latest_sequence().await?;
 
         assert_eq!(first_cursor, 1);
         assert_eq!(second_cursor, 2);
         assert_eq!(third_cursor, 3);
+        assert_eq!(lifecycle_cursor, 1);
         let mixed_records = repos.state_events.list_after(0, None, None, 10).await?;
         assert_eq!(mixed_records.len(), 3);
         assert_eq!(mixed_records[2].event.entity_type, "workspace");

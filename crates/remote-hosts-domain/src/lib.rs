@@ -1930,6 +1930,29 @@ pub struct AgentWorkItem {
     pub next_action: String,
 }
 
+/// Durable lifecycle publication health visible to Agent Work Context callers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentLifecycleOutboxStatus {
+    /// Durable lifecycle transitions not yet copied into the general state-event stream.
+    pub pending: u64,
+    /// Age in seconds of the oldest pending transition.
+    pub oldest_age_seconds: Option<u64>,
+    /// Bounded publisher failure text, when publication has degraded.
+    pub last_publish_error: Option<String>,
+}
+
+impl AgentLifecycleOutboxStatus {
+    /// Returns a healthy empty outbox status.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            pending: 0,
+            oldest_age_seconds: None,
+            last_publish_error: None,
+        }
+    }
+}
+
 /// Materialized current-session work context.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentWorkContext {
@@ -1943,6 +1966,8 @@ pub struct AgentWorkContext {
     pub overall_state: AgentWorkOverallState,
     /// Single highest-priority action.
     pub primary_action: AgentWorkPrimaryAction,
+    /// Durable lifecycle publisher health for this session's visible work.
+    pub lifecycle_outbox: AgentLifecycleOutboxStatus,
     /// Hosts containing returned items.
     pub hosts: Vec<AgentWorkHost>,
     /// Active items plus newly terminal items after a wait cursor.
@@ -1962,6 +1987,7 @@ impl AgentWorkContext {
             changed: false,
             overall_state: AgentWorkOverallState::Idle,
             primary_action: AgentWorkPrimaryAction::none(),
+            lifecycle_outbox: AgentLifecycleOutboxStatus::empty(),
             hosts: Vec::new(),
             items: Vec::new(),
         }
