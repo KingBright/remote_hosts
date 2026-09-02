@@ -3061,6 +3061,12 @@ mod tests {
         let waited: serde_json::Value = serde_json::from_slice(&waited)?;
         assert_eq!(waited["changed"], json!(false));
         assert_eq!(waited["cursor"], json!(cursor));
+        assert_eq!(waited["overall_state"], json!("waiting"));
+        assert_eq!(waited["primary_action"]["kind"], json!("wait"));
+        assert_eq!(
+            waited["primary_action"]["reason_code"],
+            json!("no_lifecycle_change")
+        );
 
         let missing = app
             .oneshot(

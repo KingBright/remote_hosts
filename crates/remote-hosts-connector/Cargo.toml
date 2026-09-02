@@ -35,4 +35,5 @@ openssh.workspace = true
 openssh-sftp-client.workspace = true
 
 [dev-dependencies]
+sqlx.workspace = true
 tempfile.workspace = true

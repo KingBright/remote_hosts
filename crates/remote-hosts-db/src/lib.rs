@@ -1,6 +1,9 @@
 //! Database access layer and migrations.
 
-use std::{collections::BTreeSet, future::Future, io, str::FromStr, time::Duration as StdDuration};
+use std::{
+    collections::BTreeSet, future::Future, io, str::FromStr, sync::Arc,
+    time::Duration as StdDuration,
+};
 
 use remote_hosts_domain::{
     AccessPath, AccessPathHealth, AccessPathId, AgentLifecycleEvent, AgentLifecycleOutboxStatus,
@@ -257,6 +260,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), DbError> {
 /// Repository bundle for the main application.
 #[derive(Clone)]
 pub struct Repositories {
+    metadata_write_gate: Arc<tokio::sync::Mutex<()>>,
     /// Host repository.
     pub hosts: HostRepository,
     /// Environment repository.
@@ -313,6 +317,7 @@ impl Repositories {
     /// Builds all repositories for a pool.
     pub fn new(pool: SqlitePool) -> Self {
         Self {
+            metadata_write_gate: Arc::new(tokio::sync::Mutex::new(())),
             hosts: HostRepository::new(pool.clone()),
             environments: EnvironmentRepository::new(pool.clone()),
             connectors: ConnectorRepository::new(pool.clone()),
@@ -339,6 +344,16 @@ impl Repositories {
             credential_bindings: CredentialBindingRepository::new(pool.clone()),
             instance_sync: InstanceSyncRepository::new(pool),
         }
+    }
+
+    /// Returns the process-local gate used to serialize short metadata write bursts.
+    ///
+    /// Remote SSH work must never hold this gate. Repository clones share it so connector
+    /// operation workers, PTY output writers, and heartbeats do not stampede `SQLite`'s single
+    /// writer while independent network operations remain concurrent.
+    #[must_use]
+    pub fn metadata_write_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.metadata_write_gate)
     }
 
     /// Returns whether new PTY and command output may use compressed-only storage.
@@ -378,6 +393,190 @@ impl Repositories {
             || std::future::ready(()),
         )
         .await
+    }
+
+    /// Atomically finishes a claimed operation and updates its owning Workspace state.
+    ///
+    /// The connector must never publish one terminal half without the other: a terminal operation
+    /// paired with a stale `working` Workspace confuses Agents, while a completed Workspace paired
+    /// with a running operation can make a remote mutation eligible for duplicate recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operation claim cannot be serialized, the Workspace is missing,
+    /// or the transaction cannot commit.
+    pub async fn finish_claimed_operation(
+        &self,
+        finish: ClaimedOperationFinish<'_>,
+        workspace_id: WorkspaceId,
+        workspace_state: WorkspaceState,
+    ) -> Result<bool, DbError> {
+        let before = self.operations.get(finish.id).await?;
+        let mut transaction = self.operations.pool.begin().await?;
+        let result = sqlx::query(
+            r"
+            UPDATE operation_runs
+            SET state_json = ?,
+                finished_at = ?,
+                exit_code = ?,
+                redacted_output_summary = ?,
+                last_error = ?,
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL
+            WHERE id = ? AND claim_token = ?
+            ",
+        )
+        .bind(to_json(&finish.state)?)
+        .bind(finish.finished_at)
+        .bind(finish.exit_code)
+        .bind(finish.redacted_output_summary)
+        .bind(finish.last_error)
+        .bind(finish.id.to_string())
+        .bind(finish.claim_token)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let workspace = update_workspace_state_row(
+            &mut *transaction,
+            workspace_id,
+            &workspace_state,
+            finish.finished_at,
+        )
+        .await?;
+        transaction.commit().await?;
+
+        if let Some(operation) = before {
+            publish_lifecycle_best_effort(
+                &self.operations.pool,
+                operation.agent_session_id,
+                Some(operation.host_id),
+                operation.workspace_id,
+                if operation.operation_type == remote_hosts_domain::OperationType::Sftp {
+                    "transfer"
+                } else {
+                    "operation"
+                },
+                &operation.id.to_string(),
+                &enum_label(&finish.state),
+                finish.finished_at,
+            )
+            .await;
+        }
+        publish_lifecycle_best_effort(
+            &self.operations.pool,
+            workspace.agent_session_id,
+            Some(workspace.host_id),
+            Some(workspace.id),
+            "workspace",
+            &workspace.id.to_string(),
+            &enum_label(&workspace.state),
+            workspace.last_activity_at,
+        )
+        .await;
+        Ok(true)
+    }
+
+    /// Atomically exhausts the oldest operation beyond its claim budget and blocks its Workspace.
+    ///
+    /// An exhausted operation and its Workspace are one Agent-visible terminal decision. Publishing
+    /// only the operation first can make a still-working Workspace look recoverable and tempt an
+    /// Agent to submit duplicate remote work after a local database error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the candidate cannot be decoded, its Workspace is missing, or the
+    /// transaction cannot commit.
+    pub async fn exhaust_next_operation_for_connector(
+        &self,
+        connector_id: ConnectorId,
+        observed_at: OffsetDateTime,
+        max_attempts: u32,
+        redacted_output_summary: &str,
+        last_error: &str,
+    ) -> Result<Option<(OperationRun, AgentWorkspace)>, DbError> {
+        let mut transaction = self.operations.pool.begin().await?;
+        let row = sqlx::query(
+            r"
+            UPDATE operation_runs
+            SET state_json = ?,
+                finished_at = ?,
+                exit_code = NULL,
+                redacted_output_summary = ?,
+                last_error = ?,
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL
+            WHERE id = (
+                SELECT id
+                FROM operation_runs exhausted_candidate
+                JOIN agent_workspaces exhausted_workspace
+                  ON exhausted_workspace.workspace_id = exhausted_candidate.workspace_id
+                WHERE exhausted_candidate.connector_id = ?
+                  AND exhausted_candidate.workspace_id IS NOT NULL
+                  AND exhausted_candidate.command_profile_json IS NOT NULL
+                  AND exhausted_workspace.state_json != ?
+                  AND exhausted_candidate.attempt_count >= ?
+                  AND (
+                    exhausted_candidate.state_json = ?
+                    OR (
+                        exhausted_candidate.state_json = ?
+                        AND exhausted_candidate.lease_expires_at IS NOT NULL
+                        AND exhausted_candidate.lease_expires_at <= ?
+                    )
+                  )
+                ORDER BY exhausted_candidate.started_at ASC, exhausted_candidate.id ASC
+                LIMIT 1
+            )
+            RETURNING *
+            ",
+        )
+        .bind(to_json(&OperationState::Exhausted)?)
+        .bind(observed_at)
+        .bind(redacted_output_summary)
+        .bind(last_error)
+        .bind(connector_id.to_string())
+        .bind(to_json(&WorkspaceState::Closed)?)
+        .bind(u32_to_i64(max_attempts))
+        .bind(to_json(&OperationState::Queued)?)
+        .bind(to_json(&OperationState::Running)?)
+        .bind(observed_at)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(row) = row else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        let operation = row_to_operation_run(&row)?;
+        let workspace_id = operation.workspace_id.ok_or_else(|| {
+            DbError::InvalidOutputSegment("exhausted operation is missing its Workspace".to_owned())
+        })?;
+        let workspace = update_workspace_state_row(
+            &mut *transaction,
+            workspace_id,
+            &WorkspaceState::Blocked,
+            observed_at,
+        )
+        .await?;
+        transaction.commit().await?;
+
+        publish_operation_lifecycle_best_effort(&self.operations.pool, &operation, observed_at)
+            .await;
+        publish_lifecycle_best_effort(
+            &self.operations.pool,
+            workspace.agent_session_id,
+            Some(workspace.host_id),
+            Some(workspace.id),
+            "workspace",
+            &workspace.id.to_string(),
+            &enum_label(&workspace.state),
+            workspace.last_activity_at,
+        )
+        .await;
+        Ok(Some((operation, workspace)))
     }
 
     async fn publish_queued_operation_with_before_commit<F, Fut>(
@@ -5095,74 +5294,6 @@ impl OperationRunRepository {
         Ok(operation)
     }
 
-    /// Atomically marks the oldest expired operation that exhausted its claim budget.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if querying or deserialization fails.
-    pub async fn exhaust_next_for_connector(
-        &self,
-        connector_id: ConnectorId,
-        observed_at: OffsetDateTime,
-        max_attempts: u32,
-        redacted_output_summary: &str,
-        last_error: &str,
-    ) -> Result<Option<OperationRun>, DbError> {
-        let row = sqlx::query(
-            r"
-            UPDATE operation_runs
-            SET state_json = ?,
-                finished_at = ?,
-                exit_code = NULL,
-                redacted_output_summary = ?,
-                last_error = ?,
-                claim_token = NULL,
-                claimed_at = NULL,
-                lease_expires_at = NULL
-            WHERE id = (
-                SELECT id
-                FROM operation_runs exhausted_candidate
-                JOIN agent_workspaces exhausted_workspace
-                  ON exhausted_workspace.workspace_id = exhausted_candidate.workspace_id
-                WHERE exhausted_candidate.connector_id = ?
-                  AND exhausted_candidate.workspace_id IS NOT NULL
-                  AND exhausted_candidate.command_profile_json IS NOT NULL
-                  AND exhausted_workspace.state_json != ?
-                  AND exhausted_candidate.attempt_count >= ?
-                  AND (
-                    exhausted_candidate.state_json = ?
-                    OR (
-                        exhausted_candidate.state_json = ?
-                        AND exhausted_candidate.lease_expires_at IS NOT NULL
-                        AND exhausted_candidate.lease_expires_at <= ?
-                    )
-                  )
-                ORDER BY exhausted_candidate.started_at ASC, exhausted_candidate.id ASC
-                LIMIT 1
-            )
-            RETURNING *
-            ",
-        )
-        .bind(to_json(&OperationState::Exhausted)?)
-        .bind(observed_at)
-        .bind(redacted_output_summary)
-        .bind(last_error)
-        .bind(connector_id.to_string())
-        .bind(to_json(&WorkspaceState::Closed)?)
-        .bind(u32_to_i64(max_attempts))
-        .bind(to_json(&OperationState::Queued)?)
-        .bind(to_json(&OperationState::Running)?)
-        .bind(observed_at)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let operation = row.as_ref().map(row_to_operation_run).transpose()?;
-        if let Some(operation) = &operation {
-            publish_operation_lifecycle_best_effort(&self.pool, operation, observed_at).await;
-        }
-        Ok(operation)
-    }
-
     /// Finishes an operation and clears its connector lease.
     ///
     /// # Errors
@@ -8075,6 +8206,20 @@ mod tests {
             busy_timeout_ms,
             i64::try_from(SQLITE_BUSY_TIMEOUT.as_millis())?
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_clones_share_the_process_metadata_write_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        let repositories = Repositories::new(pool);
+        let clone = repositories.clone();
+
+        assert!(Arc::ptr_eq(
+            &repositories.metadata_write_gate(),
+            &clone.metadata_write_gate()
+        ));
         Ok(())
     }
 

@@ -1985,8 +1985,15 @@ impl AgentWorkContext {
             context_version: 1,
             cursor,
             changed: false,
-            overall_state: AgentWorkOverallState::Idle,
-            primary_action: AgentWorkPrimaryAction::none(),
+            overall_state: AgentWorkOverallState::Waiting,
+            primary_action: AgentWorkPrimaryAction {
+                kind: "wait".to_owned(),
+                workspace_id: None,
+                entity_id: None,
+                after_sequence: None,
+                retry_after_ms: Some(1_000),
+                reason_code: "no_lifecycle_change".to_owned(),
+            },
             lifecycle_outbox: AgentLifecycleOutboxStatus::empty(),
             hosts: Vec::new(),
             items: Vec::new(),
@@ -2068,10 +2075,10 @@ pub struct HostWriteLease {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessPathId, EntityState, HostId, OperationState, SshChannelKind,
-        SshChannelTransportEvidence, SshConnectionUse, SshFileTransferMode, SshTransportBackend,
-        SshTransportCapabilities, SshTransportRuntimeId, SshTransportRuntimeState,
-        SshTransportTelemetry, now_utc,
+        AccessPathId, AgentWorkContext, AgentWorkOverallState, EntityState, HostId, OperationState,
+        SshChannelKind, SshChannelTransportEvidence, SshConnectionUse, SshFileTransferMode,
+        SshTransportBackend, SshTransportCapabilities, SshTransportRuntimeId,
+        SshTransportRuntimeState, SshTransportTelemetry, now_utc,
     };
 
     #[test]
@@ -2096,6 +2103,20 @@ mod tests {
         let value = serde_json::to_value(OperationState::Exhausted)?;
         assert_eq!(value, serde_json::json!("exhausted"));
         Ok(())
+    }
+
+    #[test]
+    fn unchanged_work_context_wait_does_not_claim_the_session_is_idle() {
+        let context = AgentWorkContext::unchanged(42);
+
+        assert!(!context.changed);
+        assert_eq!(context.cursor, 42);
+        assert_eq!(context.overall_state, AgentWorkOverallState::Waiting);
+        assert_eq!(context.primary_action.kind, "wait");
+        assert_eq!(context.primary_action.reason_code, "no_lifecycle_change");
+        assert_eq!(context.primary_action.retry_after_ms, Some(1_000));
+        assert!(context.hosts.is_empty());
+        assert!(context.items.is_empty());
     }
 
     #[test]

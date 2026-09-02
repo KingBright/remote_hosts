@@ -123,6 +123,9 @@ Heartbeat updates are advisory lifecycle metadata and are retried internally on 
 contention. A supervising client must keep observing the same PTY if a heartbeat still fails; it
 must not cancel the remote command, close the terminal, or start a duplicate solely because the
 metadata update was unavailable.
+The MCP heartbeat contract reports transient exhaustion as `metadata_persisted=false`,
+`recommended_action=continue_pty_and_retry_heartbeat`, and a bounded `poll_after_ms` instead of a
+tool failure. The existing remote shell and its output remain authoritative.
 Set one value to zero only to disable that expiry class. Each access path's `idle_ttl_seconds`
 independently controls zero-channel SSH transport retention; keepalive probes do not extend it.
 
@@ -205,6 +208,34 @@ Transport evidence is the source of truth:
 
 A logical session row alone does not prove a transport is alive.
 
+## SQLite Contention and Error Domains
+
+SQLite stores local orchestration metadata; it is not the SSH data path. The Connector keeps remote
+exec, PTY, and SFTP work concurrent, but serializes its short metadata writes through one shared
+process-local writer gate. Claim or lease-renewal contention cannot cancel an already-running
+remote action. Once a remote action has produced a result, output and the atomic
+operation/Workspace terminal transaction keep retrying transient SQLite contention, so a local
+lock does not turn into mutation replay. Retry-budget exhaustion blocks its Workspace in the same
+transaction. PTY final output is persisted before its durable session is closed; when a pending
+output batch reaches its memory bound, the Connector waits for SQLite and lets the bounded backend
+channel provide backpressure instead of accumulating unbounded output in memory.
+
+Classify incidents by origin:
+
+- `database is locked`, `SQLITE_BUSY`, lifecycle backlog, or `metadata_persisted=false` is local
+  control-plane degradation. Keep the same ids and cursor; never mark SSH unhealthy, reconnect,
+  signal a remote process, restart services, or retry a mutation solely for this reason.
+- A transport backend failure, timeout, authentication error, host-key error, or handshake error
+  may affect route health only when it came from an actual SSH operation. A database error wrapped
+  in an outer helper is not transport evidence.
+- In nested Remote Hosts use, the outer operation and inner PTY have independent durable state. An
+  outer wrapper ending does not prove the already-delivered inner command ended. Inspect the inner
+  Work Context and output before any recovery action.
+
+The writer gate is process-local because API, Connector, and MCP are separate processes. WAL busy
+timeouts and idempotent contention retries still arbitrate cross-process overlap. Keep only one
+Connector daemon per database; do not point two service installations at the same SQLite file.
+
 ## PTY Recovery
 
 After connector restart, old live shells cannot be recovered from database state. They are marked
@@ -231,9 +262,17 @@ launchd. It represents an active, history-heavy installation rather than an empt
 | Connector | 47.1 MiB | 1.38% five-sample average | 23 |
 | Combined | about 55.9 MiB | mostly connector activity | 37 |
 
-The sample contained 88 hosts, 53 access paths, 1,555 Workspaces, 1,791 operations, 379 PTYs, 384
-topology nodes, and 1,207 topology edges. The release binary was 23 MiB. The data directory used 141
-MiB, including a 127 MiB SQLite database, a 7 MiB WAL, and 3.8 MiB of artifacts; logs used 192 KiB.
+That historical sample contained 88 hosts, 53 access paths, 1,555 Workspaces, 1,791 operations, 379
+PTYs, 384 topology nodes, and 1,207 topology edges. The release binary was 23 MiB. The data directory
+used 141 MiB, including a 127 MiB SQLite database, a 7 MiB WAL, and 3.8 MiB of artifacts; logs used
+192 KiB.
+
+A newer read-only sample on 2026-09-01 shows why this is not a permanent sizing estimate. The live
+database had grown to 677 MiB with a 44 MiB WAL while compressed-only writes were still disabled.
+It contained 531,909 legacy PTY rows with 281,618,344 text bytes and 104,739 legacy operation rows
+with 43,506,841 text bytes, versus only 418 PTY segments and 9 operation segments. This is retained
+history and write amplification, not host inventory size. Use the storage counters below before
+quoting a footprint for another installation.
 
 Most disk use came from retained PTY and command output; host, route, topology, credential, and
 knowledge records were a small minority. These numbers are useful as a real daily-use reference,
@@ -284,6 +323,7 @@ curl -fsS http://127.0.0.1:8787/v1/command-profiles
 scripts/remote-hosts-service logs
 ```
 
-For a fresh MCP smoke test, start a new MCP stdio child and verify that the Agent profile exposes 18
-tools, including upload and download, that `prepare_workspace` returns compact identity plus
-`next_action`, and that a read-only runtime snapshot reports version 10.
+For a fresh MCP smoke test, start a new MCP stdio child and verify that the Agent profile exposes 22
+tools, including Agent Work Context, upload, and download; that `prepare_workspace` returns compact
+identity plus `next_action`; that Work Context reports `context_version=1`; and that a read-only
+runtime snapshot reports version 11.

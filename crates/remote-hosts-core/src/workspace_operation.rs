@@ -119,9 +119,13 @@ pub enum WorkspaceOperationError {
     /// Intent is empty or too large.
     #[error("operation intent must be 1..=240 visible characters when provided")]
     InvalidIntent,
-    /// Operation-level coordination scope is malformed or escapes the Workspace boundary.
-    #[error("operation coordination scope must be valid and remain within the Workspace scope")]
-    InvalidCoordinationScope,
+    /// Operation-level coordination scope is malformed, ambiguous, or escapes the Workspace
+    /// boundary.
+    #[error("invalid operation coordination scope: {reason}")]
+    InvalidCoordinationScope {
+        /// Actionable validation detail safe to return to an Agent.
+        reason: String,
+    },
 }
 
 /// Creates operation records under workspace and server protection policy.
@@ -404,8 +408,11 @@ pub fn resolve_operation_coordination_scope(
     requested: Option<&str>,
 ) -> Result<String, WorkspaceOperationError> {
     let scope = requested.unwrap_or(&workspace.coordination_scope);
-    validate_coordination_scope(scope)
-        .map_err(|_| WorkspaceOperationError::InvalidCoordinationScope)?;
+    validate_coordination_scope(scope).map_err(|_| {
+        invalid_coordination_scope(format!(
+            "scope {scope:?} is malformed; use `host` or a lowercase ASCII resource path"
+        ))
+    })?;
     let workspace_scope = workspace.coordination_scope.as_str();
     let within_workspace = workspace_scope == "host"
         || scope == workspace_scope
@@ -413,7 +420,9 @@ pub fn resolve_operation_coordination_scope(
             .strip_prefix(workspace_scope)
             .is_some_and(|suffix| suffix.starts_with('/'));
     if !within_workspace {
-        return Err(WorkspaceOperationError::InvalidCoordinationScope);
+        return Err(invalid_coordination_scope(format!(
+            "scope {scope:?} is outside Workspace boundary {workspace_scope:?}; outer and inner Remote Hosts operations must declare only the resources visible to their own Workspace"
+        )));
     }
     Ok(scope.to_owned())
 }
@@ -435,11 +444,18 @@ pub fn resolve_operation_coordination_scopes(
     requested_scopes: Option<&[String]>,
 ) -> Result<Vec<String>, WorkspaceOperationError> {
     if requested_scope.is_some() && requested_scopes.is_some() {
-        return Err(WorkspaceOperationError::InvalidCoordinationScope);
+        return Err(invalid_coordination_scope(
+            "`coordination_scope` and `coordination_scopes` are mutually exclusive".to_owned(),
+        ));
     }
     let mut scopes = match requested_scopes {
         Some(scopes) if (1..=16).contains(&scopes.len()) => scopes.to_vec(),
-        Some(_) => return Err(WorkspaceOperationError::InvalidCoordinationScope),
+        Some(scopes) => {
+            return Err(invalid_coordination_scope(format!(
+                "`coordination_scopes` must contain 1..=16 entries, received {}",
+                scopes.len()
+            )));
+        }
         None => vec![resolve_operation_coordination_scope(
             workspace,
             requested_scope,
@@ -451,15 +467,21 @@ pub fn resolve_operation_coordination_scopes(
     scopes.sort();
     scopes.dedup();
     for (index, scope) in scopes.iter().enumerate() {
-        if scopes.iter().skip(index + 1).any(|other| {
+        if let Some(child) = scopes.iter().skip(index + 1).find(|other| {
             other
                 .strip_prefix(scope)
                 .is_some_and(|suffix| suffix.starts_with('/'))
         }) {
-            return Err(WorkspaceOperationError::InvalidCoordinationScope);
+            return Err(invalid_coordination_scope(format!(
+                "parent scope {scope:?} overlaps child scope {child:?}; keep only the exact resources that must be acquired atomically"
+            )));
         }
     }
     Ok(scopes)
+}
+
+fn invalid_coordination_scope(reason: String) -> WorkspaceOperationError {
+    WorkspaceOperationError::InvalidCoordinationScope { reason }
 }
 
 /// Returns the narrowest common parent used by legacy single-scope readers.
@@ -753,9 +775,12 @@ mod tests {
             .err()
             .ok_or("sibling scope must not escape the Workspace boundary")?;
         assert!(matches!(
-            error,
-            WorkspaceOperationError::InvalidCoordinationScope
+            &error,
+            WorkspaceOperationError::InvalidCoordinationScope { .. }
         ));
+        assert!(error.to_string().contains("outside Workspace boundary"));
+        assert!(error.to_string().contains("service/api"));
+        assert!(error.to_string().contains("service/database"));
         Ok(())
     }
 
@@ -801,7 +826,7 @@ mod tests {
                 Some("prod/datatool-dev"),
                 Some(&["prod/datatool-dev/deployment/lichtblick".to_owned()]),
             ),
-            Err(WorkspaceOperationError::InvalidCoordinationScope)
+            Err(WorkspaceOperationError::InvalidCoordinationScope { .. })
         ));
         assert!(matches!(
             resolve_operation_coordination_scopes(
@@ -812,7 +837,7 @@ mod tests {
                     "prod/datatool-dev/storage/minio/rejected-data".to_owned(),
                 ]),
             ),
-            Err(WorkspaceOperationError::InvalidCoordinationScope)
+            Err(WorkspaceOperationError::InvalidCoordinationScope { .. })
         ));
         assert!(matches!(
             resolve_operation_coordination_scopes(
@@ -824,7 +849,28 @@ mod tests {
                         .collect::<Vec<_>>()
                 ),
             ),
-            Err(WorkspaceOperationError::InvalidCoordinationScope)
+            Err(WorkspaceOperationError::InvalidCoordinationScope { .. })
         ));
+
+        assert!(
+            resolve_operation_coordination_scopes(
+                &workspace,
+                Some("prod/datatool-dev"),
+                Some(&["prod/datatool-dev/deployment/lichtblick".to_owned()]),
+            )
+            .is_err_and(|error| error.to_string().contains("mutually exclusive"))
+        );
+
+        assert!(
+            resolve_operation_coordination_scopes(
+                &workspace,
+                None,
+                Some(&[
+                    "prod/datatool-dev/storage/minio".to_owned(),
+                    "prod/datatool-dev/storage/minio/rejected-data".to_owned(),
+                ]),
+            )
+            .is_err_and(|error| error.to_string().contains("overlaps child scope"))
+        );
     }
 }

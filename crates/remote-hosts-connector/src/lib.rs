@@ -103,6 +103,8 @@ const PTY_OUTPUT_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 const PTY_INTERACTION_TAIL_BYTES: usize = 4 * 1024;
 const WRITE_LEASE_HANDOFF_GRACE_SECONDS: i64 = 15;
 const PTY_WRITE_LEASE_SECONDS: i64 = 300;
+const TERMINAL_PERSISTENCE_RETRY_MIN_DELAY: Duration = Duration::from_millis(25);
+const TERMINAL_PERSISTENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_PTY_IDLE_TTL_SECONDS: u64 = 3_600;
 const DEFAULT_PTY_BUSY_TTL_SECONDS: u64 = 86_400;
 
@@ -1451,7 +1453,9 @@ impl OpenSshPtyBackendFactory {
             .get(session_id)
             .await?
             .ok_or_else(|| {
-                ConnectorPtyError::Backend(format!("connection session not found: {session_id}"))
+                ConnectorPtyError::ControlPlane(format!(
+                    "connection session not found: {session_id}"
+                ))
             })?;
         self.pool
             .transport_for_access_path(connection.access_path_id)
@@ -5077,7 +5081,9 @@ impl<C> RusshPtyBackendFactory<C> {
             .get(session_id)
             .await?
             .ok_or_else(|| {
-                ConnectorPtyError::Backend(format!("connection session not found: {session_id}"))
+                ConnectorPtyError::ControlPlane(format!(
+                    "connection session not found: {session_id}"
+                ))
             })?;
         self.pool
             .transport_for_access_path(connection.access_path_id)
@@ -6202,6 +6208,17 @@ pub trait QueuedPtyInputPump: Send + Sync {
     ) -> Result<Option<ConnectorPtyInputDeliveryOutcome>, ConnectorPtyError>;
 }
 
+/// Failure from the connector-local interactive file-transfer adapter.
+#[derive(Debug, thiserror::Error)]
+pub enum InteractiveFileTransferError {
+    /// Local durable control-plane state could not be read or updated.
+    #[error(transparent)]
+    Database(#[from] DbError),
+    /// The remote transfer path failed.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+}
+
 /// Connector-local file transfer path that can reuse a workspace's selected interactive PTY.
 #[async_trait]
 pub trait InteractiveFileTransferBackend: Send + Sync {
@@ -6212,7 +6229,7 @@ pub trait InteractiveFileTransferBackend: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
         request: SftpRequest,
-    ) -> Result<Option<SftpResult>, TransportError>;
+    ) -> Result<Option<SftpResult>, InteractiveFileTransferError>;
 }
 
 enum PtyPumpOutcome {
@@ -6251,6 +6268,9 @@ pub enum ConnectorPtyError {
     /// Backend failed.
     #[error("pty backend failed: {0}")]
     Backend(String),
+    /// Local control-plane state required to activate the PTY is inconsistent or unavailable.
+    #[error("pty control-plane state unavailable: {0}")]
+    ControlPlane(String),
     /// The access path has no immediately available SSH channel.
     #[error("SSH channel capacity is currently unavailable")]
     ChannelCapacityUnavailable,
@@ -6310,9 +6330,23 @@ pub enum ConnectorPtyError {
     Int(#[from] std::num::TryFromIntError),
 }
 
-fn verified_nested_ssh_command(
+fn pty_activation_error_affects_connection_health(error: &ConnectorPtyError) -> bool {
+    matches!(
+        error,
+        ConnectorPtyError::Transport(
+            TransportError::PolicyDenied(_)
+                | TransportError::LocalHandshakeBudgetExhausted { .. }
+                | TransportError::Backend(_)
+                | TransportError::Timeout
+        ) | ConnectorPtyError::Backend(_)
+            | ConnectorPtyError::ActivationTimeout
+    )
+}
+
+fn verified_nested_ssh_commands(
     target: &remote_hosts_domain::AccessPath,
-) -> Result<String, ConnectorPtyError> {
+    source_host_kind: &HostKind,
+) -> Result<Vec<String>, ConnectorPtyError> {
     let username_is_safe = !target.username.is_empty()
         && target.username.len() <= 64
         && target
@@ -6337,10 +6371,19 @@ fn verified_nested_ssh_command(
     } else {
         target.address.clone()
     };
-    Ok(format!(
-        "/usr/bin/ssh -o StrictHostKeyChecking=yes -o NumberOfPasswordPrompts=1 -p {} {}@{}\n",
+    let arguments = format!(
+        "-o StrictHostKeyChecking=yes -o NumberOfPasswordPrompts=1 -p {} {}@{}\n",
         target.port, target.username, address
-    ))
+    );
+    if matches!(source_host_kind, HostKind::Windows) {
+        let windows_arguments = arguments.replace('\n', "\r\n");
+        Ok(vec![
+            format!("C:\\Windows\\System32\\OpenSSH\\ssh.exe {arguments}"),
+            format!("C:\\Windows\\System32\\OpenSSH\\ssh.exe {windows_arguments}"),
+        ])
+    } else {
+        Ok(vec![format!("/usr/bin/ssh {arguments}")])
+    }
 }
 
 const VERIFIED_NESTED_SUDO_COMMANDS: [&str; 3] = [
@@ -6571,12 +6614,25 @@ where
                     .await?;
                 return Ok(ConnectorPtyOpenOutcome { pty_session });
             }
+            Err(error @ ConnectorPtyError::Database(_)) => {
+                retry_sqlite_contention(|| self.repositories.pty_sessions.upsert(&pty_session))
+                    .await?;
+                return Err(error);
+            }
             Err(error) => {
                 pty_session.backend_state = PtyBackendState::Failed;
                 pty_session.last_activity_at = now_utc();
                 self.repositories.pty_sessions.upsert(&pty_session).await?;
-                self.record_activation_connection_failure(&connection, &error)
-                    .await?;
+                if let Err(metadata_error) = self
+                    .record_activation_connection_failure(&connection, &error)
+                    .await
+                {
+                    tracing::warn!(
+                        pty_session_id = %pty_session.pty_session_id,
+                        %metadata_error,
+                        "failed to persist PTY activation connection health; preserving the original activation error"
+                    );
+                }
                 return Err(error);
             }
         };
@@ -7255,6 +7311,29 @@ where
         session: &PtySession,
         target: &remote_hosts_domain::AccessPath,
     ) -> Result<(), ConnectorPtyError> {
+        let workspace = self
+            .repositories
+            .workspaces
+            .get(session.workspace_id)
+            .await?
+            .filter(|workspace| {
+                workspace.id == event.workspace_id && workspace.host_id == event.host_id
+            })
+            .ok_or_else(|| {
+                ConnectorPtyError::StoredSshCommandUnverified(
+                    "PTY input does not match its authoritative Workspace and Host".to_owned(),
+                )
+            })?;
+        let source_host = self
+            .repositories
+            .hosts
+            .get(workspace.host_id)
+            .await?
+            .ok_or_else(|| {
+                ConnectorPtyError::StoredSshCommandUnverified(
+                    "source PTY Host is unavailable for platform verification".to_owned(),
+                )
+            })?;
         let preceding = self
             .repositories
             .pty_input_events
@@ -7281,10 +7360,18 @@ where
             })?;
         let payload_kind_matches = preceding.payload_kind == PtyInputPayloadKind::Text;
         let agent_session_matches = preceding.agent_session_id == event.agent_session_id;
-        let expected_command = verified_nested_ssh_command(target)?;
-        let expected_fingerprint = format!("{:x}", Sha256::digest(expected_command.as_bytes()));
-        let command_matches =
-            preceding.input_fingerprint.as_deref() == Some(expected_fingerprint.as_str());
+        let expected_fingerprints = verified_nested_ssh_commands(target, &source_host.kind)?
+            .iter()
+            .map(|command| format!("{:x}", Sha256::digest(command.as_bytes())))
+            .collect::<Vec<_>>();
+        let command_matches = preceding
+            .input_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| {
+                expected_fingerprints
+                    .iter()
+                    .any(|expected| fingerprint == expected)
+            });
         let prompt_delay_matches =
             !prompt_delay.is_negative() && prompt_delay <= time::Duration::minutes(2);
         if !(payload_kind_matches
@@ -7303,9 +7390,8 @@ where
                 "rejected stored SSH password injection because its nested command binding did not verify"
             );
             return Err(ConnectorPtyError::StoredSshCommandUnverified(format!(
-                "binding mismatch (payload_kind_matches={payload_kind_matches}, agent_session_matches={agent_session_matches}, command_matches={command_matches}, prompt_delay_matches={prompt_delay_matches}, input_sha256={}, expected_sha256={:x})",
+                "binding mismatch (payload_kind_matches={payload_kind_matches}, agent_session_matches={agent_session_matches}, command_matches={command_matches}, prompt_delay_matches={prompt_delay_matches}, input_sha256={}, expected_sha256={expected_fingerprints:?})",
                 preceding.input_fingerprint.as_deref().unwrap_or("missing"),
-                Sha256::digest(expected_command.as_bytes())
             )));
         }
         Ok(())
@@ -7549,11 +7635,27 @@ where
                     .await?;
                 return Err(ConnectorPtyError::ChannelCapacityUnavailable);
             }
+            Err(error @ ConnectorPtyError::Database(_)) => {
+                tracing::warn!(
+                    pty_session_id = %active_session.pty_session_id,
+                    %error,
+                    "PTY activation metadata is temporarily unavailable; session remains pending"
+                );
+                return Err(error);
+            }
             Err(error) => {
                 self.mark_activation_failed(active_session, &error.to_string(), true)
                     .await?;
-                self.record_activation_connection_failure(&connection, &error)
-                    .await?;
+                if let Err(metadata_error) = self
+                    .record_activation_connection_failure(&connection, &error)
+                    .await
+                {
+                    tracing::warn!(
+                        pty_session_id = %pty_session_id,
+                        %metadata_error,
+                        "failed to persist PTY activation connection health; preserving the original activation error"
+                    );
+                }
                 return Err(error);
             }
         };
@@ -7596,11 +7698,11 @@ where
             telemetry: telemetry.clone(),
             updated_at: now_utc(),
         };
-        if let Err(error) = self
-            .repositories
-            .ssh_transport_runtimes
-            .upsert(&runtime)
-            .await
+        let metadata_write_gate = self.repositories.metadata_write_gate();
+        let _write_guard = metadata_write_gate.lock().await;
+        if let Err(error) =
+            retry_sqlite_contention(|| self.repositories.ssh_transport_runtimes.upsert(&runtime))
+                .await
         {
             tracing::warn!(
                 access_path_id = %connection.access_path_id,
@@ -7621,7 +7723,7 @@ where
             .get(pty_session.workspace_id)
             .await?
             .ok_or_else(|| {
-                ConnectorPtyError::Backend(format!(
+                ConnectorPtyError::ControlPlane(format!(
                     "workspace not found: {}",
                     pty_session.workspace_id
                 ))
@@ -7632,7 +7734,7 @@ where
             .get(workspace.access_path_id)
             .await?
             .ok_or_else(|| {
-                ConnectorPtyError::Backend(format!(
+                ConnectorPtyError::ControlPlane(format!(
                     "access path not found: {}",
                     workspace.access_path_id
                 ))
@@ -7643,7 +7745,7 @@ where
             .get(workspace.host_id)
             .await?
             .ok_or_else(|| {
-                ConnectorPtyError::Backend(format!("host not found: {}", workspace.host_id))
+                ConnectorPtyError::ControlPlane(format!("host not found: {}", workspace.host_id))
             })?;
         self.backend
             .spawn(PtyBackendSpawnRequest {
@@ -7787,27 +7889,31 @@ where
                 if pending_bytes >= PTY_OUTPUT_BATCH_TARGET_BYTES
                     || pending.len() >= PTY_OUTPUT_BATCH_MAX_CHUNKS
                 {
-                    if let Err(error) =
-                        flush_pty_output_batch(&repositories, &mut pending, lease_owner.as_ref())
-                            .await
+                    if let Err(error) = flush_terminal_pty_output_batch(
+                        &repositories,
+                        &mut pending,
+                        lease_owner.as_ref(),
+                    )
+                    .await
                     {
                         tracing::warn!(
                             %pty_session_id,
                             %workspace_id,
                             %error,
-                            "deferred full PTY output batch after database contention"
+                            "failed to persist a full PTY output batch"
                         );
                     } else {
                         pending_bytes = 0;
                     }
                 }
             }
-            if flush_pty_output_batch(&repositories, &mut pending, lease_owner.as_ref())
-                .await
-                .is_err()
+            if let Err(error) =
+                flush_terminal_pty_output_batch(&repositories, &mut pending, lease_owner.as_ref())
+                    .await
             {
                 tracing::warn!(
                     %pty_session_id,
+                    %error,
                     "failed to persist the final compressed PTY output segment"
                 );
             }
@@ -7815,6 +7921,8 @@ where
             if !owns_channel_cleanup {
                 return;
             }
+            let metadata_write_gate = repositories.metadata_write_gate();
+            let _write_guard = metadata_write_gate.lock().await;
             let Ok(Some(mut session)) = repositories.pty_sessions.get(pty_session_id).await else {
                 return;
             };
@@ -7825,7 +7933,10 @@ where
                 session.backend_state = PtyBackendState::Closed;
                 session.interaction = None;
                 session.last_activity_at = now_utc();
-                if repositories.pty_sessions.upsert(&session).await.is_err() {
+                if retry_terminal_sqlite_contention(|| repositories.pty_sessions.upsert(&session))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 if let Ok(Some(workspace)) = repositories.workspaces.get(workspace_id).await
@@ -7834,24 +7945,32 @@ where
                         WorkspaceState::Closed | WorkspaceState::Failed | WorkspaceState::Throttled
                     )
                 {
-                    let _ = repositories
-                        .workspaces
-                        .update_state(workspace_id, WorkspaceState::Done, session.last_activity_at)
-                        .await;
+                    let _ = retry_terminal_sqlite_contention(|| {
+                        repositories.workspaces.update_state(
+                            workspace_id,
+                            WorkspaceState::Done,
+                            session.last_activity_at,
+                        )
+                    })
+                    .await;
                 }
             }
-            let _ = repositories
-                .connection_sessions
-                .close_channel(session.session_id, session.last_activity_at)
-                .await;
+            let _ = retry_sqlite_contention(|| {
+                repositories
+                    .connection_sessions
+                    .close_channel(session.session_id, session.last_activity_at)
+            })
+            .await;
             if let Some((host_id, coordination_scopes, agent_session_id)) = lease_owner
-                && let Err(error) = shorten_host_write_leases(
-                    &repositories,
-                    host_id,
-                    &coordination_scopes,
-                    agent_session_id,
-                    session.last_activity_at,
-                )
+                && let Err(error) = retry_sqlite_contention(|| {
+                    shorten_host_write_leases(
+                        &repositories,
+                        host_id,
+                        &coordination_scopes,
+                        agent_session_id,
+                        session.last_activity_at,
+                    )
+                })
                 .await
             {
                 tracing::warn!(
@@ -7948,17 +8067,7 @@ where
         connection: &ConnectionSession,
         error: &ConnectorPtyError,
     ) -> Result<(), ConnectorPtyError> {
-        if matches!(
-            error,
-            ConnectorPtyError::StoredSudoPromptUnavailable
-                | ConnectorPtyError::StoredSudoPasswordUnavailable
-                | ConnectorPtyError::StoredSshPromptUnavailable
-                | ConnectorPtyError::StoredSshPasswordUnavailable
-                | ConnectorPtyError::StoredSshCommandUnverified(_)
-                | ConnectorPtyError::StoredTargetSudoPromptUnavailable
-                | ConnectorPtyError::StoredTargetSudoPasswordUnavailable
-                | ConnectorPtyError::StoredTargetSudoCommandUnverified(_)
-        ) {
+        if !pty_activation_error_affects_connection_health(error) {
             return Ok(());
         }
         let observed_at = now_utc();
@@ -7980,15 +8089,19 @@ where
                 StateReasonCode::TargetSshdRateLimited,
                 Some(60),
             ),
-            ConnectorPtyError::Transport(
-                TransportError::Backend(_) | TransportError::FileTransfer(_),
-            )
+            ConnectorPtyError::Transport(TransportError::Backend(_))
             | ConnectorPtyError::Backend(_) => classify_connection_failure(&message),
             ConnectorPtyError::Transport(TransportError::Timeout)
+            | ConnectorPtyError::ActivationTimeout => (
+                EntityState::Degraded,
+                StateReasonCode::SshHandshakeFailed,
+                Some(30),
+            ),
+            ConnectorPtyError::Transport(TransportError::FileTransfer(_))
             | ConnectorPtyError::Database(_)
+            | ConnectorPtyError::ControlPlane(_)
             | ConnectorPtyError::Supervisor(_)
             | ConnectorPtyError::ChannelCapacityUnavailable
-            | ConnectorPtyError::ActivationTimeout
             | ConnectorPtyError::ConnectorMismatch
             | ConnectorPtyError::NotActive
             | ConnectorPtyError::RuntimeContinuityLost
@@ -8003,11 +8116,7 @@ where
             | ConnectorPtyError::StoredTargetSudoPromptUnavailable
             | ConnectorPtyError::StoredTargetSudoPasswordUnavailable
             | ConnectorPtyError::StoredTargetSudoCommandUnverified(_)
-            | ConnectorPtyError::Int(_) => (
-                EntityState::Degraded,
-                StateReasonCode::SshHandshakeFailed,
-                Some(30),
-            ),
+            | ConnectorPtyError::Int(_) => return Ok(()),
         };
         let circuit_breaker_eligible = !local_handshake_budget
             && !matches!(state, EntityState::AuthFailed | EntityState::HostKeyChanged);
@@ -8206,6 +8315,8 @@ async fn flush_pty_output_batch(
     if pending.is_empty() {
         return Ok(());
     }
+    let metadata_write_gate = repositories.metadata_write_gate();
+    let _write_guard = metadata_write_gate.lock().await;
     let pty_session_id = pending[0].pty_session_id;
     let workspace_id = pending[0].workspace_id;
     let observed_at = pending
@@ -8225,6 +8336,23 @@ async fn flush_pty_output_batch(
     .await?;
     pending.clear();
     Ok(())
+}
+
+async fn flush_terminal_pty_output_batch(
+    repositories: &Repositories,
+    pending: &mut Vec<PtyOutputChunk>,
+    lease_owner: Option<&(HostId, Vec<String>, AgentSessionId)>,
+) -> Result<(), DbError> {
+    let mut delay = Duration::from_millis(100);
+    loop {
+        match flush_pty_output_batch(repositories, pending, lease_owner).await {
+            Err(error) if error.is_sqlite_contention() => {
+                tokio::time::sleep(delay).await;
+                delay = doubled_duration(delay, Duration::from_secs(1));
+            }
+            result => return result,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9151,34 +9279,35 @@ where
         &self,
         workspace_id: WorkspaceId,
         request: SftpRequest,
-    ) -> Result<Option<SftpResult>, TransportError> {
+    ) -> Result<Option<SftpResult>, InteractiveFileTransferError> {
         let workspace = self
             .repositories
             .workspaces
             .get(workspace_id)
-            .await
-            .map_err(|error| TransportError::Backend(error.to_string()))?
+            .await?
             .ok_or_else(|| {
-                TransportError::Backend(format!("workspace not found: {workspace_id}"))
+                InteractiveFileTransferError::Transport(TransportError::Backend(format!(
+                    "workspace not found: {workspace_id}"
+                )))
             })?;
         if workspace.host_id != request.host_id
             || workspace.access_path_id != request.access_path_id
         {
             return Err(TransportError::PolicyDenied(
                 "interactive file transfer request does not match its workspace route".to_owned(),
-            ));
+            )
+            .into());
         }
         let access_path = self
             .repositories
             .access_paths
             .get(workspace.access_path_id)
-            .await
-            .map_err(|error| TransportError::Backend(error.to_string()))?
+            .await?
             .ok_or_else(|| {
-                TransportError::Backend(format!(
+                InteractiveFileTransferError::Transport(TransportError::Backend(format!(
                     "access path not found: {}",
                     workspace.access_path_id
-                ))
+                )))
             })?;
         if access_path.route_type != RouteType::Bastion || !access_path.proxy_chain.is_empty() {
             return Ok(None);
@@ -9206,6 +9335,7 @@ pub struct ConnectorOperationWorker<P> {
     redactor: SecretRedactor,
     artifact_store: Arc<dyn OutputArtifactStore>,
     interactive_file_transfer: StdMutex<Option<Arc<dyn InteractiveFileTransferBackend>>>,
+    metadata_write_gate: Arc<Mutex<()>>,
 }
 
 enum ClaimedOperationExecution {
@@ -9238,6 +9368,7 @@ where
         config: ConnectorOperationWorkerConfig,
         artifact_store: Arc<dyn OutputArtifactStore>,
     ) -> Self {
+        let metadata_write_gate = repositories.metadata_write_gate();
         Self {
             repositories,
             provider,
@@ -9245,6 +9376,7 @@ where
             redactor: SecretRedactor::default(),
             artifact_store,
             interactive_file_transfer: StdMutex::new(None),
+            metadata_write_gate,
         }
     }
 
@@ -9274,18 +9406,20 @@ where
         let lease_seconds = i64::try_from(self.config.lease_seconds)?;
         let lease_expires_at = claimed_at + time::Duration::seconds(lease_seconds);
         let claim_token = Uuid::new_v4().to_string();
-        let Some(operation) = self
-            .repositories
-            .operations
-            .claim_next_for_connector(
-                self.config.connector_id,
-                &claim_token,
-                claimed_at,
-                lease_expires_at,
-                self.config.max_attempts,
-            )
-            .await?
-        else {
+        let operation = {
+            let _write_guard = self.metadata_write_gate.lock().await;
+            self.repositories
+                .operations
+                .claim_next_for_connector(
+                    self.config.connector_id,
+                    &claim_token,
+                    claimed_at,
+                    lease_expires_at,
+                    self.config.max_attempts,
+                )
+                .await?
+        };
+        let Some(operation) = operation else {
             return Ok(None);
         };
 
@@ -9299,35 +9433,32 @@ where
         observed_at: time::OffsetDateTime,
     ) -> Result<Option<ConnectorOperationOutcome>, ConnectorWorkerError> {
         let summary = exhaustion_summary(self.config.max_attempts);
-        let Some(operation) = self
-            .repositories
-            .operations
-            .exhaust_next_for_connector(
-                self.config.connector_id,
-                observed_at,
-                self.config.max_attempts,
-                &summary,
-                &summary,
-            )
-            .await?
-        else {
-            return Ok(None);
+        let (operation, workspace) = {
+            let _write_guard = self.metadata_write_gate.lock().await;
+            let exhausted = retry_terminal_sqlite_contention(|| {
+                self.repositories.exhaust_next_operation_for_connector(
+                    self.config.connector_id,
+                    observed_at,
+                    self.config.max_attempts,
+                    &summary,
+                    &summary,
+                )
+            })
+            .await?;
+            let Some(exhausted) = exhausted else {
+                return Ok(None);
+            };
+            exhausted
         };
-        let workspace_id = operation
-            .workspace_id
-            .ok_or(ConnectorWorkerError::MissingWorkspace)?;
         let message = format!(
             "{} attempt_count={}; recovery_hint=inspect connector health, use an alternate access path, or queue a fresh operation after recovery",
             summary, operation.attempt_count
         );
-        self.append_system_chunk(&operation, &message).await?;
-        self.repositories
-            .workspaces
-            .update_state(workspace_id, WorkspaceState::Blocked, observed_at)
+        self.append_terminal_system_chunk(&operation, &message)
             .await?;
         Ok(Some(ConnectorOperationOutcome {
             operation_id: operation.id,
-            workspace_id,
+            workspace_id: workspace.id,
             state: OperationState::Exhausted,
             workspace_state: WorkspaceState::Blocked,
             exit_code: None,
@@ -9345,8 +9476,11 @@ where
             Ok(execution) => execution,
             Err(error) => {
                 let message = self.redactor.redact(&error.to_string());
-                self.append_system_chunk(&operation, &format!("operation rejected: {message}"))
-                    .await?;
+                self.append_terminal_system_chunk(
+                    &operation,
+                    &format!("operation rejected: {message}"),
+                )
+                .await?;
                 return self
                     .finish_operation(
                         &operation,
@@ -9363,7 +9497,8 @@ where
             return Ok(outcome);
         }
         if let Some((message, workspace_state)) = self.active_connection_block(&operation).await? {
-            self.append_system_chunk(&operation, &message).await?;
+            self.append_terminal_system_chunk(&operation, &message)
+                .await?;
             return self
                 .finish_operation(
                     &operation,
@@ -9382,8 +9517,11 @@ where
                 let message = self.redactor.redact(&error);
                 self.record_connection_failure(&operation, &message, None)
                     .await?;
-                self.append_system_chunk(&operation, &format!("transport unavailable: {message}"))
-                    .await?;
+                self.append_terminal_system_chunk(
+                    &operation,
+                    &format!("transport unavailable: {message}"),
+                )
+                .await?;
                 return self
                     .finish_operation(
                         &operation,
@@ -9504,7 +9642,10 @@ where
         .await;
         match result {
             Ok(result) => self.persist_exec_result(operation, &profile, result).await,
-            Err(error) => self.persist_transport_error(operation, error).await,
+            Err(ConnectorWorkerError::Transport(error)) => {
+                self.persist_transport_error(operation, error).await
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -9544,7 +9685,10 @@ where
         .await;
         match result {
             Ok(result) => self.persist_sftp_result(operation, result).await,
-            Err(error) => self.persist_transport_error(operation, error).await,
+            Err(ConnectorWorkerError::Transport(error)) => {
+                self.persist_transport_error(operation, error).await
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -9567,11 +9711,10 @@ where
             telemetry: after,
             updated_at: observed_at,
         };
-        if let Err(error) = self
-            .repositories
-            .ssh_transport_runtimes
-            .upsert(&runtime)
-            .await
+        let _write_guard = self.metadata_write_gate.lock().await;
+        if let Err(error) =
+            retry_sqlite_contention(|| self.repositories.ssh_transport_runtimes.upsert(&runtime))
+                .await
         {
             tracing::warn!(
                 operation_id = %operation.id,
@@ -9583,11 +9726,14 @@ where
         let Some(claim_token) = operation.claim_token.as_deref() else {
             return;
         };
-        match self
-            .repositories
-            .operations
-            .attach_transport_evidence(operation.id, claim_token, &evidence)
-            .await
+        match retry_sqlite_contention(|| {
+            self.repositories.operations.attach_transport_evidence(
+                operation.id,
+                claim_token,
+                &evidence,
+            )
+        })
+        .await
         {
             Ok(true) => operation.transport_evidence = Some(evidence),
             Ok(false) => {
@@ -9642,36 +9788,40 @@ where
         operation: &OperationRun,
         transport: Arc<dyn RemoteTransport>,
         request: ExecRequest,
-    ) -> Result<ExecResult, TransportError> {
-        let claim_token = operation.claim_token.clone().ok_or_else(|| {
-            TransportError::Backend(ConnectorWorkerError::MissingClaimToken.to_string())
-        })?;
+    ) -> Result<ExecResult, ConnectorWorkerError> {
+        let claim_token = operation
+            .claim_token
+            .clone()
+            .ok_or_else(|| ConnectorWorkerError::MissingClaimToken)?;
         let renew_delay = self.lease_renew_delay();
+        let mut next_renewal_delay = renew_delay;
         let exec = transport.exec(request);
         tokio::pin!(exec);
 
         loop {
+            let renewal_delay = tokio::time::sleep(next_renewal_delay);
+            tokio::pin!(renewal_delay);
             tokio::select! {
-                result = &mut exec => return result,
-                () = tokio::time::sleep(renew_delay) => {
-                    let lease_seconds = i64::try_from(self.config.lease_seconds)
-                        .map_err(|error| TransportError::Backend(error.to_string()))?;
-                    let renewed = self.repositories.operations
-                        .renew_claim(
-                            operation.id,
-                            &claim_token,
-                            now_utc() + time::Duration::seconds(lease_seconds),
-                        )
-                        .await
-                        .map_err(|error| TransportError::Backend(error.to_string()))?;
-                    if !renewed {
-                        return Err(TransportError::Backend(
-                            ConnectorWorkerError::LeaseLost.to_string(),
-                        ));
-                    }
-                    self.renew_write_lease(operation)
-                        .await
-                        .map_err(|error| TransportError::Backend(error.to_string()))?;
+                result = &mut exec => return result.map_err(ConnectorWorkerError::from),
+                () = &mut renewal_delay => {
+                    let renewal = self.renew_operation_ownership(operation, &claim_token);
+                    tokio::pin!(renewal);
+                    let renewal_result = tokio::select! {
+                        result = &mut exec => return result.map_err(ConnectorWorkerError::from),
+                        result = &mut renewal => result,
+                    };
+                    next_renewal_delay = match renewal_result {
+                        Ok(()) => renew_delay,
+                        Err(ConnectorWorkerError::Database(error)) => {
+                            tracing::warn!(
+                                operation_id = %operation.id,
+                                %error,
+                                "operation lease metadata is temporarily unavailable; remote exec remains active"
+                            );
+                            renewal_contention_retry_delay(renew_delay)
+                        }
+                        Err(error) => return Err(error),
+                    };
                 }
             }
         }
@@ -9684,42 +9834,52 @@ where
         transport: Arc<dyn RemoteTransport>,
         mut request: SftpRequest,
         interactive_backend: Option<Arc<dyn InteractiveFileTransferBackend>>,
-    ) -> Result<SftpResult, TransportError> {
-        let claim_token = operation.claim_token.clone().ok_or_else(|| {
-            TransportError::Backend(ConnectorWorkerError::MissingClaimToken.to_string())
-        })?;
+    ) -> Result<SftpResult, ConnectorWorkerError> {
+        let claim_token = operation
+            .claim_token
+            .clone()
+            .ok_or_else(|| ConnectorWorkerError::MissingClaimToken)?;
         let renew_delay = self.lease_renew_delay();
+        let mut next_renewal_delay = renew_delay;
         let started_at = Instant::now();
         let transfer_timeout = Duration::from_secs(request.spec.timeout_seconds);
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         request.progress_tx = Some(progress_tx);
         let direction = request.spec.direction;
         let max_size_bytes = request.spec.max_size_bytes;
-        self.append_system_chunk(
+        self.append_transfer_status_best_effort(
             operation,
             &format!(
                 "file transfer started: direction={direction:?}, max_size_bytes={max_size_bytes}"
             ),
         )
-        .await
-        .map_err(|error| TransportError::Backend(error.to_string()))?;
+        .await;
         let workspace_id = operation
             .workspace_id
-            .ok_or_else(|| TransportError::Backend("file transfer has no workspace".to_owned()))?;
+            .ok_or(ConnectorWorkerError::MissingWorkspace)?;
         let fallback_request = request.clone();
         let transfer = async move {
             if let Some(backend) = interactive_backend
                 && let Some(result) = backend
                     .transfer_for_workspace(workspace_id, request)
-                    .await?
+                    .await
+                    .map_err(|error| match error {
+                        InteractiveFileTransferError::Database(error) => {
+                            ConnectorWorkerError::Database(error)
+                        }
+                        InteractiveFileTransferError::Transport(error) => {
+                            ConnectorWorkerError::Transport(error)
+                        }
+                    })?
             {
                 return Ok(result);
             }
-            transport.sftp(fallback_request).await
+            transport
+                .sftp(fallback_request)
+                .await
+                .map_err(ConnectorWorkerError::from)
         };
         tokio::pin!(transfer);
-        let mut lease_interval = tokio::time::interval(renew_delay);
-        lease_interval.tick().await;
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
         heartbeat_interval.tick().await;
         let deadline = tokio::time::sleep_until(started_at + transfer_timeout);
@@ -9727,6 +9887,8 @@ where
         let mut progress_open = true;
         let mut latest_progress: Option<SftpProgress> = None;
         let mut last_progress_at = started_at;
+        let renewal_delay = tokio::time::sleep(next_renewal_delay);
+        tokio::pin!(renewal_delay);
 
         loop {
             tokio::select! {
@@ -9744,7 +9906,7 @@ where
                     );
                     self.append_transfer_status_best_effort(operation, &summary)
                         .await;
-                    return Err(TransportError::Timeout);
+                    return Err(ConnectorWorkerError::Transport(TransportError::Timeout));
                 }
                 progress = progress_rx.recv(), if progress_open => {
                     match progress {
@@ -9773,28 +9935,52 @@ where
                     self.append_transfer_status_best_effort(operation, &summary)
                         .await;
                 }
-                _ = lease_interval.tick() => {
-                    let lease_seconds = i64::try_from(self.config.lease_seconds)
-                        .map_err(|error| TransportError::Backend(error.to_string()))?;
-                    let renewed = self.repositories.operations
-                        .renew_claim(
-                            operation.id,
-                            &claim_token,
-                            now_utc() + time::Duration::seconds(lease_seconds),
-                        )
-                        .await
-                        .map_err(|error| TransportError::Backend(error.to_string()))?;
-                    if !renewed {
-                        return Err(TransportError::Backend(
-                            ConnectorWorkerError::LeaseLost.to_string(),
-                        ));
-                    }
-                    self.renew_write_lease(operation)
-                        .await
-                        .map_err(|error| TransportError::Backend(error.to_string()))?;
+                () = &mut renewal_delay => {
+                    let renewal = self.renew_operation_ownership(operation, &claim_token);
+                    tokio::pin!(renewal);
+                    let renewal_result = tokio::select! {
+                        result = &mut transfer => {
+                            return result;
+                        }
+                        result = &mut renewal => result,
+                    };
+                    next_renewal_delay = match renewal_result {
+                        Ok(()) => renew_delay,
+                        Err(ConnectorWorkerError::Database(error)) => {
+                            tracing::warn!(
+                                operation_id = %operation.id,
+                                %error,
+                                "operation lease metadata is temporarily unavailable; SFTP remains active"
+                            );
+                            renewal_contention_retry_delay(renew_delay)
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    renewal_delay.as_mut().reset(Instant::now() + next_renewal_delay);
                 }
             }
         }
+    }
+
+    async fn renew_operation_ownership(
+        &self,
+        operation: &OperationRun,
+        claim_token: &str,
+    ) -> Result<(), ConnectorWorkerError> {
+        let _write_guard = self.metadata_write_gate.lock().await;
+        let lease_seconds = i64::try_from(self.config.lease_seconds)?;
+        let renewed = retry_sqlite_contention(|| {
+            self.repositories.operations.renew_claim(
+                operation.id,
+                claim_token,
+                now_utc() + time::Duration::seconds(lease_seconds),
+            )
+        })
+        .await?;
+        if !renewed {
+            return Err(ConnectorWorkerError::LeaseLost);
+        }
+        self.renew_write_lease(operation).await
     }
 
     async fn renew_write_lease(
@@ -9812,10 +9998,8 @@ where
         let heartbeat_at = now_utc();
         let lease_seconds = i64::try_from(self.config.lease_seconds)?;
         let coordination_scopes = operation_coordination_scopes(operation);
-        if !self
-            .repositories
-            .host_write_leases
-            .renew_many(
+        if !retry_sqlite_contention(|| {
+            self.repositories.host_write_leases.renew_many(
                 operation.host_id,
                 &coordination_scopes,
                 agent_session_id,
@@ -9823,7 +10007,8 @@ where
                 heartbeat_at,
                 heartbeat_at + time::Duration::seconds(lease_seconds),
             )
-            .await?
+        })
+        .await?
         {
             return Err(ConnectorWorkerError::WriteLeaseLost);
         }
@@ -9867,7 +10052,6 @@ where
         profile: &CommandProfile,
         result: ExecResult,
     ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
-        self.record_connection_success(operation).await?;
         let (stdout, stdout_truncated) =
             redact_and_truncate(&self.redactor, &result.stdout, profile.output_limit_bytes);
         let (stderr, stderr_truncated) =
@@ -9896,16 +10080,20 @@ where
             stdout.len(),
             stderr.len(),
         );
-        self.append_system_chunk(operation, &summary).await?;
-        self.finish_operation(
-            operation,
-            state,
-            workspace_state,
-            result.exit_code,
-            &summary,
-            None,
-        )
-        .await
+        self.append_terminal_system_chunk(operation, &summary)
+            .await?;
+        let outcome = self
+            .finish_operation(
+                operation,
+                state,
+                workspace_state,
+                result.exit_code,
+                &summary,
+                None,
+            )
+            .await?;
+        self.record_connection_success_best_effort(operation).await;
+        Ok(outcome)
     }
 
     async fn persist_sftp_result(
@@ -9913,23 +10101,26 @@ where
         operation: &OperationRun,
         result: SftpResult,
     ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
-        self.record_connection_success(operation).await?;
         let direction = format!("{:?}", result.direction).to_lowercase();
         let file_name = result.remote_path.rsplit('/').next().unwrap_or("<invalid>");
         let summary = format!(
             "file transfer finished: state=succeeded, direction={direction}, file={file_name}, bytes={}, sha256={}, overwrite={:?}, pooled_session=true",
             result.bytes_transferred, result.sha256, result.overwrite
         );
-        self.append_system_chunk(operation, &summary).await?;
-        self.finish_operation(
-            operation,
-            OperationState::Succeeded,
-            WorkspaceState::Done,
-            Some(0),
-            &summary,
-            None,
-        )
-        .await
+        self.append_terminal_system_chunk(operation, &summary)
+            .await?;
+        let outcome = self
+            .finish_operation(
+                operation,
+                OperationState::Succeeded,
+                WorkspaceState::Done,
+                Some(0),
+                &summary,
+                None,
+            )
+            .await?;
+        self.record_connection_success_best_effort(operation).await;
+        Ok(outcome)
     }
 
     async fn persist_transport_error(
@@ -9938,13 +10129,8 @@ where
         error: TransportError,
     ) -> Result<ConnectorOperationOutcome, ConnectorWorkerError> {
         let redacted = self.redactor.redact(&error.to_string());
-        if matches!(error, TransportError::FileTransfer(_)) {
-            self.record_connection_success(operation).await?;
-        } else {
-            self.record_connection_failure(operation, &redacted, Some(&error))
-                .await?;
-        }
-        let (state, workspace_state) = match error {
+        let connection_remains_healthy = matches!(error, TransportError::FileTransfer(_));
+        let (state, workspace_state) = match &error {
             TransportError::PolicyDenied(_)
             | TransportError::LocalHandshakeBudgetExhausted { .. } => {
                 (OperationState::Rejected, WorkspaceState::Throttled)
@@ -9955,23 +10141,38 @@ where
             // that the underlying SSH connection is unhealthy.
             TransportError::FileTransfer(_) => (OperationState::Failed, WorkspaceState::Done),
         };
-        self.append_system_chunk(operation, &format!("operation failed: {redacted}"))
+        self.append_terminal_system_chunk(operation, &format!("operation failed: {redacted}"))
             .await?;
-        self.finish_operation(
-            operation,
-            state,
-            workspace_state,
-            None,
-            "operation failed during connector execution",
-            Some(&redacted),
-        )
-        .await
+        let outcome = self
+            .finish_operation(
+                operation,
+                state,
+                workspace_state,
+                None,
+                "operation failed during connector execution",
+                Some(&redacted),
+            )
+            .await?;
+        if connection_remains_healthy {
+            self.record_connection_success_best_effort(operation).await;
+        } else if let Err(health_error) = self
+            .record_connection_failure(operation, &redacted, Some(&error))
+            .await
+        {
+            tracing::warn!(
+                operation_id = %operation.id,
+                %health_error,
+                "failed to persist connection failure after operation terminal state committed"
+            );
+        }
+        Ok(outcome)
     }
 
     async fn begin_connection_use(
         &self,
         operation: &mut OperationRun,
     ) -> Result<(), ConnectorWorkerError> {
+        let _write_guard = self.metadata_write_gate.lock().await;
         let now = now_utc();
         let existing_session = match operation.session_id {
             Some(session_id) => {
@@ -10104,6 +10305,7 @@ where
         &self,
         operation: &OperationRun,
     ) -> Result<(), ConnectorWorkerError> {
+        let _write_guard = self.metadata_write_gate.lock().await;
         let Some(session_id) = operation.session_id else {
             return Ok(());
         };
@@ -10131,12 +10333,23 @@ where
         Ok(())
     }
 
+    async fn record_connection_success_best_effort(&self, operation: &OperationRun) {
+        if let Err(error) = self.record_connection_success(operation).await {
+            tracing::warn!(
+                operation_id = %operation.id,
+                %error,
+                "failed to persist connection success after operation terminal state committed"
+            );
+        }
+    }
+
     async fn record_connection_failure(
         &self,
         operation: &OperationRun,
         message: &str,
         error: Option<&TransportError>,
     ) -> Result<(), ConnectorWorkerError> {
+        let _write_guard = self.metadata_write_gate.lock().await;
         let Some(session_id) = operation.session_id else {
             return Ok(());
         };
@@ -10228,28 +10441,37 @@ where
             .as_deref()
             .ok_or(ConnectorWorkerError::MissingClaimToken)?;
         let finished_at = now_utc();
-        let finished = self
-            .repositories
-            .operations
-            .finish_claimed(ClaimedOperationFinish {
-                id: operation.id,
-                claim_token,
-                state: state.clone(),
-                finished_at,
-                exit_code,
-                redacted_output_summary: Some(summary),
-                last_error,
-            })
-            .await?;
+        let _write_guard = self.metadata_write_gate.lock().await;
+        let finished = retry_terminal_sqlite_contention(|| {
+            self.repositories.finish_claimed_operation(
+                ClaimedOperationFinish {
+                    id: operation.id,
+                    claim_token,
+                    state: state.clone(),
+                    finished_at,
+                    exit_code,
+                    redacted_output_summary: Some(summary),
+                    last_error,
+                },
+                workspace_id,
+                workspace_state.clone(),
+            )
+        })
+        .await?;
         if !finished {
             return Err(ConnectorWorkerError::LeaseLost);
         }
-        self.repositories
-            .workspaces
-            .update_state(workspace_id, workspace_state.clone(), finished_at)
-            .await?;
-        self.shorten_write_lease_after_completion(operation, finished_at)
-            .await?;
+        if let Err(error) = retry_sqlite_contention(|| {
+            self.shorten_write_lease_after_completion(operation, finished_at)
+        })
+        .await
+        {
+            tracing::warn!(
+                operation_id = %operation.id,
+                %error,
+                "failed to shorten completed operation write lease; expiry remains the safety fallback"
+            );
+        }
         Ok(ConnectorOperationOutcome {
             operation_id: operation.id,
             workspace_id,
@@ -10263,7 +10485,7 @@ where
         &self,
         operation: &OperationRun,
         finished_at: time::OffsetDateTime,
-    ) -> Result<(), ConnectorWorkerError> {
+    ) -> Result<(), DbError> {
         if !operation.requires_write_lease {
             return Ok(());
         }
@@ -10290,6 +10512,21 @@ where
             .await
     }
 
+    async fn append_terminal_system_chunk(
+        &self,
+        operation: &OperationRun,
+        message: &str,
+    ) -> Result<(), ConnectorWorkerError> {
+        self.append_output_chunk_with_persistence(
+            operation,
+            OutputStream::System,
+            message,
+            false,
+            true,
+        )
+        .await
+    }
+
     async fn append_transfer_status_best_effort(&self, operation: &OperationRun, message: &str) {
         if let Err(error) = self.append_system_chunk(operation, message).await {
             tracing::warn!(
@@ -10309,7 +10546,7 @@ where
     ) -> Result<(), ConnectorWorkerError> {
         if text.len() <= self.config.artifact_threshold_bytes {
             return self
-                .append_output_chunk(operation, stream, text, truncated)
+                .append_output_chunk_with_persistence(operation, stream, text, truncated, true)
                 .await;
         }
 
@@ -10324,10 +10561,15 @@ where
                 truncated,
             })
             .await?;
-        self.repositories
-            .operation_output_artifacts
-            .insert(&artifact)
+        {
+            let _write_guard = self.metadata_write_gate.lock().await;
+            retry_terminal_sqlite_contention(|| {
+                self.repositories
+                    .operation_output_artifacts
+                    .insert(&artifact)
+            })
             .await?;
+        }
         let summary = format!(
             "large {stream:?} output stored as artifact_id={} bytes={} sha256={} truncated={}\n{}",
             artifact.id,
@@ -10336,7 +10578,7 @@ where
             artifact.truncated,
             artifact.redacted_preview,
         );
-        self.append_output_chunk(operation, stream, &summary, true)
+        self.append_output_chunk_with_persistence(operation, stream, &summary, true, true)
             .await
     }
 
@@ -10347,30 +10589,51 @@ where
         text: &str,
         truncated: bool,
     ) -> Result<(), ConnectorWorkerError> {
+        self.append_output_chunk_with_persistence(operation, stream, text, truncated, false)
+            .await
+    }
+
+    async fn append_output_chunk_with_persistence(
+        &self,
+        operation: &OperationRun,
+        stream: OutputStream,
+        text: &str,
+        truncated: bool,
+        retry_until_available: bool,
+    ) -> Result<(), ConnectorWorkerError> {
         let workspace_id = operation
             .workspace_id
             .ok_or(ConnectorWorkerError::MissingWorkspace)?;
         let redacted_text = self.redactor.redact(text);
-        let sequence = self
-            .repositories
-            .operation_output_chunks
-            .next_sequence(operation.id)
-            .await?;
-        let chunk = OperationOutputChunk {
-            id: OperationOutputChunkId::new(),
-            operation_id: operation.id,
-            workspace_id,
-            stream,
-            sequence,
-            byte_len: u64::try_from(redacted_text.len())?,
-            redacted_text,
-            truncated,
-            created_at: now_utc(),
+        let byte_len = u64::try_from(redacted_text.len())?;
+        let _write_guard = self.metadata_write_gate.lock().await;
+        let persist = || async {
+            let sequence = self
+                .repositories
+                .operation_output_chunks
+                .next_sequence(operation.id)
+                .await?;
+            let chunk = OperationOutputChunk {
+                id: OperationOutputChunkId::new(),
+                operation_id: operation.id,
+                workspace_id,
+                stream: stream.clone(),
+                sequence,
+                byte_len,
+                redacted_text: redacted_text.clone(),
+                truncated,
+                created_at: now_utc(),
+            };
+            self.repositories
+                .operation_output_chunks
+                .insert(&chunk)
+                .await
         };
-        self.repositories
-            .operation_output_chunks
-            .insert(&chunk)
-            .await?;
+        if retry_until_available {
+            retry_terminal_sqlite_contention(persist).await?;
+        } else {
+            retry_sqlite_contention(persist).await?;
+        }
         Ok(())
     }
 }
@@ -10629,7 +10892,7 @@ where
                 }
                 () = &mut heartbeat_due => {
                     let state = self.reconcile_lifecycle(&mut report).await;
-                    self.record_connector_state(state).await?;
+                    self.record_connector_state_best_effort(state).await;
                     next_heartbeat = Instant::now() + heartbeat_interval;
                 }
                 () = &mut claim_due,
@@ -10663,14 +10926,14 @@ where
                         Some(Ok(Err(error))) => {
                             report.infrastructure_errors += 1;
                             tracing::warn!(%error, "connector daemon infrastructure error");
-                            self.record_connector_state(EntityState::Degraded).await?;
+                            self.record_connector_state_best_effort(EntityState::Degraded).await;
                             next_claim = Instant::now()
                                 + Duration::from_millis(self.config.error_backoff_ms);
                         }
                         Some(Err(error)) => {
                             report.infrastructure_errors += 1;
                             tracing::error!(%error, "connector operation task failed");
-                            self.record_connector_state(EntityState::Degraded).await?;
+                            self.record_connector_state_best_effort(EntityState::Degraded).await;
                             next_claim = Instant::now()
                                 + Duration::from_millis(self.config.error_backoff_ms);
                         }
@@ -10697,8 +10960,8 @@ where
             }
         }
 
-        self.record_connector_state(EntityState::ConnectorOffline)
-            .await?;
+        self.record_connector_state_best_effort(EntityState::ConnectorOffline)
+            .await;
         Ok(report)
     }
 
@@ -10716,7 +10979,8 @@ where
             Some(Err(error)) => {
                 report.infrastructure_errors += 1;
                 tracing::error!(%error, "connector PTY pump task failed");
-                self.record_connector_state(EntityState::Degraded).await?;
+                self.record_connector_state_best_effort(EntityState::Degraded)
+                    .await;
                 Ok(Some(Duration::from_millis(self.config.error_backoff_ms)))
             }
             None => Ok(None),
@@ -10746,7 +11010,8 @@ where
                     %error,
                     "connector daemon PTY pump error while operation is running"
                 );
-                self.record_connector_state(EntityState::Degraded).await?;
+                self.record_connector_state_best_effort(EntityState::Degraded)
+                    .await;
                 Ok(Duration::from_millis(self.config.error_backoff_ms))
             }
         }
@@ -10952,21 +11217,21 @@ where
     }
 
     async fn record_connector_state(&self, state: EntityState) -> Result<(), ConnectorDaemonError> {
+        let _write_guard = self.worker.metadata_write_gate.lock().await;
         let observed_at = now_utc();
-        let (old_state, connector) = self
-            .repositories
-            .connectors
-            .update_heartbeat(
+        let heartbeat = retry_sqlite_contention(|| {
+            self.repositories.connectors.update_heartbeat(
                 self.config.connector_id,
-                state,
+                state.clone(),
                 Some(&self.config.version),
                 self.config.current_network.as_deref(),
                 observed_at,
             )
-            .await?
-            .ok_or(ConnectorDaemonError::ConnectorNotFound(
-                self.config.connector_id,
-            ))?;
+        })
+        .await?;
+        let (old_state, connector) = heartbeat.ok_or(ConnectorDaemonError::ConnectorNotFound(
+            self.config.connector_id,
+        ))?;
         let outcome = ConnectorStateTracker::record_heartbeat(
             self.config.connector_id,
             old_state,
@@ -10974,14 +11239,46 @@ where
             observed_at,
         );
         if let Some(event) = outcome.event {
-            self.repositories.state_events.insert(&event).await?;
+            retry_sqlite_contention(|| self.repositories.state_events.insert(&event)).await?;
         }
         Ok(())
+    }
+
+    async fn record_connector_state_best_effort(&self, state: EntityState) {
+        if let Err(error) = self.record_connector_state(state.clone()).await {
+            tracing::warn!(
+                connector_id = %self.config.connector_id,
+                connector_state = ?state,
+                %error,
+                "connector heartbeat persistence is temporarily unavailable; daemon remains active"
+            );
+        }
     }
 }
 
 fn doubled_duration(current: Duration, max: Duration) -> Duration {
     current.saturating_mul(2).min(max)
+}
+
+fn renewal_contention_retry_delay(normal_delay: Duration) -> Duration {
+    normal_delay.clamp(Duration::from_millis(250), Duration::from_secs(1))
+}
+
+async fn retry_terminal_sqlite_contention<T, F, Fut>(mut operation: F) -> Result<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, DbError>>,
+{
+    let mut delay = TERMINAL_PERSISTENCE_RETRY_MIN_DELAY;
+    loop {
+        match operation().await {
+            Err(error) if error.is_sqlite_contention() => {
+                tokio::time::sleep(delay).await;
+                delay = doubled_duration(delay, TERMINAL_PERSISTENCE_RETRY_MAX_DELAY);
+            }
+            result => return result,
+        }
+    }
 }
 
 const fn normalized_busy_ttl(idle_ttl_seconds: u64, busy_ttl_seconds: u64) -> u64 {
@@ -11371,7 +11668,7 @@ mod tests {
         SftpOverwritePolicy, SftpProgress, SftpRequest, SftpResult, WorkspaceFileTransfer,
         WorkspaceOperationSupervisor, WorkspaceRunCommand, transport::TransportError,
     };
-    use remote_hosts_db::{Repositories, connect_sqlite, migrate};
+    use remote_hosts_db::{DbError, Repositories, connect_sqlite, migrate};
     use remote_hosts_domain::{
         AccessPath, AccessPathHealth, AccessPathId, AgentSession, AgentSessionId,
         AgentSessionState, AgentWorkspace, AuthorizedKeyBootstrap, AuthorizedKeyBootstrapReason,
@@ -11401,6 +11698,7 @@ mod tests {
         VERIFIED_NESTED_SUDO_COMMANDS, VaultSshCredentialProvider,
         authorized_key_bootstrap_failure_state, authorized_key_bootstrap_is_eligible,
         execute_authorized_key_install_with_timeout, initial_pty_cwd, russh_inactivity_timeout,
+        verified_nested_ssh_commands,
     };
     #[cfg(unix)]
     use super::{
@@ -12001,6 +12299,7 @@ mod tests {
         }
 
         async fn sftp(&self, request: SftpRequest) -> Result<SftpResult, TransportError> {
+            tokio::time::sleep(self.0).await;
             Ok(SftpResult {
                 direction: request.spec.direction,
                 bytes_transferred: 0,
@@ -12105,13 +12404,26 @@ mod tests {
         called: Arc<AtomicBool>,
     }
 
+    struct DatabaseFailingInteractiveFileTransfer;
+
+    #[async_trait]
+    impl super::InteractiveFileTransferBackend for DatabaseFailingInteractiveFileTransfer {
+        async fn transfer_for_workspace(
+            &self,
+            _workspace_id: WorkspaceId,
+            _request: SftpRequest,
+        ) -> Result<Option<SftpResult>, super::InteractiveFileTransferError> {
+            Err(DbError::InvalidOutputSegment("simulated local metadata failure".to_owned()).into())
+        }
+    }
+
     #[async_trait]
     impl super::InteractiveFileTransferBackend for RecordingInteractiveFileTransfer {
         async fn transfer_for_workspace(
             &self,
             _workspace_id: WorkspaceId,
             request: SftpRequest,
-        ) -> Result<Option<SftpResult>, TransportError> {
+        ) -> Result<Option<SftpResult>, super::InteractiveFileTransferError> {
             self.called.store(true, Ordering::SeqCst);
             let bytes_transferred = tokio::fs::metadata(&request.spec.local_path)
                 .await
@@ -12244,6 +12556,16 @@ mod tests {
 
     struct EndingPtyBackend;
 
+    struct EndingOutputPtyBackend {
+        text: String,
+    }
+
+    struct DatabaseErrorPtyBackend {
+        pool: sqlx::SqlitePool,
+    }
+
+    struct TransportFailurePtyBackend;
+
     struct HandshakeBudgetPtyBackend {
         retry_after_seconds: u64,
     }
@@ -12316,6 +12638,69 @@ mod tests {
             let (_output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(1);
             let (close_tx, _close_rx) = oneshot::channel();
             Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx))
+        }
+    }
+
+    #[async_trait]
+    impl ManagedPtyBackend for EndingOutputPtyBackend {
+        fn capabilities(&self) -> PtyBackendCapabilities {
+            PtyBackendCapabilities::openssh_pipe_shell()
+        }
+
+        async fn spawn(
+            &self,
+            _request: PtyBackendSpawnRequest,
+        ) -> Result<ManagedPtyProcess, super::ConnectorPtyError> {
+            let (input_tx, _input_rx) = mpsc::channel::<String>(1);
+            let (output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(1);
+            let (close_tx, _close_rx) = oneshot::channel();
+            output_tx
+                .send(PtyBackendOutput {
+                    stream: OutputStream::Stdout,
+                    text: self.text.clone(),
+                    truncated: false,
+                })
+                .await
+                .map_err(|error| super::ConnectorPtyError::Backend(error.to_string()))?;
+            drop(output_tx);
+            Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx))
+        }
+    }
+
+    #[async_trait]
+    impl ManagedPtyBackend for DatabaseErrorPtyBackend {
+        fn capabilities(&self) -> PtyBackendCapabilities {
+            PtyBackendCapabilities::russh_native_pty()
+        }
+
+        async fn spawn(
+            &self,
+            _request: PtyBackendSpawnRequest,
+        ) -> Result<ManagedPtyProcess, super::ConnectorPtyError> {
+            let error = sqlx::query("SELECT * FROM missing_pty_activation_metadata")
+                .execute(&self.pool)
+                .await
+                .err()
+                .ok_or_else(|| {
+                    super::ConnectorPtyError::Backend(
+                        "test database failure was not raised".to_owned(),
+                    )
+                })?;
+            Err(super::ConnectorPtyError::Database(error.into()))
+        }
+    }
+
+    #[async_trait]
+    impl ManagedPtyBackend for TransportFailurePtyBackend {
+        fn capabilities(&self) -> PtyBackendCapabilities {
+            PtyBackendCapabilities::russh_native_pty()
+        }
+
+        async fn spawn(
+            &self,
+            _request: PtyBackendSpawnRequest,
+        ) -> Result<ManagedPtyProcess, super::ConnectorPtyError> {
+            Err(TransportError::Backend("simulated SSH activation failure".to_owned()).into())
         }
     }
 
@@ -12928,6 +13313,16 @@ mod tests {
             Err(TransportError::LocalHandshakeBudgetExhausted {
                 retry_after_seconds: 56
             })
+        ));
+    }
+
+    #[test]
+    fn local_pty_control_plane_errors_do_not_degrade_ssh_health() {
+        assert!(!super::pty_activation_error_affects_connection_health(
+            &super::ConnectorPtyError::ControlPlane("workspace not found".to_owned())
+        ));
+        assert!(super::pty_activation_error_affects_connection_health(
+            &super::ConnectorPtyError::Backend("connection reset by peer".to_owned())
         ));
     }
 
@@ -14234,6 +14629,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_worker_keeps_remote_exec_running_when_claim_renewal_is_contended()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new_file_backed().await?;
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(SlowTransport(Duration::from_millis(1_500))),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 1,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+        let repositories = fixture.repositories.clone();
+        let operation_id = fixture.operation_id;
+        let handle = tokio::spawn(async move { worker.run_once().await });
+
+        wait_for_operation_state(&repositories, operation_id, OperationState::Running).await?;
+        let trigger = format!(
+            r"
+            CREATE TRIGGER reject_test_operation_lease_renewal
+            BEFORE UPDATE OF lease_expires_at ON operation_runs
+            WHEN OLD.id = '{operation_id}' AND NEW.lease_expires_at IS NOT NULL
+            BEGIN
+                SELECT RAISE(FAIL, 'database is locked');
+            END
+            "
+        );
+        let admin_pool = connect_sqlite(
+            fixture
+                .database_url
+                .as_deref()
+                .ok_or("file-backed fixture database URL should exist")?,
+        )
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(trigger.as_str()))
+            .execute(&admin_pool)
+            .await?;
+
+        let outcome = handle.await??.ok_or("slow operation should finish")?;
+        assert_eq!(outcome.state, OperationState::Succeeded);
+        let operation = repositories
+            .operations
+            .get(operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        assert_eq!(operation.state, OperationState::Succeeded);
+        assert_eq!(operation.attempt_count, 1);
+        let health = repositories
+            .access_path_health
+            .get(operation.access_path_id)
+            .await?
+            .ok_or("access path health should exist")?;
+        assert_eq!(health.state, EntityState::Connected);
+        assert_eq!(health.failure_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_retries_terminal_result_persistence_without_reexecuting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new_file_backed().await?;
+        let admin_pool = connect_sqlite(
+            fixture
+                .database_url
+                .as_deref()
+                .ok_or("file-backed fixture database URL should exist")?,
+        )
+        .await?;
+        let trigger = format!(
+            r#"
+            CREATE TRIGGER reject_test_terminal_operation_once
+            BEFORE UPDATE OF state_json ON operation_runs
+            WHEN OLD.id = '{}' AND NEW.state_json = '"succeeded"'
+            BEGIN
+                SELECT RAISE(FAIL, 'database is locked');
+            END
+            "#,
+            fixture.operation_id
+        );
+        sqlx::query(sqlx::AssertSqlSafe(trigger.as_str()))
+            .execute(&admin_pool)
+            .await?;
+        let release_pool = admin_pool.clone();
+        let release_trigger = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            sqlx::query("DROP TRIGGER reject_test_terminal_operation_once")
+                .execute(&release_pool)
+                .await
+        });
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(FakeTransport),
+            ConnectorOperationWorkerConfig::production_default(fixture.connector_id),
+        );
+
+        let outcome = worker
+            .run_once()
+            .await?
+            .ok_or("operation should be claimed")?;
+        release_trigger.await??;
+        assert_eq!(outcome.state, OperationState::Succeeded);
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        assert_eq!(operation.state, OperationState::Succeeded);
+        assert_eq!(operation.attempt_count, 1);
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Done);
+        assert!(worker.run_once().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_keeps_sftp_running_when_claim_renewal_is_contended()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new_file_backed().await?;
+        let claim_token = "sftp-renewal-contention";
+        let operation = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                claim_token,
+                now_utc(),
+                now_utc() + time::Duration::seconds(1),
+                3,
+            )
+            .await?
+            .ok_or("operation should be claimed")?;
+        let trigger = format!(
+            r"
+            CREATE TRIGGER reject_test_sftp_lease_renewal
+            BEFORE UPDATE OF lease_expires_at ON operation_runs
+            WHEN OLD.id = '{}' AND NEW.lease_expires_at IS NOT NULL
+            BEGIN
+                SELECT RAISE(FAIL, 'database is locked');
+            END
+            ",
+            operation.id
+        );
+        let admin_pool = connect_sqlite(
+            fixture
+                .database_url
+                .as_deref()
+                .ok_or("file-backed fixture database URL should exist")?,
+        )
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(trigger.as_str()))
+            .execute(&admin_pool)
+            .await?;
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories,
+            StaticTransportProvider::new(SlowTransport(Duration::from_millis(1_500))),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 1,
+                max_attempts: 3,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+        let request = SftpRequest {
+            operation_id: operation.id,
+            host_id: operation.host_id,
+            access_path_id: operation.access_path_id,
+            spec: FileTransferSpec {
+                direction: SftpDirection::Download,
+                local_path: "/tmp/remote-hosts-renewal-test.bin".to_owned(),
+                remote_path: "/tmp/remote-hosts-renewal-test.bin".to_owned(),
+                overwrite: SftpOverwritePolicy::Replace,
+                mode: None,
+                max_size_bytes: 1024,
+                expected_sha256: None,
+                timeout_seconds: 5,
+            },
+            progress_tx: None,
+        };
+
+        let result = worker
+            .sftp_with_lease_renewal(
+                &operation,
+                Arc::new(SlowTransport(Duration::from_millis(1_500))),
+                request,
+                None,
+            )
+            .await?;
+        assert_eq!(result.direction, SftpDirection::Download);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connector_worker_marks_expired_max_attempt_operation_exhausted()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = WorkerFixture::new().await?;
@@ -14324,6 +14920,113 @@ mod tests {
         assert!(joined.contains("automatic connector retry budget exhausted"));
         assert!(joined.contains("recovery_hint="));
         assert!(worker.run_once().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_worker_retries_atomic_exhaustion_without_partial_terminal_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new_file_backed().await?;
+        let first_claim = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "atomic-exhaustion-claim-1",
+                now_utc(),
+                now_utc() - time::Duration::seconds(1),
+                2,
+            )
+            .await?
+            .ok_or("first claim should succeed")?;
+        assert_eq!(first_claim.attempt_count, 1);
+        let second_claim = fixture
+            .repositories
+            .operations
+            .claim_next_for_connector(
+                fixture.connector_id,
+                "atomic-exhaustion-claim-2",
+                now_utc(),
+                now_utc() - time::Duration::seconds(1),
+                2,
+            )
+            .await?
+            .ok_or("second claim should succeed")?;
+        assert_eq!(second_claim.attempt_count, 2);
+
+        let database_url = fixture
+            .database_url
+            .as_deref()
+            .ok_or("file-backed fixture database URL should exist")?;
+        let admin_pool = connect_sqlite(database_url).await?;
+        let trigger = format!(
+            r#"
+            CREATE TRIGGER reject_test_atomic_exhaustion_workspace_once
+            BEFORE UPDATE OF state_json ON agent_workspaces
+            WHEN OLD.workspace_id = '{}' AND NEW.state_json = '"blocked"'
+            BEGIN
+                SELECT RAISE(FAIL, 'database is locked');
+            END
+            "#,
+            fixture.workspace_id
+        );
+        sqlx::query(sqlx::AssertSqlSafe(trigger.as_str()))
+            .execute(&admin_pool)
+            .await?;
+
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(FakeTransport),
+            ConnectorOperationWorkerConfig {
+                connector_id: fixture.connector_id,
+                lease_seconds: 300,
+                max_attempts: 2,
+                artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+                artifact_preview_bytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+            },
+        );
+        let worker_handle = tokio::spawn(async move { worker.run_once().await });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!worker_handle.is_finished());
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        assert_eq!(operation.state, OperationState::Running);
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Working);
+
+        sqlx::query("DROP TRIGGER reject_test_atomic_exhaustion_workspace_once")
+            .execute(&admin_pool)
+            .await?;
+        let outcome = worker_handle
+            .await??
+            .ok_or("worker should exhaust the stale operation")?;
+        assert_eq!(outcome.state, OperationState::Exhausted);
+        assert_eq!(outcome.workspace_state, WorkspaceState::Blocked);
+
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        assert_eq!(operation.state, OperationState::Exhausted);
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        assert_eq!(workspace.state, WorkspaceState::Blocked);
         Ok(())
     }
 
@@ -15806,6 +16509,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_pty_activation_database_error_stays_pending_without_degrading_ssh()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new_file_backed().await?;
+        let database_url = fixture
+            .database_url
+            .as_deref()
+            .ok_or("file-backed fixture database URL should exist")?;
+        let backend_pool = connect_sqlite(database_url).await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let connection = fixture
+            .repositories
+            .connection_sessions
+            .get(fixture.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        let pending = PtySessionSupervisor::default().open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: fixture.session_id,
+                cwd: Some("/tmp".to_owned()),
+                coordination_scopes: None,
+            },
+        )?;
+        fixture.repositories.pty_sessions.upsert(&pending).await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            DatabaseErrorPtyBackend { pool: backend_pool },
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+
+        let error = manager
+            .activate_next_pending()
+            .await
+            .err()
+            .ok_or("database activation error should be observable")?;
+        assert!(matches!(error, super::ConnectorPtyError::Database(_)));
+        let still_pending = fixture
+            .repositories
+            .pty_sessions
+            .get(pending.pty_session_id)
+            .await?
+            .ok_or("pending PTY should remain persisted")?;
+        assert_eq!(still_pending.backend_state, PtyBackendState::Pending);
+        assert!(still_pending.input_allowed);
+        let current_connection = fixture
+            .repositories
+            .connection_sessions
+            .get(connection.session_id)
+            .await?
+            .ok_or("connection should exist")?;
+        assert_eq!(current_connection.state, EntityState::Connected);
+        assert_eq!(current_connection.failure_count, 0);
+        let health = fixture
+            .repositories
+            .access_path_health
+            .get(connection.access_path_id)
+            .await?
+            .ok_or("access path health should exist")?;
+        assert_eq!(health.state, EntityState::Healthy);
+        assert_eq!(health.failure_count, 0);
+        assert_eq!(health.last_error_code, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_health_persistence_error_does_not_replace_transport_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new_file_backed().await?;
+        let admin_pool = connect_sqlite(
+            fixture
+                .database_url
+                .as_deref()
+                .ok_or("file-backed fixture database URL should exist")?,
+        )
+        .await?;
+        sqlx::query(
+            r"
+            CREATE TRIGGER reject_test_pty_health_persistence
+            BEFORE UPDATE ON access_path_health
+            BEGIN
+                SELECT RAISE(FAIL, 'database is locked');
+            END
+            ",
+        )
+        .execute(&admin_pool)
+        .await?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            TransportFailurePtyBackend,
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+
+        let error = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await
+            .err()
+            .ok_or("transport activation should fail")?;
+        assert!(matches!(
+            error,
+            super::ConnectorPtyError::Transport(TransportError::Backend(ref message))
+                if message.contains("simulated SSH activation failure")
+        ));
+        sqlx::query("DROP TRIGGER reject_test_pty_health_persistence")
+            .execute(&admin_pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connector_pty_manager_closes_pending_sessions_for_terminal_workspaces()
     -> Result<(), Box<dyn std::error::Error>> {
         for terminal_state in [
@@ -16072,6 +16891,82 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_pty_manager_retries_final_output_contention_before_closing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new_file_backed().await?;
+        let admin_pool = connect_sqlite(
+            fixture
+                .database_url
+                .as_deref()
+                .ok_or("file-backed fixture database URL should exist")?,
+        )
+        .await?;
+        sqlx::query(
+            r"
+            CREATE TRIGGER reject_test_final_pty_output
+            BEFORE INSERT ON pty_output_chunks
+            BEGIN
+                SELECT RAISE(FAIL, 'database is locked');
+            END
+            ",
+        )
+        .execute(&admin_pool)
+        .await?;
+        let release_pool = admin_pool.clone();
+        let release_trigger = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            sqlx::query("DROP TRIGGER reject_test_final_pty_output")
+                .execute(&release_pool)
+                .await
+        });
+        let expected = "terminal output survives metadata contention\n";
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            EndingOutputPtyBackend {
+                text: expected.to_owned(),
+            },
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        );
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+
+        release_trigger.await??;
+        wait_for_pty_output(
+            &fixture.repositories,
+            opened.pty_session.pty_session_id,
+            expected,
+        )
+        .await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let session = fixture
+                .repositories
+                .pty_sessions
+                .get(opened.pty_session.pty_session_id)
+                .await?
+                .ok_or("PTY should exist")?;
+            if session.backend_state == PtyBackendState::Closed {
+                assert_eq!(session.state, WorkspaceState::Done);
+                assert!(!session.input_allowed);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("PTY did not close after final output was persisted".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let chunks = fixture
+            .repositories
+            .pty_output_chunks
+            .list_for_session(opened.pty_session.pty_session_id, None, 10)
+            .await?;
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].redacted_text, expected);
         Ok(())
     }
 
@@ -16426,9 +17321,42 @@ mod tests {
             .workspaces
             .update_state(fixture.workspace_id, WorkspaceState::Blocked, now)
             .await?;
-        let verified_ssh_command = format!(
-            "/usr/bin/ssh -o StrictHostKeyChecking=yes -o NumberOfPasswordPrompts=1 -p {} {}@{}\n",
-            access_path.port, access_path.username, access_path.address
+        let source_host = fixture
+            .repositories
+            .hosts
+            .get(fixture.host_id)
+            .await?
+            .ok_or("source host should exist")?;
+        let verified_ssh_commands = verified_nested_ssh_commands(&access_path, &source_host.kind)?;
+        assert_eq!(verified_ssh_commands.len(), 1);
+        assert_eq!(
+            verified_ssh_commands[0],
+            format!(
+                "/usr/bin/ssh -o StrictHostKeyChecking=yes -o NumberOfPasswordPrompts=1 -p {} {}@{}\n",
+                access_path.port, access_path.username, access_path.address
+            )
+        );
+        let verified_ssh_command = verified_ssh_commands[0].clone();
+        let windows_ssh_commands = verified_nested_ssh_commands(&access_path, &HostKind::Windows)?;
+        assert_eq!(windows_ssh_commands.len(), 2);
+        assert_eq!(
+            windows_ssh_commands[0],
+            format!(
+                "C:\\Windows\\System32\\OpenSSH\\ssh.exe -o StrictHostKeyChecking=yes -o NumberOfPasswordPrompts=1 -p {} {}@{}\n",
+                access_path.port, access_path.username, access_path.address
+            )
+        );
+        assert_eq!(
+            windows_ssh_commands[1],
+            format!(
+                "C:\\Windows\\System32\\OpenSSH\\ssh.exe -o StrictHostKeyChecking=yes -o NumberOfPasswordPrompts=1 -p {} {}@{}\r\n",
+                access_path.port, access_path.username, access_path.address
+            )
+        );
+        assert!(
+            windows_ssh_commands
+                .iter()
+                .all(|command| command != &verified_ssh_command)
         );
         let command_event = PtyInputEvent {
             id: PtyInputEventId::new(),
@@ -17983,6 +18911,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interactive_transfer_database_failure_does_not_degrade_ssh_health()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let fallback_called = Arc::new(AtomicBool::new(false));
+        let worker = ConnectorOperationWorker::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(InteractiveRoutingTransport {
+                fallback_called: Arc::clone(&fallback_called),
+            }),
+            ConnectorOperationWorkerConfig::production_default(fixture.connector_id),
+        );
+        worker
+            .run_once()
+            .await?
+            .ok_or("fixture operation should finish first")?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace should exist")?;
+        let health_before = fixture
+            .repositories
+            .access_path_health
+            .get(workspace.access_path_id)
+            .await?
+            .ok_or("access path health should remain available")?;
+
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("interactive-db-failure.bin");
+        tokio::fs::write(&source, b"metadata-failure-must-not-poison-ssh").await?;
+        let plan = WorkspaceOperationSupervisor::default().queue_file_transfer(
+            &WorkspaceFileTransfer {
+                workspace,
+                spec: FileTransferSpec {
+                    direction: SftpDirection::Upload,
+                    local_path: source.to_string_lossy().into_owned(),
+                    remote_path: "/tmp/interactive-db-failure.bin".to_owned(),
+                    overwrite: SftpOverwritePolicy::Replace,
+                    mode: Some(0o600),
+                    max_size_bytes: 1024,
+                    expected_sha256: None,
+                    timeout_seconds: 30,
+                },
+                intent: Some("separate local metadata failure from SSH health".to_owned()),
+                idempotency_key: None,
+                queued_operations: 0,
+                active_exec_channels: 0,
+                overload_cooldown_active: false,
+            },
+        )?;
+        fixture
+            .repositories
+            .publish_queued_operation(
+                &plan.operation,
+                &plan.initial_output_chunk,
+                plan.workspace_state,
+                now_utc(),
+            )
+            .await?;
+        worker.set_interactive_file_transfer(Arc::new(DatabaseFailingInteractiveFileTransfer));
+
+        let result = worker.run_once().await;
+        assert!(matches!(
+            result,
+            Err(super::ConnectorWorkerError::Database(_))
+        ));
+        assert!(!fallback_called.load(Ordering::SeqCst));
+        let health = fixture
+            .repositories
+            .access_path_health
+            .get(plan.operation.access_path_id)
+            .await?
+            .ok_or("access path health should remain available")?;
+        assert_eq!(health.state, health_before.state);
+        assert_eq!(health.failure_count, health_before.failure_count);
+        assert_eq!(health.last_error_code, health_before.last_error_code);
+        assert_eq!(health.next_retry_at, health_before.next_retry_at);
+        Ok(())
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn connector_daemon_overlaps_readonly_operations()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -18157,6 +19167,71 @@ mod tests {
             "connector heartbeat must advance while a remote operation is still running"
         );
 
+        wait_for_operation_state(
+            &fixture.repositories,
+            fixture.operation_id,
+            OperationState::Succeeded,
+        )
+        .await?;
+        stop_tx.send(true)?;
+        handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connector_daemon_survives_temporary_heartbeat_database_contention()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new_file_backed().await?;
+        let admin_pool = connect_sqlite(
+            fixture
+                .database_url
+                .as_deref()
+                .ok_or("file-backed fixture database URL should exist")?,
+        )
+        .await?;
+        let daemon = ConnectorDaemon::new(
+            fixture.repositories.clone(),
+            StaticTransportProvider::new(SlowTransport(Duration::from_millis(500))),
+            ConnectorOperationWorkerConfig::production_default(fixture.connector_id),
+            ConnectorDaemonConfig {
+                connector_id: fixture.connector_id,
+                version: "heartbeat-contention-test".to_owned(),
+                current_network: None,
+                max_concurrent_operations: 1,
+                heartbeat_interval_ms: 10,
+                idle_min_delay_ms: 5,
+                idle_max_delay_ms: 10,
+                error_backoff_ms: 5,
+            },
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { daemon.run_until_stopped(stop_rx).await });
+        wait_for_operation_state(
+            &fixture.repositories,
+            fixture.operation_id,
+            OperationState::Running,
+        )
+        .await?;
+        sqlx::query(
+            r"
+            CREATE TRIGGER reject_test_connector_heartbeat
+            BEFORE UPDATE ON connectors
+            BEGIN
+                SELECT RAISE(FAIL, 'database is locked');
+            END
+            ",
+        )
+        .execute(&admin_pool)
+        .await?;
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !handle.is_finished(),
+            "temporary heartbeat persistence contention must not terminate the connector daemon"
+        );
+        sqlx::query("DROP TRIGGER reject_test_connector_heartbeat")
+            .execute(&admin_pool)
+            .await?;
         wait_for_operation_state(
             &fixture.repositories,
             fixture.operation_id,
@@ -18446,6 +19521,8 @@ mod tests {
 
     struct WorkerFixture {
         repositories: Repositories,
+        database_url: Option<String>,
+        _database_directory: Option<tempfile::TempDir>,
         host_id: HostId,
         agent_session_id: AgentSessionId,
         connector_id: ConnectorId,
@@ -18459,6 +19536,24 @@ mod tests {
         async fn new() -> Result<Self, Box<dyn std::error::Error>> {
             let pool = connect_sqlite("sqlite::memory:").await?;
             migrate(&pool).await?;
+            Self::from_pool(pool, None, None).await
+        }
+
+        async fn new_file_backed() -> Result<Self, Box<dyn std::error::Error>> {
+            let directory = tempfile::tempdir()?;
+            let database_path = directory.path().join("remote-hosts-test.sqlite");
+            let database_url = format!("sqlite://{}", database_path.display());
+            let pool = connect_sqlite(&database_url).await?;
+            migrate(&pool).await?;
+            Self::from_pool(pool, Some(database_url), Some(directory)).await
+        }
+
+        #[allow(clippy::too_many_lines)]
+        async fn from_pool(
+            pool: sqlx::SqlitePool,
+            database_url: Option<String>,
+            database_directory: Option<tempfile::TempDir>,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let repositories = Repositories::new(pool);
             let now = now_utc();
             let host = Host {
@@ -18618,6 +19713,8 @@ mod tests {
 
             Ok(Self {
                 repositories,
+                database_url,
+                _database_directory: database_directory,
                 host_id: host.id,
                 agent_session_id: agent_session.id,
                 connector_id: connector.id,

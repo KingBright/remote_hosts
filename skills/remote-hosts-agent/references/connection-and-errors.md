@@ -34,6 +34,13 @@ Before remote execution, inspect:
 
 ## Stop States
 
+Before using this list, separate local control-plane errors from SSH evidence. `database is locked`,
+`SQLITE_BUSY`, lifecycle publisher backlog, and heartbeat `metadata_persisted=false` describe the
+current Remote Hosts instance only. They do not prove TCP, SSH, the bastion, or an already-running
+inner PTY failed. Keep the same ids and cursor, follow the bounded metadata retry action, and inspect
+inner output when Remote Hosts is nested. Never reconnect, restart, signal, close, or replay a
+mutation solely because local metadata persistence was delayed.
+
 Stop and diagnose instead of retrying when you see:
 
 - `connector_offline`: local connector is not heartbeating; check the platform service manager and

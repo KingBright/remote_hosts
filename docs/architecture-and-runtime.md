@@ -212,8 +212,10 @@ the bare macOS form, the installed Agent skill requires an explicit `sudo` comma
 before the prompt on the same PTY, with no intervening input.
 
 For a registered target reachable only from the active PTY host, the caller may send the exact
-connector-verified `/usr/bin/ssh` command and then request
-`use_stored_password_from_host_id=<target-host-id>` on the resulting generic password prompt. Pin the target host key first and use `StrictHostKeyChecking=yes` so this also works with older OpenSSH clients while still failing closed on unknown or changed keys. The
+connector-verified `/usr/bin/ssh` command on POSIX or `C:\\Windows\\System32\\OpenSSH\\ssh.exe`
+on Windows. The accepted executable form is bound to the source PTY Workspace's authoritative Host
+kind; a Windows path fingerprint is rejected on POSIX and vice versa. On the resulting generic
+password prompt, request `use_stored_password_from_host_id=<target-host-id>`. Pin the target host key first and use `StrictHostKeyChecking=yes` so this also works with older OpenSSH clients while still failing closed on unknown or changed keys. The
 target must have one enabled SSH path. The public input event stores only
 `stored_ssh_password` metadata, while its private payload contains only the target access-path id.
 Before and after vault decryption, the connector verifies the live prompt, unchanged target path,
@@ -263,8 +265,11 @@ bounded last publisher error so observability degradation is never silent. It ne
 input, or exposes foreign-session command/output identifiers. The loopback/admin HTTP equivalents
 are `GET /v1/agent-sessions/{id}/work-context` and
 `POST /v1/agent-sessions/{id}/work-context/wait`. A timed-out wait returns a compact
-`changed=false` acknowledgement with the unchanged cursor and empty host/item arrays; callers keep
-the last changed context, and the unchanged cursor makes a racing lifecycle event replayable.
+`changed=false` acknowledgement with `overall_state=waiting`, a single
+`primary_action.kind=wait`, the unchanged cursor, and empty host/item arrays. It never claims that
+an active Session became idle merely because no new lifecycle row arrived. Callers keep the last
+changed context and wait again from the same cursor; the unchanged cursor makes a racing lifecycle
+event replayable.
 
 SQLite triggers append minimal Workspace, operation, PTY, input, transfer-progress, and connection
 transitions to `lifecycle_outbox` in the same transaction as the durable business state. Agent Work
@@ -278,6 +283,19 @@ acknowledgement in `agent_work_context_cursors`, so MCP/API restarts do not re-d
 acknowledged terminal row or consume another Host filter's terminal rows; events racing the wait
 remain above the cursor. Cursors must not be reused with a different Host filter. Legacy event rows
 remain readable.
+
+SQLite is a durable control plane, not part of the SSH transport. The Connector serializes its
+short operation, PTY-output, heartbeat, transport-evidence, and terminal-state metadata writes
+through one process-local writer gate while SSH exec, PTY, and SFTP I/O remain concurrent. A
+transient `SQLITE_BUSY`/`SQLITE_LOCKED` during claim or lease renewal does not cancel an already
+running remote operation. Terminal output and the operation/Workspace terminal transaction keep
+retrying transient contention without re-executing the remote action; exhausted operations and
+their blocked Workspaces also commit together. PTY output applies bounded-channel backpressure
+once its in-memory persistence batch is full, rather than continuing to grow memory during a long
+SQLite outage. PTY heartbeat persistence is advisory: MCP returns `metadata_persisted=false` and
+`continue_pty_and_retry_heartbeat`, while the existing shell remains authoritative. Local metadata
+failures never update access-path health or become `ssh_handshake_failed`; only an observed
+transport failure may degrade SSH health.
 
 ## MCP Profiles
 

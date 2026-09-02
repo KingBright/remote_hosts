@@ -5614,7 +5614,7 @@ impl RemoteHostsMcpServer {
                 },
             )
             .map_err(|error| error.to_string())?;
-        retry_sqlite_contention(|| async {
+        let persistence = retry_sqlite_contention(|| async {
             self.repositories.pty_sessions.upsert(&updated).await?;
             if updated.state != WorkspaceState::Closed {
                 self.repositories
@@ -5628,9 +5628,19 @@ impl RemoteHostsMcpServer {
             }
             Ok(())
         })
-        .await
-        .map_err(|error| tool_error(&error))?;
-        Ok(Json(pty_session_output(&updated)?))
+        .await;
+        let mut output = pty_session_output(&updated)?;
+        match persistence {
+            Ok(()) => output.metadata_persisted = Some(true),
+            Err(error) if error.is_sqlite_contention() => {
+                output.metadata_persisted = Some(false);
+                "continue_pty_and_retry_heartbeat".clone_into(&mut output.recommended_action);
+                output.poll_after_ms = Some(1_000);
+                output.advisory_warning = Some("local_metadata_temporarily_unavailable".to_owned());
+            }
+            Err(error) => return Err(tool_error(&error)),
+        }
+        Ok(Json(output))
     }
 
     /// Close a PTY session.
@@ -6686,6 +6696,12 @@ pub struct PtySessionOutput {
     pub recommended_action: String,
     /// Suggested delay before polling when activation or output is still pending.
     pub poll_after_ms: Option<u64>,
+    /// Whether this advisory request was durably persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_persisted: Option<bool>,
+    /// Bounded local control-plane warning that does not imply SSH or PTY failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advisory_warning: Option<String>,
 }
 
 fn pty_session_output(pty_session: &PtySession) -> Result<PtySessionOutput, String> {
@@ -6702,6 +6718,8 @@ fn pty_session_output(pty_session: &PtySession) -> Result<PtySessionOutput, Stri
         backend_ready,
         recommended_action: recommended_action.to_owned(),
         poll_after_ms,
+        metadata_persisted: None,
+        advisory_warning: None,
     })
 }
 
@@ -8731,6 +8749,12 @@ mod tests {
         .await?;
         assert_eq!(unchanged["changed"], json!(false));
         assert_eq!(unchanged["cursor"], json!(cursor));
+        assert_eq!(unchanged["overall_state"], json!("waiting"));
+        assert_eq!(unchanged["primary_action"]["kind"], json!("wait"));
+        assert_eq!(
+            unchanged["primary_action"]["reason_code"],
+            json!("no_lifecycle_change")
+        );
         assert_eq!(unchanged["items"], json!([]));
         assert!(unchanged.to_string().len() < 1024);
 
@@ -8787,7 +8811,8 @@ mod tests {
         )
         .await?;
         assert_eq!(consumed["changed"], json!(false));
-        assert_eq!(consumed["overall_state"], json!("idle"));
+        assert_eq!(consumed["overall_state"], json!("waiting"));
+        assert_eq!(consumed["primary_action"]["kind"], json!("wait"));
         assert_eq!(consumed["items"], json!([]));
         Ok(())
     }
@@ -12656,6 +12681,88 @@ mod tests {
         assert_eq!(closed["pty_session"]["state"], json!("closed"));
         assert_eq!(closed["pty_session"]["input_allowed"], json!(false));
         assert_eq!(closed["pty_session"]["last_exit_code"], json!(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_pty_heartbeat_reports_advisory_metadata_contention_without_tool_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let created = call_tool(
+            fixture.server(),
+            tools::CREATE_WORKSPACE,
+            Some(json!({
+                "host_id": fixture.host_id.to_string(),
+                "access_path_id": fixture.access_path_id.to_string(),
+                "label": "heartbeat-contention",
+                "cwd": "/tmp"
+            })),
+        )
+        .await?;
+        let workspace_id = created["workspace"]["id"]
+            .as_str()
+            .ok_or("created workspace id should be a string")?;
+        let opened = call_tool(
+            fixture.server(),
+            tools::OPEN_WORKSPACE_PTY_SESSION,
+            Some(json!({"workspace_id": workspace_id, "cwd": "/tmp"})),
+        )
+        .await?;
+        let pty_session_id = opened["pty_session"]["pty_session_id"]
+            .as_str()
+            .ok_or("pty session id should be a string")?;
+        sqlx::query(
+            r"
+            CREATE TRIGGER fail_advisory_heartbeat
+            BEFORE UPDATE ON pty_sessions
+            BEGIN
+                SELECT RAISE(FAIL, 'database is locked');
+            END;
+            ",
+        )
+        .execute(&fixture.pool)
+        .await?;
+
+        let heartbeat = call_tool_raw(
+            fixture.server(),
+            tools::HEARTBEAT_PTY_SESSION,
+            Some(json!({
+                "pty_session_id": pty_session_id,
+                "state": "working",
+                "foreground_process": "python long-running.py",
+                "cwd": "/tmp",
+                "recent_output_ref": null,
+                "last_exit_code": null,
+                "input_allowed": true
+            })),
+        )
+        .await?;
+        assert_ne!(heartbeat.is_error, Some(true));
+        let heartbeat = heartbeat
+            .structured_content
+            .ok_or("heartbeat response should contain structured content")?;
+        assert_eq!(heartbeat["metadata_persisted"], json!(false));
+        assert_eq!(
+            heartbeat["recommended_action"],
+            json!("continue_pty_and_retry_heartbeat")
+        );
+        assert_eq!(heartbeat["poll_after_ms"], json!(1_000));
+        assert_eq!(
+            heartbeat["advisory_warning"],
+            json!("local_metadata_temporarily_unavailable")
+        );
+
+        sqlx::query("DROP TRIGGER fail_advisory_heartbeat")
+            .execute(&fixture.pool)
+            .await?;
+        let stored = fixture
+            .repositories
+            .pty_sessions
+            .get(PtySessionId::from(uuid::Uuid::parse_str(pty_session_id)?))
+            .await?
+            .ok_or("PTY should remain available")?;
+        assert_eq!(stored.foreground_process, None);
+        assert!(stored.input_allowed);
         Ok(())
     }
 
