@@ -2175,6 +2175,8 @@ pub struct RusshTransportConfig {
     pub windows: bool,
     /// Use a managed exec data stream when this gateway route cannot carry SFTP writes.
     pub use_exec_file_transfer: bool,
+    /// Fall back to the managed exec data stream only when a POSIX route cannot start SFTP.
+    pub allow_exec_file_transfer_fallback: bool,
     /// Host key policy.
     pub host_key_policy: HostKeyPolicy,
     /// Optional `known_hosts` path.
@@ -2259,6 +2261,8 @@ impl<C> RusshTransport<C> {
         let channel_limit = usize::from(config.max_concurrent_channels.max(1));
         let file_transfer_mode = if config.use_exec_file_transfer {
             SshFileTransferMode::ExecFramed
+        } else if config.allow_exec_file_transfer_fallback {
+            SshFileTransferMode::SftpWithExecFallback
         } else {
             SshFileTransferMode::Sftp
         };
@@ -2648,23 +2652,13 @@ where
             .map_err(|error| TransportError::FileTransfer(error.to_string()))?;
         let timeout = Duration::from_secs(request.spec.timeout_seconds);
         let _channel_permit = self.acquire_channel().await?;
-        if self.config.use_exec_file_transfer {
-            if let Ok(result) =
-                tokio::time::timeout(timeout, execute_russh_exec_file_transfer(self, request)).await
-            {
-                result
-            } else {
-                let mut guard = self.session.lock().await;
-                if guard.take().is_some() {
-                    self.telemetry.disconnected();
-                }
-                Err(TransportError::Timeout)
-            }
+        if let Ok(result) =
+            tokio::time::timeout(timeout, execute_russh_file_transfer(self, request)).await
+        {
+            result
         } else {
-            let session = self.session().await?;
-            tokio::time::timeout(timeout, execute_russh_sftp(session, request))
-                .await
-                .map_err(|_| TransportError::Timeout)?
+            self.invalidate_current_session().await;
+            Err(TransportError::Timeout)
         }
     }
 
@@ -2676,6 +2670,93 @@ where
             "russh port forwarding is not implemented yet".to_owned(),
         ))
     }
+}
+
+async fn execute_russh_file_transfer<C>(
+    transport: &RusshTransport<C>,
+    request: SftpRequest,
+) -> Result<SftpResult, TransportError>
+where
+    C: SshCredentialProvider,
+{
+    if transport.config.use_exec_file_transfer {
+        return execute_russh_exec_file_transfer(transport, request).await;
+    }
+
+    let session = transport.session().await?;
+    let startup_timeout = sftp_subsystem_startup_timeout(
+        transport.config.connect_timeout_seconds,
+        request.spec.timeout_seconds,
+    );
+    match execute_russh_sftp(session, request.clone(), startup_timeout).await {
+        Ok(result) => Ok(result),
+        Err(error)
+            if should_fallback_to_exec_file_transfer(
+                transport.config.allow_exec_file_transfer_fallback,
+                &error,
+            ) =>
+        {
+            tracing::warn!(
+                error = %error.as_transport_error(),
+                "SFTP subsystem is unavailable; using verified POSIX exec file transfer"
+            );
+            execute_russh_exec_file_transfer(transport, request)
+                .await
+                .map_err(|fallback_error| {
+                    TransportError::FileTransfer(format!(
+                        "SFTP subsystem is unavailable ({}); POSIX exec fallback failed ({fallback_error})",
+                        error.as_transport_error()
+                    ))
+                })
+        }
+        Err(error) => Err(error.into_transport_error()),
+    }
+}
+
+enum RusshSftpAttemptError {
+    SubsystemUnavailable(TransportError),
+    Transfer(TransportError),
+}
+
+impl RusshSftpAttemptError {
+    fn as_transport_error(&self) -> &TransportError {
+        match self {
+            Self::SubsystemUnavailable(error) | Self::Transfer(error) => error,
+        }
+    }
+
+    fn into_transport_error(self) -> TransportError {
+        match self {
+            Self::SubsystemUnavailable(error) | Self::Transfer(error) => error,
+        }
+    }
+}
+
+fn should_fallback_to_exec_file_transfer(
+    fallback_allowed: bool,
+    error: &RusshSftpAttemptError,
+) -> bool {
+    fallback_allowed && matches!(error, RusshSftpAttemptError::SubsystemUnavailable(_))
+}
+
+fn sftp_subsystem_startup_timeout(
+    connect_timeout_seconds: u64,
+    transfer_timeout_seconds: u64,
+) -> Duration {
+    let fallback_reserving_limit = transfer_timeout_seconds.saturating_div(4).max(1);
+    Duration::from_secs(connect_timeout_seconds.max(1).min(fallback_reserving_limit))
+}
+
+async fn await_sftp_subsystem_startup<F, T>(
+    timeout: Duration,
+    future: F,
+) -> Result<T, RusshSftpAttemptError>
+where
+    F: Future<Output = Result<T, RusshSftpAttemptError>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| RusshSftpAttemptError::SubsystemUnavailable(TransportError::Timeout))?
 }
 
 async fn execute_russh_exec_file_transfer<C>(
@@ -4394,21 +4475,31 @@ fn sanitized_transfer_diagnostics(
 async fn execute_russh_sftp(
     session: Arc<client::Handle<RusshClientHandler>>,
     request: SftpRequest,
-) -> Result<SftpResult, TransportError> {
+    startup_timeout: Duration,
+) -> Result<SftpResult, RusshSftpAttemptError> {
     let channel = session.channel_open_session().await.map_err(|error| {
-        TransportError::FileTransfer(format!("open SFTP channel on pooled SSH session: {error}"))
+        RusshSftpAttemptError::Transfer(TransportError::FileTransfer(format!(
+            "open SFTP channel on pooled SSH session: {error}"
+        )))
     })?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|error| {
-            TransportError::FileTransfer(format!("request SFTP subsystem: {error}"))
-        })?;
-    let sftp = RusshSftp::new(channel.into_stream())
-        .await
-        .map_err(|error| {
-            TransportError::FileTransfer(format!("initialize SFTP subsystem: {error}"))
-        })?;
+    let sftp = await_sftp_subsystem_startup(startup_timeout, async move {
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|error| {
+                RusshSftpAttemptError::SubsystemUnavailable(TransportError::FileTransfer(format!(
+                    "request SFTP subsystem: {error}"
+                )))
+            })?;
+        RusshSftp::new(channel.into_stream())
+            .await
+            .map_err(|error| {
+                RusshSftpAttemptError::SubsystemUnavailable(TransportError::FileTransfer(format!(
+                    "initialize SFTP subsystem: {error}"
+                )))
+            })
+    })
+    .await?;
     sftp.set_timeout(request.spec.timeout_seconds);
     let result = match request.spec.direction {
         SftpDirection::Upload => russh_upload(&sftp, &request).await,
@@ -4420,7 +4511,7 @@ async fn execute_russh_sftp(
         .map_err(|error| TransportError::FileTransfer(format!("close SFTP subsystem: {error}")));
     match (result, close_result) {
         (Ok(result), Ok(())) => Ok(result),
-        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(RusshSftpAttemptError::Transfer(error)),
     }
 }
 
@@ -4822,6 +4913,10 @@ where
         let use_exec_file_transfer = !windows
             && access_path.route_type == RouteType::Bastion
             && access_path.proxy_chain.is_empty();
+        let allow_exec_file_transfer_fallback = !windows
+            && !use_exec_file_transfer
+            && !access_path.requires_tty
+            && access_path.proxy_chain.is_empty();
         let config = RusshTransportConfig {
             access_path_id,
             address: access_path.address,
@@ -4829,6 +4924,7 @@ where
             username: access_path.username,
             windows,
             use_exec_file_transfer,
+            allow_exec_file_transfer_fallback,
             host_key_policy: self.host_key_policy,
             known_hosts_path: self.known_hosts_path.clone(),
             connect_timeout_seconds: self.connect_timeout_seconds,
@@ -18443,6 +18539,119 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!first.config.use_exec_file_transfer);
+        assert!(first.config.allow_exec_file_transfer_fallback);
+        assert_eq!(
+            first
+                .transport_telemetry()
+                .ok_or("russh transport should expose telemetry")?
+                .capabilities
+                .file_transfer_mode,
+            SshFileTransferMode::SftpWithExecFallback
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exec_file_transfer_fallback_is_limited_to_sftp_subsystem_unavailability() {
+        let unavailable = super::RusshSftpAttemptError::SubsystemUnavailable(
+            TransportError::FileTransfer("initialize SFTP subsystem: Timeout".to_owned()),
+        );
+        let transfer_failure = super::RusshSftpAttemptError::Transfer(
+            TransportError::FileTransfer("remote destination already exists".to_owned()),
+        );
+
+        assert!(super::should_fallback_to_exec_file_transfer(
+            true,
+            &unavailable
+        ));
+        assert!(!super::should_fallback_to_exec_file_transfer(
+            false,
+            &unavailable
+        ));
+        assert!(!super::should_fallback_to_exec_file_transfer(
+            true,
+            &transfer_failure
+        ));
+    }
+
+    #[tokio::test]
+    async fn sftp_subsystem_startup_timeout_is_fallback_eligible() {
+        let result = super::await_sftp_subsystem_startup(
+            Duration::from_millis(5),
+            std::future::pending::<Result<(), super::RusshSftpAttemptError>>(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(super::RusshSftpAttemptError::SubsystemUnavailable(
+                TransportError::Timeout
+            ))
+        ));
+    }
+
+    #[test]
+    fn sftp_subsystem_startup_timeout_reserves_end_to_end_fallback_budget() {
+        assert_eq!(
+            super::sftp_subsystem_startup_timeout(5, 600),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            super::sftp_subsystem_startup_timeout(30, 8),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            super::sftp_subsystem_startup_timeout(0, 1),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn russh_public_posix_route_advertises_sftp_with_exec_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let operation = fixture
+            .repositories
+            .operations
+            .get(fixture.operation_id)
+            .await?
+            .ok_or("operation should exist")?;
+        let mut access_path = fixture
+            .repositories
+            .access_paths
+            .get(operation.access_path_id)
+            .await?
+            .ok_or("access path should exist")?;
+        access_path.route_type = RouteType::Public;
+        fixture
+            .repositories
+            .access_paths
+            .upsert(&access_path)
+            .await?;
+        let pool = RusshTransportPool::new(
+            fixture.repositories.clone(),
+            Arc::new(UnusedSshCredentialProvider),
+            HostKeyPolicy::Add,
+            None,
+            5,
+            30,
+            ServerProtectionPolicy::default().max_new_ssh_handshakes_per_10_min,
+        );
+
+        let transport = pool
+            .transport_for_access_path(operation.access_path_id)
+            .await?;
+
+        assert!(!transport.config.use_exec_file_transfer);
+        assert!(transport.config.allow_exec_file_transfer_fallback);
+        assert_eq!(
+            transport
+                .transport_telemetry()
+                .ok_or("russh transport should expose telemetry")?
+                .capabilities
+                .file_transfer_mode,
+            SshFileTransferMode::SftpWithExecFallback
+        );
         Ok(())
     }
 
@@ -18588,6 +18797,15 @@ mod tests {
             .await?;
 
         assert!(transport.config.use_exec_file_transfer);
+        assert!(!transport.config.allow_exec_file_transfer_fallback);
+        assert_eq!(
+            transport
+                .transport_telemetry()
+                .ok_or("russh transport should expose telemetry")?
+                .capabilities
+                .file_transfer_mode,
+            SshFileTransferMode::ExecFramed
+        );
         Ok(())
     }
 

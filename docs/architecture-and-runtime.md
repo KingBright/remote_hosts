@@ -184,7 +184,12 @@ data from a same-directory temporary file.
 
 The connector chooses a route-compatible implementation:
 
-- Direct routes use pooled SFTP.
+- Direct POSIX routes prefer pooled SFTP and use a bounded subsystem-startup window within the
+  single end-to-end transfer timeout. They fall back to the verified framed exec channel only
+  when that startup window expires or the SFTP subsystem cannot be requested or initialized.
+  Transfer, validation, permission, and placement failures never switch protocols after file
+  mutation may have started.
+- Direct Windows routes use pooled SFTP without the POSIX fallback.
 - Non-interactive single-hop POSIX bastions may use bounded framed exec channels.
 - Interactive asset-menu bastions reuse the Workspace's already-selected active PTY.
 
