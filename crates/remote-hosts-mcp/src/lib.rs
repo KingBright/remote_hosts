@@ -1492,7 +1492,12 @@ impl RemoteHostsMcpServer {
                     let chunks = self
                         .repositories
                         .operation_output_chunks
-                        .list_for_workspace(workspace.id, Some(operation.id), None, 20)
+                        .list_for_workspace(
+                            workspace.id,
+                            Some(operation.id),
+                            next_sequence.checked_sub(21),
+                            20,
+                        )
                         .await
                         .map_err(|error| tool_error(&error))?;
                     transfer_progress_from_chunks(&chunks)
@@ -8120,6 +8125,72 @@ mod tests {
             .ok_or("terminal transfer result should parse")?;
         assert_eq!(parsed.bytes, Some(8192));
         assert_eq!(parsed.sha256.as_deref(), Some(digest.as_str()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_work_context_reads_latest_transfer_progress_after_twenty_chunks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let server = fixture
+            .server()
+            .with_agent_session_context(AgentSessionContext {
+                client_kind: Some("codex".into()),
+                client_instance_id: Some("transfer-tail-test".into()),
+                project_key: Some("remote-hosts".into()),
+                conversation_key: Some("transfer-tail-test".into()),
+            });
+        let prepared = call_tool(
+            server.clone(),
+            tools::PREPARE_WORKSPACE,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        let workspace_id =
+            super::parse_workspace_id(prepared["workspace"]["id"].as_str().ok_or("workspace")?)?;
+        let queued = call_tool(
+            server.clone(),
+            tools::UPLOAD_FILE,
+            Some(json!({
+                "workspace_id": workspace_id.to_string(), "local_path": "/tmp/source.bin",
+                "remote_path": "/tmp/destination.bin", "intent": "verify latest transfer progress"
+            })),
+        )
+        .await?;
+        let operation_id =
+            super::parse_operation_id(queued["operation"]["id"].as_str().ok_or("operation")?)?;
+        for sequence in 1..=45 {
+            let text = format!(
+                "file transfer progress: stage=minio_uploading, bytes_transferred={sequence}, total_bytes=100, resumed_bytes=0, retry_count=0, elapsed_seconds=1"
+            );
+            fixture
+                .repositories
+                .operation_output_chunks
+                .insert(&OperationOutputChunk {
+                    id: OperationOutputChunkId::new(),
+                    operation_id,
+                    workspace_id,
+                    stream: OutputStream::System,
+                    sequence,
+                    byte_len: text.len() as u64,
+                    redacted_text: text,
+                    truncated: false,
+                    created_at: now_utc(),
+                })
+                .await?;
+        }
+        let snapshot = call_tool(
+            server.clone(),
+            tools::GET_AGENT_WORK_CONTEXT,
+            Some(json!({"mode":"snapshot"})),
+        )
+        .await?;
+        let items = snapshot["items"].as_array().ok_or("items")?;
+        let item = items
+            .iter()
+            .find(|item| item["entity_id"] == json!(operation_id.to_string()))
+            .ok_or("transfer item")?;
+        assert_eq!(item["progress"]["bytes"], json!(45));
         Ok(())
     }
 

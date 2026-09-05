@@ -48,6 +48,8 @@ use remote_hosts_domain::{
     SshTransportTelemetry, StateReasonCode, WorkspaceId, WorkspaceState, now_utc,
 };
 use remote_hosts_vault::{CredentialSecret, CredentialVault, EncryptedCredentialBlob};
+
+pub mod minio_relay;
 use russh::{
     ChannelMsg, client,
     keys::{
@@ -623,6 +625,8 @@ async fn openssh_upload(
             local_path: spec.local_path.clone(),
             remote_path: spec.remote_path.clone(),
             overwrite: spec.overwrite,
+            transfer_method: None,
+            warnings: Vec::new(),
         })
     }
     .await;
@@ -700,6 +704,8 @@ async fn openssh_download(
             local_path: spec.local_path.clone(),
             remote_path: spec.remote_path.clone(),
             overwrite: spec.overwrite,
+            transfer_method: None,
+            warnings: Vec::new(),
         })
     }
     .await;
@@ -2619,6 +2625,7 @@ where
                 Arc::clone(&session),
                 command,
                 request.profile.output_limit_bytes,
+                completion_marker.as_deref(),
             ),
         )
         .await;
@@ -3249,6 +3256,8 @@ fn exec_upload_result(
         local_path: spec.local_path.clone(),
         remote_path: spec.remote_path.clone(),
         overwrite: spec.overwrite,
+        transfer_method: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -3673,6 +3682,8 @@ async fn execute_russh_exec_download_attempt(
             local_path: spec.local_path.clone(),
             remote_path: spec.remote_path.clone(),
             overwrite: spec.overwrite,
+            transfer_method: None,
+            warnings: Vec::new(),
         })
     }
     .await;
@@ -3749,7 +3760,12 @@ async fn execute_russh_transfer_command(
     let command = framed_posix_script_ssh_exec_command(&script, &marker);
     let mut outcome = tokio::time::timeout(
         EXEC_TRANSFER_STAGE_TIMEOUT,
-        execute_russh_command(session, command, EXEC_TRANSFER_OUTPUT_LIMIT_BYTES),
+        execute_russh_command(
+            session,
+            command,
+            EXEC_TRANSFER_OUTPUT_LIMIT_BYTES,
+            Some(&marker),
+        ),
     )
     .await
     .map_err(|_| TransportError::Timeout)?
@@ -3929,9 +3945,14 @@ async fn verify_russh_upload_destination(
     let verification =
         russh_exec_upload_destination_verify_command(remote_path, expected_size, expected_sha256);
     let command = framed_posix_script_ssh_exec_command(&verification, &marker);
-    let mut outcome = execute_russh_command(session, command, EXEC_TRANSFER_OUTPUT_LIMIT_BYTES)
-        .await
-        .map_err(|error| file_transfer_context("verify placed pooled upload", error))?;
+    let mut outcome = execute_russh_command(
+        session,
+        command,
+        EXEC_TRANSFER_OUTPUT_LIMIT_BYTES,
+        Some(&marker),
+    )
+    .await
+    .map_err(|error| file_transfer_context("verify placed pooled upload", error))?;
     let marker_seen = recover_framed_exec_status(&mut outcome, &marker);
     if !marker_seen {
         return Err(TransportError::FileTransfer(format!(
@@ -4606,6 +4627,8 @@ async fn russh_upload(
             local_path: spec.local_path.clone(),
             remote_path: spec.remote_path.clone(),
             overwrite: spec.overwrite,
+            transfer_method: None,
+            warnings: Vec::new(),
         })
     }
     .await;
@@ -4689,6 +4712,8 @@ async fn russh_download(
             local_path: spec.local_path.clone(),
             remote_path: spec.remote_path.clone(),
             overwrite: spec.overwrite,
+            transfer_method: None,
+            warnings: Vec::new(),
         })
     }
     .await;
@@ -5692,7 +5717,7 @@ async fn install_authorized_key(
     let command = authorized_keys_install_command(&key, windows);
     execute_authorized_key_install_with_timeout(
         AUTHORIZED_KEY_BOOTSTRAP_TIMEOUT,
-        execute_russh_command(session, command, 16 * 1024),
+        execute_russh_command(session, command, 16 * 1024, None),
     )
     .await
 }
@@ -5774,6 +5799,7 @@ async fn execute_russh_command(
     session: Arc<client::Handle<RusshClientHandler>>,
     command: String,
     output_limit_bytes: usize,
+    completion_marker: Option<&str>,
 ) -> Result<ExecResult, TransportError> {
     let mut channel = session
         .channel_open_session()
@@ -5783,7 +5809,8 @@ async fn execute_russh_command(
         .exec(true, command)
         .await
         .map_err(|error| TransportError::Backend(error.to_string()))?;
-    let result = receive_russh_exec_result(&mut channel, output_limit_bytes).await;
+    let result =
+        receive_russh_exec_result(&mut channel, output_limit_bytes, completion_marker).await;
     let _ = channel.close().await;
     result
 }
@@ -5791,14 +5818,19 @@ async fn execute_russh_command(
 async fn receive_russh_exec_result(
     channel: &mut russh::Channel<client::Msg>,
     output_limit_bytes: usize,
+    completion_marker: Option<&str>,
 ) -> Result<ExecResult, TransportError> {
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut exit_code = None;
     let mut truncated = false;
+    let mut control_tail = Vec::new();
     while let Some(message) = channel.wait().await {
         match message {
             ChannelMsg::Data { data } => {
+                if completion_marker.is_some() {
+                    retain_exec_control_tail(&mut control_tail, &data);
+                }
                 append_limited_utf8(&mut stdout, &data, output_limit_bytes, &mut truncated);
             }
             ChannelMsg::ExtendedData { data, ext: 1 } => {
@@ -5821,12 +5853,16 @@ async fn receive_russh_exec_result(
             _ => {}
         }
     }
-    Ok(ExecResult {
+    let mut result = ExecResult {
         exit_code,
         stdout,
         stderr,
         truncated,
-    })
+    };
+    if let Some(marker) = completion_marker {
+        restore_truncated_exec_frame(&mut result, &control_tail, marker);
+    }
+    Ok(result)
 }
 
 async fn run_russh_pty_channel<C>(
@@ -6069,6 +6105,36 @@ fn framed_posix_command(command: &str, marker: &str) -> String {
     let script =
         format!("{command}\nstatus=$?\nprintf '\\n{marker} %s\\n' \"$status\"\nexit \"$status\"");
     russh_transfer_exec_command(&script)
+}
+
+// Control evidence has a separate fixed budget from user-visible output.
+const EXEC_CONTROL_TAIL_BYTES: usize = 512;
+
+fn retain_exec_control_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
+    let bytes = &bytes[bytes.len().saturating_sub(EXEC_CONTROL_TAIL_BYTES)..];
+    let discard = (tail.len() + bytes.len()).saturating_sub(EXEC_CONTROL_TAIL_BYTES);
+    tail.drain(..discard);
+    tail.extend_from_slice(bytes);
+}
+
+fn restore_truncated_exec_frame(result: &mut ExecResult, tail: &[u8], marker: &str) {
+    use std::fmt::Write as _;
+
+    if !result.truncated {
+        return;
+    }
+    let mut control = ExecResult {
+        exit_code: None,
+        stdout: String::from_utf8_lossy(tail).into_owned(),
+        stderr: String::new(),
+        truncated: false,
+    };
+    if recover_framed_exec_status(&mut control, marker)
+        && let Some(status) = control.exit_code
+    {
+        // Reinsert only the validated control frame; the caller consumes and removes it.
+        let _ = write!(result.stdout, "\n{marker} {status}\n");
+    }
 }
 
 fn recover_framed_exec_status(result: &mut ExecResult, marker: &str) -> bool {
@@ -6515,6 +6581,7 @@ pub struct ConnectorPtyManager<B> {
     backend: B,
     config: ConnectorPtyManagerConfig,
     credential_provider: Option<Arc<dyn SshCredentialProvider>>,
+    minio_relay: Option<Arc<minio_relay::MinioRelayStore>>,
     active: Arc<Mutex<BTreeMap<PtySessionId, ActivePtyHandle>>>,
     capacity_wait_notified: Arc<Mutex<BTreeSet<PtySessionId>>>,
 }
@@ -6530,6 +6597,7 @@ where
             backend,
             config,
             credential_provider: None,
+            minio_relay: None,
             active: Arc::new(Mutex::new(BTreeMap::new())),
             capacity_wait_notified: Arc::new(Mutex::new(BTreeSet::new())),
         }
@@ -6540,6 +6608,32 @@ where
     pub fn with_credential_provider(mut self, provider: Arc<dyn SshCredentialProvider>) -> Self {
         self.credential_provider = Some(provider);
         self
+    }
+
+    /// Enables only explicitly configured, vault-backed interactive-bastion file relays.
+    #[must_use]
+    pub fn with_minio_relay(mut self, relay: Option<minio_relay::MinioRelayStore>) -> Self {
+        if let Some(store) = &relay {
+            tracing::info!(
+                profiles = store.config.profiles.len(),
+                "loaded private file relay policy"
+            );
+        }
+        self.minio_relay = relay.map(Arc::new);
+        self
+    }
+
+    /// Loads an optional private relay policy beside the configured vault file.
+    ///
+    /// # Errors
+    /// Rejects unreadable or invalid relay configuration.
+    pub fn with_minio_relay_config(
+        self,
+        path: &Path,
+        master: SecretString,
+    ) -> Result<Self, TransportError> {
+        let store = minio_relay::MinioRelayStore::load(path, self.repositories.clone(), master)?;
+        Ok(self.with_minio_relay(store))
     }
 
     /// Reconciles stale active PTY records left by an earlier connector process.
@@ -8675,6 +8769,7 @@ where
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn prepare_interactive_pty_upload(
         &self,
         handle: &InteractivePtyTransferHandle,
@@ -8717,6 +8812,8 @@ where
                 local_path: spec.local_path.clone(),
                 remote_path: spec.remote_path.clone(),
                 overwrite: spec.overwrite,
+                transfer_method: None,
+                warnings: Vec::new(),
             }));
         };
 
@@ -8910,6 +9007,8 @@ where
             local_path: spec.local_path.clone(),
             remote_path: spec.remote_path.clone(),
             overwrite: spec.overwrite,
+            transfer_method: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -9016,6 +9115,8 @@ where
             local_path: spec.local_path.clone(),
             remote_path: spec.remote_path.clone(),
             overwrite: spec.overwrite,
+            transfer_method: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -9122,9 +9223,27 @@ where
         stage: &str,
         script: &str,
     ) -> Result<ExecResult, TransportError> {
+        self.execute_pty_transfer_stage_with_timeout(
+            handle,
+            operation_id,
+            stage,
+            script,
+            PTY_TRANSFER_STAGE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn execute_pty_transfer_stage_with_timeout(
+        &self,
+        handle: &InteractivePtyTransferHandle,
+        operation_id: OperationId,
+        stage: &str,
+        script: &str,
+        timeout: Duration,
+    ) -> Result<ExecResult, TransportError> {
         let (command, marker) = pty_transfer_stage_command(operation_id, stage, script);
         let output = self
-            .send_pty_command_and_wait(handle, command, &marker, PTY_TRANSFER_STAGE_TIMEOUT)
+            .send_pty_command_and_wait(handle, command, &marker, timeout)
             .await?;
         let marker_prefix = format!("{marker} ");
         let exit_code = output.lines().find_map(|line| {
@@ -9407,6 +9526,18 @@ where
             })?;
         if access_path.route_type != RouteType::Bastion || !access_path.proxy_chain.is_empty() {
             return Ok(None);
+        }
+        if let Some(store) = &self.minio_relay
+            && let Some(profile) = store
+                .config
+                .profiles
+                .iter()
+                .find(|profile| profile.matches_route(&access_path))
+            && let Some(result) = self
+                .transfer_through_minio(store, profile, &request, workspace_id)
+                .await?
+        {
+            return Ok(Some(result));
         }
         let handle = self.interactive_transfer_handle(workspace_id).await?;
         let result = match request.spec.direction {
@@ -10200,8 +10331,12 @@ where
         let direction = format!("{:?}", result.direction).to_lowercase();
         let file_name = result.remote_path.rsplit('/').next().unwrap_or("<invalid>");
         let summary = format!(
-            "file transfer finished: state=succeeded, direction={direction}, file={file_name}, bytes={}, sha256={}, overwrite={:?}, pooled_session=true",
-            result.bytes_transferred, result.sha256, result.overwrite
+            "file transfer finished: state=succeeded, direction={direction}, file={file_name}, bytes={}, sha256={}, overwrite={:?}, transport={}, warnings={:?}",
+            result.bytes_transferred,
+            result.sha256,
+            result.overwrite,
+            result.transfer_method.as_deref().unwrap_or("ssh"),
+            result.warnings
         );
         self.append_terminal_system_chunk(operation, &summary)
             .await?;
@@ -12313,6 +12448,8 @@ mod tests {
                 local_path: request.spec.local_path,
                 remote_path: request.spec.remote_path,
                 overwrite: request.spec.overwrite,
+                transfer_method: None,
+                warnings: Vec::new(),
             })
         }
 
@@ -12359,6 +12496,8 @@ mod tests {
                 local_path: request.spec.local_path,
                 remote_path: request.spec.remote_path,
                 overwrite: request.spec.overwrite,
+                transfer_method: None,
+                warnings: Vec::new(),
             })
         }
 
@@ -12404,6 +12543,8 @@ mod tests {
                 local_path: request.spec.local_path,
                 remote_path: request.spec.remote_path,
                 overwrite: request.spec.overwrite,
+                transfer_method: None,
+                warnings: Vec::new(),
             })
         }
 
@@ -12536,6 +12677,8 @@ mod tests {
                 local_path: request.spec.local_path,
                 remote_path: request.spec.remote_path,
                 overwrite: request.spec.overwrite,
+                transfer_method: None,
+                warnings: Vec::new(),
             }))
         }
     }
@@ -12572,6 +12715,8 @@ mod tests {
                 local_path: request.spec.local_path,
                 remote_path: request.spec.remote_path,
                 overwrite: request.spec.overwrite,
+                transfer_method: None,
+                warnings: Vec::new(),
             })
         }
 
@@ -12613,6 +12758,8 @@ mod tests {
                 local_path: request.spec.local_path,
                 remote_path: request.spec.remote_path,
                 overwrite: request.spec.overwrite,
+                transfer_method: None,
+                warnings: Vec::new(),
             })
         }
 
@@ -13043,6 +13190,57 @@ mod tests {
 
         assert_eq!(result.exit_code, Some(23));
         assert_eq!(result.stdout, "output\n");
+    }
+
+    #[test]
+    fn truncated_exec_keeps_control_frame_across_packet_boundaries() {
+        let marker = "REMOTE_HOSTS_EXEC_DONE_truncated";
+        for status in [0, 17] {
+            let wire = format!("{}\n{marker} {status}\n", "x".repeat(8192));
+            let mut result = remote_hosts_core::ExecResult {
+                exit_code: Some(0), // Some gateways report zero even when the command fails.
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+            };
+            let mut tail = Vec::new();
+            for packet in wire.as_bytes().chunks(7) {
+                super::append_limited_utf8(&mut result.stdout, packet, 32, &mut result.truncated);
+                super::retain_exec_control_tail(&mut tail, packet);
+                assert!(tail.len() <= super::EXEC_CONTROL_TAIL_BYTES);
+            }
+            super::restore_truncated_exec_frame(&mut result, &tail, marker);
+            assert!(super::recover_framed_exec_status(&mut result, marker));
+            assert_eq!(result.exit_code, Some(status));
+            assert_eq!(result.stdout, "x".repeat(32));
+            assert!(result.truncated);
+        }
+    }
+
+    #[test]
+    fn truncated_exec_does_not_invent_completion_from_ssh_zero() {
+        let marker = "REMOTE_HOSTS_EXEC_DONE_missing";
+        for tail in [
+            b"unconfirmed".as_slice(),
+            b"REMOTE_HOSTS_EXEC_DONE_other 0\n",
+        ] {
+            let mut result = remote_hosts_core::ExecResult {
+                exit_code: Some(0),
+                stdout: "bounded output".to_owned(),
+                stderr: String::new(),
+                truncated: true,
+            };
+            super::restore_truncated_exec_frame(&mut result, tail, marker);
+            assert!(!super::recover_framed_exec_status(&mut result, marker));
+            assert_eq!(result.stdout, "bounded output");
+        }
+    }
+
+    #[test]
+    fn exec_control_tail_bounds_a_single_large_packet() {
+        let mut tail = b"old".to_vec();
+        super::retain_exec_control_tail(&mut tail, &vec![b'x'; 8192]);
+        assert_eq!(tail, vec![b'x'; super::EXEC_CONTROL_TAIL_BYTES]);
     }
 
     #[tokio::test]
@@ -14487,7 +14685,7 @@ mod tests {
             .list_for_workspace(fixture.workspace_id, Some(plan.operation.id), None, 20)
             .await?;
         assert!(chunks.iter().any(|chunk| {
-            chunk.redacted_text.contains("pooled_session=true")
+            chunk.redacted_text.contains("transport=ssh")
                 && chunk.redacted_text.contains("file=manifest.yaml")
         }));
         assert!(chunks.iter().any(|chunk| {
@@ -15653,6 +15851,96 @@ mod tests {
         assert!(chunks.is_empty());
         manager
             .close(opened.pty_session.pty_session_id, Some(1))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn minio_relay_uses_actual_size_and_rejects_wrong_selected_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = WorkerFixture::new().await?;
+        let workspace = fixture
+            .repositories
+            .workspaces
+            .get(fixture.workspace_id)
+            .await?
+            .ok_or("workspace")?;
+        let mut path = fixture
+            .repositories
+            .access_paths
+            .get(workspace.access_path_id)
+            .await?
+            .ok_or("path")?;
+        path.route_type = RouteType::Bastion;
+        path.requires_tty = true;
+        fixture.repositories.access_paths.upsert(&path).await?;
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("must-not-exist.bin");
+        let config = directory.path().join("minio-relays.json");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&json!({"profiles":[{
+                "name":"test-relay", "host_id":fixture.host_id, "access_path_id":path.id,
+                "expected_hostname":"deliberately-wrong-target", "endpoint":"https://storage.invalid",
+                "bucket":"remote-hosts-test", "credential_id":path.credential_id, "threshold_bytes":2
+            }]}))?,
+        )?;
+        let manager = ConnectorPtyManager::new(
+            fixture.repositories.clone(),
+            LocalScriptPtyBackend::new(),
+            ConnectorPtyManagerConfig::production_default(fixture.connector_id),
+        )
+        .with_minio_relay_config(
+            &config,
+            secrecy::SecretString::from("fixture-master".to_owned()),
+        )?;
+        let store = manager.minio_relay.as_ref().ok_or("relay store")?;
+        let profile = store.config.profiles.first().ok_or("relay profile")?;
+        let request = SftpRequest {
+            operation_id: OperationId::new(),
+            host_id: fixture.host_id,
+            access_path_id: path.id,
+            progress_tx: None,
+            spec: FileTransferSpec {
+                direction: SftpDirection::Upload,
+                local_path: source.to_string_lossy().into_owned(),
+                remote_path: destination.to_string_lossy().into_owned(),
+                overwrite: SftpOverwritePolicy::Deny,
+                mode: None,
+                max_size_bytes: DEFAULT_SFTP_MAX_SIZE_BYTES,
+                expected_sha256: None,
+                timeout_seconds: 60,
+            },
+        };
+        tokio::fs::write(&source, b"x").await?;
+        assert!(
+            manager
+                .transfer_through_minio(store, profile, &request, fixture.workspace_id)
+                .await?
+                .is_none(),
+            "large safety ceiling must not select relay for one source byte"
+        );
+        let opened = manager
+            .open(fixture.workspace_id, fixture.session_id, None)
+            .await?;
+        tokio::fs::write(&source, b"xx").await?;
+        let result = super::InteractiveFileTransferBackend::transfer_for_workspace(
+            &manager,
+            fixture.workspace_id,
+            request,
+        )
+        .await;
+        assert!(
+            result
+                .err()
+                .ok_or("wrong target must fail")?
+                .to_string()
+                .contains("target identity")
+        );
+        assert!(!destination.exists());
+        manager
+            .close(opened.pty_session.pty_session_id, Some(0))
             .await?;
         Ok(())
     }

@@ -17,6 +17,8 @@ remote-hosts-core = { path = "../remote-hosts-core" }
 remote-hosts-db = { path = "../remote-hosts-db" }
 remote-hosts-domain = { path = "../remote-hosts-domain" }
 remote-hosts-vault = { path = "../remote-hosts-vault" }
+reqwest = { workspace = true, features = ["stream"] }
+md-5 = "0.11"
 russh.workspace = true
 russh-sftp.workspace = true
 secrecy.workspace = true

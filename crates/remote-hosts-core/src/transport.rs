@@ -226,6 +226,12 @@ pub struct SftpResult {
     pub remote_path: String,
     /// Overwrite policy used for final placement.
     pub overwrite: SftpOverwritePolicy,
+    /// Actual file-byte transport when selected by a specialized backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_method: Option<String>,
+    /// Follow-up work after verified placement; never implies the file mutation should be replayed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Port-forward request placeholder.

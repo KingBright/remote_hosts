@@ -217,6 +217,12 @@ pub fn peer_sync_router_with_state(state: ApiState) -> Router {
 ///
 /// Returns an error if binding the listener or serving HTTP fails.
 pub async fn serve(addr: SocketAddr, state: ApiState) -> Result<(), std::io::Error> {
+    if !addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the unauthenticated operator API requires a loopback listener",
+        ));
+    }
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, router_with_state(state)).await
 }
@@ -2992,6 +2998,20 @@ mod tests {
     use super::{
         ApiState, activity_operation_item, peer_sync_router_with_state, router_with_state,
     };
+
+    #[tokio::test]
+    async fn operator_listener_rejects_non_loopback_without_an_unlocked_vault()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        let state = ApiState::new(Repositories::new(pool));
+        for address in ["0.0.0.0:0", "[::]:0", "192.168.1.2:0"] {
+            let Err(error) = super::serve(address.parse()?, state.clone()).await else {
+                return Err("operator listener must reject before binding".into());
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn http_agent_work_context_snapshot_is_read_only_and_session_scoped()

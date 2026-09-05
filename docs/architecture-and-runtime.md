@@ -368,7 +368,8 @@ returns raw private input payloads or secret material.
 
 Remote Hosts intentionally avoids third-party vault coupling. Its local vault key is generated with
 mode `0600`; encrypted credentials live in the database, and only metadata leaves credential APIs.
-An HTTP process with an unlocked vault is restricted to a loopback bind.
+The full operator HTTP API is restricted to a loopback bind regardless of vault state.
+Only the separate authenticated, restricted peer-sync listener may use a non-loopback bind.
 
 Managed execution applies command-profile validation, explicit intent, policy gates, output limits,
 redaction, connector state, Workspaces, and audit. The default Agent surface can run arbitrary

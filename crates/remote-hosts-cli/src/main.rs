@@ -36,6 +36,21 @@ struct Cli {
 /// CLI commands.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Verify configured private `MinIO` relay credentials and exact object CRUD without printing secrets.
+    MinioRelayCheck {
+        /// Existing Remote Hosts database.
+        #[arg(long, env = "REMOTE_HOSTS_DATABASE_URL")]
+        database_url: String,
+        /// Non-secret relay policy JSON.
+        #[arg(long)]
+        config: PathBuf,
+        /// Existing vault master password file; contents never enter stdout or arguments.
+        #[arg(long, env = "REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE")]
+        vault_master_password_file: PathBuf,
+        /// Create only a missing dedicated relay bucket and configure orphan retention.
+        #[arg(long)]
+        provision: bool,
+    },
     /// Run a local dependency and configuration doctor.
     Doctor,
     /// Run database migrations.
@@ -342,6 +357,22 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::MinioRelayCheck {
+            database_url,
+            config,
+            vault_master_password_file,
+            provision,
+        } => {
+            let repositories = connect_repositories(&database_url).await?;
+            let master = read_required_vault_master_password(Some(&vault_master_password_file))?;
+            let relay = remote_hosts_connector::minio_relay::MinioRelayStore::load(
+                &config,
+                repositories,
+                master,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("relay configuration does not exist"))?;
+            println!("{}", serde_json::to_string(&relay.check(provision).await?)?);
+        }
         Command::Doctor => {
             println!("remote-hosts doctor: ok");
             println!("rust target: {}", std::env::consts::OS);
@@ -450,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
             let repositories = connect_repositories(&database_url).await?;
             let vault_master_password =
                 read_optional_vault_master_password(vault_master_password_file.as_ref())?;
-            ensure_safe_api_bind(bind, vault_master_password.is_some())?;
+            ensure_safe_api_bind(bind)?;
             if peer_sync_bind.is_some_and(|peer_bind| peer_bind == bind) {
                 anyhow::bail!(
                     "peer-sync bind must differ from the full local API bind; use a separate port"
@@ -1148,7 +1179,7 @@ fn build_pty_input_pump(
                 Some(provider) => manager.with_credential_provider(provider),
                 None => manager,
             };
-            let manager = Arc::new(manager);
+            let manager = Arc::new(attach_minio_relay(manager, args)?);
             Ok(ConnectorPtyServices {
                 input_pump: manager.clone(),
                 interactive_file_transfer: manager,
@@ -1164,7 +1195,7 @@ fn build_pty_input_pump(
                 Some(provider) => manager.with_credential_provider(provider),
                 None => manager,
             };
-            let manager = Arc::new(manager);
+            let manager = Arc::new(attach_minio_relay(manager, args)?);
             Ok(ConnectorPtyServices {
                 input_pump: manager.clone(),
                 interactive_file_transfer: manager,
@@ -1173,6 +1204,24 @@ fn build_pty_input_pump(
         #[cfg(unix)]
         _ => anyhow::bail!("PTY backend mode does not match the shared SSH transport pool"),
     }
+}
+
+fn attach_minio_relay<B: remote_hosts_connector::ManagedPtyBackend + 'static>(
+    manager: ConnectorPtyManager<B>,
+    args: &WorkerDaemonArgs,
+) -> anyhow::Result<ConnectorPtyManager<B>> {
+    let Some(vault_path) = args.vault_master_password_file.as_ref() else {
+        return Ok(manager);
+    };
+    let Some(parent) = vault_path.parent() else {
+        return Ok(manager);
+    };
+    let config = parent.join("minio-relays.json");
+    if !config.exists() {
+        return Ok(manager);
+    }
+    let master = read_required_vault_master_password(Some(vault_path))?;
+    Ok(manager.with_minio_relay_config(&config, master)?)
 }
 
 fn parse_host_key_policy(input: &str) -> anyhow::Result<HostKeyPolicy> {
@@ -1258,11 +1307,11 @@ fn read_optional_vault_master_password(
     path.map(read_vault_master_password).transpose()
 }
 
-fn ensure_safe_api_bind(bind: SocketAddr, vault_unlocked: bool) -> anyhow::Result<()> {
-    if vault_unlocked && !bind.ip().is_loopback() {
+fn ensure_safe_api_bind(bind: SocketAddr) -> anyhow::Result<()> {
+    if !bind.ip().is_loopback() {
         anyhow::bail!(
-            "refusing to expose an unlocked credential vault on non-loopback bind {bind}; \
-             bind to 127.0.0.1 and use an SSH tunnel"
+            "refusing to expose the unauthenticated operator API on non-loopback bind {bind}; \
+             bind to loopback and use an SSH tunnel; peer sync uses its separate restricted listener"
         );
     }
     Ok(())
@@ -1373,10 +1422,12 @@ mod tests {
     }
 
     #[test]
-    fn unlocked_http_vault_requires_loopback_bind() -> anyhow::Result<()> {
-        ensure_safe_api_bind("127.0.0.1:8787".parse()?, true)?;
-        ensure_safe_api_bind("0.0.0.0:8787".parse()?, false)?;
-        assert!(ensure_safe_api_bind("0.0.0.0:8787".parse()?, true).is_err());
+    fn operator_http_api_requires_loopback_bind() -> anyhow::Result<()> {
+        ensure_safe_api_bind("127.0.0.1:8787".parse()?)?;
+        ensure_safe_api_bind("[::1]:8787".parse()?)?;
+        for address in ["0.0.0.0:8787", "[::]:8787", "192.168.1.2:8787"] {
+            assert!(ensure_safe_api_bind(address.parse()?).is_err());
+        }
         Ok(())
     }
 

@@ -79,7 +79,7 @@ Topology metadata rejects secret-like keys. Passwords, API tokens, service accou
 and database credentials belong in the encrypted node credential binding endpoint or management
 form. API responses return credential metadata and bindings, never plaintext.
 
-An API process with the vault unlocked is restricted to loopback. Use an SSH tunnel when the local
+The full operator API is restricted to loopback whether the vault is locked or unlocked. Use an SSH tunnel when the local
 management console must be accessed remotely.
 
 ## Relevant API Groups
