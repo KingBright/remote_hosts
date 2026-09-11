@@ -1,0 +1,7 @@
+{
+  "version": "0.3.4",
+  "candidate_sha256": "073989b51289d78cc81c7052670e05c537a82dad6536def3a359544ce17820e0",
+  "state": "failed",
+  "error": "gateway_readiness_unavailable: check connectivity and gateway upgrade",
+  "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/8f089801405a6bc739eb42bc/result-attempts/a646c489c1ea41a38fcfc6c7f10886b2.json"
+}

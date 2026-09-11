@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "version": "0.3.5",
+  "state": "selected_targets_deployed_and_accepted",
+  "recorded_at": "2026-09-10T18:39:16.748633+00:00",
+  "all_selected_targets_deployed": true,
+  "all_selected_targets_accepted": true,
+  "selected_targets": [
+    "NAS gateway",
+    "MacBook-M2-Max"
+  ],
+  "deferred_targets": [
+    {
+      "name": "Mac-Studio",
+      "last_observed_version": "0.3.0",
+      "modified": false,
+      "reason": "explicit user deferral"
+    }
+  ],
+  "manifest_sha256": "1da9c013109090d14d2b36c8f75f9c4ce0fc26a4efcaf257c66ab720d8516347",
+  "package_path": "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.3.5",
+  "source_snapshot_id": "c55f822a5b43579cb490c5ffa6673b7df2f40d7e4da6e6464fc34bf68daabcc3",
+  "verification": "docs/releases/0.3.5/verification.json",
+  "source_input_count": 122,
+  "current_worktree_matches_snapshot": true,
+  "current_worktree_differences": [],
+  "functional_tests": {
+    "passed": 258,
+    "failed": 0,
+    "rust_passed": 175,
+    "python_passed": 83,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "repeat_verification": "docs/releases/0.3.5/warm-verification.json",
+  "cache_measurement": {
+    "scope": "same frozen inputs, same leased checkout, complete source verification only",
+    "snapshot_id": "c55f822a5b43579cb490c5ffa6673b7df2f40d7e4da6e6464fc34bf68daabcc3",
+    "samples_per_condition": 1,
+    "initial_cache_population_seconds": 1128.206,
+    "warm_verification_seconds": 79.40998300001957,
+    "synchronization": {
+      "snapshot_id": "c55f822a5b43579cb490c5ffa6673b7df2f40d7e4da6e6464fc34bf68daabcc3",
+      "files": 122,
+      "written_files": 0,
+      "preserved_files": 122,
+      "removed_files": 0,
+      "checkout": "/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout",
+      "cache_semantics": "unchanged bytes and executable modes keep mtime; no hardlinks"
+    },
+    "tests": {
+      "passed": 258,
+      "failed": 0,
+      "rust_passed": 175,
+      "python_passed": 83,
+      "python_failed": 0,
+      "python_skipped": 1,
+      "ignored_benchmarks": 2,
+      "test_gates_completed_successfully": true
+    },
+    "warm_exit_code": 0,
+    "excludes": [
+      "release builds",
+      "transfer",
+      "deployment",
+      "ChatGPT scheduling and model generation"
+    ],
+    "interpretation": "cache reuse observation, not an end-to-end speedup benchmark or performance guarantee after arbitrary edits"
+  },
+  "nas": {
+    "version": "0.3.5",
+    "pid": 11227,
+    "installed_sha256": "c074ca811ae1edf8749079e1907037822b010e02fa038f274fa1d5bbfc6deee0",
+    "backup": "/opt/remote-hosts-code/releases/before-0.3.5-20260911T022754",
+    "receipt": "docs/releases/0.3.5/nas-updater.json"
+  },
+  "macbook": {
+    "version": "0.3.5",
+    "pid": 17869,
+    "installed_sha256": "0933bd69a1ac690106afdc19017236cae977fe758087c30168d4db4425e2f490",
+    "backup": "/Users/jinliang/.local/share/remote-hosts-code/releases/before-0.3.5-20260911T022852-52c9227d/remote-hosts-code",
+    "stable_seconds": 20.088213207985973,
+    "samples": 10,
+    "all_lanes_verified": true,
+    "updater_runs": 1,
+    "updater_exit_code": 0,
+    "receipt": "docs/releases/0.3.5/macbook-updater.json"
+  },
+  "acceptance": {
+    "standard": "docs/releases/0.3.5/acceptance-macbook.json",
+    "features": "docs/releases/0.3.5/features-macbook.json",
+    "native_file": "docs/releases/0.3.5/native-acceptance.json",
+    "temporary_oauth_revoked": true
+  },
+  "gates": {
+    "source_verification": "passed",
+    "macos_release": "passed",
+    "linux_release": "passed",
+    "artifact_integrity": "passed",
+    "gateway_cutover": "passed",
+    "agent_cutover_and_readiness": "passed",
+    "macbook_full_acceptance": "passed",
+    "native_file_handoff": "passed"
+  },
+  "new_confirmation_requested": false,
+  "credentials_changed": false,
+  "security_settings_changed": false,
+  "studio_upgraded": false,
+  "git_commit_or_push": false,
+  "prior_frozen_packages_modified": false,
+  "limitations": [
+    "build cache measurements are single samples for identical inputs, not arbitrary-edit or network speed guarantees",
+    "forced termination/power-loss cleanup of detached build children is not a proven guarantee; tracked under RH-039",
+    "cross-process file transfer resume remains planned, not implemented by this release",
+    "new optional tool parameters were checked via authorized direct MCP; this conversation can retain older native input schemas"
+  ]
+}

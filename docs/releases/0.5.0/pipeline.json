@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "version": "0.5.0",
+  "state": "passed",
+  "phase": "finished",
+  "snapshot_id": "68dc1227a55c7c1305235a07198da13dbd9292043c3a92e4a883c71eab2b95d8",
+  "snapshot": "/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/050-s5",
+  "verify_only": false,
+  "started_at": "2026-09-11T06:52:19.178597+00:00",
+  "pid": 57262,
+  "stages": {
+    "verification": {
+      "state": "finished",
+      "started_at": "2026-09-11T06:52:20.515641+00:00",
+      "log": "/Users/jinliang/Workspace/remote_hosts/target/iteration-050-s5/pipeline-logs/verification.log",
+      "exit_code": 0,
+      "elapsed_seconds": 136.424,
+      "sha256": "1ca891f18d912020678594c8196c0ec5897b94a6b23f407a9de4b2794aca245b"
+    },
+    "macos_release": {
+      "state": "finished",
+      "started_at": "2026-09-11T06:54:37.067989+00:00",
+      "log": "/Users/jinliang/Workspace/remote_hosts/target/iteration-050-s5/pipeline-logs/macos_release.log",
+      "exit_code": 0,
+      "elapsed_seconds": 133.453,
+      "sha256": "561f9754aa454be8ee35bb4cee9cefec12c28251b9139c61054850eceabcb2a9"
+    },
+    "linux_release": {
+      "state": "finished",
+      "started_at": "2026-09-11T06:56:50.533720+00:00",
+      "log": "/Users/jinliang/Workspace/remote_hosts/target/iteration-050-s5/pipeline-logs/linux_release.log",
+      "exit_code": 0,
+      "elapsed_seconds": 130.352,
+      "sha256": "efada3ba52a8a7e9bb2f547788aa37dfc8ccaf897d82a45c53832e446ed1f26a"
+    },
+    "package": {
+      "state": "finished",
+      "started_at": "2026-09-11T06:59:00.945101+00:00",
+      "log": "/Users/jinliang/Workspace/remote_hosts/target/iteration-050-s5/pipeline-logs/package.log",
+      "exit_code": 0,
+      "elapsed_seconds": 2.017,
+      "sha256": "ddbb1a95a18b2adbec6d962c27363cd5aa814eadc3523f893fc74ee2d9ae9297"
+    }
+  },
+  "deployed": false,
+  "synchronization": {
+    "snapshot_id": "68dc1227a55c7c1305235a07198da13dbd9292043c3a92e4a883c71eab2b95d8",
+    "files": 152,
+    "written_files": 4,
+    "preserved_files": 148,
+    "removed_files": 0,
+    "checkout": "/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout",
+    "cache_semantics": "unchanged bytes and executable modes keep mtime; no hardlinks"
+  },
+  "execution_root": "/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout",
+  "cargo_target_dir": "/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target",
+  "toolchain": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: aarch64-apple-darwin\nrelease: 1.94.1\nLLVM version: 21.1.8",
+  "phase_started_at": "2026-09-11T06:59:00.945136+00:00",
+  "activity": "output_advanced",
+  "updated_at": "2026-09-11T06:59:03.293946+00:00",
+  "updated_epoch": 1789109943.293968,
+  "child_processes_observed": 0,
+  "stage_elapsed_seconds": 2.016,
+  "seconds_since_observed_progress": 0.0,
+  "log_bytes": 1917,
+  "observed_log": "/Users/jinliang/Workspace/remote_hosts/target/iteration-050-s5/pipeline-logs/package.log",
+  "cpu_delta_seconds": 0,
+  "verification_gate": "passed",
+  "verification": {
+    "path": "/Users/jinliang/Workspace/remote_hosts/target/iteration-050-s5/pipeline-logs/verification.json",
+    "sha256": "5187e8a3cb71fb18bb52cc75fe70fcee5d43966c59decaaa8f15ead530a7d1df",
+    "tests": {
+      "passed": 338,
+      "failed": 0,
+      "rust_passed": 230,
+      "python_passed": 108,
+      "python_failed": 0,
+      "python_skipped": 1,
+      "ignored_benchmarks": 2,
+      "test_gates_completed_successfully": true
+    }
+  },
+  "package": {
+    "path": "/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout/dist/remote-hosts-code-0.5.0",
+    "manifest_sha256": "d29ead4d6c2f30fde934cab86e29f5dc91c74cd33eec476c9348712938920c17",
+    "artifacts": {
+      "remote-hosts-code-macos-arm64": {
+        "sha256": "6bcd4bbcab83cd7542e3205e938cb4696858fc25e6e95d3346ec5f8b18763609",
+        "size": 25936368
+      },
+      "remote-hosts-code-linux-amd64": {
+        "sha256": "15fbaa239c727b13079a1247773ae051e00c84efabca12b18cad2b5df691d8f6",
+        "size": 24202368
+      },
+      "upgrade-code-agent.py": {
+        "sha256": "bbf6c8386639aef9d7af80ddbfe4ca5a316f7429e6b54b56093e6b62c3300f21",
+        "size": 10016
+      },
+      "agent_upgrade_support.py": {
+        "sha256": "92a2fdbaebc3599d09c64c10492ad16496a61c83cd83bfc97448dac5422a93d1",
+        "size": 11559
+      },
+      "launch-code-upgrade.py": {
+        "sha256": "6f66a3b05f355ba941e5b961ac11358bb771917d9ccb79ce4d924c12ce23e6d6",
+        "size": 6979
+      },
+      "upgrade-code-gateway.py": {
+        "sha256": "086ab4e906b576ca308b9e46219d937331db552800d73ed1eee5c4941d696b05",
+        "size": 6239
+      },
+      "check-code-gateway.py": {
+        "sha256": "f71b1870c354f8d9e48d9c3be6be9c474b36040621da9edd1f1b1059c51a58ab",
+        "size": 16503
+      },
+      "release_receipts.py": {
+        "sha256": "a2c70b5735c4d924173acb4b8f6d3250b1b2d1f008ad3e685ca1e0abf6a93398",
+        "size": 11810
+      },
+      "maintenance_client.py": {
+        "sha256": "2b0c09481d0a14e2ee8d4dd216023eeb9a3c5448e444d91e446ff48b40fabebe",
+        "size": 3142
+      },
+      "release_targets.py": {
+        "sha256": "29107d4b4289df296cbd03fcce401f50b9c31787bf992771ee4cdb96022acc4f",
+        "size": 1258
+      },
+      "sync_bundle.py": {
+        "sha256": "36471c5c8aadd5fdf671549161e90b9e9d42c15f6a852d940a8b25222c8d605c",
+        "size": 2887
+      },
+      "release_client.py": {
+        "sha256": "195722bd16546cdbb652f1b20b99474d44a283fc71cb6d7b55a950eddd96dc69",
+        "size": 6118
+      },
+      "publish-code.py": {
+        "sha256": "6566f7005c567bb1230f5da7694dd1d8ad33965f7bc8a95f583eba22e52e599b",
+        "size": 15544
+      },
+      "check-collaboration.py": {
+        "sha256": "25679277aaa0f391110e21a21125971aac5c79c0d0fcdd5c731a2e2c14811299",
+        "size": 8747
+      }
+    }
+  },
+  "source_inputs_unchanged": true
+}

@@ -1,0 +1,22 @@
+   Compiling remote-hosts-code v0.3.3 (/Users/jinliang/Workspace/remote_hosts/crates/remote-hosts-code)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.80s
+     Running tests/receipt_delivery_034.rs (/Users/jinliang/rust-target/debug/deps/receipt_delivery_034-5b3a83f65e0a766f)
+
+running 1 test
+test transient_receipt_failure_recovers_without_job_redispatch_or_reexecution ... FAILED
+
+failures:
+
+---- transient_receipt_failure_recovers_without_job_redispatch_or_reexecution stdout ----
+
+thread 'transient_receipt_failure_recovers_without_job_redispatch_or_reexecution' (6049827) panicked at crates/remote-hosts-code/tests/receipt_delivery_034.rs:39:26:
+lost receipt remained pending until gateway redispatch instead of being redelivered: Elapsed(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    transient_receipt_failure_recovers_without_job_redispatch_or_reexecution
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.06s
+
+error: test failed, to rerun pass `-p remote-hosts-code --test receipt_delivery_034`

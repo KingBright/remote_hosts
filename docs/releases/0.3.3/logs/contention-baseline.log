@@ -1,0 +1,29 @@
+   Compiling remote-hosts-code v0.3.2 (/Users/jinliang/Workspace/remote_hosts/crates/remote-hosts-code)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 53.81s
+     Running unittests src/lib.rs (/Users/jinliang/rust-target/debug/deps/remote_hosts_code-d83f25e1ad4db656)
+
+running 2 tests
+test agent::scheduling_tests::waiting_writes_do_not_take_sibling_execution_slots ... FAILED
+test agent::scheduling_tests::actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it ... FAILED
+
+failures:
+
+---- agent::scheduling_tests::waiting_writes_do_not_take_sibling_execution_slots stdout ----
+
+thread 'agent::scheduling_tests::waiting_writes_do_not_take_sibling_execution_slots' (5896938) panicked at crates/remote-hosts-code/src/agent_scheduling_tests.rs:46:23:
+two writes waiting on A occupied both execution slots; B starved: Elapsed(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- agent::scheduling_tests::actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it stdout ----
+
+thread 'agent::scheduling_tests::actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it' (5896937) panicked at crates/remote-hosts-code/src/agent_scheduling_tests.rs:84:23:
+queued writes for aliases of blocked A hid runnable project B: Elapsed(())
+
+
+failures:
+    agent::scheduling_tests::actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it
+    agent::scheduling_tests::waiting_writes_do_not_take_sibling_execution_slots
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 33 filtered out; finished in 2.10s
+
+error: test failed, to rerun pass `-p remote-hosts-code --lib`

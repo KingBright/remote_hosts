@@ -1,0 +1,15 @@
+{
+  "version": "0.4.0",
+  "state": "needs_recovery",
+  "phase": "await_verified_build",
+  "targets": [
+    "NAS gateway",
+    "MacBook-M2-Max",
+    "Mac-Studio"
+  ],
+  "targets_accepted": false,
+  "steps": {},
+  "observed_at_epoch": 1789092162,
+  "failure_type": "TimeoutError",
+  "next_action": "Inspect the recorded stage and original receipts; do not rebuild or repeat successful target updates."
+}

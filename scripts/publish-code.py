@@ -20,6 +20,12 @@ import release_receipts as rr
 from release_targets import selected
 from release_client import Client
 
+def acceptance_run_id(version, device_id):
+    value='release-'+version+'-'+device_id
+    value=re.sub(r'[^A-Za-z0-9-]+','-',value).strip('-')
+    if not value or not value.replace('-','').isalnum():raise ValueError('invalid acceptance run id')
+    return value
+
 def validate(config):
     if not config['agents'] or len(config['agents'])>8:raise ValueError('bounded explicit agent set required')
     seen=set()
@@ -133,7 +139,7 @@ def main():
                         time.sleep(2)
                     else:raise RuntimeError('original updater outcome pending; inspect saved result path without reinstalling')
                     rr.atomic_json(ad/'updater.json',receipt);phase='functional_acceptance';record()
-                    cmd=['/opt/homebrew/bin/python3',str(package/'check-code-gateway.py'),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(ad/'acceptance.json'),'--run-id','release-'+args.version+'-'+ident,'--expected-version',args.version,'--dispatch-protocol','2','--device-id',ident]
+                    cmd=['/opt/homebrew/bin/python3',str(package/'check-code-gateway.py'),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(ad/'acceptance.json'),'--run-id',acceptance_run_id(args.version,ident),'--expected-version',args.version,'--dispatch-protocol','2','--device-id',ident]
                     def standard():
                         with (ad/'acceptance.log').open('x') as log:subprocess.run(cmd,cwd=root,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=1200)
                         value=json.loads((ad/'acceptance.json').read_text())

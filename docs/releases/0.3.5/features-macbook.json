@@ -1,0 +1,25 @@
+{
+  "version": "0.3.5",
+  "state": "passed",
+  "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+  "interface": "authenticated_direct_mcp",
+  "studio_modified": false,
+  "same_file_twenty_ranges": "one_physical_read",
+  "short_command": "passed",
+  "replay_same_result": "passed",
+  "batch_budget_and_cursor": "passed",
+  "operations": [
+    "e63b5f35-b195-4398-89a6-178d2757af11",
+    "594e722a-97f4-4781-a72d-72880337d2c8"
+  ],
+  "reported_agent_features": [
+    "terminal_wait_v1",
+    "line_fragments_v1",
+    "partial_reads_v1",
+    "request_snapshot_v1",
+    "poll_readiness_v1",
+    "resource_filter_v1",
+    "durable_receipts_v1"
+  ],
+  "temporary_oauth_revoked": true
+}

@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-10T10:33:15.548977+00:00",
+  "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+  "state": "recovered_smoke_verified",
+  "user_action": "bootout of com.remote-hosts.code-upgrade-030-20260910",
+  "agent": {
+    "loaded": true,
+    "exit_code": 0,
+    "top_level": {
+      "state": "running",
+      "runs": "644",
+      "pid": "1927"
+    }
+  },
+  "updater": {
+    "loaded": false,
+    "exit_code": 113,
+    "top_level": {}
+  },
+  "runtime_build": {
+    "pid": 1927,
+    "started_at": 1789035048,
+    "version": "0.3.0"
+  },
+  "installed_sha256": "588a353b2f00cd6ef10434e09e994b870cc6463fa0bef2e7b29c780907b28d85",
+  "gateway_health": {
+    "dispatch_protocol": 2,
+    "execution_limits": {
+      "control": 2,
+      "read": 8,
+      "terminal": 4,
+      "transfer": 2,
+      "write": 2
+    },
+    "file_transfer": true,
+    "max_file_bytes": 67108864,
+    "progress_protocol": 1,
+    "service": "remote-hosts-code",
+    "status": "ok",
+    "version": "0.3.0"
+  },
+  "first_remote_observation_at": "2026-09-10T10:23:44.377344+00:00",
+  "first_remote_observation_pid": 1927,
+  "first_remote_observation_runs": 644,
+  "same_process_and_run_count_at_final_check": true,
+  "remote_code_read_operation": "83abbbf9-fc9e-4a63-9245-5246b7bb49cc",
+  "remote_terminal_operation": "90c2f90c-e116-4cca-980b-b16c5b561971",
+  "updater_regressions": {
+    "tests_passed": 10,
+    "test_terminal": "9a55db13-1310-43c4-b4de-b1441be85c8a",
+    "services_mocked": true,
+    "log": "target/updater-reentry-031/tests-final.log",
+    "log_sha256": "4e205166683c86468aaa1412401b1667c3063108c4eccd008a2473aa5cff2fcf",
+    "input_sha256": {
+      "scripts/upgrade-code-agent.py": "ad399c05f4f66b2c6088a904e7588255f3fe1b0aa1167ea30ecd302c56277f02",
+      "scripts/tests/test_upgrade_code_agent.py": "581b8936443bc8df90295f2647b9904a74f5d2f1cabb3b3e34aef0a9b5dc44b5"
+    }
+  },
+  "cause_assessment": "Repeated same-binary updates and Agent restarts were observed; after removal of the updater the same PID and runs remained stable. Main-agent crash is not established.",
+  "source_fix_scope": "working-tree updater only; frozen 0.3.0 artifacts unchanged",
+  "service_restarts_in_this_turn": 0,
+  "rollback_in_this_turn": false,
+  "full_release_acceptance_completed": false
+}

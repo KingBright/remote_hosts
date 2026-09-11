@@ -1,0 +1,113 @@
+{
+  "version": "0.4.0",
+  "state": "needs_recovery",
+  "phase": "verify_agent_cutovers",
+  "targets": [
+    "NAS gateway",
+    "MacBook-M2-Max",
+    "Mac-Studio"
+  ],
+  "targets_accepted": false,
+  "steps": {
+    "studio_staging": {
+      "state": "passed",
+      "archive_sha256": "710ff722c665ca3f04eb7c5469655d846d3287e4e875b8134e5cd366f3b701ef",
+      "import_operation_id": "a1f246ca-c6b9-4505-bcab-d77b2a6b66c7"
+    },
+    "nas": {
+      "state": "upgraded",
+      "version": "0.4.0",
+      "candidate_sha256": "18c80eec5b318c51bd678cb6e21bf3b2d0ffad1c242b9e585b816b82761df718",
+      "backup": "/opt/remote-hosts-code/releases/before-0.4.0-20260911T113143",
+      "previous_sha256": "c074ca811ae1edf8749079e1907037822b010e02fa038f274fa1d5bbfc6deee0",
+      "pid": 28645,
+      "installed_sha256": "18c80eec5b318c51bd678cb6e21bf3b2d0ffad1c242b9e585b816b82761df718",
+      "health": {
+        "capabilities_protocol": 1,
+        "checkpoint_bytes": 4194304,
+        "dispatch_protocol": 2,
+        "execution_limits": {
+          "control": 2,
+          "read": 8,
+          "terminal": 4,
+          "transfer": 2,
+          "write": 2
+        },
+        "file_transfer": true,
+        "max_file_bytes": 67108864,
+        "observation_protocol": 1,
+        "progress_protocol": 1,
+        "readiness_protocol": 1,
+        "resource_dispatch_protocol": 1,
+        "service": "remote-hosts-code",
+        "status": "ok",
+        "transfer_protocol": 2,
+        "version": "0.4.0"
+      },
+      "caddy_override_removed": false
+    },
+    "studio_launch": {
+      "label": "com.remote-hosts.code-upgrade.94fd518917e5d5e506b714e5",
+      "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/94fd518917e5d5e506b714e5/result.json",
+      "state": "started",
+      "exit_code": 0
+    },
+    "macbook_launch": {
+      "label": "com.remote-hosts.code-upgrade.0f3fda8532ab2d00a39f32db",
+      "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/0f3fda8532ab2d00a39f32db/result.json",
+      "state": "started",
+      "exit_code": 0
+    }
+  },
+  "observed_at_epoch": 1789097619,
+  "package": "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.4.0",
+  "manifest_sha256": "2733d348dbef6f1293304c5805d9dba348cc3422c6fbdece0d956a6a496f24d1",
+  "tests": {
+    "passed": 290,
+    "failed": 0,
+    "rust_passed": 205,
+    "python_passed": 85,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "operations": [
+    {
+      "key": "release040-q1-studio-extract",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:70854d05-8758-40ba-9aae-e71e10299d5b",
+      "terminal_id": "22e6ae0d-4c30-4eef-95fa-e3bf785b681f"
+    },
+    {
+      "key": "release040-q1-studio-launch",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:70854d05-8758-40ba-9aae-e71e10299d5b",
+      "terminal_id": "d66245f0-fb4e-44e9-bfe2-ca244444a119"
+    },
+    {
+      "key": "release040-q1-studio-result",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:70854d05-8758-40ba-9aae-e71e10299d5b",
+      "terminal_id": "e0fbbefa-0589-4795-b096-5129d64d8d40"
+    }
+  ],
+  "runtime_observation": [
+    {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "online": true,
+      "version": "0.4.0",
+      "last_seen": 1789097567
+    },
+    {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "name": "Mac-Studio",
+      "online": true,
+      "version": "0.4.0",
+      "last_seen": 1789097581
+    }
+  ],
+  "failure_type": "RuntimeError",
+  "failure_line": 30,
+  "command_exit_code": null,
+  "next_action": "Inspect the recorded stage and original receipts; do not rebuild or repeat successful target updates.",
+  "temporary_oauth_revoked": true
+}

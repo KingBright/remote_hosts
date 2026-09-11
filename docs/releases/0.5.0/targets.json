@@ -1,0 +1,10 @@
+{
+  "origin":"https://mcp.hackerlife.fun",
+  "password_file":"/Users/jinliang/.local/share/remote-hosts-code/setup/gateway-login-password.txt",
+  "controller_workspace":"ba3bf113-2390-466e-88bc-40d5b4f02884:1d51494e-0c96-4a2e-92e6-1ee24ca33bb2",
+  "gateway":{"ssh_host":"root@hackerlife.fun","ssh_port":222,"root":"/opt/remote-hosts-code"},
+  "agents":[
+    {"device_id":"ba3bf113-2390-466e-88bc-40d5b4f02884","workspace_id":"ba3bf113-2390-466e-88bc-40d5b4f02884:1d51494e-0c96-4a2e-92e6-1ee24ca33bb2","name":"MacBook-M2-Max","home":"/Users/jinliang","root":"/Users/jinliang/Workspace/remote_hosts","local":true},
+    {"device_id":"8af88e35-f316-4dd9-9810-fa5bd3a22196","workspace_id":"8af88e35-f316-4dd9-9810-fa5bd3a22196:70854d05-8758-40ba-9aae-e71e10299d5b","name":"Mac-Studio","home":"/Users/jinliang","root":"/Users/jinliang/workspace","local":false}
+  ]
+}

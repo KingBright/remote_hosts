@@ -1,0 +1,17 @@
+{
+  "version": "0.3.1",
+  "candidate_sha256": "bec00275be4ad78d02ffec5395392735bb61f9a7abd64aa26517b7036c6f6d58",
+  "state": "upgraded",
+  "backup": "/Users/jinliang/.local/share/remote-hosts-code/releases/before-0.3.1-20260910T211647-51a1be72/remote-hosts-code",
+  "previous_sha256": "588a353b2f00cd6ef10434e09e994b870cc6463fa0bef2e7b29c780907b28d85",
+  "installed_sha256": "bec00275be4ad78d02ffec5395392735bb61f9a7abd64aa26517b7036c6f6d58",
+  "pid": 43322,
+  "started_at": 1789046218,
+  "gateway_verified": true,
+  "readiness": "stable_authenticated_control_plane",
+  "stable_seconds": 16.630955083994195,
+  "samples": 7,
+  "all_lanes_verified": true,
+  "functional_acceptance": "separate_required_gate",
+  "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/3687f8fe11c129337ba6d72f/result-attempts/366048d5d1174aa89e503629cbda6d8a.json"
+}

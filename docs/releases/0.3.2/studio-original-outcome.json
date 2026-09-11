@@ -1,0 +1,20 @@
+{
+  "recorded_date": "2026-09-10",
+  "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+  "original_candidate_version": "0.3.1",
+  "original_updater_result": {
+    "state": "failed",
+    "error": "agent still has active work; upgrade not applied",
+    "candidate_sha256": "bec00275be4ad78d02ffec5395392735bb61f9a7abd64aa26517b7036c6f6d58",
+    "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/ed42e2678742ce3d50775dbb/result-attempts/262003e4749543c5ad43c57d9257cfc9.json"
+  },
+  "receipt_read_operation": "e0f04e5b-7cac-497f-a688-fbec5ba16a13",
+  "active_work_observation_operation": "62f94b77-028d-40bd-80b1-6e0d1201c943",
+  "observed_at_epoch": 1789048018,
+  "runtime": {"pid":50827,"started_at":1789028414,"version":"0.3.0"},
+  "other_active_terminal": {"id":"634eaade-58c4-40e9-b7b9-985e6ff523ab","workspace_id":"8af88e35-f316-4dd9-9810-fa5bd3a22196:23c62bf9-a8ac-4369-a8fb-d81e39f3665f","created_at":1789043921},
+  "unfinished_operation_ids": [],
+  "production_binary_replaced_by_original_attempt": false,
+  "other_terminal_cancelled": false,
+  "handling": "Preserve active work. Do not turn a failed idle preflight into an unknown successful install, and do not replay the original launch intent."
+}

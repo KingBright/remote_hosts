@@ -1,0 +1,38 @@
+{
+  "origin": "https://mcp.hackerlife.fun",
+  "version": "0.3.5",
+  "run_id": "release035m1",
+  "selected_device_ids": [
+    "ba3bf113-2390-466e-88bc-40d5b4f02884"
+  ],
+  "dispatch_protocol": 2,
+  "oauth": "passed",
+  "mcp_tool_count": 15,
+  "devices": [
+    {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "workspace_id": "ba3bf113-2390-466e-88bc-40d5b4f02884:3b0ce82b-b7f8-47f8-ad4c-de9a06b03d14",
+      "range_read": "passed",
+      "syntax_tree": "passed",
+      "precise_edit": "passed",
+      "duplicate_edit": "passed",
+      "stale_version_rejected": true,
+      "search": "passed",
+      "terminal_test_exit_code": 0,
+      "probe_file_removed": true,
+      "agent_version": "0.3.5",
+      "binary_transfer_bytes": 2097152,
+      "binary_sha256": "91d3beb88a9b2f778a6c44a1c53b63d3c79931845a9aef84b3fb414610bd1938",
+      "download": "passed",
+      "upload": "passed",
+      "http_range": "passed",
+      "upload_retry": "passed",
+      "overwrite_rejected": true,
+      "checksum_mismatch_rejected": true
+    }
+  ],
+  "test_oauth_grant_revoked": true,
+  "state": "passed",
+  "summary": "Public TLS/OAuth/MCP and 1 selected device(s) passed: MacBook-M2-Max; version 0.3.5; temporary OAuth grant revoked"
+}

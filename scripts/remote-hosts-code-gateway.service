@@ -1,0 +1,21 @@
+[Unit]
+Description=Remote Hosts unified personal MCP gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/remote-hosts-code
+ExecStart=/bin/python3 /opt/remote-hosts-code/run-code-gateway.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWriteDirectories=/volume1/docker/remote-hosts-code
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

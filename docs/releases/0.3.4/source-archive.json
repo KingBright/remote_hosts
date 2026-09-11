@@ -1,0 +1,47 @@
+{
+  "observed_at": "2026-09-10T16:08:08.941057+00:00",
+  "snapshot_id": "4169b5248896b9ca71dfccddf90532ddfd6ed2bf19d96db27b97c24df00aea29",
+  "files_verified": 118,
+  "functional_tests": {
+    "passed": 225,
+    "failed": 0,
+    "rust_passed": 175,
+    "python_passed": 50,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "source_inputs_unchanged": true,
+  "archive": "docs/releases/0.3.4/verified-source.tar.gz",
+  "size": 566283,
+  "sha256": "4a2303eaba70b744e2da8c7fe1b5d685ecaa4fb71a341bbdf3d17195ddda6ce6",
+  "gate_logs": {
+    "fmt": {
+      "path": "docs/releases/0.3.4/logs/fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_code": 0
+    },
+    "clippy": {
+      "path": "docs/releases/0.3.4/logs/clippy.log",
+      "sha256": "94e1bb0a603b42923326f9322909ec9a57cd7195e8ca57da0247562ad4bb97fb",
+      "exit_code": 0
+    },
+    "rust_tests": {
+      "path": "docs/releases/0.3.4/logs/rust_tests.log",
+      "sha256": "e068bb4e92076c19fe768c6d1fc8ecc8e5488754c02701da144e105e8a0f15ba",
+      "exit_code": 0
+    },
+    "python_tests": {
+      "path": "docs/releases/0.3.4/logs/python_tests.log",
+      "sha256": "49d00660c10f361f8cc548ae9b31ae951821a4d13ed94c1ffd7bdea7f32e310f",
+      "exit_code": 0
+    },
+    "workspace": {
+      "path": "docs/releases/0.3.4/logs/workspace.log",
+      "sha256": "9ed7c826667ea6190541b797e7dfd8e51ec111732ba64b7654840eb24bf6d789",
+      "exit_code": 0
+    }
+  },
+  "production_deployed": false
+}

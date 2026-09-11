@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.5.0",
+    "manifest": "d29ead4d6c2f30fde934cab86e29f5dc91c74cd33eec476c9348712938920c17",
+    "config": "6aff31f2eba690da2903fb7484e7cab578ff444c7ab569c2c727dabfa21e4738"
+  },
+  "steps": {
+    "stage": {
+      "state": "completed",
+      "input_sha256": "1d225e9b3904d06e01ff54c661055d059e04b0c3fb1848e155ea180f46912c4c",
+      "requested_at_epoch": 1789110041.170227,
+      "result": {
+        "state": "staged"
+      }
+    },
+    "upgrade": {
+      "state": "completed",
+      "input_sha256": "1d225e9b3904d06e01ff54c661055d059e04b0c3fb1848e155ea180f46912c4c",
+      "requested_at_epoch": 1789110114.314124,
+      "result": {
+        "state": "upgraded",
+        "version": "0.5.0",
+        "candidate_sha256": "15fbaa239c727b13079a1247773ae051e00c84efabca12b18cad2b5df691d8f6",
+        "backup": "/opt/remote-hosts-code/releases/before-0.5.0-20260911T150155",
+        "previous_sha256": "6ff56f9a5a2254805371afe12814188d55695d5b9687e7349911330a0e7823d3",
+        "pid": 1552,
+        "installed_sha256": "15fbaa239c727b13079a1247773ae051e00c84efabca12b18cad2b5df691d8f6",
+        "health": {
+          "capabilities_protocol": 1,
+          "checkpoint_bytes": 4194304,
+          "dispatch_protocol": 2,
+          "execution_limits": {
+            "control": 2,
+            "read": 8,
+            "terminal": 4,
+            "transfer": 2,
+            "write": 2
+          },
+          "file_transfer": true,
+          "maintenance_protocol": 1,
+          "max_file_bytes": 67108864,
+          "observation_protocol": 1,
+          "progress_protocol": 1,
+          "readiness_protocol": 1,
+          "resource_dispatch_protocol": 1,
+          "service": "remote-hosts-code",
+          "status": "ok",
+          "terminal_observation_protocol": 1,
+          "transfer_protocol": 2,
+          "version": "0.5.0"
+        },
+        "caddy_override_removed": false
+      }
+    }
+  },
+  "updated_at_epoch": 1789110119.45982
+}

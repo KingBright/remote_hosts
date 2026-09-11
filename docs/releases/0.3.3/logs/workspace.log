@@ -1,0 +1,12 @@
+    Checking remote-hosts-domain v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-domain)
+    Checking remote-hosts-vault v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-vault)
+    Checking remote-hosts-launcher v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-launcher)
+    Checking remote-hosts-code v0.3.3 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-code)
+    Checking remote-hosts-db v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-db)
+    Checking remote-hosts-core v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-core)
+    Checking remote-hosts-sync v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-sync)
+    Checking remote-hosts-connector v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-connector)
+    Checking remote-hosts-mcp v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-mcp)
+    Checking remote-hosts-api v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-api)
+    Checking remote-hosts-cli v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/crates/remote-hosts-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 01s

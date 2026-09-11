@@ -1,0 +1,16 @@
+{
+  "version": "0.3.5",
+  "state": "passed",
+  "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+  "upload_operation_id": "31774a2e-ace6-43d2-a2c1-38bc5d3aa7eb",
+  "download_operation_id": "7d901f66-c115-4fa9-a540-d6e3e8465af1",
+  "bytes": 65536,
+  "sha256": "7daca2095d0438260fa849183dfc67faa459fdf4936e1bc91eec6b281b27e4c2",
+  "native_file_parameter": "passed",
+  "full_http_download": "passed",
+  "http_range": "passed",
+  "local_hash_verified": true,
+  "source_probe_removed": true,
+  "studio_modified": false,
+  "temporary_oauth_revoked": true
+}

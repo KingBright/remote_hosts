@@ -1,0 +1,11 @@
+{
+  "date": "2026-09-10",
+  "source": "native Remote_Hosts.devices_list after verification, build and evidence finalization",
+  "gateway": {"version":"0.3.2","tool_count":15,"tools_sha256":"24f2bc854b6bc9d8bee223de219bed38e6517b32b35c97af5327dfbd8a633693"},
+  "macbook": {"device_id":"ba3bf113-2390-466e-88bc-40d5b4f02884","name":"MacBook-M2-Max","version":"0.3.2","online":true,"last_seen":1789056957,"session":"06beef8a6cff4037b8b9f35e4df27686753378d5d47a43d5b3a4ebd5399be09a"},
+  "studio": {"device_id":"8af88e35-f316-4dd9-9810-fa5bd3a22196","name":"Mac-Studio","version":"0.3.0","online":true,"last_seen":1789056955,"release_selection":"deferred_by_user"},
+  "release_033_deployed":false,
+  "release_034_deployed":false,
+  "observation_mutated_services":false,
+  "per_version_confirmation_required":false
+}

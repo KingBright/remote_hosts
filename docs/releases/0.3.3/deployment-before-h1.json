@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "version": "0.3.3",
+  "recorded_at": "2026-09-10T15:20:02.058143+00:00",
+  "state": "source_verified_build_blocked",
+  "source_verified": true,
+  "source_verification": "docs/releases/0.3.3/verification-g1.json",
+  "snapshot_id": "3cac61e38c76a606c34d15c29914431547758d5b82df63a4ada06419d713dbf3",
+  "source_archive": "docs/releases/0.3.3/source-archive.json",
+  "functional_tests": {
+    "passed": 215,
+    "failed": 0,
+    "rust_passed": 165,
+    "python_passed": 50,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "selected_release_targets": [
+    "NAS gateway",
+    "MacBook-M2-Max"
+  ],
+  "deferred_targets": [
+    {
+      "name": "Mac-Studio",
+      "reason": "explicit user direction: defer while busy; not a blocker for selected release scope",
+      "new_upgrade_submitted": false,
+      "background_upgrade_scheduled": false
+    }
+  ],
+  "observed_running": {
+    "gateway": {
+      "version": "0.3.2"
+    },
+    "macbook": {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "version": "0.3.2",
+      "online": true,
+      "last_seen": 1789053474
+    },
+    "studio": {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "version": "0.3.0",
+      "online": true,
+      "last_seen": 1789053476
+    }
+  },
+  "gates": {
+    "format": "passed",
+    "strict_clippy": "passed",
+    "rust_tests": "165_passed",
+    "python_tests": "50_passed_1_opt_in_skipped",
+    "workspace": "passed",
+    "snapshot_recheck_and_archive": "passed_115_inputs",
+    "macos_release_build": "blocked_before_execution",
+    "linux_release_build": "blocked_before_execution",
+    "packaging": "not_started",
+    "production_upgrade": "not_started",
+    "live_033_acceptance": "not_run"
+  },
+  "release_build_started": false,
+  "deployed": false,
+  "services_restarted": false,
+  "git_commit_or_push": false,
+  "prior_release_artifacts_modified": false,
+  "resume_rule": "Use the preserved snapshot and its input-bound verification for an authorized release build; do not rerun tests on changing source or wait for Studio. New source changes require a separate candidate."
+}

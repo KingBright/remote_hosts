@@ -1,0 +1,44 @@
+{
+  "version": "0.4.1",
+  "items": [
+    {
+      "kind": "host_pre_dispatch_block",
+      "key": "rh041-negative-test-run-r1",
+      "execution_started": false,
+      "scope": "old implementation baseline",
+      "note": "No claim of old-code failing execution. Changed candidate later passed complete fixed-input checks."
+    },
+    {
+      "kind": "edit_preflight_conflict",
+      "operation_id": "83890663-5211-457f-811a-dbbb74d2990f",
+      "changed": false,
+      "resolution": "Used unique contextual anchors for two transaction statements."
+    },
+    {
+      "kind": "macos_test_path_alias",
+      "initial_verification": "target/iteration-041-r1/pipeline-logs/verification.json",
+      "passed": 311,
+      "failed": 1,
+      "resolution": "Expected path normalized using resolve; no product identity checks weakened. Final r2 complete run passed312."
+    },
+    {
+      "kind": "host_pre_dispatch_block",
+      "key": "rh041-studio-pre-cutover-state-r1",
+      "execution_started": false,
+      "scope": "Studio active-work metadata read"
+    },
+    {
+      "kind": "studio_busy",
+      "evidence": "docs/releases/0.4.1/studio-updater-failed.json",
+      "service_changed": false,
+      "handling": "Other work not cancelled; no forced installation or duplicate request."
+    },
+    {
+      "kind": "host_pre_dispatch_block",
+      "key": "rh041-macbook-full-live-acceptance-r1",
+      "execution_started": false,
+      "scope": "standard code/write/terminal/file acceptance",
+      "handling": "Not repackaged or rerouted. Separate read-only context paging test does not cover this missing gate."
+    }
+  ]
+}

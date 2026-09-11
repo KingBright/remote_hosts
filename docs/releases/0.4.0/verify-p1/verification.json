@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "candidate_version": "0.4.0",
+  "checked_date_utc": "2026-09-11",
+  "project": "/Users/jinliang/Workspace/remote_hosts",
+  "conclusion": "not_release_ready",
+  "production_changed_this_verification": false,
+  "runtime_observation": {
+    "interface": "Remote_Hosts.devices_list",
+    "gateway_version": "0.3.5",
+    "devices": [
+      {"device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884", "name": "MacBook-M2-Max", "version": "0.3.5", "online": true, "last_seen_epoch": 1789094884},
+      {"device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196", "name": "Mac-Studio", "version": "0.3.0", "online": true, "last_seen_epoch": 1789094884}
+    ]
+  },
+  "previous_publication": {
+    "report": "docs/releases/0.4.0/deployment-n2.json",
+    "state": "needs_recovery",
+    "phase": "await_verified_build",
+    "failure_type": "TimeoutError",
+    "steps": {},
+    "targets_accepted": false,
+    "missing_files": [
+      "target/iteration-040-n2/targeted-result.json",
+      "target/iteration-040-n2/pipeline.json",
+      "docs/releases/0.4.0/workflow-acceptance-n2.json"
+    ],
+    "original_operations": {
+      "96d97c16-e4f7-4f4f-a8d2-75267d3f8025": "exit 1: targeted-result.json missing",
+      "ff32240c-14b2-43ef-84ce-bb6c8d4e5eb3": "exit 0: publication driver syntax checked only",
+      "80aaf999-339d-4ab4-8c87-b6a83ef35b62": "exit 0: publication waiter started only",
+      "2ec0d275-4fb8-481c-a937-d28d12dfabe2": "exit 0: publication_not_yet_accepted; no install or test replay"
+    }
+  },
+  "fresh_verification": {
+    "operation_id": "704a95a2-e360-4510-917f-7babff7d6541",
+    "terminal_exit_code": 1,
+    "terminal_output_complete": true,
+    "pipeline": "target/iteration-040-p1/pipeline.json",
+    "snapshot": "target/source-snapshots/040-p1",
+    "snapshot_id": "336d06e6ee42e68db8e15227b18959f8884a53f409e58a8339f54c04a0b3f19e",
+    "input_file_count": 133,
+    "input_bytes": 3240971,
+    "state": "failed",
+    "phase": "verification",
+    "completed_gates": {"fmt": {"exit_code": 1, "elapsed_seconds": 1.0017419169889763}},
+    "not_executed_gates": ["clippy", "rust_tests", "python_tests", "workspace", "macos_release", "linux_release", "package", "deployment", "live_acceptance"],
+    "format_log": "target/release-slot/checkout/target/source-verification/20260911T025042Z-5b932e3e/fmt.log",
+    "format_log_sha256": "ffd8eca7fd684b593655c2c7362754fe34e4ba476ef189e819e85a8fd3b9e26e",
+    "format_locations": [
+      {"path": "crates/remote-hosts-code/src/agent.rs", "line": 319},
+      {"path": "crates/remote-hosts-code/src/transfer_control.rs", "line": 146},
+      {"path": "crates/remote-hosts-code/src/transfer_receiver.rs", "line": 386}
+    ],
+    "interpretation": "Formatting differences are confirmed. No conclusion about the final candidate's functional correctness follows from an unexecuted test gate."
+  },
+  "followup_call": {
+    "idempotency_key": "rh040-format-fix-and-verified-build-20260911-p2",
+    "tool": "terminal_exec",
+    "state": "blocked_before_execution",
+    "message": "因 OpenAI 无法确定请求的安全状态，已拦截此工具调用。",
+    "operation_id": null,
+    "format_fix_executed": false,
+    "equivalent_reroute_attempted": false
+  },
+  "recovery": {
+    "next_steps": [
+      "Complete formatting of the three identified source files through an authorized execution path; do not weaken any checks.",
+      "Capture a new immutable snapshot; retain 040-p1 and the failed original receipts.",
+      "Execute the producer pipeline and verify all gate exits and input identity; do not start a publisher merely waiting for a nonexistent file.",
+      "Only after the package manifest is validated, publish the gateway and both authorized Macs using the existing independent updater and health checks.",
+      "Verify both devices with explicit device IDs and preserve separate functional acceptance receipts."
+    ],
+    "routine_release_reconfirmation_needed": false,
+    "rollback_needed_from_current_evidence": false
+  }
+}

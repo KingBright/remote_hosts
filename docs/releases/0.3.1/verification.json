@@ -1,0 +1,92 @@
+{
+  "version": "0.3.1",
+  "run_id": "20260910T125334Z-55dbf63e",
+  "scope": "native source verification, not deployment",
+  "state": "passed",
+  "source_inputs": {
+    "Cargo.lock": "e9cb2eabf66a62ce2664758959f3ccfcb774f5f2149b0480f7c9f62848a3c4a9",
+    "Cargo.toml": "e31c96abd30fee37d41b814a0be5dc16e2d8af5446be750b13fcc5ef0a8cde3b",
+    "crates/remote-hosts-code/Cargo.toml": "2bfeb8bf501e99e573122c5d053a978a4209d78f9c1489256d02a8cff78a467c",
+    "crates/remote-hosts-code/src/agent.rs": "e57071d937877fe40bb733ec2fc0228c6cb2f7c048ff76a0f88fe246e9c17d88",
+    "crates/remote-hosts-code/src/auth.rs": "f2d638d8a2b97ee229bbc2b37b7f50953be41c136ba1496708a34444c9f821da",
+    "crates/remote-hosts-code/src/files.rs": "5923c7afd1b4327aa243b03651b79833ec07dd46b0b95025c9372bb4f9831c8b",
+    "crates/remote-hosts-code/src/gateway.rs": "d759a40b582e5877805a1365fd05fcb5d1e4b5749c6b6fe9414443850eec8f2c",
+    "crates/remote-hosts-code/src/lib.rs": "31e2d1c80ad676df6c5efaaa228fbfa007f153ad270621535d2682aba5c7523d",
+    "crates/remote-hosts-code/src/main.rs": "4bbef74d356b4ffbac1a4fab15483e1b3b31884cf89df1e904244ebf72a94922",
+    "crates/remote-hosts-code/src/progress.rs": "1ac2f7ae43282742130dd79dc93a5917c06c04523c109516555b574159e856b1",
+    "crates/remote-hosts-code/src/reads.rs": "1c7ff9546b35a017d868759f3a77c0673aaf61cff5936abb5b0993487474c462",
+    "crates/remote-hosts-code/src/resumable.rs": "cd80e33537a4a0591c583789e8ca3eceee0a2fefdd89bac57787f61c68c7c276",
+    "crates/remote-hosts-code/src/scheduler.rs": "351e272903156ad2574ebb9448682689f2cf21dfe243a4019d94afc1d615903a",
+    "crates/remote-hosts-code/src/store.rs": "965e95fcf633652edee3eafa9bb41d471b17188be1dd0dfb12e4e89a549d9932",
+    "crates/remote-hosts-code/src/terminal.rs": "7af9faadb75d62c9b7dccfc576cd832990695eca34239e5456c34300398d1112",
+    "crates/remote-hosts-code/src/terminal_output.rs": "43d078ac5c88d70777e735a01f8bbff98cf8997d2527f68582c864486de143f3",
+    "crates/remote-hosts-code/src/tools.rs": "2f42bac8194a73c8b8c0d706ac6e210a8e47759a6266c7b49f96c5fb37c1ae00",
+    "crates/remote-hosts-code/src/transfer_watch.rs": "4cccf8e7aeb9d0a2dab7addfa302b29c8c85ab0c8dbdea5609b1770489716a43",
+    "crates/remote-hosts-code/src/transfers.rs": "8215b87c88ab20b2d43c09230b846a2c3e9fe949c0adafa769a747bf1263d6f2",
+    "crates/remote-hosts-code/tests/concurrency.rs": "50a8243d17933e10774f1032bec6cca06e73e03d9b79a3c84f1da600e2842583",
+    "crates/remote-hosts-code/tests/file_transfers.rs": "81465e20edb544a72b26cecbb8e60b6ff188f746401c68c46fc531fbb48ebfd2",
+    "crates/remote-hosts-code/tests/gateway_latency.rs": "610270c59f5fb6dd759df6f1053ff67ef3e9d2bfc947e6f28b28b45b7a240470",
+    "crates/remote-hosts-code/tests/integration.rs": "a54b000bbee4342c58e39f2652881d317279229f2ceebb3304eb53957d09add2",
+    "crates/remote-hosts-code/tests/interaction_031.rs": "df5effa38f241a52b34a5f1812d87fea13a708f0973361d013d8b1f547c2f081",
+    "crates/remote-hosts-code/tests/iteration_reliability.rs": "f92daae94659542da53e7bf33fac67afbbb77e119eaa84eaa52d4ba999a54251",
+    "crates/remote-hosts-code/tests/review_regressions.rs": "5564ca8aedd8bd45b588e2b3e8a22b9386396f566892aa24f8c3b2a1b90501ea",
+    "crates/remote-hosts-code/tests/terminal_read_latency.rs": "5d661a103f2667a4f57555e7504eacf149b7b00e899d5a645277fb32774c160d",
+    "crates/remote-hosts-code/tests/terminal_regressions.rs": "6df0d2f60fa8257d32b0ae527be34a2b53f83db1ade04723720c91fdda5cbb11",
+    "scripts/agent_upgrade_support.py": "e4368b1cb77e688381e939b33fd634ceb11122aa578f8963c58a679b32dda56f",
+    "scripts/check-code-gateway.py": "dc5a2e3aea0047a5fb5415c242caa8fd9099aa35fe8ec0b2df9f0514dc7133a2",
+    "scripts/check-code-source.py": "2d07d29a7a5871684757b90043ef01a50f92a91a188a915ade94c99f47f17a92",
+    "scripts/code-gateway-dns.py": "91fb72b56daea48ad2934a28e516883b7849b41553c127da2da558b2bf26a253",
+    "scripts/install-code-agent.py": "6d64ab4538068ff986845f9e528447adff36abf0fde5ad1602ea70a1b6913e5c",
+    "scripts/install-code-gateway.py": "194dfd6421026593898b354dde91ee8d0829e0309eab788bba88c659f79f5301",
+    "scripts/launch-code-upgrade.py": "22c565d09994f62b6d145b60228dc17a8300e7bf0daa14857fc632e0571363d6",
+    "scripts/package-code-release.py": "270d57362887ebf3141f37aae7ff1143017a083fb1bb6fa4a2b7a578a00d7667",
+    "scripts/product-backlog.py": "fed0368c800bd9c94ebc9f65b98ccd76301ea60e97ee82e9255211fc318b8bde",
+    "scripts/run-code-gateway.py": "eab446c500a1c19517c06fb20a4f6a5ba6c91a27e001cb5b705921a8888633ad",
+    "scripts/tests/test_release_031.py": "9d2499d19806a65076278f3f9d29652aa9ac6829a913707c91c3bd96f61c7112",
+    "scripts/tests/test_upgrade_code_agent.py": "5ecfbd914f462217ccdf61e280b1260006d28087aef458b5342ba4028e039177",
+    "scripts/upgrade-code-agent.py": "437efa56e3c65198a9ec9fb1809b89732a68629696847da688657e54a662c194",
+    "scripts/upgrade-code-gateway.py": "086ab4e906b576ca308b9e46219d937331db552800d73ed1eee5c4941d696b05"
+  },
+  "checks": {
+    "fmt": {
+      "exit_code": 0,
+      "elapsed_seconds": 0.7009765840048203,
+      "log": "target/iteration-031/20260910T125334Z-55dbf63e/fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "clippy": {
+      "exit_code": 0,
+      "elapsed_seconds": 28.370907374992385,
+      "log": "target/iteration-031/20260910T125334Z-55dbf63e/clippy.log",
+      "sha256": "8b6bbf26ae01622a7940532dbedc4edd8dd98fc739454969e2ad82ed26d64da5"
+    },
+    "rust_tests": {
+      "exit_code": 0,
+      "elapsed_seconds": 249.51690904100542,
+      "log": "target/iteration-031/20260910T125334Z-55dbf63e/rust_tests.log",
+      "sha256": "a721fc092b571db2b1f85f7343e799ef8affee2512100b0c68b6c8fd7bcc091c"
+    },
+    "python_tests": {
+      "exit_code": 0,
+      "elapsed_seconds": 0.6986735410027904,
+      "log": "target/iteration-031/20260910T125334Z-55dbf63e/python_tests.log",
+      "sha256": "af78592da03fa8fc452991012220b9a91a40dc21fc08aee5cba4319e2ef93133"
+    },
+    "workspace": {
+      "exit_code": 0,
+      "elapsed_seconds": 16.58353045799595,
+      "log": "target/iteration-031/20260910T125334Z-55dbf63e/workspace.log",
+      "sha256": "fbad6b28825fbac16131003a2cbe75ecd6e74d30942a9d2239cbd8041c86eebd"
+    }
+  },
+  "deployed": false,
+  "source_inputs_unchanged": true,
+  "functional_tests": {
+    "passed": 166,
+    "failed": 0,
+    "rust_passed": 144,
+    "python_passed": 22,
+    "ignored_benchmarks": 2
+  },
+  "verified_at": "2026-09-10T12:58:30.214212+00:00"
+}

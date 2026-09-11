@@ -1,0 +1,58 @@
+{
+  "version": "0.4.1",
+  "state": "partially_deployed_acceptance_incomplete",
+  "all_requested_targets_accepted": false,
+  "manifest_sha256": "7bdf0da605e4b60923a45a59aec42d3886e7e463e96544d6170af4600f671bcc",
+  "source_verification": "docs/releases/0.4.1/verification.json",
+  "tests": {
+    "passed": 312,
+    "failed": 0,
+    "rust_passed": 213,
+    "python_passed": 99,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "nas": {
+    "state": "upgraded",
+    "version": "0.4.1",
+    "pid": 14982,
+    "sha256": "6ff56f9a5a2254805371afe12814188d55695d5b9687e7349911330a0e7823d3",
+    "evidence": "docs/releases/0.4.1/nas-updater.json"
+  },
+  "macbook": {
+    "state": "upgraded_readiness_and_context_verified",
+    "version": "0.4.1",
+    "pid": 47347,
+    "sha256": "bfbbeae07843b53f26e8d425c8ae1742514714e35cd6ba3fb62100876c2d6645",
+    "evidence": "docs/releases/0.4.1/macbook-runtime-proof.json"
+  },
+  "studio": {
+    "state": "busy_upgrade_not_applied",
+    "running_version": "0.4.0",
+    "candidate_version": "0.4.1",
+    "candidate_staged": true,
+    "service_changed": false,
+    "evidence": "docs/releases/0.4.1/studio-updater-failed.json"
+  },
+  "acceptance": {
+    "macbook_context_readonly": "passed",
+    "standard_macbook": "blocked_before_execution",
+    "both_device_standard": "not_run",
+    "new_transfer_and_range_live": "not_run",
+    "parallel_exports_live": "not_run"
+  },
+  "source_archive": "docs/releases/0.4.1/verified-source.tar.gz",
+  "source_archive_sha256": "db96e435a87616f40e3be07903419124c661df38192bddb90bd02f94e0182fa1",
+  "publisher_final": "docs/releases/0.4.1/deployment-r1.json",
+  "publisher_ended": true,
+  "temporary_oauth_revoked": true,
+  "next_actions": [
+    "Retain already deployed NAS/MacBook; do not reinstall to repeat acceptance.",
+    "Observe original Studio busy outcome, preserve other work and start a separate bounded installation attempt only after idle is established.",
+    "Complete the explicit MacBook and both-device standard gates through a normally authorized host operation; do not infer success from read-only context checks."
+  ],
+  "background_work_scheduled": false,
+  "git_commit_or_push": false
+}

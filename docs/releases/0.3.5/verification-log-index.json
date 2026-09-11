@@ -1,0 +1,32 @@
+{
+  "fmt": {
+    "path": "docs/releases/0.3.5/logs/fmt.log",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "exit_code": 0,
+    "elapsed_seconds": 0.9623892090166919
+  },
+  "clippy": {
+    "path": "docs/releases/0.3.5/logs/clippy.log",
+    "sha256": "f4c2bc2e1149d7d669870cfdbaf03297f30f612a0199e237c79a5b11d743d316",
+    "exit_code": 0,
+    "elapsed_seconds": 298.0165742079844
+  },
+  "rust_tests": {
+    "path": "docs/releases/0.3.5/logs/rust_tests.log",
+    "sha256": "bfdbe322267d57834feddcd14cf4b4501e3809ca5c320e08ebd5fbda3edb9d8f",
+    "exit_code": 0,
+    "elapsed_seconds": 682.8118484170118
+  },
+  "python_tests": {
+    "path": "docs/releases/0.3.5/logs/python_tests.log",
+    "sha256": "fea2144442b25b5dd8055a564296747b3df2071e6fdaeaef2a990eea74846f89",
+    "exit_code": 0,
+    "elapsed_seconds": 7.31917370800511
+  },
+  "workspace": {
+    "path": "docs/releases/0.3.5/logs/workspace.log",
+    "sha256": "273f5e80b8acadd14f58abbcb0b5cc87ee8432e1b4affd3af14a96978a664e9a",
+    "exit_code": 0,
+    "elapsed_seconds": 138.47245804200065
+  }
+}

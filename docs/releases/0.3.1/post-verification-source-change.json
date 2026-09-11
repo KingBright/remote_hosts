@@ -1,0 +1,42 @@
+{
+  "observed_at": "2026-09-10T13:30:27.708632+00:00",
+  "source_mismatches": [
+    {
+      "path": "crates/remote-hosts-code/src/gateway.rs",
+      "tested_sha256": "d759a40b582e5877805a1365fd05fcb5d1e4b5749c6b6fe9414443850eec8f2c",
+      "current_sha256": "62c8e7ae0be7ad0064ecb2cdd6144a982633a78ab796b3b48ecad787cbff3db8"
+    },
+    {
+      "path": "scripts/agent_upgrade_support.py",
+      "tested_sha256": "e4368b1cb77e688381e939b33fd634ceb11122aa578f8963c58a679b32dda56f",
+      "current_sha256": "e775630d647c7c9f96637e611483d7f722917905695832ceb2811bb1e756dd34"
+    },
+    {
+      "path": "scripts/check-code-source.py",
+      "tested_sha256": "2d07d29a7a5871684757b90043ef01a50f92a91a188a915ade94c99f47f17a92",
+      "current_sha256": "f66df841ba8efa3c3d36e3729158cfa4eef8cb5b2835ef6766a6733d09604526"
+    },
+    {
+      "path": "scripts/launch-code-upgrade.py",
+      "tested_sha256": "22c565d09994f62b6d145b60228dc17a8300e7bf0daa14857fc632e0571363d6",
+      "current_sha256": "bbd9a74c3774b0a248f8c5f5156ab8f6d8524ba5b89087e4a96e716591623e23"
+    },
+    {
+      "path": "scripts/package-code-release.py",
+      "tested_sha256": "270d57362887ebf3141f37aae7ff1143017a083fb1bb6fa4a2b7a578a00d7667",
+      "current_sha256": "f99ed311527eab67d1478d962e5316949f329a45a753e4c83b350e72644923bc"
+    },
+    {
+      "path": "scripts/tests/test_release_031.py",
+      "tested_sha256": "9d2499d19806a65076278f3f9d29652aa9ac6829a913707c91c3bd96f61c7112",
+      "current_sha256": "16bddff5288325bf82d33a17bc765e7db3ec77c8c43f76436a1bfd4f02a9508a"
+    },
+    {
+      "path": "scripts/upgrade-code-agent.py",
+      "tested_sha256": "437efa56e3c65198a9ec9fb1809b89732a68629696847da688657e54a662c194",
+      "current_sha256": "e3ce64e76734339ec33e1064ac53f5263bb81967d8b7d1e9d6beeeea1abc576b"
+    }
+  ],
+  "artifact_mismatches": [],
+  "manifest_sha256": "9c19b6c5b5f3c404c71ae5c52b37f2c9fb282d301a34121af63d26012ba23eef"
+}

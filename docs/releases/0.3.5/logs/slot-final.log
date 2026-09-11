@@ -1,0 +1,29 @@
+test_busy_pipeline_does_not_execute_any_command (test_build_slot.BuildSlotTests.test_busy_pipeline_does_not_execute_any_command) ... {"state": "busy", "version": "0.3.5", "phase": "lease", "snapshot_id": "6b38b8abd4d0f91bc2488618d0eea4f61d923ee8daa748b6a533a8b23b1c3267", "verification": null, "package": null, "next_action": "observe owner.report; this attempt did not start compilation"}
+ok
+test_changed_executable_mode_is_replaced_and_recorded (test_build_slot.BuildSlotTests.test_changed_executable_mode_is_replaced_and_recorded) ... ok
+test_concurrent_owner_returns_original_report_without_work (test_build_slot.BuildSlotTests.test_concurrent_owner_returns_original_report_without_work) ... ok
+test_dirty_checkout_is_rejected_without_erasing_new_changes (test_build_slot.BuildSlotTests.test_dirty_checkout_is_rejected_without_erasing_new_changes) ... ok
+test_existing_report_is_observation_not_a_new_build (test_build_slot.BuildSlotTests.test_existing_report_is_observation_not_a_new_build) ... {"state": "existing_attempt", "original_state": "failed", "report": "/private/var/folders/q_/0bykfl6x79zgp4fkvht8ddmc0000gn/T/tmpshd7lnrq/prior.json", "action": "observe_original; no build started"}
+ok
+test_existing_version_fails_before_expensive_checks (test_build_slot.BuildSlotTests.test_existing_version_fails_before_expensive_checks) ... {"state": "failed", "version": "0.3.5", "phase": "lease", "snapshot_id": "6b38b8abd4d0f91bc2488618d0eea4f61d923ee8daa748b6a533a8b23b1c3267", "verification": null, "package": null, "next_action": "inspect the saved stage log; do not rerun an unknown operation"}
+ok
+test_extra_source_file_is_not_silently_deleted (test_build_slot.BuildSlotTests.test_extra_source_file_is_not_silently_deleted) ... ok
+test_failed_stage_retains_exit_code_log_and_does_not_claim_success (test_build_slot.BuildSlotTests.test_failed_stage_retains_exit_code_log_and_does_not_claim_success) ... {"phase": "fixture", "state": "running", "report": "/private/var/folders/q_/0bykfl6x79zgp4fkvht8ddmc0000gn/T/tmp6q43035c/stage.json"}
+ok
+test_identical_snapshot_keeps_inode_mtime_and_does_not_link_inputs (test_build_slot.BuildSlotTests.test_identical_snapshot_keeps_inode_mtime_and_does_not_link_inputs) ... ok
+test_lock_released_on_failure (test_build_slot.BuildSlotTests.test_lock_released_on_failure) ... ok
+test_next_candidate_copies_only_changed_input_at_same_checkout_path (test_build_slot.BuildSlotTests.test_next_candidate_copies_only_changed_input_at_same_checkout_path) ... ok
+test_process_sampling_excludes_other_users_jobs (test_build_slot.BuildSlotTests.test_process_sampling_excludes_other_users_jobs) ... ok
+test_progress_reads_active_cargo_log_and_rejects_escaped_path (test_build_slot.BuildSlotTests.test_progress_reads_active_cargo_log_and_rejects_escaped_path) ... ok
+test_removed_input_does_not_delete_build_outputs (test_build_slot.BuildSlotTests.test_removed_input_does_not_delete_build_outputs) ... ok
+test_snapshot_and_checkout_must_not_overlap (test_build_slot.BuildSlotTests.test_snapshot_and_checkout_must_not_overlap) ... ok
+test_stage_rejects_input_mutation_even_with_zero_exit (test_build_slot.BuildSlotTests.test_stage_rejects_input_mutation_even_with_zero_exit) ... {"phase": "fixture", "state": "running", "report": "/private/var/folders/q_/0bykfl6x79zgp4fkvht8ddmc0000gn/T/tmpvw7lyhb9/stage.json"}
+ok
+test_status_query_does_not_run_a_command (test_build_slot.BuildSlotTests.test_status_query_does_not_run_a_command) ... ok
+test_symlinked_metadata_does_not_redirect_status_writes (test_build_slot.BuildSlotTests.test_symlinked_metadata_does_not_redirect_status_writes) ... ok
+test_unowned_directory_and_symlink_are_rejected (test_build_slot.BuildSlotTests.test_unowned_directory_and_symlink_are_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 1.835s
+
+OK

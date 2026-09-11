@@ -1,0 +1,45 @@
+{
+  "recorded_at": "2026-09-10T15:20:02.058143+00:00",
+  "version": "0.3.3",
+  "events": [
+    {
+      "kind": "host_tool_pre_dispatch_block",
+      "tool": "terminal_exec",
+      "idempotency_key": "rh033-macbook-inventory-0910-g1",
+      "scope": "combined environment inventory",
+      "execution_started": false,
+      "message": "因 OpenAI 无法确定请求的安全状态，已拦截此工具调用。",
+      "handling": "Not replayed. Independent source reads, edits and regression tests ran normally."
+    },
+    {
+      "kind": "host_tool_pre_dispatch_block",
+      "tool": "terminal_exec",
+      "idempotency_key": "rh033-build-frozen-release-0910-g1",
+      "scope": "frozen snapshot release builds and packaging",
+      "execution_started": false,
+      "message": "因 OpenAI 无法确定请求的安全状态，已拦截此工具调用。",
+      "handling": "Not retried, split or moved to another route. Source test evidence retained; no release binary or deployment from this action."
+    },
+    {
+      "kind": "regression_reproduced",
+      "scope": "resource scheduling",
+      "baseline": "docs/releases/0.3.3/logs/contention-baseline.log",
+      "baseline_failed": 2,
+      "final_result": "both passed on fixed snapshot",
+      "additional_case": "initial repair exposed slow queue drain; completion wakeup added without widening the eight-second drain test"
+    },
+    {
+      "kind": "test_fixture_timing",
+      "scope": "Python cancellation regression",
+      "baseline": "docs/releases/0.3.3/logs/python-regressions.log",
+      "observation": "interpreter startup exceeded the 200ms cancellation window under load; started output absent",
+      "resolution": "synchronize child-group startup before measuring original cancellation window; final suite passed"
+    },
+    {
+      "kind": "caller_expected_version_typo",
+      "operation_id": "08195c73-4b68-4684-ae99-4a318f3c5122",
+      "execution_changed_files": false,
+      "resolution": "corrected to the exact version returned by the service; not attributed to concurrent edits"
+    }
+  ]
+}

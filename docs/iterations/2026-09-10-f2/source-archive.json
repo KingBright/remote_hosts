@@ -1,0 +1,8 @@
+{
+  "snapshot_id": "1c8a49ed007b900aa6cfddb3804a4ef3788a3c0df77de0c9abc0eb1a90aa0578",
+  "archive": "docs/iterations/2026-09-10-f2/verified-rust-inputs.tar.gz",
+  "size": 554072,
+  "sha256": "458440a3d989d3461fe01a33ec7de4667df4423f2839f8c5c433b19eb41c76e6",
+  "files_verified": 112,
+  "scope": "preserved source inputs; not a release binary or full Python validation"
+}

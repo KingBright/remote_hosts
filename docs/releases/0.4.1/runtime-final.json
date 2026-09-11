@@ -1,0 +1,8 @@
+{
+  "source": "native Remote_Hosts.devices_list after publication and read-only context acceptance",
+  "gateway": {"version":"0.4.1","tool_count":18,"transfer_protocol":2,"tools_sha256":"ffff9c1dd0f7178ba3a2e6a571e8b91edfe17fa97bce4ec1a9a76e7f1243a0fe"},
+  "macbook": {"device_id":"ba3bf113-2390-466e-88bc-40d5b4f02884","version":"0.4.1","online":true,"last_seen":1789101693,"session":"bb0356570aa042bba46de502ac65a7845b808727a7e5443996189b2f5dd9636e","receipt_delivery":{"pending":0,"blocked":0,"sending":0},"readiness":"verified","context_readonly_acceptance":"passed","standard_acceptance":"not_run_host_blocked"},
+  "studio": {"device_id":"8af88e35-f316-4dd9-9810-fa5bd3a22196","version":"0.4.0","online":true,"last_seen":1789101691,"session":"fcae5e7cf1b54a0d89feb20fd6cc368c22709d22c9304309aa007395b7c687c2","receipt_delivery":{"pending":0,"blocked":0,"sending":0},"upgrade":"rejected_before_installation_due_to_active_work","service_changed":false},
+  "all_requested_targets_deployed_and_accepted": false,
+  "background_upgrade_scheduled": false
+}

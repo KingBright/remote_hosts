@@ -1,0 +1,76 @@
+{
+  "version": "0.4.1",
+  "state": "needs_recovery",
+  "phase": "observe_original_updaters",
+  "targets": [
+    "NAS gateway",
+    "MacBook-M2-Max",
+    "Mac-Studio"
+  ],
+  "manifest_sha256": "7bdf0da605e4b60923a45a59aec42d3886e7e463e96544d6170af4600f671bcc",
+  "tests": {
+    "passed": 312,
+    "failed": 0,
+    "rust_passed": 213,
+    "python_passed": 99,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "targets_accepted": false,
+  "operations": [
+    {
+      "stage": "export",
+      "operation_id": "cbc77097-465b-40fc-a876-85afcd46b087"
+    },
+    {
+      "stage": "import",
+      "operation_id": "cc86edc9-3bad-4850-9571-25171706b184"
+    },
+    {
+      "key": "r041-studio-extract",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:70854d05-8758-40ba-9aae-e71e10299d5b",
+      "terminal_id": "b7e08ee3-11f2-41af-8d8b-2a693088e4a5"
+    },
+    {
+      "key": "r041-studio-launch",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:70854d05-8758-40ba-9aae-e71e10299d5b",
+      "terminal_id": "dd16b6e8-7f34-4a20-ae0e-ba0c2fb0719a"
+    }
+  ],
+  "package": "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.4.1",
+  "observed_at_epoch": 1789101210,
+  "launches": {
+    "macbook": {
+      "label": "com.remote-hosts.code-upgrade.0cc037e5d487111e82315d18",
+      "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/0cc037e5d487111e82315d18/result.json",
+      "state": "started",
+      "exit_code": 0
+    },
+    "studio": {
+      "label": "com.remote-hosts.code-upgrade.be0211f82f705d0c84ce27f8",
+      "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/be0211f82f705d0c84ce27f8/result.json",
+      "state": "started",
+      "exit_code": 0
+    }
+  },
+  "runtime_observation": [
+    {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "online": true,
+      "version": "0.4.1",
+      "last_seen": 1789101203
+    },
+    {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "online": true,
+      "version": "0.4.0",
+      "last_seen": 1789101202
+    }
+  ],
+  "failure_type": "ReleaseError",
+  "failure_code": "runtime_not_ready",
+  "next_action": "inspect original updater paths; do not reinstall",
+  "temporary_oauth_revoked": true
+}

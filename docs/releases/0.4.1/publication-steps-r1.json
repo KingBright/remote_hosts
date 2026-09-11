@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.4.1",
+    "manifest_sha256": "7bdf0da605e4b60923a45a59aec42d3886e7e463e96544d6170af4600f671bcc",
+    "devices": [
+      "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "8af88e35-f316-4dd9-9810-fa5bd3a22196"
+    ],
+    "gateway": "https://mcp.hackerlife.fun"
+  },
+  "steps": {
+    "preserve_package": {
+      "state": "completed",
+      "input_sha256": "8ec9f3ed0aca405c2f0b087652bce0a8faa6ed1c59ef4afcf67bed3ad4c9d301",
+      "requested_at_epoch": 1789100584.205284,
+      "result": {
+        "path": "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.4.1",
+        "manifest_sha256": "7bdf0da605e4b60923a45a59aec42d3886e7e463e96544d6170af4600f671bcc"
+      }
+    },
+    "studio_stage": {
+      "state": "completed",
+      "input_sha256": "47c40aeceb18dfbd951d9815915ac69ee91597e854532d68124633aa6020c152",
+      "requested_at_epoch": 1789100604.0766232,
+      "result": {
+        "archive_sha256": "43381dcd365ae4acc6b825e4dd23d47a71c00c9b7a399a03b587a0d6952b7cd5",
+        "import_operation_id": "cc86edc9-3bad-4850-9571-25171706b184"
+      }
+    },
+    "nas_stage": {
+      "state": "completed",
+      "input_sha256": "2e6bda73e6160ce5357962f109cd4636457d29c534c9ee54193ffcc794443d4b",
+      "requested_at_epoch": 1789100759.079045,
+      "result": {
+        "path": "/opt/remote-hosts-code/releases/0.4.1",
+        "manifest_sha256": "7bdf0da605e4b60923a45a59aec42d3886e7e463e96544d6170af4600f671bcc"
+      }
+    },
+    "nas_upgrade": {
+      "state": "completed",
+      "input_sha256": "596071e6e6c0f7cfde8e9c0bda5cfccd9a560b781e55462e84f33fb267214b78",
+      "requested_at_epoch": 1789100831.282101,
+      "result": {
+        "state": "upgraded",
+        "version": "0.4.1",
+        "candidate_sha256": "6ff56f9a5a2254805371afe12814188d55695d5b9687e7349911330a0e7823d3",
+        "backup": "/opt/remote-hosts-code/releases/before-0.4.1-20260911T122712",
+        "previous_sha256": "18c80eec5b318c51bd678cb6e21bf3b2d0ffad1c242b9e585b816b82761df718",
+        "pid": 14982,
+        "installed_sha256": "6ff56f9a5a2254805371afe12814188d55695d5b9687e7349911330a0e7823d3",
+        "health": {
+          "capabilities_protocol": 1,
+          "checkpoint_bytes": 4194304,
+          "dispatch_protocol": 2,
+          "execution_limits": {
+            "control": 2,
+            "read": 8,
+            "terminal": 4,
+            "transfer": 2,
+            "write": 2
+          },
+          "file_transfer": true,
+          "max_file_bytes": 67108864,
+          "observation_protocol": 1,
+          "progress_protocol": 1,
+          "readiness_protocol": 1,
+          "resource_dispatch_protocol": 1,
+          "service": "remote-hosts-code",
+          "status": "ok",
+          "transfer_protocol": 2,
+          "version": "0.4.1"
+        },
+        "caddy_override_removed": false
+      }
+    },
+    "studio_launch": {
+      "state": "completed",
+      "input_sha256": "a70b13d2f88ff418f554d6d3cfee31a657b69574ed977aebdd27be68b4ba8697",
+      "requested_at_epoch": 1789100834.970079,
+      "result": {
+        "label": "com.remote-hosts.code-upgrade.be0211f82f705d0c84ce27f8",
+        "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/be0211f82f705d0c84ce27f8/result.json",
+        "state": "started",
+        "exit_code": 0
+      }
+    },
+    "macbook_launch": {
+      "state": "completed",
+      "input_sha256": "994eb614feb6a667dd4a0a6f8caa6fa052f5022e995b347d2539392027dce9c8",
+      "requested_at_epoch": 1789100844.074645,
+      "result": {
+        "label": "com.remote-hosts.code-upgrade.0cc037e5d487111e82315d18",
+        "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/0cc037e5d487111e82315d18/result.json",
+        "state": "started",
+        "exit_code": 0
+      }
+    }
+  },
+  "updated_at_epoch": 1789100844.430945
+}

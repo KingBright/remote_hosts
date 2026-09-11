@@ -1,0 +1,54 @@
+{
+  "version": "0.3.0",
+  "scope": "MacBook native source verification; not release deployment",
+  "verified_at": "2026-09-10T06:21:54.072965+00:00",
+  "functional_tests": {
+    "passed": 135,
+    "failed": 0,
+    "code_crate_passed": 71,
+    "legacy_mcp_passed": 64,
+    "ignored_benchmarks": 2
+  },
+  "checks": {
+    "fmt": "passed",
+    "clippy_all_targets_deny_warnings": "passed",
+    "workspace_check": "passed"
+  },
+  "validation_terminal_id": "880207cb-2cf0-4ed1-9aa2-fe994ee3251d",
+  "source_inputs_unchanged": true,
+  "source_inputs": {
+    "Cargo.toml": "e31c96abd30fee37d41b814a0be5dc16e2d8af5446be750b13fcc5ef0a8cde3b",
+    "Cargo.lock": "d48c0de01cf360b547c141328353a59248193c4710fa97c147145dbbc7266f7c",
+    "crates/remote-hosts-code/Cargo.toml": "c619a521325a9a03792baaa2df091dd7bd2134f97324b8e3c57a3777cfcbb084",
+    "crates/remote-hosts-code/src/agent.rs": "76d2795f2e572e7301539c314fc7a48a5c07e8cae52738ad20e5e765e2206a6f",
+    "crates/remote-hosts-code/src/auth.rs": "f2d638d8a2b97ee229bbc2b37b7f50953be41c136ba1496708a34444c9f821da",
+    "crates/remote-hosts-code/src/files.rs": "a4b0c637420caf4f3683b5dcb914e9306a6d7f71abbc752005f17129a6d84c21",
+    "crates/remote-hosts-code/src/gateway.rs": "9015adeeb86b5dc8103b979912ff2e892d7a272a8fcfb6ec0318162bd38c79b5",
+    "crates/remote-hosts-code/src/lib.rs": "12ad3e1d1b6b77cf2613c6a53134dea6b1714bf64d357c985193cde5c51f496f",
+    "crates/remote-hosts-code/src/main.rs": "4bbef74d356b4ffbac1a4fab15483e1b3b31884cf89df1e904244ebf72a94922",
+    "crates/remote-hosts-code/src/progress.rs": "1ac2f7ae43282742130dd79dc93a5917c06c04523c109516555b574159e856b1",
+    "crates/remote-hosts-code/src/resumable.rs": "cd80e33537a4a0591c583789e8ca3eceee0a2fefdd89bac57787f61c68c7c276",
+    "crates/remote-hosts-code/src/scheduler.rs": "351e272903156ad2574ebb9448682689f2cf21dfe243a4019d94afc1d615903a",
+    "crates/remote-hosts-code/src/store.rs": "965e95fcf633652edee3eafa9bb41d471b17188be1dd0dfb12e4e89a549d9932",
+    "crates/remote-hosts-code/src/terminal.rs": "a4640f49748b8736b6dde0caa4ea352e444bfbe9c7240c097b0453f15bb2e8e0",
+    "crates/remote-hosts-code/src/terminal_output.rs": "43d078ac5c88d70777e735a01f8bbff98cf8997d2527f68582c864486de143f3",
+    "crates/remote-hosts-code/src/tools.rs": "33507d4a80757763fa1d7596c9943d15278c91fb4a018f186fe7fda3635f7843",
+    "crates/remote-hosts-code/src/transfer_watch.rs": "4cccf8e7aeb9d0a2dab7addfa302b29c8c85ab0c8dbdea5609b1770489716a43",
+    "crates/remote-hosts-code/src/transfers.rs": "8215b87c88ab20b2d43c09230b846a2c3e9fe949c0adafa769a747bf1263d6f2",
+    "crates/remote-hosts-code/tests/concurrency.rs": "50a8243d17933e10774f1032bec6cca06e73e03d9b79a3c84f1da600e2842583",
+    "crates/remote-hosts-code/tests/file_transfers.rs": "81465e20edb544a72b26cecbb8e60b6ff188f746401c68c46fc531fbb48ebfd2",
+    "crates/remote-hosts-code/tests/gateway_latency.rs": "610270c59f5fb6dd759df6f1053ff67ef3e9d2bfc947e6f28b28b45b7a240470",
+    "crates/remote-hosts-code/tests/integration.rs": "a54b000bbee4342c58e39f2652881d317279229f2ceebb3304eb53957d09add2",
+    "crates/remote-hosts-code/tests/iteration_reliability.rs": "f92daae94659542da53e7bf33fac67afbbb77e119eaa84eaa52d4ba999a54251",
+    "crates/remote-hosts-code/tests/review_regressions.rs": "5564ca8aedd8bd45b588e2b3e8a22b9386396f566892aa24f8c3b2a1b90501ea",
+    "crates/remote-hosts-code/tests/terminal_read_latency.rs": "5d661a103f2667a4f57555e7504eacf149b7b00e899d5a645277fb32774c160d",
+    "crates/remote-hosts-code/tests/terminal_regressions.rs": "6df0d2f60fa8257d32b0ae527be34a2b53f83db1ade04723720c91fdda5cbb11"
+  },
+  "log_sha256": {
+    "fmt-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "clippy-final.log": "5a6c251b1cb258515ac7c64f25a0b7094bfafe95e0810db8574d7cab5067cbca",
+    "tests-final.log": "fbfb211820634930e40160143ba20b8df8738d2dda258aae6d5634d622fe5915",
+    "workspace-final.log": "548750af9c41570266064184d96b655034cb452fe164f02cd810e74efa518e4e"
+  },
+  "deployed": false
+}

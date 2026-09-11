@@ -9,3 +9,9 @@
 *.sqlite-wal
 .env
 .DS_Store
+__pycache__/
+*.pyc
+# Release evidence keeps hashes/JSON/Markdown in Git, not generated binary archives or lock files.
+docs/**/*.tar.gz
+docs/**/*.tgz
+docs/**/*.lock

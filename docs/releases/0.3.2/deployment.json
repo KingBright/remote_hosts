@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "version": "0.3.2",
+  "recorded_at": "2026-09-10T14:14:32.640681+00:00",
+  "state": "gateway_and_macbook_upgraded;full_acceptance_incomplete",
+  "all_targets_accepted": false,
+  "manifest_sha256": "e5465cb75319e856c67b41f1f5ba1789b3ef491cd8a95b514cad2ec2bc5dcc3c",
+  "source_verification": "docs/releases/0.3.2/verification-final.json",
+  "default_test_gates": {
+    "passed": 194,
+    "failed": 0,
+    "rust_passed": 153,
+    "python_passed": 41,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "extra_opt_in_probe": "docs/releases/0.3.2/live-oneshot.json",
+  "frozen_artifacts_verified": true,
+  "current_worktree_matches_frozen_verification": false,
+  "changed_input_paths": [
+    "crates/remote-hosts-code/src/observations.rs",
+    "crates/remote-hosts-code/tests/observations_032.rs",
+    "scripts/check-code-source.py"
+  ],
+  "nas": {
+    "state": "upgraded_running_hash_verified",
+    "version": "0.3.2",
+    "pid": 20154,
+    "installed_sha256": "c35b290afad47b899a3cd3f08f8e094cb869c51afe0076400b26e79b318e470e",
+    "backup": "/opt/remote-hosts-code/releases/before-0.3.2-20260910T220242",
+    "receipt": "docs/releases/0.3.2/nas-updater.json",
+    "operation_id": "449d1793-2232-4228-a3c4-caf1da42f669"
+  },
+  "macbook": {
+    "state": "upgraded_stable_control_plane_and_readonly_features_verified",
+    "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+    "version": "0.3.2",
+    "pid": 88373,
+    "installed_sha256": "7188c126aa83521d6cbd7bf3ec91fdd9e18b5c789c29a2ae43c59ee5f5add3f5",
+    "backup": "/Users/jinliang/.local/share/remote-hosts-code/releases/before-0.3.2-20260910T220427-532c35b2/remote-hosts-code",
+    "stable_seconds": 23.000799457993708,
+    "samples": 9,
+    "all_lanes_advanced": [
+      "control",
+      "read",
+      "terminal",
+      "transfer",
+      "write"
+    ],
+    "updater_runs": 1,
+    "updater_exit_code": 0,
+    "features_receipt": "docs/releases/0.3.2/features-macbook.json",
+    "full_code_file_acceptance": "blocked_not_executed"
+  },
+  "mac_studio": {
+    "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+    "version": "0.3.0",
+    "online_at_last_observation": true,
+    "last_seen": 1789049553,
+    "state": "not_upgraded_unrelated_active_work_preserved",
+    "prior_031_outcome": "failed_idle_preflight;no_binary_change",
+    "evidence": "docs/releases/0.3.2/studio-original-outcome.json",
+    "new_032_upgrade_submitted": false
+  },
+  "host_schema": {
+    "new_optional_inputs_exercised_via": "authenticated direct MCP",
+    "native_devices_list_new_fields_observed": true,
+    "conversation_input_schema_refresh": "not_proven",
+    "not_provided_hash_is_not_a_match": true
+  },
+  "gates": {
+    "source_default_checks": "passed_for_frozen_inputs",
+    "extra_real_launchd_probe": "passed",
+    "macos_release": "passed",
+    "linux_release": "passed",
+    "nas_running_hash": "passed",
+    "macbook_stable_readiness": "passed",
+    "read_only_new_feature_acceptance": "passed",
+    "standard_macbook_live_mutating_acceptance": "blocked_not_executed",
+    "studio_032_upgrade": "not_attempted_active_work",
+    "all_device_acceptance": "not_completed"
+  },
+  "credentials_changed": false,
+  "unrelated_tasks_cancelled": false,
+  "git_commit_or_push": false,
+  "prior_release_packages_modified": false
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "observed_on": "2026-09-11",
+  "purpose": "next-version planning, not feature implementation or acceptance",
+  "project_root": "/Users/jinliang/Workspace/remote_hosts",
+  "workspace_id": "ba3bf113-2390-466e-88bc-40d5b4f02884:1d51494e-0c96-4a2e-92e6-1ee24ca33bb2",
+  "runtime": {"gateway_version":"0.4.1","gateway_tool_count":18,"macbook_version":"0.4.1","macbook_online":true,"macbook_last_seen":1789105680,"studio_version":"0.4.0","studio_online":true,"studio_last_seen":1789105679},
+  "host_discovery": {"tool_count":15,"operation_get_accepts":"operation_id only","gap_observed":true,"unique_root_cause_not_proven":true},
+  "git_observation": {"terminal_id":"77102598-a939-441a-8892-3839900b2d88","terminal_exit_code":0,"branch":"main","head_short":"b3252b5","untracked_examples":["crates/remote-hosts-code/","scripts/release-code.py","scripts/release_receipts.py","scripts/tests/"],"does_not_imply_no_backup":true},
+  "diff_probe": {"operation_id":"34d5eb5a-37bb-4483-8807-52c99771fa18","paths":["crates/remote-hosts-code/"],"diff":"","truncated":false,"untracked_source_already_observed":true},
+  "code_read_operations": ["cb703246-3743-4a9d-9993-67aa854e3e7f","2247d88d-3023-475e-acee-c1f33db2456b","93552540-d567-4207-8d65-bb71b416532a"],
+  "backlog_version_before_planning":"365aa3b1ef7aec9eeef9711dcb86fbca2655b81e30cce4951969c2a1504630f9",
+  "source_tests_run_this_planning_turn": false,
+  "production_changes_this_planning_turn": false,
+  "git_mutations_this_planning_turn": false
+}

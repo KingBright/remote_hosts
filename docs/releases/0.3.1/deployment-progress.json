@@ -1,0 +1,63 @@
+{
+  "version": "0.3.1",
+  "observed_at": "2026-09-10T13:15:05.089799+00:00",
+  "state": "gateway_upgraded_agents_pending",
+  "all_targets_accepted": false,
+  "manifest_sha256": "9c19b6c5b5f3c404c71ae5c52b37f2c9fb282d301a34121af63d26012ba23eef",
+  "source_verification": "docs/releases/0.3.1/verification.json",
+  "tests_passed": 166,
+  "nas": {
+    "state": "upgraded",
+    "version": "0.3.1",
+    "candidate_sha256": "837976347819bca1d54063d7750e02a5e70474e50d4086398e076a099655ef9e",
+    "backup": "/opt/remote-hosts-code/releases/before-0.3.1-20260910T211130",
+    "previous_sha256": "bdc2fce190911f45cc1f25ac4d31ece5ca3d482e4e6efdc58d900cc934e0fab4",
+    "pid": 3338,
+    "installed_sha256": "837976347819bca1d54063d7750e02a5e70474e50d4086398e076a099655ef9e",
+    "health": {
+      "dispatch_protocol": 2,
+      "execution_limits": {
+        "control": 2,
+        "read": 8,
+        "terminal": 4,
+        "transfer": 2,
+        "write": 2
+      },
+      "file_transfer": true,
+      "max_file_bytes": 67108864,
+      "progress_protocol": 1,
+      "readiness_protocol": 1,
+      "service": "remote-hosts-code",
+      "status": "ok",
+      "version": "0.3.1"
+    },
+    "caddy_override_removed": false
+  },
+  "macbook": {
+    "state": "not_upgraded",
+    "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884"
+  },
+  "mac_studio": {
+    "state": "candidate_transfer_in_progress",
+    "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+    "stage_terminal_id": "eb686f5e-be1a-4d9a-9594-03beab4c80f0"
+  },
+  "staging_route_observations": [
+    {
+      "device": "Mac-Studio",
+      "route": "MacStudio.local SSH",
+      "result": "DNS resolution failed"
+    },
+    {
+      "device": "Mac-Studio",
+      "route": "verified local address SSH",
+      "result": "connection timeout"
+    },
+    {
+      "device": "Mac-Studio",
+      "route": "authorized gateway artifact transfer",
+      "result": "in_progress"
+    }
+  ],
+  "notes": "Runtime and functional acceptance remain separate. No old release package was overwritten."
+}

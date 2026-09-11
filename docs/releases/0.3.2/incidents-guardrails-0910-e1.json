@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-10",
+  "candidate_version": "0.3.2",
+  "production_changed_by_this_iteration": false,
+  "iteration_record": "docs/releases/0.3.2/iteration-guardrails-20260910.md",
+  "events": [
+    {
+      "related_issues": ["RH-026", "RH-042", "RH-044"],
+      "stage": "regression_baseline",
+      "operation_id": "751b0b9b-7213-490e-b3c5-9a6a9815ceb1",
+      "result": "four_failed_one_error_one_passed",
+      "evidence": "target/release-guardrails-031/baseline-corrected.log",
+      "note": "Corrected mock argument signatures before interpreting negative cases. Do not use the earlier incorrectly mocked pass as evidence."
+    },
+    {
+      "related_issues": ["RH-027", "RH-030"],
+      "stage": "host_tool_pre_dispatch",
+      "tool": "terminal_exec",
+      "idempotency_key": "rh030-two-device-acceptance-0910-e1",
+      "action": "explicit two-device public OAuth/MCP acceptance for version 0.3.0",
+      "observed": "此工具调用被 OpenAI 的安全检查屏蔽。请仔细检查你发送的内容。",
+      "execution_started": false,
+      "handling": "Not replayed. No success or test-failure receipt attributed to this unexecuted call."
+    },
+    {
+      "related_issues": ["RH-026", "RH-025"],
+      "stage": "source_verification",
+      "operation_id": "57514f07-be8c-4dbc-85db-226e250fc9ce",
+      "process_exit_code": 1,
+      "verification_state": "stale",
+      "check_exit_codes": {"fmt": 0, "clippy": 0, "rust_tests": 0, "python_tests": 0, "workspace": 0},
+      "observed_test_summary": {"passed": 185, "failed": 0, "rust_passed": 144, "python_passed": 41, "python_skipped": 1, "ignored_benchmarks": 2},
+      "evidence": "docs/releases/0.3.2/verification.json",
+      "note": "Inputs changed while checks ran. Passing test processes do not establish validation of the final working tree. Exact changed-input diagnostic was not obtained in this iteration; do not infer the editor."
+    },
+    {
+      "related_issues": ["RH-026", "RH-030"],
+      "stage": "host_tool_pre_dispatch",
+      "tool": "terminal_exec",
+      "idempotency_key": "rh032-investigate-stale-evidence-0910-e1",
+      "action": "read stale-verification changed-input details and current file fingerprints",
+      "observed": "因 OpenAI 无法确定请求的安全状态，已拦截此工具调用。",
+      "execution_started": false,
+      "handling": "No equivalent reroute or retry. Retain the observed stale result and continue only independent documentation work."
+    },
+    {
+      "related_issues": ["RH-044"],
+      "stage": "isolated_launchd_probe",
+      "operation_id": "2ca45eed-11a8-4dfd-8ed2-4fc701a318ec",
+      "result": "passed",
+      "runs": 1,
+      "exit_code": 0,
+      "post_exit_observation_seconds": 12,
+      "test_task_unloaded": true,
+      "actual_upgrader_executed": false,
+      "evidence": "target/release-guardrails-031/launchd-probe.log"
+    }
+  ]
+}

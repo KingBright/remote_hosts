@@ -1,0 +1,25 @@
+{
+  "observed_at": "2026-09-10T14:11:47.773168+00:00",
+  "agent": {
+    "query_exit_code": 0,
+    "state": "running",
+    "runs": "648",
+    "pid": "88373"
+  },
+  "updater": {
+    "query_exit_code": 0,
+    "state": "not running",
+    "runs": "1",
+    "last exit code": "0"
+  },
+  "installed_sha256": "7188c126aa83521d6cbd7bf3ec91fdd9e18b5c789c29a2ae43c59ee5f5add3f5",
+  "source_input_count": 84,
+  "source_mismatches": [
+    "crates/remote-hosts-code/src/observations.rs",
+    "crates/remote-hosts-code/tests/observations_032.rs",
+    "scripts/check-code-source.py"
+  ],
+  "artifact_mismatches": [],
+  "manifest_sha256": "e5465cb75319e856c67b41f1f5ba1789b3ef491cd8a95b514cad2ec2bc5dcc3c",
+  "observation_only": true
+}

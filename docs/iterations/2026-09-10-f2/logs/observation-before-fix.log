@@ -1,0 +1,45 @@
+   Compiling remote-hosts-code v0.3.2 (/Users/jinliang/Workspace/remote_hosts/crates/remote-hosts-code)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 14s
+     Running tests/observations_032.rs (/Users/jinliang/rust-target/debug/deps/observations_032-90009726cea3ef17)
+
+running 12 tests
+test expired_artifact_does_not_hide_other_authorized_results ... FAILED
+test device_manifest_detects_schema_mismatch_without_guessing_old_agent_features ... ok
+test explicit_single_query_budget_is_honored_without_changing_legacy_shape ... FAILED
+test features_are_saved_only_from_authenticated_device_polls ... ok
+test large_batch_results_are_explicitly_omitted_not_truncated ... ok
+test legacy_single_shape_and_batch_order_are_preserved_without_dispatch ... ok
+test malformed_mixed_or_duplicate_requests_never_create_jobs ... ok
+test permission_checks_cover_every_id_before_batch_output ... ok
+test only_meaningful_progress_changes_the_cursor ... ok
+test small_results_that_fit_the_budget_are_not_all_omitted ... FAILED
+test receipt_wakes_existing_batch_wait_and_does_not_reexecute ... ok
+test unchanged_wait_is_bounded_and_does_not_renew_job ... ok
+
+failures:
+
+---- expired_artifact_does_not_hide_other_authorized_results stdout ----
+
+thread 'expired_artifact_does_not_hide_other_authorized_results' (5796399) panicked at crates/remote-hosts-code/tests/observations_032.rs:77:48:
+called `Result::unwrap()` on an `Err` value: download artifact unavailable
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- explicit_single_query_budget_is_honored_without_changing_legacy_shape stdout ----
+
+thread 'explicit_single_query_budget_is_honored_without_changing_legacy_shape' (5796404) panicked at crates/remote-hosts-code/tests/observations_032.rs:236:5:
+assertion failed: serde_json::to_vec(&out).unwrap().len() <= 4096
+
+---- small_results_that_fit_the_budget_are_not_all_omitted stdout ----
+
+thread 'small_results_that_fit_the_budget_are_not_all_omitted' (5796428) panicked at crates/remote-hosts-code/tests/observations_032.rs:219:5:
+20 tiny results fit but were unnecessarily omitted
+
+
+failures:
+    expired_artifact_does_not_hide_other_authorized_results
+    explicit_single_query_budget_is_honored_without_changing_legacy_shape
+    small_results_that_fit_the_budget_are_not_all_omitted
+
+test result: FAILED. 9 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+error: test failed, to rerun pass `-p remote-hosts-code --test observations_032`

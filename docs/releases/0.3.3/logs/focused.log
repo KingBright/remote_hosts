@@ -1,0 +1,56 @@
+   Compiling remote-hosts-code v0.3.2 (/Users/jinliang/Workspace/remote_hosts/crates/remote-hosts-code)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 41s
+     Running unittests src/lib.rs (/Users/jinliang/rust-target/debug/deps/remote_hosts_code-d83f25e1ad4db656)
+
+running 35 tests
+test agent::scheduling_tests::waiting_writes_do_not_take_sibling_execution_slots ... ok
+test agent::tests::deduplicates_mutations_and_rejects_other_devices ... ok
+test files::tests::budget_and_traversal ... ok
+test files::tests::precise_edits_and_conflicts ... ok
+test files::tests::preflight_is_all_files ... ok
+test files::tests::symlink_escape ... ok
+test progress::tests::rejects_untrusted_progress_values ... ok
+test progress::tests::tracks_retries_and_drops_completed_handles ... ok
+test reads::tests::fragment_requires_version_and_valid_utf8_cursor ... ok
+test reads::tests::partial_batch_preserves_success_and_reports_conflicts ... ok
+test reads::tests::twenty_ranges_read_and_hash_one_file_once ... ok
+test reads::tests::utf8_long_line_reconstructs_without_loop_or_loss ... ok
+test resumable::tests::active_stream_may_exceed_idle_interval_but_stalled_stream_fails ... ok
+test resumable::tests::ignored_range_restarts_instead_of_appending ... ok
+test resumable::tests::invalid_range_or_changed_etag_does_not_append ... ok
+test resumable::tests::resumes_from_received_offset_without_duplicate_bytes ... ok
+test resumable::tests::validates_ranges_and_rejects_unknown_lengths ... ok
+test scheduler::tests::active_jobs_are_unique_and_removed_on_drop ... ok
+test scheduler::tests::gateway_transfer_limits_are_global_and_per_device ... ok
+test scheduler::tests::keyed_locks_serialize_only_the_same_resource_and_are_pruned ... ok
+test scheduler::tests::overlapping_roots_serialize_but_sibling_roots_do_not ... ok
+test scheduler::tests::transfer_capacity_does_not_consume_read_or_terminal_slots ... ok
+test terminal_output::tests::arbitrary_chunk_boundaries_preserve_text_and_redaction ... ok
+test terminal_output::tests::bounded_seek_uses_utf8_cursor_boundaries ... ok
+test agent::scheduling_tests::actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it ... FAILED
+test terminal_output::tests::incomplete_utf8_is_replaced_only_at_eof ... ok
+test terminal_output::tests::json_keys_and_overlapping_key_suffixes_are_redacted ... ok
+test terminal_output::tests::very_long_unterminated_values_are_not_buffered ... ok
+test transfer_watch::tests::no_sender_or_receiver_progress_times_out ... ok
+test transfer_watch::tests::slow_sender_or_slow_receiver_can_exceed_idle_interval ... ok
+test transfers::tests::binary_publish_default_no_clobber_and_hash_conflicts ... ok
+test transfers::tests::bounded_snapshot_and_failed_stage_cleanup ... ok
+test transfers::tests::capability_transfer_rejects_symlink_escape ... ok
+test transfers::tests::source_allowlist_and_private_addresses ... ok
+test terminal_output::tests::capture_is_private_bounded_and_does_not_store_raw_secrets ... ok
+
+failures:
+
+---- agent::scheduling_tests::actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it stdout ----
+
+thread 'agent::scheduling_tests::actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it' (5915872) panicked at crates/remote-hosts-code/src/agent_scheduling_tests.rs:199:6:
+released resource did not become schedulable again: Elapsed(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    agent::scheduling_tests::actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it
+
+test result: FAILED. 34 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.51s
+
+error: test failed, to rerun pass `-p remote-hosts-code --lib`

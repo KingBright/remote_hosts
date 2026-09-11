@@ -1,0 +1,193 @@
+{
+  "version": "0.4.0",
+  "state": "selected_targets_deployed_and_accepted",
+  "phase": "complete",
+  "targets": [
+    "NAS gateway",
+    "MacBook-M2-Max",
+    "Mac-Studio"
+  ],
+  "targets_accepted": true,
+  "steps": {
+    "studio_staging": {
+      "state": "passed",
+      "archive_sha256": "710ff722c665ca3f04eb7c5469655d846d3287e4e875b8134e5cd366f3b701ef",
+      "import_operation_id": "a1f246ca-c6b9-4505-bcab-d77b2a6b66c7"
+    },
+    "nas": {
+      "state": "upgraded",
+      "version": "0.4.0",
+      "candidate_sha256": "18c80eec5b318c51bd678cb6e21bf3b2d0ffad1c242b9e585b816b82761df718",
+      "backup": "/opt/remote-hosts-code/releases/before-0.4.0-20260911T113143",
+      "previous_sha256": "c074ca811ae1edf8749079e1907037822b010e02fa038f274fa1d5bbfc6deee0",
+      "pid": 28645,
+      "installed_sha256": "18c80eec5b318c51bd678cb6e21bf3b2d0ffad1c242b9e585b816b82761df718",
+      "health": {
+        "capabilities_protocol": 1,
+        "checkpoint_bytes": 4194304,
+        "dispatch_protocol": 2,
+        "execution_limits": {
+          "control": 2,
+          "read": 8,
+          "terminal": 4,
+          "transfer": 2,
+          "write": 2
+        },
+        "file_transfer": true,
+        "max_file_bytes": 67108864,
+        "observation_protocol": 1,
+        "progress_protocol": 1,
+        "readiness_protocol": 1,
+        "resource_dispatch_protocol": 1,
+        "service": "remote-hosts-code",
+        "status": "ok",
+        "transfer_protocol": 2,
+        "version": "0.4.0"
+      },
+      "caddy_override_removed": false
+    },
+    "studio_launch": {
+      "label": "com.remote-hosts.code-upgrade.94fd518917e5d5e506b714e5",
+      "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/94fd518917e5d5e506b714e5/result.json",
+      "state": "started",
+      "exit_code": 0
+    },
+    "macbook_launch": {
+      "label": "com.remote-hosts.code-upgrade.0f3fda8532ab2d00a39f32db",
+      "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/0f3fda8532ab2d00a39f32db/result.json",
+      "state": "started",
+      "exit_code": 0
+    },
+    "macbook": {
+      "version": "0.4.0",
+      "candidate_sha256": "73e0bd2de3746cc5044f73a1107af9791f7e7f28d005091298cbcbef68c6faee",
+      "state": "upgraded",
+      "phase": "completed",
+      "gateway_preflight": {
+        "attempts": 1,
+        "elapsed_ms": 3440
+      },
+      "backup": "/Users/jinliang/.local/share/remote-hosts-code/releases/before-0.4.0-20260911T113158-448a186a/remote-hosts-code",
+      "previous_sha256": "0933bd69a1ac690106afdc19017236cae977fe758087c30168d4db4425e2f490",
+      "service_changed": true,
+      "installed_sha256": "73e0bd2de3746cc5044f73a1107af9791f7e7f28d005091298cbcbef68c6faee",
+      "pid": 8130,
+      "started_at": 1789097529,
+      "gateway_verified": true,
+      "readiness": "stable_authenticated_control_plane",
+      "session": "948bb9b56eea49aba1a7d28e342a5dec337c96b3ad7942b495e284df795065d7",
+      "runs": "654",
+      "stable_seconds": 19.925287582998862,
+      "samples": 11,
+      "gateway_seen_advanced": true,
+      "advanced_lanes": [
+        "control",
+        "read",
+        "terminal",
+        "transfer",
+        "write"
+      ],
+      "all_lanes_verified": true,
+      "functional_acceptance": "separate_required_gate",
+      "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/0f3fda8532ab2d00a39f32db/result-attempts/b4c909e4f86945e5a37941acc055579a.json"
+    },
+    "studio": {
+      "version": "0.4.0",
+      "candidate_sha256": "73e0bd2de3746cc5044f73a1107af9791f7e7f28d005091298cbcbef68c6faee",
+      "state": "upgraded",
+      "phase": "completed",
+      "gateway_preflight": {
+        "attempts": 1,
+        "elapsed_ms": 932
+      },
+      "backup": "/Users/jinliang/.local/share/remote-hosts-code/releases/before-0.4.0-20260911T113153-5c37594d/remote-hosts-code",
+      "previous_sha256": "588a353b2f00cd6ef10434e09e994b870cc6463fa0bef2e7b29c780907b28d85",
+      "service_changed": true,
+      "installed_sha256": "73e0bd2de3746cc5044f73a1107af9791f7e7f28d005091298cbcbef68c6faee",
+      "pid": 15386,
+      "started_at": 1789097514,
+      "gateway_verified": true,
+      "readiness": "stable_authenticated_control_plane",
+      "session": "fcae5e7cf1b54a0d89feb20fd6cc368c22709d22c9304309aa007395b7c687c2",
+      "runs": "4",
+      "stable_seconds": 24.48698383383453,
+      "samples": 10,
+      "gateway_seen_advanced": true,
+      "advanced_lanes": [
+        "control",
+        "read",
+        "terminal",
+        "transfer",
+        "write"
+      ],
+      "all_lanes_verified": true,
+      "functional_acceptance": "separate_required_gate",
+      "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/94fd518917e5d5e506b714e5/result-attempts/7014b6d12bad431abbc4ce4b007a50f8.json"
+    },
+    "functional_acceptance": {
+      "state": "passed",
+      "path": "/Users/jinliang/Workspace/remote_hosts/docs/releases/0.4.0/acceptance-two-devices-q1.json",
+      "devices": [
+        "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+        "ba3bf113-2390-466e-88bc-40d5b4f02884"
+      ]
+    }
+  },
+  "observed_at_epoch": 1789098017,
+  "package": "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.4.0",
+  "manifest_sha256": "2733d348dbef6f1293304c5805d9dba348cc3422c6fbdece0d956a6a496f24d1",
+  "tests": {
+    "passed": 290,
+    "failed": 0,
+    "rust_passed": 205,
+    "python_passed": 85,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "operations": [
+    {
+      "key": "release040-q1-studio-extract",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:70854d05-8758-40ba-9aae-e71e10299d5b",
+      "terminal_id": "22e6ae0d-4c30-4eef-95fa-e3bf785b681f"
+    },
+    {
+      "key": "release040-q1-studio-launch",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:70854d05-8758-40ba-9aae-e71e10299d5b",
+      "terminal_id": "d66245f0-fb4e-44e9-bfe2-ca244444a119"
+    },
+    {
+      "key": "release040-q1-studio-result",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:70854d05-8758-40ba-9aae-e71e10299d5b",
+      "terminal_id": "e0fbbefa-0589-4795-b096-5129d64d8d40"
+    }
+  ],
+  "runtime_observation": [
+    {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "online": true,
+      "version": "0.4.0",
+      "last_seen": 1789097567
+    },
+    {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "name": "Mac-Studio",
+      "online": true,
+      "version": "0.4.0",
+      "last_seen": 1789097581
+    }
+  ],
+  "temporary_oauth_revoked": true,
+  "receipt_recovery": {
+    "cause": "original Studio receipt was read before its stability window completed",
+    "service_changed": false,
+    "original_successful_studio_read_terminal": "afda8edb-87cd-4d67-b13e-763f7deb8e7e",
+    "previous_failure_preserved": "docs/releases/0.4.0/deployment-q1-before-receipt-recovery.json",
+    "temporary_oauth_revoked": true
+  },
+  "workflow_acceptance": "docs/releases/0.4.0/workflow-acceptance-q1.json",
+  "source_archive": "docs/releases/0.4.0/verified-source-q1.tar.gz",
+  "source_archive_sha256": "dd09c496a3826d2dfbd99396c7c94df1feb1da32daa8bfe3149a6d3e171ad343"
+}

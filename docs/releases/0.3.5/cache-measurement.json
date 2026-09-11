@@ -1,0 +1,34 @@
+{
+  "scope": "same frozen inputs, same leased checkout, complete source verification only",
+  "snapshot_id": "c55f822a5b43579cb490c5ffa6673b7df2f40d7e4da6e6464fc34bf68daabcc3",
+  "samples_per_condition": 1,
+  "initial_cache_population_seconds": 1128.206,
+  "warm_verification_seconds": 79.40998300001957,
+  "synchronization": {
+    "snapshot_id": "c55f822a5b43579cb490c5ffa6673b7df2f40d7e4da6e6464fc34bf68daabcc3",
+    "files": 122,
+    "written_files": 0,
+    "preserved_files": 122,
+    "removed_files": 0,
+    "checkout": "/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout",
+    "cache_semantics": "unchanged bytes and executable modes keep mtime; no hardlinks"
+  },
+  "tests": {
+    "passed": 258,
+    "failed": 0,
+    "rust_passed": 175,
+    "python_passed": 83,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "warm_exit_code": 0,
+  "excludes": [
+    "release builds",
+    "transfer",
+    "deployment",
+    "ChatGPT scheduling and model generation"
+  ],
+  "interpretation": "cache reuse observation, not an end-to-end speedup benchmark or performance guarantee after arbitrary edits"
+}

@@ -1,0 +1,30 @@
+{
+  "version": "0.3.2",
+  "recorded_at": "2026-09-10T14:14:32.640681+00:00",
+  "items": [
+    {
+      "issue_id": "RH-030",
+      "stage": "host_pre_dispatch",
+      "tool": "terminal_exec",
+      "idempotency_key": "rh032-public-macbook-acceptance-f1",
+      "action": "selected MacBook standard live code/write/file roundtrip acceptance",
+      "message": "此工具调用被 OpenAI 的安全检查屏蔽。请仔细检查你发送的内容。",
+      "execution_started": false,
+      "handling": "Not replayed or repackaged. Separate preplanned read-only new-feature checks ran and are separately scoped."
+    },
+    {
+      "issue_id": "RH-027",
+      "kind": "prior_studio_update_outcome_resolved",
+      "original_version": "0.3.1",
+      "result": "idle_preflight_failed; binary_not_replaced",
+      "evidence": "studio-original-outcome.json",
+      "handling": "Unrelated active terminal preserved; no new update submitted on Studio."
+    },
+    {
+      "issue_id": "RH-026",
+      "kind": "later_worktree_inputs_changed",
+      "evidence": "post-verification-source-change.json",
+      "handling": "Frozen packages match hashes; later source changes retained and not falsely covered by old tests."
+    }
+  ]
+}

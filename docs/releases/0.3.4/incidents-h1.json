@@ -1,0 +1,31 @@
+{
+  "version": "0.3.4",
+  "date": "2026-09-10",
+  "events": [
+    {
+      "issue": "RH-024",
+      "stage": "test_fixture",
+      "result": "first loopback fixture rejected by production HTTPS-origin validation",
+      "corrective_action": "initialize a valid HTTPS origin, then inject loopback HTTP in the isolated test only",
+      "evidence": "logs/receipt-baseline.log"
+    },
+    {
+      "issue": "RH-024",
+      "stage": "corrected_regression_baseline",
+      "result": "old implementation timed out after 6s with no result redelivery",
+      "evidence": "logs/receipt-baseline-corrected.log"
+    },
+    {
+      "stage": "edit_preflight",
+      "operation_id": "60438f0c-9a88-458b-8331-b5b84429ef98",
+      "result": "ambiguous replacement matched two struct fields; all-file preflight refused changes",
+      "corrective_action": "use unique struct context; no overwrite of concurrent changes"
+    },
+    {
+      "issue": "RH-030",
+      "stage": "deployment_dependency",
+      "result": "no 0.3.4 staging attempted after earlier staging rejection",
+      "evidence": "../0.3.3/incidents-h1.json"
+    }
+  ]
+}

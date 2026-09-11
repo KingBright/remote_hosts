@@ -1,0 +1,48 @@
+{
+  "updater": {
+    "version": "0.4.0",
+    "candidate_sha256": "73e0bd2de3746cc5044f73a1107af9791f7e7f28d005091298cbcbef68c6faee",
+    "state": "upgraded",
+    "phase": "completed",
+    "gateway_preflight": {
+      "attempts": 1,
+      "elapsed_ms": 932
+    },
+    "backup": "/Users/jinliang/.local/share/remote-hosts-code/releases/before-0.4.0-20260911T113153-5c37594d/remote-hosts-code",
+    "previous_sha256": "588a353b2f00cd6ef10434e09e994b870cc6463fa0bef2e7b29c780907b28d85",
+    "service_changed": true,
+    "installed_sha256": "73e0bd2de3746cc5044f73a1107af9791f7e7f28d005091298cbcbef68c6faee",
+    "pid": 15386,
+    "started_at": 1789097514,
+    "gateway_verified": true,
+    "readiness": "stable_authenticated_control_plane",
+    "session": "fcae5e7cf1b54a0d89feb20fd6cc368c22709d22c9304309aa007395b7c687c2",
+    "runs": "4",
+    "stable_seconds": 24.48698383383453,
+    "samples": 10,
+    "gateway_seen_advanced": true,
+    "advanced_lanes": [
+      "control",
+      "read",
+      "terminal",
+      "transfer",
+      "write"
+    ],
+    "all_lanes_verified": true,
+    "functional_acceptance": "separate_required_gate",
+    "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/94fd518917e5d5e506b714e5/result-attempts/7014b6d12bad431abbc4ce4b007a50f8.json"
+  },
+  "launchd": {
+    "com.remote-hosts.code-agent": {
+      "state": "running",
+      "runs": "4",
+      "pid": "15386"
+    },
+    "com.remote-hosts.code-upgrade.94fd518917e5d5e506b714e5": {
+      "state": "not running",
+      "runs": "1",
+      "last exit code": "0"
+    }
+  },
+  "service_changed_by_observation": false
+}

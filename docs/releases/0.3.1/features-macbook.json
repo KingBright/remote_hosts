@@ -1,0 +1,40 @@
+{
+  "state": "passed",
+  "version": "0.3.1",
+  "gateway": {
+    "dispatch_protocol": 2,
+    "execution_limits": {
+      "control": 2,
+      "read": 8,
+      "terminal": 4,
+      "transfer": 2,
+      "write": 2
+    },
+    "file_transfer": true,
+    "max_file_bytes": 67108864,
+    "progress_protocol": 1,
+    "readiness_protocol": 1,
+    "service": "remote-hosts-code",
+    "status": "ok",
+    "version": "0.3.1"
+  },
+  "tool_count": 15,
+  "devices": [
+    {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "agent_version": "0.3.1",
+      "utf8_bytes": 77005,
+      "fragment_pages": 3,
+      "long_line_exact_reconstruction": true,
+      "physical_reads_for_20_ranges": 1,
+      "cache_hits": 19,
+      "partial_batch": true,
+      "short_command_single_result": true,
+      "short_command_replay_equal": true,
+      "test_files_removed": true,
+      "terminal_operation": "c0b7ae75-f287-4e6f-a6b8-51e1ff4f6ffa"
+    }
+  ],
+  "oauth_grant_revoked": true
+}

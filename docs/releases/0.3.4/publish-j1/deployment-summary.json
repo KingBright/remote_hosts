@@ -1,0 +1,9 @@
+{
+  "state": "gateway_upgraded_macbook_unconfirmed",
+  "nas_version": "0.3.4",
+  "macbook_last_observed_version": "0.3.2",
+  "gateway_acceptance": "passed",
+  "macbook_original_result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/8f089801405a6bc739eb42bc/result.json",
+  "studio_modified": false,
+  "new_confirmation_required": false
+}

@@ -1,0 +1,32 @@
+{
+  "observed_at": "2026-09-10T17:13:50.050772+00:00",
+  "installed_sha256": "073989b51289d78cc81c7052670e05c537a82dad6536def3a359544ce17820e0",
+  "agent": {
+    "query_exit_code": 0,
+    "state": "running",
+    "runs": "650",
+    "pid": "34639"
+  },
+  "updater": {
+    "query_exit_code": 0,
+    "state": "not running",
+    "runs": "1",
+    "last exit code": "0"
+  },
+  "runtime": {
+    "build": {
+      "pid": 34639,
+      "started_at": 1789060312,
+      "version": "0.3.4"
+    },
+    "receipt_delivery": {
+      "blocked": 0,
+      "oldest_created_at": null,
+      "pending": 0,
+      "protocol": 1,
+      "reported_at": 1789060429,
+      "sending": 0
+    }
+  },
+  "studio_untouched": true
+}

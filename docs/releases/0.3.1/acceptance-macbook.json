@@ -1,0 +1,33 @@
+{
+  "origin": "https://mcp.hackerlife.fun",
+  "version": "0.3.1",
+  "run_id": "release031-macbook-e1",
+  "dispatch_protocol": 2,
+  "oauth": "passed",
+  "mcp_tool_count": 15,
+  "devices": [
+    {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "workspace_id": "ba3bf113-2390-466e-88bc-40d5b4f02884:68aedcf7-d8c9-4ddf-b4c7-3b25ce8f6478",
+      "range_read": "passed",
+      "syntax_tree": "passed",
+      "precise_edit": "passed",
+      "duplicate_edit": "passed",
+      "stale_version_rejected": true,
+      "search": "passed",
+      "terminal_test_exit_code": 0,
+      "probe_file_removed": true,
+      "agent_version": "0.3.1",
+      "binary_transfer_bytes": 2097152,
+      "binary_sha256": "91d3beb88a9b2f778a6c44a1c53b63d3c79931845a9aef84b3fb414610bd1938",
+      "download": "passed",
+      "upload": "passed",
+      "http_range": "passed",
+      "upload_retry": "passed",
+      "overwrite_rejected": true,
+      "checksum_mismatch_rejected": true
+    }
+  ],
+  "test_oauth_grant_revoked": true
+}

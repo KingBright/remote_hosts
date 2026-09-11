@@ -1,0 +1,16 @@
+{
+  "recorded_at": "2026-09-10T13:57:54.209904+00:00",
+  "test": "test_exited_counter_job_is_not_restarted",
+  "state": "passed",
+  "test_operation": "eb76981d-3d0f-4516-9717-bdb1bbc8cae7",
+  "checks": {
+    "runs": 1,
+    "exit_code": 0,
+    "no_reentry_observation_seconds": 12,
+    "disposable_job_removed": true,
+    "real_agent_unchanged": true
+  },
+  "log_sha256": "2b80d4c4e86b0fbbfef1096a763b06f84efb64531e81d1ad58b083e342cc11e8",
+  "source_inputs": "verification-final.json",
+  "counting": "194 default-gate passes plus this separately opted-in test; original receipt retains its skipped count"
+}

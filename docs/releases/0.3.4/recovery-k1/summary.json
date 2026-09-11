@@ -1,0 +1,9 @@
+{
+  "state": "selected_targets_upgraded_control_plane_verified_full_acceptance_pending",
+  "macbook_pid": 34639,
+  "version": "0.3.4",
+  "helper_tests_passed": 64,
+  "issue_count": 46,
+  "full_acceptance": "not_executed_host_refusal",
+  "no_more_reinstall_needed": true
+}

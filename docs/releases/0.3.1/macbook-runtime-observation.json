@@ -1,0 +1,19 @@
+{
+  "observed_at": "2026-09-10T13:26:25.070452+00:00",
+  "device": "MacBook-M2-Max",
+  "agent": {
+    "query_exit_code": 0,
+    "state": "running",
+    "runs": "646",
+    "pid": "43322"
+  },
+  "updater": {
+    "query_exit_code": 0,
+    "state": "not running",
+    "runs": "1",
+    "last exit code": "0"
+  },
+  "installed_sha256": "bec00275be4ad78d02ffec5395392735bb61f9a7abd64aa26517b7036c6f6d58",
+  "updater_runs_exactly_once": true,
+  "service_restarted_by_this_observation": false
+}

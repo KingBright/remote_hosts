@@ -1,0 +1,12 @@
+{
+  "version": "0.4.1",
+  "state": "passed",
+  "scope": "MacBook read-only workspace-context paging; not standard file/write/terminal acceptance",
+  "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+  "pages_observed": 3,
+  "unique_terminal_ids": 6,
+  "active_only": "passed",
+  "summary": "passed",
+  "terminal_cursor_present": true,
+  "temporary_oauth_revoked": true
+}

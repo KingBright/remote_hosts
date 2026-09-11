@@ -1,0 +1,19 @@
+{
+  "date": "2026-09-10",
+  "version": "0.3.3",
+  "explicit_user_authorization": "Verify, build, deploy selected targets and accept in one iteration without a new confirmation; Studio deferred.",
+  "build_operation_id": "6cd22d84-e5ad-4c09-b150-5562f8ef6633",
+  "build_exit_code": 0,
+  "events": [{
+    "issue_id": "RH-030",
+    "tool": "terminal_exec",
+    "idempotency_key": "rh033-stage-verified-release-20260910-h1",
+    "stage": "host_pre_dispatch",
+    "action": "Copy verified package locally and stage the NAS binary/helpers through the existing authenticated SSH route",
+    "observed": "此工具调用被 OpenAI 的安全检查屏蔽。请仔细检查你发送的内容。",
+    "execution_started": false,
+    "equivalent_retry": false,
+    "production_changed": false,
+    "handling": "Retain the built package and continue independent 0.3.4 development. Do not infer a reason not supplied by the host."
+  }]
+}

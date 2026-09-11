@@ -1,0 +1,9 @@
+{
+  "snapshot_id": "29631f9b0328e8e0efec205029d90cbc9decac9fd940758f33557635658adfa7",
+  "file_count": 133,
+  "archive": "docs/releases/0.4.0/verify-q1/source.tar.gz",
+  "sha256": "114a6fe3d4b4256208e5b24d39f1f86906358ae1ba25e4b2b418e733099d5ce7",
+  "archive_reopened_and_verified": true,
+  "verification_state": "running",
+  "production_unchanged": true
+}

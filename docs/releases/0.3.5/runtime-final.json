@@ -1,0 +1,29 @@
+{
+  "source": "native Remote_Hosts.devices_list after completed deployment and acceptance",
+  "gateway": {
+    "version": "0.3.5",
+    "tool_count": 15,
+    "dispatch_protocol": 2,
+    "resource_dispatch_protocol": 1,
+    "tools_sha256": "24f2bc854b6bc9d8bee223de219bed38e6517b32b35c97af5327dfbd8a633693"
+  },
+  "macbook": {
+    "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+    "version": "0.3.5",
+    "online": true,
+    "last_seen": 1789065675,
+    "session": "e5a0ec53c5b94dcebb9a6ee5f2159e2c1805d8393c004fa395d5b657d124b50b",
+    "receipt_delivery": {"pending": 0, "blocked": 0, "sending": 0, "reported_at": 1789065675},
+    "receipt_delivery_stale": false
+  },
+  "studio": {
+    "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+    "version": "0.3.0",
+    "online": true,
+    "last_seen": 1789065676,
+    "release_selection": "explicitly_deferred",
+    "modified_by_this_release": false
+  },
+  "all_selected_targets_deployed_and_accepted": true,
+  "all_devices_upgraded": false
+}

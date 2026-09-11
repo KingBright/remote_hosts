@@ -1,0 +1,51 @@
+{
+  "device": "MacBook-M2-Max",
+  "version": "0.4.1",
+  "updater": {
+    "version": "0.4.1",
+    "candidate_sha256": "bfbbeae07843b53f26e8d425c8ae1742514714e35cd6ba3fb62100876c2d6645",
+    "state": "upgraded",
+    "phase": "completed",
+    "gateway_preflight": {
+      "attempts": 1,
+      "elapsed_ms": 1211
+    },
+    "backup": "/Users/jinliang/.local/share/remote-hosts-code/releases/before-0.4.1-20260911T122726-ca335ce2/remote-hosts-code",
+    "previous_sha256": "73e0bd2de3746cc5044f73a1107af9791f7e7f28d005091298cbcbef68c6faee",
+    "service_changed": true,
+    "installed_sha256": "bfbbeae07843b53f26e8d425c8ae1742514714e35cd6ba3fb62100876c2d6645",
+    "pid": 47347,
+    "started_at": 1789100857,
+    "gateway_verified": true,
+    "readiness": "stable_authenticated_control_plane",
+    "session": "bb0356570aa042bba46de502ac65a7845b808727a7e5443996189b2f5dd9636e",
+    "runs": "656",
+    "stable_seconds": 21.302520458004437,
+    "samples": 9,
+    "gateway_seen_advanced": true,
+    "advanced_lanes": [
+      "control",
+      "read",
+      "terminal",
+      "transfer",
+      "write"
+    ],
+    "all_lanes_verified": true,
+    "functional_acceptance": "separate_required_gate",
+    "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/0cc037e5d487111e82315d18/result-attempts/dfaa674fa4ce42dc9bf00a7a9235dbcd.json"
+  },
+  "launchd": {
+    "com.remote-hosts.code-agent": {
+      "state": "running",
+      "runs": "656",
+      "pid": "47347"
+    },
+    "com.remote-hosts.code-upgrade.0cc037e5d487111e82315d18": {
+      "state": "not running",
+      "runs": "1",
+      "last exit code": "0"
+    }
+  },
+  "installed_sha256": "bfbbeae07843b53f26e8d425c8ae1742514714e35cd6ba3fb62100876c2d6645",
+  "service_changed_by_observation": false
+}

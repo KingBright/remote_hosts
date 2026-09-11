@@ -1,0 +1,30 @@
+{
+  "state": "upgraded",
+  "version": "0.3.4",
+  "candidate_sha256": "c41bb5639cbc374c70dbab8e5925cd08992220bd36765df6094c6c4f3943385b",
+  "backup": "/opt/remote-hosts-code/releases/before-0.3.4-20260911T004653",
+  "previous_sha256": "c35b290afad47b899a3cd3f08f8e094cb869c51afe0076400b26e79b318e470e",
+  "pid": 9656,
+  "installed_sha256": "c41bb5639cbc374c70dbab8e5925cd08992220bd36765df6094c6c4f3943385b",
+  "health": {
+    "capabilities_protocol": 1,
+    "dispatch_protocol": 2,
+    "execution_limits": {
+      "control": 2,
+      "read": 8,
+      "terminal": 4,
+      "transfer": 2,
+      "write": 2
+    },
+    "file_transfer": true,
+    "max_file_bytes": 67108864,
+    "observation_protocol": 1,
+    "progress_protocol": 1,
+    "readiness_protocol": 1,
+    "resource_dispatch_protocol": 1,
+    "service": "remote-hosts-code",
+    "status": "ok",
+    "version": "0.3.4"
+  },
+  "caddy_override_removed": false
+}

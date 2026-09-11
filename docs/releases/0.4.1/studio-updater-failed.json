@@ -1,0 +1,17 @@
+{
+  "source": "native terminal_read for original read-only observer",
+  "terminal_id": "6b51e845-6219-4729-9e3b-69c4b399ae16",
+  "updater": {
+    "version": "0.4.1",
+    "candidate_sha256": "bfbbeae07843b53f26e8d425c8ae1742514714e35cd6ba3fb62100876c2d6645",
+    "state": "failed",
+    "phase": "waiting_idle",
+    "gateway_preflight": {
+      "attempts": 1,
+      "elapsed_ms": 1539
+    },
+    "service_changed": false,
+    "error": "agent still has active work; upgrade not applied",
+    "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/be0211f82f705d0c84ce27f8/result-attempts/78ac5f9202b5412f9e2c2577f447fa47.json"
+  }
+}

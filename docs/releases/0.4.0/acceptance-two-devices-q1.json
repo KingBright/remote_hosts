@@ -1,0 +1,61 @@
+{
+  "origin": "https://mcp.hackerlife.fun",
+  "version": "0.4.0",
+  "run_id": "release040q1",
+  "selected_device_ids": [
+    "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+    "ba3bf113-2390-466e-88bc-40d5b4f02884"
+  ],
+  "dispatch_protocol": 2,
+  "oauth": "passed",
+  "mcp_tool_count": 18,
+  "devices": [
+    {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "workspace_id": "ba3bf113-2390-466e-88bc-40d5b4f02884:d39e7c03-3692-4dfb-929d-89aa688b20e9",
+      "range_read": "passed",
+      "syntax_tree": "passed",
+      "precise_edit": "passed",
+      "duplicate_edit": "passed",
+      "stale_version_rejected": true,
+      "search": "passed",
+      "terminal_test_exit_code": 0,
+      "probe_file_removed": true,
+      "agent_version": "0.4.0",
+      "binary_transfer_bytes": 2097152,
+      "binary_sha256": "91d3beb88a9b2f778a6c44a1c53b63d3c79931845a9aef84b3fb414610bd1938",
+      "download": "passed",
+      "upload": "passed",
+      "http_range": "passed",
+      "upload_retry": "passed",
+      "overwrite_rejected": true,
+      "checksum_mismatch_rejected": true
+    },
+    {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "name": "Mac-Studio",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:d6762559-7315-4c3e-bda1-761640f0667f",
+      "range_read": "passed",
+      "syntax_tree": "passed",
+      "precise_edit": "passed",
+      "duplicate_edit": "passed",
+      "stale_version_rejected": true,
+      "search": "passed",
+      "terminal_test_exit_code": 0,
+      "probe_file_removed": true,
+      "agent_version": "0.4.0",
+      "binary_transfer_bytes": 2097152,
+      "binary_sha256": "91d3beb88a9b2f778a6c44a1c53b63d3c79931845a9aef84b3fb414610bd1938",
+      "download": "passed",
+      "upload": "passed",
+      "http_range": "passed",
+      "upload_retry": "passed",
+      "overwrite_rejected": true,
+      "checksum_mismatch_rejected": true
+    }
+  ],
+  "test_oauth_grant_revoked": true,
+  "state": "passed",
+  "summary": "Public TLS/OAuth/MCP and 2 selected device(s) passed: MacBook-M2-Max, Mac-Studio; version 0.4.0; temporary OAuth grant revoked"
+}

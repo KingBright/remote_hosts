@@ -1,0 +1,35 @@
+{
+  "release_dir": "/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/033-g1/dist/remote-hosts-code-0.3.3",
+  "manifest_sha256": "4b8bdfd70108841fda294773eff02e18d34977c4a4cdf64255eb2d59e53a077e",
+  "artifacts": {
+    "remote-hosts-code-macos-arm64": {
+      "sha256": "cb812b292334eea6c1eebc3898f9ef59856ea0a708ca3f75312caf57b7bf40ef",
+      "size": 24726480
+    },
+    "remote-hosts-code-linux-amd64": {
+      "sha256": "becbd01574f37771c724e727b314d251c4e1089a834f008a2ea1320c6cdafc74",
+      "size": 22988456
+    },
+    "upgrade-code-agent.py": {
+      "sha256": "e3ce64e76734339ec33e1064ac53f5263bb81967d8b7d1e9d6beeeea1abc576b",
+      "size": 9023
+    },
+    "agent_upgrade_support.py": {
+      "sha256": "e775630d647c7c9f96637e611483d7f722917905695832ceb2811bb1e756dd34",
+      "size": 7363
+    },
+    "launch-code-upgrade.py": {
+      "sha256": "bbd9a74c3774b0a248f8c5f5156ab8f6d8524ba5b89087e4a96e716591623e23",
+      "size": 6954
+    },
+    "upgrade-code-gateway.py": {
+      "sha256": "086ab4e906b576ca308b9e46219d937331db552800d73ed1eee5c4941d696b05",
+      "size": 6239
+    },
+    "check-code-gateway.py": {
+      "sha256": "1596129df5244affaf35df70614bb56a294590e07d8f9bc11b616e4fc42c8690",
+      "size": 15932
+    }
+  },
+  "deployed": false
+}

@@ -1,0 +1,555 @@
+   Compiling cfg-if v1.0.4
+   Compiling typenum v1.20.1
+   Compiling memchr v2.8.3
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-core v0.3.32
+   Compiling itoa v1.0.18
+   Compiling libc v0.2.186
+   Compiling serde_core v1.0.228
+   Compiling once_cell v1.21.4
+   Compiling scopeguard v1.2.0
+   Compiling rand_core v0.10.1
+   Compiling bytes v1.12.0
+   Compiling lock_api v0.4.14
+   Compiling stable_deref_trait v1.2.1
+   Compiling zerofrom v0.1.8
+   Compiling equivalent v1.0.2
+   Compiling zmij v1.0.21
+   Compiling writeable v0.6.3
+   Compiling litemap v0.8.2
+   Compiling hashbrown v0.17.1
+   Compiling yoke v0.8.3
+   Compiling futures-io v0.3.32
+   Compiling futures-task v0.3.32
+   Compiling log v0.4.33
+   Compiling zeroize_derive v1.5.0
+   Compiling utf8_iter v1.0.4
+   Compiling zerovec v0.11.6
+   Compiling hybrid-array v0.4.13
+   Compiling zerotrie v0.2.4
+   Compiling futures-sink v0.3.32
+   Compiling cmov v0.5.4
+   Compiling generic-array v0.14.7
+   Compiling icu_normalizer_data v2.2.0
+   Compiling tracing-core v0.1.36
+   Compiling untrusted v0.9.0
+   Compiling errno v0.3.14
+   Compiling getrandom v0.4.3
+   Compiling socket2 v0.6.4
+   Compiling ctutils v0.4.2
+   Compiling signal-hook-registry v1.4.8
+   Compiling mio v1.2.1
+   Compiling icu_properties_data v2.2.0
+   Compiling indexmap v2.14.0
+   Compiling percent-encoding v2.3.2
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling block-buffer v0.12.1
+   Compiling slab v0.4.12
+   Compiling icu_collections v2.2.0
+   Compiling crypto-common v0.2.2
+   Compiling block-buffer v0.10.4
+   Compiling icu_locale_core v2.2.0
+   Compiling crypto-common v0.1.7
+   Compiling zeroize v1.9.0
+   Compiling tracing v0.1.44
+   Compiling futures-channel v0.3.32
+   Compiling subtle v2.6.1
+   Compiling crossbeam-utils v0.8.22
+   Compiling form_urlencoded v1.2.2
+   Compiling getrandom v0.2.17
+   Compiling serde v1.0.228
+   Compiling futures-util v0.3.32
+   Compiling time-core v0.1.9
+   Compiling num-conv v0.2.2
+   Compiling bitflags v2.13.0
+   Compiling num-traits v0.2.19
+   Compiling powerfmt v0.2.0
+   Compiling time-macros v0.2.31
+   Compiling aws-lc-sys v0.42.0
+   Compiling rustls-pki-types v1.15.0
+   Compiling serde_json v1.0.150
+   Compiling http v1.4.2
+   Compiling foldhash v0.2.0
+   Compiling smallvec v1.15.2
+   Compiling allocator-api2 v0.2.21
+   Compiling icu_provider v2.2.0
+   Compiling aws-lc-rs v1.17.1
+   Compiling concurrent-queue v2.5.0
+   Compiling ring v0.17.14
+   Compiling hashbrown v0.16.1
+   Compiling icu_properties v2.2.0
+   Compiling base64 v0.22.1
+   Compiling crc-catalog v2.5.0
+   Compiling parking v2.2.1
+   Compiling sha1_smol v1.0.1
+   Compiling uuid v1.23.4
+   Compiling event-listener v5.4.1
+   Compiling hashlink v0.11.1
+   Compiling crc v3.4.0
+   Compiling parking_lot_core v0.9.12
+   Compiling icu_normalizer v2.2.0
+   Compiling http-body v1.0.1
+   Compiling parking_lot v0.12.5
+   Compiling thiserror v2.0.18
+   Compiling crossbeam-queue v0.3.13
+   Compiling digest v0.10.7
+   Compiling inout v0.2.2
+   Compiling tokio v1.52.3
+   Compiling rustls-webpki v0.103.13
+   Compiling idna_adapter v1.2.2
+   Compiling byteorder v1.5.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.11.0
+   Compiling idna v1.1.0
+   Compiling rustls v0.23.41
+   Compiling digest v0.11.3
+   Compiling cipher v0.5.2
+   Compiling deranged v0.5.8
+   Compiling atoi v2.0.0
+   Compiling spin v0.9.8
+   Compiling cpufeatures v0.2.17
+   Compiling tower-service v0.3.3
+   Compiling time v0.3.53
+   Compiling chacha20 v0.10.1
+   Compiling sha2 v0.10.9
+   Compiling futures-intrusive v0.5.0
+   Compiling url v2.5.8
+   Compiling unicode-normalization v0.1.25
+   Compiling webpki-roots v1.0.8
+   Compiling either v1.16.0
+   Compiling aho-corasick v1.1.4
+   Compiling regex-syntax v0.8.11
+   Compiling unicode-bidi v0.3.18
+   Compiling unicode-properties v0.1.4
+   Compiling hmac v0.13.0
+   Compiling stringprep v0.1.5
+   Compiling cpufeatures v0.3.0
+   Compiling fnv v1.0.7
+   Compiling dotenvy v0.15.7
+   Compiling try-lock v0.2.5
+   Compiling atomic-waker v1.1.2
+   Compiling ipnet v2.12.1
+   Compiling whoami v2.1.2
+   Compiling strsim v0.11.1
+   Compiling hex v0.4.3
+   Compiling want v0.3.1
+   Compiling rand v0.10.2
+   Compiling sha2 v0.11.0
+   Compiling ref-cast v1.0.25
+   Compiling futures-executor v0.3.32
+   Compiling hkdf v0.13.0
+   Compiling httparse v1.10.1
+   Compiling flume v0.12.0
+   Compiling regex-automata v0.4.14
+   Compiling md-5 v0.11.0
+   Compiling http-body-util v0.1.3
+   Compiling chrono v0.4.45
+   Compiling tokio-util v0.7.18
+   Compiling tokio-stream v0.1.18
+   Compiling sync_wrapper v1.0.2
+   Compiling httpdate v1.0.3
+   Compiling tower-layer v0.3.3
+   Compiling dyn-clone v1.0.20
+   Compiling core-foundation-sys v0.8.7
+   Compiling sqlx-core v0.9.0
+   Compiling h2 v0.4.19
+   Compiling darling_core v0.23.0
+   Compiling schemars v1.2.1
+   Compiling core-foundation v0.10.1
+   Compiling security-framework-sys v2.17.0
+   Compiling libsqlite3-sys v0.37.0
+   Compiling tower v0.5.3
+   Compiling rand_core v0.6.4
+   Compiling base64ct v1.8.3
+   Compiling security-framework v3.7.0
+   Compiling password-hash v0.5.0
+   Compiling rustix v1.1.4
+   Compiling tokio-rustls v0.26.4
+   Compiling blake2 v0.10.6
+   Compiling tower-http v0.6.11
+   Compiling argon2 v0.5.3
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling darling_macro v0.23.0
+   Compiling regex v1.12.4
+   Compiling tree-sitter-language v0.1.8
+   Compiling rmcp v2.1.0
+   Compiling io-lifetimes v2.0.4
+   Compiling sse-stream v0.2.6
+   Compiling sqlx-postgres v0.9.0
+   Compiling sqlx-sqlite v0.9.0
+   Compiling darling v0.23.0
+   Compiling futures v0.3.32
+   Compiling utf8parse v0.2.2
+   Compiling rmcp-macros v2.1.0
+   Compiling anstyle-parse v1.0.0
+   Compiling colorchoice v1.0.5
+   Compiling anstyle-query v1.1.5
+   Compiling anstyle v1.0.14
+   Compiling fastrand v2.4.1
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling thiserror v1.0.69
+   Compiling fs-set-times v0.20.3
+   Compiling anstream v1.0.0
+   Compiling hyper v1.10.1
+   Compiling tempfile v3.27.0
+   Compiling crossbeam-epoch v0.9.21
+   Compiling io-extras v0.18.4
+   Compiling tree-sitter v0.25.10
+   Compiling bstr v1.13.1
+   Compiling ryu v1.0.23
+   Compiling maybe-owned v0.3.4
+   Compiling nu-ansi-term v0.50.3
+   Compiling same-file v1.0.6
+   Compiling clap_lex v1.1.0
+   Compiling mime v0.3.17
+   Compiling lazy_static v1.5.0
+   Compiling ambient-authority v0.0.2
+   Compiling sharded-slab v0.1.7
+   Compiling cap-primitives v3.4.6
+   Compiling axum-core v0.5.6
+   Compiling globset v0.4.19
+   Compiling clap_builder v4.6.0
+   Compiling walkdir v2.5.0
+   Compiling hyper-util v0.1.20
+   Compiling serde_urlencoded v0.7.1
+   Compiling nix v0.28.0
+   Compiling crossbeam-deque v0.8.8
+   Compiling filedescriptor v0.8.3
+   Compiling anyhow v1.0.103
+   Compiling matchers v0.2.0
+   Compiling tracing-serde v0.2.0
+   Compiling serde_path_to_error v0.1.20
+   Compiling tracing-log v0.2.0
+   Compiling serial2 v0.2.38
+   Compiling thread_local v1.1.9
+   Compiling shell-words v1.1.1
+   Compiling streaming-iterator v0.1.9
+   Compiling downcast-rs v1.2.1
+   Compiling matchit v0.8.4
+   Compiling portable-pty v0.9.0
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling axum v0.8.9
+   Compiling clap v4.6.1
+   Compiling tracing-subscriber v0.3.23
+   Compiling nix v0.30.1
+   Compiling ignore v0.4.32
+   Compiling tree-sitter-javascript v0.25.0
+   Compiling tree-sitter-typescript v0.23.2
+   Compiling tree-sitter-rust v0.24.2
+   Compiling tree-sitter-python v0.25.0
+   Compiling sqlx-macros-core v0.9.0
+   Compiling cap-std v3.4.6
+   Compiling diffy v0.4.2
+   Compiling fs2 v0.4.3
+   Compiling similar v2.7.0
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling semver v1.0.28
+   Compiling zstd-safe v7.2.4
+   Compiling hash32 v0.2.1
+   Compiling rustc_version v0.4.1
+   Compiling universal-hash v0.6.1
+   Compiling remote-hosts-domain v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout/crates/remote-hosts-domain)
+   Compiling poly1305 v0.9.0
+   Compiling aead v0.6.1
+   Compiling heapless v0.7.17
+   Compiling cobs v0.3.0
+   Compiling chacha20poly1305 v0.11.0
+   Compiling secrecy v0.10.3
+   Compiling remote-hosts-vault v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout/crates/remote-hosts-vault)
+   Compiling sqlx-macros v0.9.0
+   Compiling postcard v1.1.3
+   Compiling remote-hosts-core v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout/crates/remote-hosts-core)
+   Compiling sqlx v0.9.0
+   Compiling zstd v0.13.3
+   Compiling remote-hosts-code v0.3.5 (/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout/crates/remote-hosts-code)
+   Compiling remote-hosts-db v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout/crates/remote-hosts-db)
+   Compiling remote-hosts-sync v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout/crates/remote-hosts-sync)
+   Compiling remote-hosts-mcp v0.1.0 (/Users/jinliang/Workspace/remote_hosts/target/release-slot/checkout/crates/remote-hosts-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9m 56s
+     Running unittests src/lib.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/remote_hosts_code-533f1a0d7c691226)
+
+running 43 tests
+test agent::scheduling_tests::waiting_writes_do_not_take_sibling_execution_slots ... ok
+test agent::tests::deduplicates_mutations_and_rejects_other_devices ... ok
+test delivery::tests::accepted_receipt_drops_only_delivery_intent_not_local_idempotency_record ... ok
+test delivery::tests::changing_destination_or_device_does_not_forward_saved_results ... ok
+test delivery::tests::final_result_and_receipt_intent_commit_together_and_conflicts_rollback ... ok
+test delivery::tests::http_success_without_explicit_acceptance_never_deletes_receipt ... ok
+test delivery::tests::old_ack_cannot_delete_a_new_attempt_lease ... ok
+test delivery::tests::pending_receipt_survives_reopening_storage_and_keeps_exact_bytes ... ok
+test delivery::tests::permanent_conflict_is_retained_without_automatic_retry_or_reexecution ... ok
+test delivery::tests::slow_responses_use_two_senders_and_do_not_allocate_unbounded_tasks ... ok
+test files::tests::budget_and_traversal ... ok
+test files::tests::precise_edits_and_conflicts ... ok
+test files::tests::preflight_is_all_files ... ok
+test files::tests::symlink_escape ... ok
+test progress::tests::rejects_untrusted_progress_values ... ok
+test progress::tests::tracks_retries_and_drops_completed_handles ... ok
+test reads::tests::fragment_requires_version_and_valid_utf8_cursor ... ok
+test reads::tests::partial_batch_preserves_success_and_reports_conflicts ... ok
+test reads::tests::twenty_ranges_read_and_hash_one_file_once ... ok
+test agent::scheduling_tests::actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it ... ok
+test reads::tests::utf8_long_line_reconstructs_without_loop_or_loss ... ok
+test resumable::tests::ignored_range_restarts_instead_of_appending ... ok
+test resumable::tests::invalid_range_or_changed_etag_does_not_append ... ok
+test resumable::tests::resumes_from_received_offset_without_duplicate_bytes ... ok
+test resumable::tests::active_stream_may_exceed_idle_interval_but_stalled_stream_fails ... ok
+test resumable::tests::validates_ranges_and_rejects_unknown_lengths ... ok
+test scheduler::tests::active_jobs_are_unique_and_removed_on_drop ... ok
+test scheduler::tests::gateway_transfer_limits_are_global_and_per_device ... ok
+test scheduler::tests::keyed_locks_serialize_only_the_same_resource_and_are_pruned ... ok
+test scheduler::tests::transfer_capacity_does_not_consume_read_or_terminal_slots ... ok
+test terminal_output::tests::arbitrary_chunk_boundaries_preserve_text_and_redaction ... ok
+test terminal_output::tests::bounded_seek_uses_utf8_cursor_boundaries ... ok
+test scheduler::tests::overlapping_roots_serialize_but_sibling_roots_do_not ... ok
+test terminal_output::tests::incomplete_utf8_is_replaced_only_at_eof ... ok
+test terminal_output::tests::json_keys_and_overlapping_key_suffixes_are_redacted ... ok
+test terminal_output::tests::very_long_unterminated_values_are_not_buffered ... ok
+test transfer_watch::tests::no_sender_or_receiver_progress_times_out ... ok
+test transfer_watch::tests::slow_sender_or_slow_receiver_can_exceed_idle_interval ... ok
+test transfers::tests::binary_publish_default_no_clobber_and_hash_conflicts ... ok
+test transfers::tests::bounded_snapshot_and_failed_stage_cleanup ... ok
+test transfers::tests::capability_transfer_rejects_symlink_escape ... ok
+test transfers::tests::source_allowlist_and_private_addresses ... ok
+test terminal_output::tests::capture_is_private_bounded_and_does_not_store_raw_secrets ... ok
+
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.32s
+
+     Running unittests src/main.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/remote_hosts_code-989b289d3117bc89)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/concurrency.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/concurrency-a904ecc1f1f67a2e)
+
+running 5 tests
+test concurrent_duplicate_mutation_returns_one_durable_result ... ok
+test lane_filter_skips_transfer_backlog_and_heartbeat_renews_only_own_active_jobs ... ok
+test stalled_gateway_stream_does_not_block_another_device ... ok
+test actual_agent_poll_loop_keeps_serving_during_stalled_transfer ... ok
+test stalled_transfer_does_not_block_reads_or_terminal_start ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running tests/file_transfers.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/file_transfers-626c088013d338b8)
+
+running 4 tests
+test host_file_parameter_metadata_and_safety_annotations_survive_catalog ... ok
+test gateway_rejects_wrong_device_bad_hash_and_oversized_upload ... ok
+test real_streaming_export_checksum_range_expiry_and_duplicate ... ok
+test source_url_is_not_in_durable_job_and_is_device_scoped ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.08s
+
+     Running tests/gateway_latency.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/gateway_latency-836d7a28dbbefe1e)
+
+running 1 test
+test local_relay_latency ... ignored, local latency probe; run with --ignored --nocapture
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/integration-d97c0e8d02763458)
+
+running 3 tests
+test device_binding_terminal_input_cancel_and_restart ... ok
+test relay_edit_retry_and_isolation ... ok
+test oauth_pkce_mcp_and_refresh_replay ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.03s
+
+     Running tests/interaction_031.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/interaction_031-da1211239afaf369)
+
+running 5 tests
+test new_read_and_wait_options_are_schema_checked ... ok
+test readiness_endpoint_is_authenticated_scoped_and_does_not_refresh_online_lease ... ok
+test short_command_returns_output_exit_and_replay_does_not_rerun ... ok
+test short_wait_does_not_cancel_process_and_cursor_is_reusable ... ok
+test startup_failure_retries_in_same_process_then_records_all_lane_acknowledgements ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.33s
+
+     Running tests/iteration_reliability.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/iteration_reliability-248fd4ade8e52a64)
+
+running 2 tests
+test progress_is_observable_device_scoped_and_rejects_invalid_values ... ok
+test cancel_and_read_remain_available_when_terminal_inputs_are_busy ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/observations_032.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/observations_032-fa632a2c4505f06f)
+
+running 12 tests
+test expired_artifact_does_not_hide_other_authorized_results ... ok
+test device_manifest_detects_schema_mismatch_without_guessing_old_agent_features ... ok
+test explicit_single_query_budget_is_honored_without_changing_legacy_shape ... ok
+test features_are_saved_only_from_authenticated_device_polls ... ok
+test large_batch_results_are_explicitly_omitted_not_truncated ... ok
+test legacy_single_shape_and_batch_order_are_preserved_without_dispatch ... ok
+test malformed_mixed_or_duplicate_requests_never_create_jobs ... ok
+test permission_checks_cover_every_id_before_batch_output ... ok
+test only_meaningful_progress_changes_the_cursor ... ok
+test small_results_that_fit_the_budget_are_not_all_omitted ... ok
+test receipt_wakes_existing_batch_wait_and_does_not_reexecute ... ok
+test unchanged_wait_is_bounded_and_does_not_renew_job ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/receipt_delivery_034.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/receipt_delivery_034-0b39d6a4850f974e)
+
+running 2 tests
+test accepted_but_lost_ack_replays_exact_receipt_and_keeps_one_side_effect ... ok
+test transient_receipt_failure_recovers_without_job_redispatch_or_reexecution ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+
+     Running tests/resource_dispatch_033.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/resource_dispatch_033-185277c4f2c18c70)
+
+running 4 tests
+test blocked_terminal_input_does_not_hide_new_commands_or_cancel ... ok
+test malformed_or_foreign_resource_filters_are_rejected_before_claiming_jobs ... ok
+test write_filter_skips_busy_workspace_and_legacy_requests_can_resume_it ... ok
+test filtered_long_poll_ends_without_cancelling_or_rewriting_queued_work ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/review_regressions.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/review_regressions-8e94b8923af2312f)
+
+running 14 tests
+test edits_reject_nul_bytes_before_writing_any_file ... ok
+test catalog_schema_rejects_nested_unknown_fields_types_and_bounds ... ok
+test invalid_arguments_are_rejected_before_device_lookup_or_queueing ... ok
+test listing_rejects_overflowing_cursor_without_panicking ... ok
+test expired_device_lease_can_be_replaced ... ok
+test receipt_cannot_complete_another_devices_job ... ok
+test receipt_accepts_exact_replay_but_rejects_conflicting_result ... ok
+test receipt_rejects_undispatched_operations ... ok
+test receipt_rejects_unknown_operations ... ok
+test receipt_requires_an_object_result ... ok
+test search_keeps_a_late_match_inside_an_oversized_line ... ok
+test search_keeps_the_matching_line_when_context_exceeds_budget ... ok
+test search_window_preserves_utf8_and_reports_byte_offset ... ok
+test simultaneous_device_sessions_have_only_one_winner ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/state_recovery_033.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/state_recovery_033-1427723578405e52)
+
+running 3 tests
+test page_filters_expired_rows_and_validates_limits ... ok
+test more_than_one_thousand_rows_are_not_silently_reported_as_complete ... ok
+test terminal_restart_recovers_active_records_beyond_the_first_history_page ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/terminal_read_latency.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/terminal_read_latency-227c795f6251f567)
+
+running 1 test
+test compare_legacy_and_stable_terminal_tail_reads ... ignored, explicit local benchmark; no timing threshold in functional CI
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/terminal_regressions.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/terminal_regressions-9da6bf53469d8690)
+
+running 14 tests
+test exited_shell_does_not_leave_output_holding_descendants ... ok
+test failed_spawn_does_not_leave_a_starting_terminal ... ok
+test interactive_prompt_without_newline_remains_usable ... ok
+test cancellation_kills_the_process_group_and_is_repeatable ... ok
+test legacy_raw_logs_keep_redaction_and_restart_reports_runtime_loss ... ok
+test noninteractive_rejects_terminal_input ... ok
+test missing_logs_are_errors_not_silent_empty_success ... ok
+test noninteractive_uses_real_pipes_and_stdin_eof ... ok
+test split_device_secret_never_becomes_a_published_prefix ... ok
+test terminal_output_and_controls_remain_workspace_bound ... ok
+test terminal_capacity_is_released_after_cancellation ... ok
+test unfinished_quoted_credentials_do_not_leak_or_shift_cursors ... ok
+test utf8_split_across_reads_does_not_move_existing_cursors ... ok
+test timeout_seals_output_and_keeps_the_terminal_id ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.72s
+
+     Running unittests src/lib.rs (/Users/jinliang/Workspace/remote_hosts/target/release-slot/cargo-target/debug/deps/remote_hosts_mcp-706b3db6e2db8d90)
+
+running 64 tests
+test tests::agent_work_context_ack_cursor_is_scoped_by_host_filter ... ok
+test tests::agent_work_context_materializes_changed_terminal_beyond_recent_entity_window ... ok
+test tests::agent_work_context_parses_bounded_transfer_progress_and_terminal_sha ... ok
+test tests::agent_work_context_isolates_sessions_and_consumes_terminal_events_once ... ok
+test tests::agent_work_context_prioritizes_type_only_pty_interaction_without_input_payload ... ok
+test tests::agent_work_context_reads_latest_transfer_progress_after_twenty_chunks ... ok
+test tests::agent_work_context_rejects_invalid_snapshot_and_wait_cursors ... ok
+test tests::agent_work_context_recovers_terminal_outbox_after_publisher_failure_and_restart ... ok
+test tests::agent_work_context_typical_ten_item_response_stays_under_eight_kib ... ok
+test tests::agent_work_context_snapshot_is_idle_for_an_empty_session ... ok
+test tests::agent_work_context_wait_cursor_does_not_skip_burst_events_beyond_limit ... ok
+test tests::expired_workspace_reconciliation_preserves_live_operation_and_pty ... ok
+test tests::explicit_agent_conversation_context_is_stable_and_isolated ... ok
+test tests::concurrent_workspace_inserts_cannot_exceed_logical_capacity ... ok
+test tests::mcp_agent_ensure_host_prefers_exact_identity_for_shared_bastion_endpoint ... ok
+test tests::mcp_agent_ensure_host_registers_and_reuses_one_canonical_machine ... ok
+test tests::mcp_agent_rejects_legacy_unowned_workspace_while_admin_can_inspect_it ... ok
+test tests::mcp_agent_reuses_environment_and_reclassifies_same_endpoint_route ... ok
+test tests::mcp_agent_sessions_isolate_workspaces_on_one_shared_host ... ok
+test tests::mcp_agent_ensure_host_creates_named_password_credential_in_one_call ... ok
+test tests::mcp_create_workspace_supports_multiple_logical_workspaces ... ok
+test tests::mcp_get_workspace_result_combines_output_and_artifacts ... ok
+test tests::mcp_host_runtime_snapshot_bootstraps_agent_state_in_one_call ... ok
+test tests::mcp_knowledge_search_treats_punctuation_as_literal_boundaries ... ok
+test tests::mcp_lease_warmup_failure_does_not_reverse_atomic_publish ... ok
+test tests::mcp_list_hosts_returns_structured_content_without_credentials ... ok
+test tests::mcp_live_runtime_event_wait_observes_future_transition ... ok
+test tests::mcp_multi_resource_mutation_does_not_block_unrelated_production_work ... ok
+test tests::mcp_mutations_coordinate_by_host_without_blocking_readonly_work ... ok
+test tests::mcp_open_pty_creates_resolving_connection_when_none_is_reusable ... ok
+test tests::mcp_operation_idempotency_is_scoped_to_one_agent_session ... ok
+test tests::mcp_output_artifact_tools_return_metadata_and_bounded_content ... ok
+test tests::mcp_prepare_workspace_does_not_reuse_unavailable_workspaces ... ok
+test tests::mcp_prepare_workspace_reaps_expired_foreign_capacity_and_explains_result ... ok
+test tests::mcp_prepare_workspace_reuses_one_workspace_and_returns_context ... ok
+test tests::mcp_pty_heartbeat_reports_advisory_metadata_contention_without_tool_failure ... ok
+test tests::mcp_pty_input_preacquires_exact_pty_scopes_without_host_widening ... ok
+test tests::mcp_pty_lifecycle_tools_manage_agent_visible_state ... ok
+test tests::mcp_queue_operation_rolls_back_when_atomic_publish_fails ... ok
+test tests::mcp_queues_target_host_password_without_exposing_target_or_secret ... ok
+test tests::mcp_registry_record_tools_reject_secret_like_content ... ok
+test tests::mcp_registry_tools_upsert_records_without_duplicates ... ok
+test tests::mcp_run_in_workspace_can_atomically_wait_for_its_exact_operation ... ok
+test tests::mcp_run_in_workspace_queues_operation_and_exposes_output ... ok
+test tests::mcp_run_in_workspace_rejects_exec_for_tty_only_access_path ... ok
+test tests::mcp_run_in_workspace_supports_shell_profile_but_rejects_disguised_shell_arguments ... ok
+test tests::mcp_runtime_event_wait_distinguishes_live_only_from_replay ... ok
+test tests::mcp_runtime_snapshot_compacts_historical_connection_sessions ... ok
+test tests::mcp_runtime_snapshot_exposes_local_handshake_wait_without_target_blame ... ok
+test tests::mcp_runtime_snapshot_exposes_saturated_ssh_channel_capacity ... ok
+test tests::mcp_runtime_snapshot_guides_pooled_transport_recovery_without_restart ... ok
+test tests::mcp_runtime_snapshot_ignores_sessions_from_disabled_access_paths ... ok
+test tests::mcp_runtime_snapshot_marks_expired_local_handshake_budget_ready ... ok
+test tests::mcp_runtime_snapshot_warns_agents_before_multi_hop_retry ... ok
+test tests::mcp_scoped_mutations_allow_siblings_but_block_parent_scopes ... ok
+test tests::mcp_sftp_atomic_publish_rolls_back_in_compressed_mode_and_can_retry ... ok
+test tests::mcp_three_agent_sessions_can_queue_declared_readonly_shell_work_concurrently ... ok
+test tests::mcp_tool_list_exposes_safety_annotations ... ok
+test tests::mcp_tool_profiles_expose_bounded_task_oriented_surfaces ... ok
+test tests::mcp_upload_file_queues_sftp_and_redacts_paths_from_public_audit ... ok
+test tests::mcp_wait_workspace_state_returns_visible_state ... ok
+test tests::project_only_agent_context_does_not_merge_conversations ... ok
+test tests::runtime_snapshot_exposes_live_pty_input_without_generic_workspace_block ... ok
+test tests::mcp_agent_stores_and_updates_host_password_without_returning_plaintext ... ok
+
+test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.18s
+
+   Doc-tests remote_hosts_code
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests remote_hosts_mcp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,22 @@
+{
+  "observed_at": "2026-09-10T14:14:32.640681+00:00",
+  "changed_inputs": [
+    {
+      "path": "crates/remote-hosts-code/src/observations.rs",
+      "tested_sha256": "8bbc57dfdae95a86b9bf9677e92c9c255e3b15cfb98d37d19e853067e3d82d79",
+      "current_sha256": "d17b21a4f8d451de0ffe276a7f900d908540096933344c117c3706b18b85f730"
+    },
+    {
+      "path": "crates/remote-hosts-code/tests/observations_032.rs",
+      "tested_sha256": "20d816132380457696036b914c148568c1789cc0750f0e330051a166ead9bf99",
+      "current_sha256": "8e259c47092468c8d254ffcb83b617f580f232ae98d0da647dab94a0d50b6566"
+    },
+    {
+      "path": "scripts/check-code-source.py",
+      "tested_sha256": "3d27ea435fb71dfe16be25f61919e56f352e1f9d0e595422342aa4220ee3066c",
+      "current_sha256": "5d69d72b04c924a39f941e33f57fa5998ee244d33ec90ce4397e5e2155c4954d"
+    }
+  ],
+  "frozen_release_artifacts_unchanged": true,
+  "handling": "Preserve later worktree edits. Frozen-source test success does not cover changed inputs. No attribution to an author is inferred."
+}

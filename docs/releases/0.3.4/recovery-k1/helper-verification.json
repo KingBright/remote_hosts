@@ -1,0 +1,22 @@
+{
+  "recorded_at": "2026-09-10T17:11:40.239366+00:00",
+  "tests_ran": 65,
+  "passed": 64,
+  "skipped": 1,
+  "python_inputs_unchanged": true,
+  "helpers": {
+    "launch-code-upgrade.py": "bbd9a74c3774b0a248f8c5f5156ab8f6d8524ba5b89087e4a96e716591623e23",
+    "upgrade-code-agent.py": "466c69f4e95328d748e78a7845f9afd38abb6296e4b449087fdfa7dee4a95ba9",
+    "agent_upgrade_support.py": "92a2fdbaebc3599d09c64c10492ad16496a61c83cd83bfc97448dac5422a93d1"
+  },
+  "original_binary_and_package_unchanged": true,
+  "gateway_preflight": {
+    "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+    "agent_version": "0.3.2",
+    "readiness_protocol": 1,
+    "_transport": {
+      "attempts": 1,
+      "elapsed_ms": 1075
+    }
+  }
+}

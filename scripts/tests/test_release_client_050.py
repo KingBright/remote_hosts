@@ -18,6 +18,12 @@ class ClientTests(unittest.TestCase):
     def test_invalid_origins_never_construct_requests(self):
         for origin in ('http://example.test','https://user:secret@example.test','https://example.test/?token=x'):
             with self.assertRaises(ValueError):Client(origin)
+    def test_acceptance_run_id_normalizes_semver_without_weakening_validator(self):
+        path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_050_id',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        value=m.acceptance_run_id('0.5.0','00000000-0000-0000-0000-000000000001')
+        self.assertEqual(value,'release-0-5-0-00000000-0000-0000-0000-000000000001')
+        self.assertTrue(value.replace('-','').isalnum())
+
     def test_target_config_disallows_option_injection_and_duplicate_device(self):
         path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_050',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
         config={'agents':[{'device_id':'00000000-0000-0000-0000-000000000001','workspace_id':'00000000-0000-0000-0000-000000000001:w','home':'/home/test'}],'gateway':{'ssh_host':'-oProxyCommand=bad','ssh_port':22,'root':'/opt/test'}}

@@ -1,0 +1,45 @@
+{
+  "version": "0.3.1",
+  "recorded_at": "2026-09-10T13:31:51.004781+00:00",
+  "items": [
+    {
+      "issue_id": "RH-041",
+      "kind": "staging_route_unavailable",
+      "device": "Mac-Studio",
+      "observations": [
+        "MacStudio.local DNS failure",
+        "verified 192.168.2.110 SSH timeout"
+      ],
+      "resolution": "Authenticated gateway artifact transfer completed. No device substitution or weakened host-key checking."
+    },
+    {
+      "issue_id": "RH-030",
+      "kind": "tool_blocked",
+      "idempotency_key": "rh031-studio-updater-observation-20260910-e1",
+      "execution_started": false,
+      "scope": "Studio updater/process/log diagnostic",
+      "handling": "Not retried through a disguised or equivalent command."
+    },
+    {
+      "issue_id": "RH-030",
+      "kind": "tool_blocked",
+      "idempotency_key": "rh031-studio-public-functional-acceptance-20260910-e1",
+      "execution_started": false,
+      "scope": "Selected Studio public functional acceptance",
+      "handling": "No claim of Studio 0.3.1 acceptance; no new installation request."
+    },
+    {
+      "issue_id": "RH-028",
+      "kind": "misleading_human_summary",
+      "operation_id": "fe201063-83dc-499a-9fff-a72d8c80464c",
+      "observation": "Script printed both live devices passed despite --device-id selecting only MacBook. JSON correctly lists one device.",
+      "handling": "Only the JSON device list is counted; human summary fix remains open."
+    },
+    {
+      "issue_id": "RH-035",
+      "kind": "host_schema_stale",
+      "observation": "After server upgrade, tool discovery still exposes terminal_exec without wait_ms. Direct authenticated MCP catalog and live checks expose the new fields.",
+      "handling": "New-parameter checks labeled direct-MCP, not native host schema acceptance."
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "observed_date": "2026-09-10",
+  "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+  "scope": "Read original 0.3.1 updater result; no new install request",
+  "read_operation_id": "393759c3-ffc2-4416-8da9-cb6294b134e5",
+  "read_exit_code": 0,
+  "job_label": "com.remote-hosts.code-upgrade.ed42e2678742ce3d50775dbb",
+  "updater_state": "not running",
+  "updater_runs": 1,
+  "updater_exit_code": 1,
+  "result": {
+    "version": "0.3.1",
+    "candidate_sha256": "bec00275be4ad78d02ffec5395392735bb61f9a7abd64aa26517b7036c6f6d58",
+    "state": "failed",
+    "error": "agent still has active work; upgrade not applied",
+    "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/ed42e2678742ce3d50775dbb/result-attempts/262003e4749543c5ad43c57d9257cfc9.json"
+  },
+  "agent": {"state":"running","runs":3,"pid":50827,"installed_version":"0.3.0"},
+  "conclusion":"known rejection before installation, not outcome_unknown and not a rollback",
+  "new_upgrade_performed":false
+}

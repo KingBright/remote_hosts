@@ -1,0 +1,18 @@
+{
+  "state": "passed",
+  "scope": "gateway 0.3.4 with independently reported MacBook agent version",
+  "studio_modified": false,
+  "gateway_version": "0.3.4",
+  "agent_version": "0.3.2",
+  "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+  "single_budget": "passed",
+  "legacy_result_replay": "passed",
+  "mixed_batch": "passed",
+  "read_operation_id": "597689d6-a992-4fc6-8a9d-7c19a244a4ca",
+  "native_import": "passed",
+  "export_http_download": "passed",
+  "http_range": "passed",
+  "bytes": 51200,
+  "sha256": "101ca181691b0fac2abd4edb88b01c2d20570e32219d348cb23c456f9db25005",
+  "temporary_oauth_revoked": true
+}

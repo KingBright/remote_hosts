@@ -1,0 +1,22 @@
+{
+  "started_at": "2026-09-10T17:06:19.218764+00:00",
+  "pid": 30434,
+  "python": "/opt/homebrew/opt/python@3.14/bin/python3.14",
+  "proxy_schemes": [],
+  "endpoint": "configured_gateway/device/readiness",
+  "request_identity": "existing_packaged_updater",
+  "http_status": 200,
+  "server": "cloudflare",
+  "cf_ray": "a39005ca3d6e25b4-AMS",
+  "body_bytes": 313,
+  "result": "passed",
+  "observation": {
+    "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+    "ready": true,
+    "agent_version": "0.3.2",
+    "last_seen": 1789059979,
+    "observed_at": 1789059980,
+    "readiness_protocol": 1
+  },
+  "elapsed_seconds": 1.451
+}

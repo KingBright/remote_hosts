@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.5.0",
+    "manifest": "d29ead4d6c2f30fde934cab86e29f5dc91c74cd33eec476c9348712938920c17",
+    "config": "6aff31f2eba690da2903fb7484e7cab578ff444c7ab569c2c727dabfa21e4738"
+  },
+  "steps": {
+    "launch": {
+      "state": "completed",
+      "input_sha256": "93450c5c1ca1e7187276a8e1ca94583347b0f1375c45b2138952aba3a88e6761",
+      "requested_at_epoch": 1789110216.584173,
+      "result": {
+        "label": "com.remote-hosts.code-upgrade.97b6efa68d128af771b91444",
+        "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/97b6efa68d128af771b91444/result.json",
+        "state": "started",
+        "exit_code": 0
+      }
+    },
+    "standard": {
+      "state": "outcome_unknown",
+      "input_sha256": "96719a3c3660d5011cdd86fc41bd3f9e27dbe6bab41be8e0153407fbbad8cd45",
+      "requested_at_epoch": 1789110339.2599301,
+      "failure_type": "CalledProcessError"
+    }
+  },
+  "updated_at_epoch": 1789110339.546164
+}

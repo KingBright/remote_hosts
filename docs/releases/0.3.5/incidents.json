@@ -1,0 +1,31 @@
+{
+  "version": "0.3.5",
+  "events": [
+    {
+      "stage": "optional_live_concurrency_probe",
+      "idempotency_key": "rh035-live-slot-observation-20260911-m2",
+      "result": "host refused before execution",
+      "executed": false,
+      "equivalent_retry": false,
+      "message": "因 OpenAI 无法确定请求的安全状态，已拦截此工具调用。",
+      "scope": "additional simultaneous-build probe only; main build, sequential measurement and deployment executed normally"
+    },
+    {
+      "stage": "diagnostic_invocation",
+      "operation_id": "4518693b-10ba-49a6-b5ac-bab0311f949c",
+      "result": "incorrect import of a nonexistent diagnostic placeholder; not product code or build failure"
+    },
+    {
+      "stage": "toolchain_display",
+      "result": "cargo zigbuild --version unsupported; actual cross build command succeeded"
+    },
+    {
+      "stage": "static_review",
+      "issue": "RH-039",
+      "result": "forced kill can outlive cooperative cleanup of separately sessioned compiler children; do not equate parent exit or lock release with completed cleanup",
+      "production_fault_injected": false,
+      "scope": "follow-up risk; all current build stages completed normally"
+    }
+  ],
+  "production_release_blocked": false
+}

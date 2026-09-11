@@ -1,0 +1,31 @@
+{
+  "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+  "name": "Mac-Studio",
+  "state": "needs_recovery",
+  "phase": "functional_acceptance",
+  "launch": {
+    "label": "com.remote-hosts.code-upgrade.a8997c485fb5335220c7c1df",
+    "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/a8997c485fb5335220c7c1df/result.json",
+    "state": "started",
+    "exit_code": 0
+  },
+  "updater": {
+    "active_operations": 0,
+    "active_terminals": 0,
+    "all_lanes_verified": true,
+    "candidate_sha256": "6bcd4bbcab83cd7542e3205e938cb4696858fc25e6e95d3346ec5f8b18763609",
+    "gateway_verified": true,
+    "installed_sha256": "6bcd4bbcab83cd7542e3205e938cb4696858fc25e6e95d3346ec5f8b18763609",
+    "phase": "completed",
+    "pid": 50008,
+    "samples": 10,
+    "service_changed": true,
+    "session": "a574ff65baaa402e9ab48082b765f1316e6687df17724fc9aed0850b0e093d16",
+    "stable_seconds": 23.129051331430674,
+    "started_at": 1789110296,
+    "state": "upgraded",
+    "version": "0.5.0"
+  },
+  "failure_type": "CalledProcessError",
+  "next_action": "inspect original per-target stage and receipts; do not repeat installation"
+}

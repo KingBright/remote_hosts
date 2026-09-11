@@ -1,0 +1,23 @@
+{
+  "old_failure": "original-failure.json",
+  "exact_original_transport_cause": "not_recoverable_from_swallowed_exception",
+  "current_same_request_probes": "terminal and launchd HTTP200",
+  "helper_test_summary": {
+    "passed": 64,
+    "skipped": 1,
+    "new_tests": 14
+  },
+  "new_updater_result": "upgraded",
+  "http_retries_in_successful_production_preflight": 0,
+  "full_acceptance": {
+    "idempotency_key": "rh034-recovered-macbook-full-acceptance-20260911-k1",
+    "stage": "host_pre_dispatch",
+    "message": "此工具调用被 OpenAI 的安全检查屏蔽。请仔细检查你发送的内容。",
+    "executed": false,
+    "equivalent_retry": false
+  },
+  "network_security_configuration_changed": false,
+  "credentials_changed": false,
+  "nas_reinstalled": false,
+  "studio_changed": false
+}

@@ -1,0 +1,80 @@
+{
+  "origin": "https://mcp.hackerlife.fun:8443",
+  "oauth": "passed",
+  "mcp_tool_count": 13,
+  "devices": [
+    {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "workspace_id": "ba3bf113-2390-466e-88bc-40d5b4f02884:271f8966-73c7-4933-a186-5c07080ab6c9",
+      "range_read": "passed",
+      "syntax_tree": "passed",
+      "precise_edit": "passed",
+      "duplicate_edit": "passed",
+      "stale_version_rejected": true,
+      "search": "passed",
+      "terminal_test_exit_code": 0,
+      "probe_file_removed": true
+    },
+    {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "name": "Mac-Studio",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:66825741-b184-4d28-b763-a6bbbe3fcab2",
+      "range_read": "passed",
+      "syntax_tree": "passed",
+      "precise_edit": "passed",
+      "duplicate_edit": "passed",
+      "stale_version_rejected": true,
+      "search": "passed",
+      "terminal_test_exit_code": 0,
+      "probe_file_removed": true
+    }
+  ],
+  "test_oauth_grant_revoked": true,
+  "verification_date": "2026-09-09 Asia/Shanghai",
+  "browser_acceptance": {
+    "status": "passed",
+    "date": "2026-09-09 Asia/Shanghai",
+    "conversation_url": "https://chatgpt.com/c/6aa0f794-2f24-83e8-a368-6ccd7bc0c74b",
+    "connector_id": "asdk_app_6aa0f561ae488191b277a75b5ae5059f",
+    "oauth": "connected",
+    "devices_online": [
+      "MacBook-M2-Max",
+      "Mac-Studio"
+    ],
+    "tools_called": [
+      "devices_list",
+      "workspace_open",
+      "code_list",
+      "code_read"
+    ],
+    "read": {
+      "path": "Cargo.toml",
+      "start_line": 1,
+      "end_line": 12,
+      "total_lines": 71,
+      "truncated": false,
+      "operation_id": "46be9093-c639-4820-9a55-24171f18d9ab"
+    },
+    "terminal_commands_executed": false,
+    "files_edited": false
+  },
+  "artifacts": {
+    "macos_arm64_sha256": "07a32542a8b4d844ccf52aa57c21a94a8d3f619ceddbddbe656fb2e1466d3f94",
+    "linux_x86_64_musl_sha256": "f8653fab9b0dcdf67fbe5aaf86b1c486e0279ce1c67d9dbc71d60ffc2fcf93c7"
+  },
+  "checks": {
+    "new_functional_tests": 8,
+    "existing_mcp_tests": 64,
+    "workspace_check": "passed",
+    "clippy_deny_warnings": "passed",
+    "news_http_status": 200
+  },
+  "public_mcp_url": "https://mcp.hackerlife.fun/mcp",
+  "deployment_header_fixes": {
+    "source_updated": true,
+    "runtime": "Caddy response header overrides; existing binary retained",
+    "referrer_policy": "same-origin",
+    "csp_form_action": "'self' https://chatgpt.com"
+  }
+}

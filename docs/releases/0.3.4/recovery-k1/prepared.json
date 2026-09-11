@@ -1,0 +1,14 @@
+{
+  "state": "prepared",
+  "label": "com.remote-hosts.code-upgrade.ccdae89f56194d5dd97ae190",
+  "directory": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/ccdae89f56194d5dd97ae190",
+  "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/ccdae89f56194d5dd97ae190/result.json",
+  "version": "0.3.4",
+  "candidate": "/Users/jinliang/Workspace/remote_hosts/target/source-snapshots/034-h1/dist/remote-hosts-code-0.3.4/remote-hosts-code-macos-arm64",
+  "candidate_sha256": "073989b51289d78cc81c7052670e05c537a82dad6536def3a359544ce17820e0",
+  "file_sha256": {
+    "upgrade-code-agent.py": "466c69f4e95328d748e78a7845f9afd38abb6296e4b449087fdfa7dee4a95ba9",
+    "agent_upgrade_support.py": "92a2fdbaebc3599d09c64c10492ad16496a61c83cd83bfc97448dac5422a93d1",
+    "job.plist": "9f196835c7e45bd96f9ae48297e6703b22f0afb024bd17da75346218e5b0b3f5"
+  }
+}

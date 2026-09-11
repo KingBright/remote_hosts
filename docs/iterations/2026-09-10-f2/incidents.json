@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-10",
+  "events": [
+    {"related_issue":"RH-030","tool":"terminal_exec","idempotency_key":"rh-next-20260910-f1-snapshot-tests-run","stage":"host_tool_pre_dispatch","action":"Run Python snapshot regression suite","observed":"因 OpenAI 无法确定请求的安全状态，已拦截此工具调用。","execution_started":false,"handling":"Not retried or routed through a different execution path. Other independent Rust checks continued; this Python gate remains unverified."},
+    {"related_issue":"RH-026","stage":"isolated_source_build","snapshot":"target/source-snapshots/032-f1","observed":"sqlx migration directory ../../migrations missing from captured input set","execution_started":true,"handling":"Expanded declared inputs and captured a separate 032-f2 snapshot. Retained the failed snapshot and logs."},
+    {"related_issues":["RH-027","RH-030"],"tool":"terminal_exec","idempotency_key":"rh-next-20260910-f2-studio-idle-and-candidate","stage":"host_tool_pre_dispatch","action":"Inspect current Studio idle state and frozen candidate hashes","observed":"因 OpenAI 无法确定请求的安全状态，已拦截此工具调用。","execution_started":false,"handling":"No new upgrade submitted. The previously retrieved rejection receipt remains valid evidence for that original attempt only."}
+  ],
+  "deployment_performed_by_this_iteration":false,
+  "git_commit_or_push":false
+}

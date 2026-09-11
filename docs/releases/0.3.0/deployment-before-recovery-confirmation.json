@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "version": "0.3.0",
+  "recorded_date": "2026-09-10",
+  "state": "blocked_before_gateway_upgrade",
+  "production_deployed": false,
+  "candidate": {
+    "path": "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.3.0",
+    "manifest_sha256": "27978ff5c35a6fb31abda2a16ed8607e4e769980d0a1b15f33b9380fbdff42e9",
+    "source_verification": "docs/iteration-0.3.0-verification.json",
+    "source_verification_sha256": "4c3c6bb51d4793b706e62855af72e4e49c439fbc4acf6aceafdbed3dcf9a731f",
+    "source_inputs_matched_at_packaging": true,
+    "functional_tests_passed": 135,
+    "builds": [
+      {"target":"macos-arm64","operation_id":"8a390bc9-457b-488f-906f-b9513be28a64","exit_code":0,"size":24518528,"sha256":"588a353b2f00cd6ef10434e09e994b870cc6463fa0bef2e7b29c780907b28d85"},
+      {"target":"linux-amd64-musl","operation_id":"34b17cd4-c299-44d3-90da-d95075726015","exit_code":0,"size":22854920,"sha256":"bdc2fce190911f45cc1f25ac4d31ece5ca3d482e4e6efdc58d900cc934e0fab4"}
+    ]
+  },
+  "staging": {
+    "nas": {"path":"/opt/remote-hosts-code/releases/0.3.0","state":"copied_and_hash_verified","transfer_operation":"6b335595-ed8e-48e6-b000-8cbe69708061","verification_operation":"ae14d08e-3535-4a54-a95c-367f6c2c64ad","installed_version":"0.2.0","main_pid":26915,"service_state":"active"},
+    "macbook": {"path":"/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.3.0","state":"packaged","last_observed_agent_version":"0.2.0","device_id":"ba3bf113-2390-466e-88bc-40d5b4f02884"},
+    "mac_studio": {"path":"/Users/jinliang/.local/share/remote-hosts-code/releases/0.3.0/agent-release-0.3.0.tgz","state":"copied_and_archive_hash_verified","archive_sha256":"8e8f39c42cc8d43c4718dc2c6e7385120a6386dba725091639ee7816d8a8d8d7","verification_operation":"0d9a3ba9-165f-48a0-b658-cbf1074927f5","transfer_operation":"4bbf9be2-ea1e-4560-b35a-2e7f86387ddc","last_observed_agent_version":"0.2.0","device_id":"8af88e35-f316-4dd9-9810-fa5bd3a22196"}
+  },
+  "blocked_action": {
+    "issue_id":"RH-027",
+    "related_issue":"RH-030",
+    "tool":"terminal_exec",
+    "idempotency_key":"rh030-nas-upgrade-0910-b1",
+    "stage":"host_tool_pre_dispatch",
+    "message":"此工具调用被 OpenAI 的安全检查屏蔽。请仔细检查你发送的内容。",
+    "execution_started":false,
+    "gateway_restart_performed":false,
+    "agent_upgrades_attempted":false,
+    "reason_agents_not_upgraded":"New agents require gateway dispatch_protocol=2; preserve the working 0.2.0 installation until the gateway upgrade is authorized and verified."
+  },
+  "gates": {
+    "source_verification":"passed_prior_receipt_bound_to_inputs",
+    "native_release_build":"passed",
+    "linux_release_build":"passed",
+    "candidate_packaging":"passed",
+    "gateway_upgrade":"blocked_not_executed",
+    "agent_upgrade":"not_started",
+    "public_030_acceptance":"not_run",
+    "native_chatgpt_030_attachment_roundtrip":"not_run"
+  },
+  "credentials_modified":false,
+  "unrelated_services_modified":false,
+  "rollback_performed":false,
+  "notes":"A staging success is not an installed/running release. Keep the candidate manifest immutable. Append actual deployment and acceptance evidence before changing this state to deployed."
+}

@@ -1,0 +1,10 @@
+{
+  "state": "passed",
+  "scope": "owner-authorized gateway artifact copy to selected Mac-Studio workspace",
+  "sha256": "96806e5aca1f00ee22f195733e671668cf7c1d6be9802a7ce5186b19b0f03afd",
+  "size": 8401720,
+  "destination": ".remote-hosts-release-staging-031/studio-package.tgz",
+  "export_operation": "f926f938-80aa-4dc3-a595-cb689780dea7",
+  "import_operation": "ed0b47df-2ad9-45a5-9c55-654aedf40f55",
+  "oauth_grant_revoked": true
+}
