@@ -42,6 +42,49 @@ fn summary(s: &Session) -> Value {
     json!({"protocol":2,"operation_id":s.id,"size":s.size,"sha256":s.sha256,
     "confirmed_bytes":s.offset,"chunk_bytes":CHUNK,"completed":s.completed,"expires_at":s.expires})
 }
+fn receiver_error_status(error: &anyhow::Error) -> StatusCode {
+    if error.is::<tokio::time::error::Elapsed>() {
+        return StatusCode::REQUEST_TIMEOUT;
+    }
+    let text = error.to_string();
+    if text.contains("too_large") {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    if text.contains("missing") {
+        return StatusCode::NOT_FOUND;
+    }
+    if text.contains("cancelled") {
+        return StatusCode::FORBIDDEN;
+    }
+    if text.contains("filename_too_long") {
+        return StatusCode::BAD_REQUEST;
+    }
+    const CONFLICTS: &[&str] = &[
+        "identity_conflict",
+        "offset_conflict",
+        "chunk_checksum_mismatch",
+        "staging_size_mismatch",
+        "overlapping_chunk_conflict",
+        "duplicate_chunk_conflict",
+        "already_completed",
+        "already_finished",
+        "not_complete",
+        "checksum_mismatch",
+        "completed_data_missing",
+        "completed_artifact_expired",
+        "completed_artifact_expired_or_changed",
+    ];
+    if CONFLICTS.iter().any(|marker| text.contains(marker)) {
+        StatusCode::CONFLICT
+    } else if text.contains("expired") {
+        StatusCode::GONE
+    } else {
+        // A database/IO persistence error can happen after chunk bytes are
+        // already durable but before the offset commit. Returning 5xx lets the
+        // sender observe the old checkpoint and safely replay the same chunk.
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
 async fn authorized(g: &Gateway, h: &HeaderMap, id: &str) -> Result<Job> {
     let job = transfer_control::device_job(g, h, id).await?;
     ensure!(job.tool == "file_download", "export required");
@@ -248,16 +291,13 @@ async fn chunk(State(g): State<Gateway>, Path(id): Path<String>, request: Reques
     }.await;
     match result {
         Ok(v) => Json(v).into_response(),
-        Err(e) if e.is::<tokio::time::error::Elapsed>() => {
-            StatusCode::REQUEST_TIMEOUT.into_response()
+        Err(e) => {
+            let status = receiver_error_status(&e);
+            if status.is_server_error() {
+                tracing::warn!(operation_id=%id, phase="chunk", "transfer receiver persistence failure; retry is allowed");
+            }
+            status.into_response()
         }
-        Err(e) if e.to_string().contains("too_large") => {
-            StatusCode::PAYLOAD_TOO_LARGE.into_response()
-        }
-        Err(e) if e.to_string().contains("expired") => StatusCode::GONE.into_response(),
-        Err(e) if e.to_string().contains("missing") => StatusCode::NOT_FOUND.into_response(),
-        Err(e) if e.to_string().contains("cancelled") => StatusCode::FORBIDDEN.into_response(),
-        Err(_) => StatusCode::CONFLICT.into_response(),
     }
 }
 async fn complete(State(g): State<Gateway>, Path(id): Path<String>, h: HeaderMap) -> Response {
@@ -348,7 +388,13 @@ async fn complete(State(g): State<Gateway>, Path(id): Path<String>, h: HeaderMap
     .await;
     match result {
         Ok(v) => Json(v).into_response(),
-        Err(_) => StatusCode::CONFLICT.into_response(),
+        Err(e) => {
+            let status = receiver_error_status(&e);
+            if status.is_server_error() {
+                tracing::warn!(operation_id=%id, phase="complete", "transfer receiver persistence failure; retry is allowed");
+            }
+            status.into_response()
+        }
     }
 }
 async fn abort(State(g): State<Gateway>, Path(id): Path<String>, h: HeaderMap) -> Response {
@@ -373,7 +419,7 @@ async fn abort(State(g): State<Gateway>, Path(id): Path<String>, h: HeaderMap) -
     }.await;
     match result {
         Ok(()) => Json(json!({"cleanup_complete":true})).into_response(),
-        Err(_) => StatusCode::CONFLICT.into_response(),
+        Err(e) => receiver_error_status(&e).into_response(),
     }
 }
 async fn control_cancelled(g: &Gateway, id: &str) -> bool {
@@ -403,4 +449,37 @@ async fn cleanup_expired(g: &Gateway) -> Result<()> {
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receiver_errors_keep_integrity_conflicts_separate_from_retryable_internal_failures() {
+        assert_eq!(
+            receiver_error_status(&anyhow::anyhow!("offset_conflict")),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            receiver_error_status(&anyhow::anyhow!("chunk_checksum_mismatch")),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            receiver_error_status(&anyhow::anyhow!("database is locked")),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            receiver_error_status(&anyhow::anyhow!("disk sync failed")),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            receiver_error_status(&anyhow::anyhow!("session_expired")),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            receiver_error_status(&anyhow::anyhow!("completed_artifact_expired")),
+            StatusCode::CONFLICT
+        );
+    }
 }

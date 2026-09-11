@@ -118,3 +118,56 @@ async fn r070_source_authorization_state_is_observable_and_structured() {
     assert_eq!(status["error_code"], "source_authorization_required");
     assert_eq!(status["refresh_supported"], true);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r071_transient_receiver_5xx_retries_the_same_durable_chunk() {
+    let mut f = Fixture::new().await;
+    let bytes: Vec<u8> = (0..CHUNK + 777).map(|i| (i % 241) as u8).collect();
+    std::fs::write(f.ws.root.join("data.bin"), &bytes).unwrap();
+    let j = f
+        .job("file_download", json!({"expected_version":hash(&bytes)}))
+        .await;
+    let injected = Arc::new(AtomicBool::new(false));
+    async fn fail_final_chunk_once(
+        State(injected): State<Arc<AtomicBool>>,
+        request: AxumRequest,
+        next: Next,
+    ) -> Response {
+        let final_chunk = request.uri().path().ends_with("/chunk")
+            && request
+                .headers()
+                .get("x-transfer-offset")
+                .and_then(|v| v.to_str().ok())
+                == Some("4194304");
+        if final_chunk && !injected.swap(true, Ordering::SeqCst) {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        next.run(request).await
+    }
+    let router = f
+        .g
+        .router()
+        .unwrap()
+        .layer(middleware::from_fn_with_state(
+            injected.clone(),
+            fail_final_chunk_once,
+        ));
+    let server = f.serve(Some(router));
+    let result = tokio::time::timeout(Duration::from_secs(30), f.agent.execute(&j))
+        .await
+        .expect("sender retry timed out")
+        .expect("sender treated transient 5xx as permanent");
+    assert_eq!(result["state"], "completed");
+    assert!(injected.load(Ordering::SeqCst));
+    assert_eq!(
+        std::fs::read(
+            f.g.config
+                .state_dir
+                .join("file-objects")
+                .join(format!("{}.blob", j.id))
+        )
+        .unwrap(),
+        bytes
+    );
+    server.abort();
+}

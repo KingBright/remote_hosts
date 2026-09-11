@@ -10,7 +10,7 @@ use axum::{
     extract::{Request as AxumRequest, State},
     http::{Request, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use remote_hosts_code::{
     AgentConfig, DeviceRegistration, GatewayConfig,
