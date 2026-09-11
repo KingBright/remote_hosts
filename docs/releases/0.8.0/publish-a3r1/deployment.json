@@ -1,0 +1,24 @@
+{
+  "version": "0.8.0",
+  "state": "needs_recovery",
+  "phase": "verified_inputs",
+  "targets": [
+    "ba3bf113-2390-466e-88bc-40d5b4f02884",
+    "8af88e35-f316-4dd9-9810-fa5bd3a22196"
+  ],
+  "manifest_sha256": "9ddff2f112a878d38373723f9942a88f2e431b8653f2b66146d75bae750658b0",
+  "tests": {
+    "passed": 361,
+    "failed": 0,
+    "rust_passed": 239,
+    "python_passed": 122,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "agents": {},
+  "all_targets_accepted": false,
+  "failure_type": "CalledProcessError",
+  "temporary_oauth_revoked": true
+}

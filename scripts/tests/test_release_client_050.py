@@ -24,6 +24,32 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(value,'release-0-5-0-00000000-0000-0000-0000-000000000001')
         self.assertTrue(value.replace('-','').isalnum())
 
+    def test_gateway_staging_retries_partial_scp_and_atomically_publishes(self):
+        path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_080_stage',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        expected='a'*64;dest='/release/artifact';temp=dest+'.partial-'+expected[:12];remote={};scp_calls=[]
+        def run(argv, timeout=180):
+            if argv[0]=='scp':
+                scp_calls.append(list(argv))
+                if len(scp_calls)==1:
+                    remote[temp]='partial'
+                    raise __import__('subprocess').CalledProcessError(1,argv)
+                remote[temp]=expected
+                return ''
+            command=argv[-1]
+            if command.startswith('if test -f '):
+                key=temp if temp in command else dest
+                return (remote.get(key,'absent')+'  '+key) if key in remote else 'absent'
+            if command.startswith('rm -f '):
+                remote.pop(temp,None);return ''
+            if command.startswith('mv -f '):
+                remote[dest]=remote.pop(temp);return ''
+            if command.startswith('sha256sum '):
+                return remote[dest]+'  '+dest
+            raise AssertionError(command)
+        result=m.stage_remote_artifact(run,['ssh'],['scp'],'root@example',pathlib.Path('/local/artifact'),dest,expected,attempts=3)
+        self.assertEqual(result['state'],'staged');self.assertEqual(result['attempts'],2)
+        self.assertEqual(len(scp_calls),2);self.assertEqual(remote[dest],expected);self.assertNotIn(temp,remote)
+
     def test_accept_only_requires_verified_installed_runtime(self):
         path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_080_accept',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
         sha='a'*64

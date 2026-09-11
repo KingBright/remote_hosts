@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.8.0",
+    "manifest": "9ddff2f112a878d38373723f9942a88f2e431b8653f2b66146d75bae750658b0",
+    "config": "6aff31f2eba690da2903fb7484e7cab578ff444c7ab569c2c727dabfa21e4738"
+  },
+  "steps": {
+    "stage": {
+      "state": "outcome_unknown",
+      "input_sha256": "0e30f39b9618520756f94c958e354e01a830c42de0b700dd87a6013adb7794b1",
+      "requested_at_epoch": 1789148287.550991,
+      "failure_type": "CalledProcessError"
+    }
+  },
+  "updated_at_epoch": 1789148357.4548311
+}

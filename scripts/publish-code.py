@@ -49,6 +49,50 @@ def validate(config):
     if not pathlib.PurePosixPath(gateway['root']).is_absolute():raise ValueError('absolute gateway root required')
     return config
 
+def stage_remote_artifact(run, ssh, scp, host, local, dest, expected, attempts=3):
+    """Stage one immutable artifact with bounded retry and atomic publication.
+
+    A failed SCP may still have delivered the complete temporary file, so every
+    retry re-checks its SHA before deciding to retransmit. Partial files never
+    become the final candidate name.
+    """
+    if attempts < 1 or attempts > 5:
+        raise ValueError('invalid staging retry bound')
+    temp = dest + '.partial-' + expected[:12]
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            final_sha = run(ssh + ['if test -f '+shlex.quote(dest)+'; then sha256sum '+shlex.quote(dest)+'; else printf absent; fi']).split()[0]
+            if final_sha == expected:
+                return {'state':'staged','attempts':attempt-1,'reused':True}
+            if final_sha != 'absent':
+                raise ValueError('remote artifact conflict')
+            temp_sha = run(ssh + ['if test -f '+shlex.quote(temp)+'; then sha256sum '+shlex.quote(temp)+'; else printf absent; fi']).split()[0]
+            if temp_sha not in ('absent', expected):
+                run(ssh + ['rm -f '+shlex.quote(temp)])
+                temp_sha = 'absent'
+            if temp_sha != expected:
+                try:
+                    run(scp + [str(local), host+':'+temp], 600)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                    last_error = type(error).__name__
+                temp_sha = run(ssh + ['if test -f '+shlex.quote(temp)+'; then sha256sum '+shlex.quote(temp)+'; else printf absent; fi']).split()[0]
+            if temp_sha != expected:
+                raise RuntimeError('staged temporary artifact hash mismatch')
+            run(ssh + ['mv -f '+shlex.quote(temp)+' '+shlex.quote(dest)])
+            if run(ssh + ['sha256sum '+shlex.quote(dest)]).split()[0] != expected:
+                raise RuntimeError('remote hash mismatch after atomic publish')
+            return {'state':'staged','attempts':attempt,'reused':False}
+        except ValueError:
+            raise
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as error:
+            last_error = type(error).__name__
+            if attempt == attempts:
+                break
+            time.sleep(min(2 ** (attempt - 1), 4))
+    raise RuntimeError('gateway staging failed after bounded retries: '+str(last_error))
+
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--config',required=True,type=pathlib.Path);p.add_argument('--pipeline',required=True,type=pathlib.Path);p.add_argument('--report-dir',required=True,type=pathlib.Path);p.add_argument('--version',required=True);p.add_argument('--apply',action='store_true');p.add_argument('--accept-only',action='store_true',help='rerun acceptance for already verified installed agents; never install or restart');args=p.parse_args()
     config=validate(json.loads(args.config.read_text()));root=pathlib.Path(config.get('project_root',pathlib.Path(__file__).resolve().parents[1])).resolve(strict=True);plan=rr.verified_build(args.pipeline,args.version)
@@ -126,13 +170,12 @@ def main():
         with rr.StepJournal(directory/'gateway-steps.json',binding) as journal:
             def stage_gateway():
                 command(ssh+['umask 077; mkdir -p '+shlex.quote(remote)])
+                staged={}
+                scp=['scp','-O','-P',str(gateway['ssh_port']),'-o','BatchMode=yes','-o','StrictHostKeyChecking=yes']
                 for name in ('remote-hosts-code-linux-amd64','upgrade-code-gateway.py','manifest.json'):
                     dest=remote+'/'+name;expected=rr.digest(package/name)
-                    have=command(ssh+['if test -f '+shlex.quote(dest)+'; then sha256sum '+shlex.quote(dest)+'; else printf absent; fi']).split()[0]
-                    if have=='absent':command(['scp','-O','-P',str(gateway['ssh_port']),'-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',str(package/name),gateway['ssh_host']+':'+remote+'/'],600)
-                    elif have!=expected:raise ValueError('remote artifact conflict')
-                    if command(ssh+['sha256sum '+shlex.quote(dest)]).split()[0]!=expected:raise ValueError('remote hash mismatch')
-                return {'state':'staged'}
+                    staged[name]=stage_remote_artifact(command,ssh,scp,gateway['ssh_host'],package/name,dest,expected)
+                return {'state':'staged','artifacts':staged}
             journal.step('stage',binding,stage_gateway)
             def update_gateway():
                 argv=['python3',remote+'/upgrade-code-gateway.py','--candidate',remote+'/remote-hosts-code-linux-amd64','--sha256',manifest['artifacts']['remote-hosts-code-linux-amd64']['sha256'],'--version',args.version,'--result',remote+'/deployment.json']
