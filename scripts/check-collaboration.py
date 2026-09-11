@@ -13,12 +13,17 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--config',type=pathlib.Path,required=True);p.add_argument('--device-id',required=True);p.add_argument('--version',required=True);p.add_argument('--report',type=pathlib.Path,required=True);args=p.parse_args()
     if args.report.exists():raise SystemExit('existing probe retained; inspect original result')
     config=json.loads(args.config.read_text());agent=next(a for a in config['agents'] if a['device_id']==args.device_id)
-    c=Client(config['origin'],config['password_file']);r={'version':args.version,'device_id':args.device_id,'state':'running','checks':{},'operation_ids':[]};phase='login';folder='remote_hosts_accept_050_'+args.device_id[:8];key='collab-'+args.version+'-'+args.device_id
+    c=Client(config['origin'],config['password_file']);r={'version':args.version,'device_id':args.device_id,'state':'running','checks':{},'operation_ids':[]};phase='login';folder='remote_hosts_accept_070_'+args.device_id[:8];key='collab-'+args.version+'-'+args.device_id;version=tuple(map(int,args.version.split('.')))
     def record():r['phase']=phase;atomic_json(args.report,r)
     def term(ws,code,stage):return c.terminal(ws,'/opt/homebrew/bin/python3 -c '+shlex.quote(code),key+'-'+stage,60)
     try:
         c.login();inventory=c.tool('devices_list',{});device=next(d for d in inventory['devices'] if d['device_id']==args.device_id)
         assert device['online'] and device['capabilities']['version']==args.version
+        if version >= (0,7,0):
+            limits=device['capabilities'].get('transfer_limits');features=device.get('runtime_features',{}).get('names',[])
+            assert limits and limits['protocol']==1 and limits['default_max_bytes']==67108864 and limits['hard_max_bytes']==268435456 and limits['checkpoint_bytes']==4194304
+            assert 'large_file_transfer_v1' in features and 'source_authorization_status_v1' in features
+            r['checks']['negotiated_transfer_limits']={'passed':True,'default_max_bytes':limits['default_max_bytes'],'hard_max_bytes':limits['hard_max_bytes'],'checkpoint_bytes':limits['checkpoint_bytes']}
         phase='fixture';record()
         term(agent['workspace_id'],"import pathlib,subprocess,os;p=pathlib.Path("+repr(folder)+");p.mkdir(exist_ok=False);subprocess.run(['git','init','-q',str(p)],env=dict(os.environ,GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1'),check=True)",'fixture')
         workspace=c.tool('workspace_open',{'device_id':args.device_id,'root':agent['root']+'/'+folder,'idempotency_key':key+'-open'})['workspace']['id'];r['workspace_id']=workspace;record()
@@ -42,6 +47,16 @@ def main():
         assert applied['state']=='completed' and applied['changed_files']==3 and applied['reused_files']==97 and applied['bytes_written']==153
         assert c.tool('files_sync',apply)==applied
         r['checks']['delta_sync']={'passed':True,'manifest_files':100,'changed_files':3,'reused_files':97,'content_bytes_written':153,'network_bundle_bytes':bundle['size'],'same_key_replay_unchanged':True};record()
+        if version >= (0,7,0):
+            phase='large_file_roundtrip';record();large_size=64*1024*1024+1024*1024
+            large=json.loads(term(workspace,"import pathlib,hashlib,json;p=pathlib.Path('large.source');p.write_bytes(b'');p.open('r+b').truncate("+str(64*1024*1024+1024*1024)+");h=hashlib.sha256();f=p.open('rb')\nwhile b:=f.read(1024*1024):h.update(b)\nprint(json.dumps({'size':p.stat().st_size,'sha256':h.hexdigest()}))",'large-create'))
+            assert large['size']==large_size
+            large_export=c.tool('file_download',{'workspace_id':workspace,'path':'large.source','expected_version':large['sha256'],'max_bytes':70*1024*1024,'idempotency_key':key+'-large-export'});r['operation_ids'].append(large_export['operation_id'])
+            large_import=c.tool('file_upload',{'workspace_id':workspace,'path':'large.received','expected_version':'absent','sha256':large['sha256'],'max_bytes':70*1024*1024,'idempotency_key':key+'-large-import','file':{'file_id':large_export['artifact_id'],'download_url':large_export['download_url'],'file_name':'large.bin'}});r['operation_ids'].append(large_import['operation_id'])
+            assert large_import['state']=='completed' and large_import['sha256']==large['sha256'] and large_import['size']==large_size
+            observed=json.loads(term(workspace,"import pathlib,hashlib,json;p=pathlib.Path('large.received');h=hashlib.sha256();f=p.open('rb')\nwhile b:=f.read(1024*1024):h.update(b)\nprint(json.dumps({'size':p.stat().st_size,'sha256':h.hexdigest()}))",'large-verify'))
+            assert observed==large
+            r['checks']['large_file_roundtrip']={'passed':True,'bytes':large_size,'sha256':large['sha256'],'directions':['device_to_gateway','gateway_to_device'],'explicit_max_bytes':70*1024*1024};record()
         phase='terminal_observation';record()
         started=c.tool('terminal_exec',{'workspace_id':workspace,'command':'sleep 0.2; printf observed; exit 9','idempotency_key':key+'-observe','timeout_seconds':5})
         r['operation_ids'].append(started['operation_id']);end=time.monotonic()+30;polls=0
@@ -93,7 +108,8 @@ def main():
         full_text=sum(len(x.get('text','').encode()) for x in full['content']);compact_text=sum(len(x.get('text','').encode()) for x in compact['content']);assert compact_text<256 and len(compact['structuredContent']['devices'])==len(full['structuredContent']['devices'])
         r['checks']['compact_response']={'passed':True,'text_bytes_full':full_text,'text_bytes_compact':compact_text,'scope':'opt-in text channel only; structured content preserved; not token benchmark'}
         phase='cleanup';record()
-        term(workspace,"import pathlib,hashlib,json;p=pathlib.Path('.');assert {x.name for x in p.iterdir()}=={'.git','dst','change','bundle.source','bundle.received'};assert {x.name for x in (p/'dst').iterdir()}=={f'f{i}.bin' for i in range(100)}\nfor i in range(100):\n expected=b'user-edit' if i==0 else (bytes([i,1,254])*17 if i<3 else bytes([i,0,255])*17);assert(p/'dst'/f'f{i}.bin').read_bytes()==expected\nassert (p/'change'/'a.txt').read_text()=='user edit\\n' and (p/'change'/'b.txt').read_text()=='beta\\n';assert hashlib.sha256((p/'bundle.received').read_bytes()).hexdigest()=="+repr(bundle['sha256']), 'verify-cleanup')
+        expected_names={'.git','dst','change','bundle.source','bundle.received'}|({'large.source','large.received'} if version >= (0,7,0) else set())
+        term(workspace,"import pathlib,hashlib,json;p=pathlib.Path('.');assert {x.name for x in p.iterdir()}=="+repr(expected_names)+";assert {x.name for x in (p/'dst').iterdir()}=={f'f{i}.bin' for i in range(100)}\nfor i in range(100):\n expected=b'user-edit' if i==0 else (bytes([i,1,254])*17 if i<3 else bytes([i,0,255])*17);assert(p/'dst'/f'f{i}.bin').read_bytes()==expected\nassert (p/'change'/'a.txt').read_text()=='user edit\\n' and (p/'change'/'b.txt').read_text()=='beta\\n';assert hashlib.sha256((p/'bundle.received').read_bytes()).hexdigest()=="+repr(bundle['sha256']), 'verify-cleanup')
         term(agent['workspace_id'],"import pathlib,shutil;p=pathlib.Path("+repr(folder)+");assert p.is_dir() and not p.is_symlink();shutil.rmtree(p)",'cleanup')
         r['fixture_removed']=True;r['state']='passed';phase='complete'
     except Exception as error:r.update(state='failed',failure_type=type(error).__name__,recovery='inspect recorded original operations and fixture; do not reinstall')

@@ -29,14 +29,43 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
-pub const MAX_BYTES: usize = 64 * 1024 * 1024;
-const DISK_CAP: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const DISK_CAP: u64 = 1024 * 1024 * 1024;
+pub(crate) const STORAGE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 const BLOB_TTL: i64 = 3600;
+pub(crate) const SOURCE_TTL: i64 = 900;
 const LINK_TTL: i64 = 900;
 const IDLE: Duration = crate::resumable::IDLE;
 
-fn limit(v: &Value) -> Result<usize> {
-    files::number(v, "max_bytes", MAX_BYTES, 1, MAX_BYTES)
+pub(crate) fn limit(v: &Value) -> Result<usize> {
+    files::number(v, "max_bytes", DEFAULT_MAX_BYTES, 1, MAX_BYTES)
+}
+pub(crate) fn ensure_storage_capacity(path: &Path, requested: u64) -> Result<u64> {
+    let available = fs2::available_space(path)?;
+    ensure!(
+        available >= requested.saturating_add(STORAGE_RESERVE_BYTES),
+        "storage_capacity_insufficient: keep reserve space or request a smaller transfer"
+    );
+    Ok(available)
+}
+pub(crate) async fn source_authorization_status(g: &Gateway, id: &str) -> Result<Value> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT expires FROM kv WHERE kind='file_source' AND key=?")
+            .bind(id)
+            .fetch_optional(&g.store.pool)
+            .await?;
+    let control = crate::transfer_control::control(g, id).await?;
+    let at = now();
+    let (state, expires_at) = match row {
+        Some((expires,)) if expires > at => ("available", Some(expires)),
+        Some((expires,)) => ("expired", Some(expires)),
+        None => ("required", None),
+    };
+    Ok(json!({"protocol":1,"state":state,"expires_at":expires_at,
+        "error_code":if state=="available" {Value::Null} else {json!("source_authorization_required")},
+        "refresh_supported":true,"transfer_revision":control.revision,
+        "next_action":if state=="available" {"observe_original_operation"} else {"transfer_resume_with_refreshed_file_authorization"}}))
 }
 pub(crate) fn valid_hash(value: &str) -> bool {
     value.len() == 64
@@ -308,9 +337,11 @@ pub(crate) async fn upload_managed(
                 );
                 break;
             }
+            Ok(response) if response.status().as_u16() == 410 => anyhow::bail!(
+                "source_authorization_required: refresh the original file authorization with transfer_resume; destination unchanged"
+            ),
             Ok(response) if response.status().is_client_error() => anyhow::bail!(
-                "file source unavailable or expired (HTTP {}); destination unchanged",
-                response.status().as_u16()
+                "file_source_rejected: authorization or operation identity rejected; destination unchanged"
             ),
             _ if attempt < 2 => {
                 progress.retry(0);
@@ -537,7 +568,11 @@ async fn get_source(
     }
     match g.store.get::<Value>("file_source", &id).await {
         Ok(Some(value)) => Json(value).into_response(),
-        _ => StatusCode::GONE.into_response(),
+        Ok(None) => match source_authorization_status(&g, &id).await {
+            Ok(status) => (StatusCode::GONE, Json(status)).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 async fn get_received_progress(
@@ -667,7 +702,9 @@ async fn receive_file(
             Ok(n) => n,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        if used.saturating_add(size as u64) > DISK_CAP {
+        if used.saturating_add(size as u64) > DISK_CAP
+            || ensure_storage_capacity(&g.config.state_dir, size as u64).is_err()
+        {
             return StatusCode::INSUFFICIENT_STORAGE.into_response();
         }
         let temporary =

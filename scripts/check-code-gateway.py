@@ -143,6 +143,11 @@ def main():
     assert health["version"] == args.expected_version
     if args.dispatch_protocol is not None:
         assert health.get("dispatch_protocol") == args.dispatch_protocol
+    if tuple(map(int, args.expected_version.split('.'))) >= (0, 7, 0):
+        assert health.get("transfer_limits_protocol") == 1
+        assert health.get("default_file_bytes") == 67108864
+        assert health.get("max_file_bytes") == 268435456
+        assert health.get("storage_reserve_bytes") == 268435456
 
     def tool(name, arguments, allow_error=False):
         result = rpc("tools/call", {"name": name, "arguments": arguments})

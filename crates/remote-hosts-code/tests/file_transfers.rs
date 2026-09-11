@@ -93,10 +93,15 @@ fn host_file_parameter_metadata_and_safety_annotations_survive_catalog() {
     let mut bad = args;
     bad["file"].as_object_mut().unwrap().remove("file_id");
     assert!(tools::validate("file_upload", &bad).is_err());
+    tools::validate(
+        "file_download",
+        &json!({"workspace_id":"w","path":"f","idempotency_key":"k","max_bytes":67108865}),
+    )
+    .unwrap();
     assert!(
         tools::validate(
             "file_download",
-            &json!({"workspace_id":"w","path":"f","idempotency_key":"k","max_bytes":67108865})
+            &json!({"workspace_id":"w","path":"f","idempotency_key":"k2","max_bytes":268435457})
         )
         .is_err()
     );

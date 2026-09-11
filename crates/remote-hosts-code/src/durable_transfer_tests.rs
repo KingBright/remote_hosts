@@ -248,7 +248,8 @@ async fn retained_transfers_have_a_bounded_quota_and_expire() {
     prefix(&c, &mut first, b"old");
     first.expires_at = crate::now() - 1;
     first.save(&store).await.unwrap();
-    for n in 0..8 {
+    let reservations = crate::transfers::DISK_CAP as usize / crate::transfers::DEFAULT_MAX_BYTES;
+    for n in 0..reservations {
         let mut next = job.clone();
         next.id = uuid::Uuid::new_v4().to_string();
         Journal::load_or_create(&c, &ws, &next, &store, Arc::default())

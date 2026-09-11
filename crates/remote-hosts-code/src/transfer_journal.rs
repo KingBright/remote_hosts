@@ -113,7 +113,7 @@ impl Journal {
         let max = crate::files::number(
             &job.arguments,
             "max_bytes",
-            crate::transfers::MAX_BYTES,
+            crate::transfers::DEFAULT_MAX_BYTES,
             1,
             crate::transfers::MAX_BYTES,
         )?;
@@ -150,10 +150,11 @@ impl Journal {
                 && (used as u64)
                     .saturating_add(leftover_bytes)
                     .saturating_add(max as u64)
-                    <= 512 * 1024 * 1024
+                    <= crate::transfers::DISK_CAP
                 && count < 128,
             "transfer_storage_limit: cancel or expire retained transfers"
         );
+        crate::transfers::ensure_storage_capacity(&directory, max as u64)?;
         let mut j = Self {
             operation_id: job.id.clone(),
             device_id: config.device_id.clone(),

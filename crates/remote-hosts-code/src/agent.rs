@@ -348,6 +348,7 @@ impl Agent {
                 .collect(),
             allow_write: self.config.allow_write,
             allow_exec: self.config.allow_exec,
+            transfer_limits: Some(crate::capabilities::TransferLimits::current()),
         };
         // A launchd process marker is not readiness. Only successful authenticated
         // poll round-trips populate the per-lane timestamps for this exact session.

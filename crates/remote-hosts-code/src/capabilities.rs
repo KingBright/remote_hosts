@@ -8,6 +8,31 @@ static CATALOG_SHA: LazyLock<String> =
     LazyLock::new(|| hash(serde_json::to_vec(&tools::catalog()).expect("static catalog")));
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct TransferLimits {
+    pub protocol: u32,
+    pub default_max_bytes: u64,
+    pub hard_max_bytes: u64,
+    pub checkpoint_bytes: u64,
+}
+impl TransferLimits {
+    pub fn current() -> Self {
+        Self {
+            protocol: 1,
+            default_max_bytes: crate::transfers::DEFAULT_MAX_BYTES as u64,
+            hard_max_bytes: crate::transfers::MAX_BYTES as u64,
+            checkpoint_bytes: crate::transfer_receiver::CHUNK as u64,
+        }
+    }
+    pub fn valid(&self) -> bool {
+        self.protocol == 1
+            && self.default_max_bytes > 0
+            && self.default_max_bytes <= self.hard_max_bytes
+            && self.hard_max_bytes <= crate::transfers::MAX_BYTES as u64
+            && self.checkpoint_bytes == crate::transfer_receiver::CHUNK as u64
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeFeatures {
     pub protocol: u32,
     pub names: Vec<String>,
@@ -37,6 +62,8 @@ impl RuntimeFeatures {
                 "operation_lifecycle_v1",
                 "change_set_resume_v1",
                 "workspace_gc_v1",
+                "large_file_transfer_v1",
+                "source_authorization_status_v1",
                 "transfer_recovery_guards_v1",
             ]
             .map(str::to_owned)
@@ -57,7 +84,7 @@ impl RuntimeFeatures {
 pub(crate) fn gateway_manifest(known: Option<&str>) -> Value {
     json!({"version":env!("CARGO_PKG_VERSION"),"tools_sha256":*CATALOG_SHA,
         "tool_count":tools::catalog().len(),"dispatch_protocol":2,"readiness_protocol":1,
-        "observation_protocol":2,"capabilities_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,
+        "observation_protocol":2,"capabilities_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"transfer_limits_protocol":1,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"default_file_bytes":crate::transfers::DEFAULT_MAX_BYTES,"max_file_bytes":crate::transfers::MAX_BYTES,"storage_reserve_bytes":crate::transfers::STORAGE_RESERVE_BYTES,
         "optional_inputs":{"all_tools":["response_mode"],"operation_get":["operation_ids","wait_ms","cursor","max_bytes"],
             "terminal_exec":["wait_ms"],"code_read":["allow_partial","requests[].line_byte_offset"],
             "devices_list":["known_tools_sha256"],

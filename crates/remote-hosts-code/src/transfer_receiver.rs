@@ -91,7 +91,7 @@ async fn initialize(
     let max = files::number(
         &job.arguments,
         "max_bytes",
-        transfers::MAX_BYTES,
+        transfers::DEFAULT_MAX_BYTES,
         1,
         transfers::MAX_BYTES,
     )
@@ -131,9 +131,10 @@ async fn initialize(
             Err(e) => return Err(e.into()),
         };
         ensure!(
-            used.saturating_sub(uncommitted).saturating_add(size as u64) <= 512 * 1024 * 1024,
+            used.saturating_sub(uncommitted).saturating_add(size as u64) <= transfers::DISK_CAP,
             "gateway_storage_limit"
         );
+        transfers::ensure_storage_capacity(&g.config.state_dir, size as u64)?;
         let path = part(&g, &id);
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).write(true).create_new(true);

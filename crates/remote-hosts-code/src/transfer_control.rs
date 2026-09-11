@@ -193,7 +193,7 @@ pub(crate) async fn apply(g: &Gateway, p: &Principal, name: &str, args: &Value) 
         if let Some(source) = &source {
             let saved_revision = v["result"]["transfer_revision"].as_i64();
             sqlx::query("INSERT INTO kv(kind,key,value,expires) SELECT 'file_source',?,?,? WHERE EXISTS (SELECT 1 FROM jobs j JOIN kv c ON c.kind='transfer_control' AND c.key=j.id WHERE j.id=? AND j.state<>'done' AND json_extract(c.value,'$.revision')=? AND json_extract(c.value,'$.cancel_requested')=0) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value,expires=excluded.expires")
-                .bind(id).bind(serde_json::to_string(source)?).bind(now()+900).bind(id).bind(saved_revision)
+                .bind(id).bind(serde_json::to_string(source)?).bind(now()+crate::transfers::SOURCE_TTL).bind(id).bind(saved_revision)
                 .execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -238,7 +238,7 @@ pub(crate) async fn apply(g: &Gateway, p: &Principal, name: &str, args: &Value) 
             c.revision = c.revision.checked_add(1).context("revision overflow")?;
             if let Some(source) = &source {
                 sqlx::query("INSERT INTO kv VALUES('file_source',?,?,?) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value,expires=excluded.expires")
-                    .bind(id).bind(serde_json::to_string(source)?).bind(now()+900).execute(&mut *tx).await?;
+                    .bind(id).bind(serde_json::to_string(source)?).bind(now()+crate::transfers::SOURCE_TTL).execute(&mut *tx).await?;
             }
             sqlx::query("UPDATE jobs SET state='queued',result=NULL,updated=? WHERE id=?")
                 .bind(now())

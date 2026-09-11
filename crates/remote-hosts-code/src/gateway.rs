@@ -62,6 +62,8 @@ pub struct DeviceHello {
     pub roots: Vec<String>,
     pub allow_write: bool,
     pub allow_exec: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_limits: Option<crate::capabilities::TransferLimits>,
 }
 /// Optional extensions keep old serial agents compatible with the new gateway.
 #[derive(Deserialize)]
@@ -91,6 +93,11 @@ impl PollRequest {
             && self.hello.version.len() <= 64
             && self.hello.roots.len() <= 50
             && self.hello.roots.iter().all(|r| r.len() <= 4096)
+            && self
+                .hello
+                .transfer_limits
+                .as_ref()
+                .is_none_or(crate::capabilities::TransferLimits::valid)
             && self.lanes.as_ref().is_none_or(|v| v.len() <= 5)
             && self
                 .runtime_features
@@ -213,7 +220,7 @@ impl Gateway {
             .merge(crate::maintenance::routes(self.clone()))
             .route(
                 "/healthz",
-                get(|| async { Json(json!({"status":"ok","service":"remote-hosts-code","version":env!("CARGO_PKG_VERSION"),"file_transfer":true,"max_file_bytes":crate::transfers::MAX_BYTES,"dispatch_protocol":2,"progress_protocol":1,"readiness_protocol":1,"observation_protocol":2,"capabilities_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"execution_limits":{"read":8,"write":2,"transfer":2,"terminal":4,"control":2}})) }),
+                get(|| async { Json(json!({"status":"ok","service":"remote-hosts-code","version":env!("CARGO_PKG_VERSION"),"file_transfer":true,"default_file_bytes":crate::transfers::DEFAULT_MAX_BYTES,"max_file_bytes":crate::transfers::MAX_BYTES,"storage_reserve_bytes":crate::transfers::STORAGE_RESERVE_BYTES,"transfer_limits_protocol":1,"dispatch_protocol":2,"progress_protocol":1,"readiness_protocol":1,"observation_protocol":2,"capabilities_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"execution_limits":{"read":8,"write":2,"transfer":2,"terminal":4,"control":2}})) }),
             )
             .merge(
                 Router::new()
@@ -380,13 +387,39 @@ impl Gateway {
                     );
                 }
             }
+            if matches!(name, "file_upload" | "file_download") {
+                let requested_max = args
+                    .get("max_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(crate::transfers::DEFAULT_MAX_BYTES as u64);
+                if requested_max > crate::transfers::DEFAULT_MAX_BYTES as u64 {
+                    ensure!(
+                        online
+                            .as_ref()
+                            .and_then(|o| o.runtime_features.as_ref())
+                            .is_some_and(|f| f.names.iter().any(|n| n == "large_file_transfer_v1"))
+                            && online
+                                .as_ref()
+                                .and_then(|o| o.hello.transfer_limits.as_ref())
+                                .is_some_and(
+                                    |l| l.protocol == 1 && requested_max <= l.hard_max_bytes
+                                ),
+                        "device_feature_unavailable: selected agent did not negotiate requested large-file limit"
+                    );
+                }
+            }
             ensure!(
-                online.is_some_and(|o| now() - o.last_seen < 45),
+                online.as_ref().is_some_and(|o| now() - o.last_seen < 45),
                 "device_offline: reconnect the selected device; do not fail over"
             );
             if let Some(source) = &source {
                 self.store
-                    .put("file_source", &id, source, now() + 900)
+                    .put(
+                        "file_source",
+                        &id,
+                        source,
+                        now() + crate::transfers::SOURCE_TTL,
+                    )
                     .await?;
             }
             sqlx::query("INSERT OR IGNORE INTO jobs VALUES(?,?,?,?,?,NULL,'queued',?)")
@@ -416,7 +449,12 @@ impl Gateway {
         if let Some(source) = &source {
             // Also refresh URLs on an exact retry without changing operation identity.
             self.store
-                .put("file_source", &id, source, now() + 900)
+                .put(
+                    "file_source",
+                    &id,
+                    source,
+                    now() + crate::transfers::SOURCE_TTL,
+                )
                 .await?;
         }
         // Publish only after the insertion is committed; retries keep the same job.
@@ -513,6 +551,10 @@ impl Gateway {
             let control = crate::transfer_control::control(self, id).await?;
             pending["cancel_requested"] = json!(control.cancel_requested);
             pending["transfer_revision"] = json!(control.revision);
+            if job.tool == "file_upload" {
+                pending["source_authorization"] =
+                    crate::transfers::source_authorization_status(self, id).await?;
+            }
         }
         Ok(pending)
     }

@@ -9,6 +9,27 @@ pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &
         )
     } else if message.starts_with("invalid_arguments") {
         ("invalid_arguments", "correct_arguments", "not_executed")
+    } else if message.contains("source_authorization_required") {
+        (
+            "source_authorization_required",
+            "refresh_original_file_authorization_with_transfer_resume",
+            "not_executed_or_paused",
+        )
+    } else if message.contains("file_source_rejected") {
+        (
+            "file_source_rejected",
+            "inspect_original_file_identity_and_authorization",
+            "not_executed_or_paused",
+        )
+    } else if message.contains("storage_capacity_insufficient")
+        || message.contains("gateway_storage_limit")
+        || message.contains("transfer_storage_limit")
+    {
+        (
+            "storage_capacity_insufficient",
+            "free_storage_or_request_a_smaller_transfer",
+            "not_executed_or_paused",
+        )
     } else if message.contains("device_feature_unavailable") {
         (
             "device_feature_unavailable",
@@ -114,6 +135,24 @@ mod tests {
     }
     #[test]
     fn workflow_recovery_codes_are_specific() {
+        let source = super::error(
+            "file_upload",
+            "source_authorization_required",
+            Some("id"),
+            "agent_execute",
+        );
+        assert_eq!(source["error_code"], "source_authorization_required");
+        assert_eq!(source["outcome"], "not_executed_or_paused");
+        let storage = super::error(
+            "file_download",
+            "storage_capacity_insufficient",
+            Some("id"),
+            "agent_execute",
+        );
+        assert_eq!(
+            storage["recovery_action"],
+            "free_storage_or_request_a_smaller_transfer"
+        );
         let change = super::error(
             "change_resume",
             "change_set_unavailable: journal missing",

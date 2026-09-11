@@ -227,14 +227,14 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "file_upload",
-        "Transfer a conversation file to a relative path on the selected device. Binary-safe streaming, up to 64 MiB. Default refuses overwrite; replacing requires expected_version equal to the existing SHA-256. Optional sha256 verifies the incoming bytes. New agents persist 4 MiB checkpoints across restarts. Paused jobs keep their operation_id; use transfer_resume for exhausted retries or refreshed file authorization. Completed publishing is recovered by the recorded content identity. Never put bytes/Base64 or a sandbox path in JSON. Reuse idempotency_key on retry; poll operation_get for pending work.",
-        json!({"workspace_id":string(),"idempotency_key":string(),"path":string(),"file":{"type":"object","properties":{"download_url":string(),"file_id":string(),"mime_type":string(),"file_name":string()},"required":["download_url","file_id"],"additionalProperties":false},"expected_version":string(),"sha256":string(),"max_bytes":integer(1,67108864)}),
+        "Transfer a conversation file to a relative path on the selected device. Binary-safe streaming; default limit is 64 MiB and 0.7+ agents may explicitly negotiate up to 256 MiB with max_bytes. Large transfers are rejected before queueing unless the selected agent reports support. Default refuses overwrite; replacing requires expected_version equal to the existing SHA-256. Optional sha256 verifies incoming bytes. 4 MiB checkpoints survive restarts. operation_get reports source authorization state; use transfer_resume with refreshed file authorization when required. Never put bytes/Base64 or a sandbox path in JSON.",
+        json!({"workspace_id":string(),"idempotency_key":string(),"path":string(),"file":{"type":"object","properties":{"download_url":string(),"file_id":string(),"mime_type":string(),"file_name":string()},"required":["download_url","file_id"],"additionalProperties":false},"expected_version":string(),"sha256":string(),"max_bytes":integer(1,268435456)}),
         vec!["workspace_id", "idempotency_key", "path", "file"],
     );
     add(
         "file_download",
-        "Snapshot a selected device file and send verified chunks to the gateway; new agents resume from the receiver's durable offset across restarts. Return a temporary HTTPS link plus SHA-256 and size. Binary-safe, up to 64 MiB; does not modify the source. Use a stable idempotency_key, optional expected_version to reject changed content, and operation_get to retrieve pending results or renew the link within one hour. The bearer link grants file access for 15 minutes: share only with the requesting user.",
-        json!({"workspace_id":string(),"idempotency_key":string(),"path":string(),"expected_version":string(),"max_bytes":integer(1,67108864)}),
+        "Snapshot a selected device file and send verified chunks to the gateway; checkpoints resume from the durable receiver offset across restarts. Default limit is 64 MiB and 0.7+ agents may explicitly negotiate up to 256 MiB with max_bytes. Large transfers are rejected before queueing unless the selected agent reports support and both sides enforce storage reserve. Return a temporary HTTPS link plus SHA-256 and size; does not modify the source.",
+        json!({"workspace_id":string(),"idempotency_key":string(),"path":string(),"expected_version":string(),"max_bytes":integer(1,268435456)}),
         vec!["workspace_id", "idempotency_key", "path"],
     );
     add(
@@ -251,7 +251,7 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "transfer_resume",
-        "Resume a paused/awaiting_source file transfer with the SAME operation ID. Does not replay arbitrary commands or overwrite target-version preconditions. Optional file refreshes expired authorization; a changed file_id requires an original expected SHA-256. Retained checkpoints expire after 24 hours. Completed/cancelled operations are not rerun.",
+        "Resume a paused/awaiting_source file transfer with the SAME operation ID. Does not replay arbitrary commands or overwrite target-version preconditions. operation_get reports whether source authorization is available, expired or needs refresh. Optional file refreshes expired authorization; a changed file_id requires an original expected SHA-256. Retained checkpoints expire after 24 hours. Completed/cancelled operations are not rerun.",
         json!({"operation_id":string(),"idempotency_key":string(),"file":{"type":"object","properties":{"download_url":string(),"file_id":string(),"mime_type":string(),"file_name":string()},"required":["download_url","file_id"],"additionalProperties":false}}),
         vec!["operation_id", "idempotency_key"],
     );

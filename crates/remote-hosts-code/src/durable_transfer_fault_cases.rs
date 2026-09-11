@@ -13,7 +13,7 @@ async fn cleanup_checks_publication_inode_and_preserves_replacement_file() {
 #[tokio::test]
 async fn completed_private_files_still_count_if_cleanup_did_not_finish() {
     let (_d,c,ws,job,store,mut j)=fixture().await;
-    let file=transfer_journal::open_data(&j.data_path(&c),true).unwrap();file.set_len((512*1024*1024)as u64).unwrap();
+    let file=transfer_journal::open_data(&j.data_path(&c),true).unwrap();file.set_len(crate::transfers::DISK_CAP).unwrap();
     j.phase="completed".into();j.result=Some(json!({"state":"completed"}));j.save(&store).await.unwrap();
     let mut next=job;next.id=uuid::Uuid::new_v4().to_string();assert!(Journal::load_or_create(&c,&ws,&next,&store,Arc::default()).await.is_err());
 }
