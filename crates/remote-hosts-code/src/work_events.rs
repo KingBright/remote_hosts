@@ -9,13 +9,24 @@ pub(crate) async fn install(store: &Store) -> Result<()> {
         .execute(&store.pool)
         .await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS work_event_floor(workspace TEXT PRIMARY KEY,seq INTEGER NOT NULL)").execute(&store.pool).await?;
+    // Trigger definitions are versioned behavior. Recreate them under one
+    // immediate transaction so concurrent process startup cannot interleave
+    // drop/create and publish duplicate or stale definitions.
+    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("DROP TRIGGER IF EXISTS work_event_insert")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DROP TRIGGER IF EXISTS work_event_update")
+        .execute(&mut *tx)
+        .await?;
     // Only state transitions, never polling requests, command text, output, or credentials.
     for statement in [
-        r#"CREATE TRIGGER IF NOT EXISTS work_event_insert AFTER INSERT ON kv WHEN NEW.kind IN ('terminal','transfer_local','local_operation') AND json_valid(NEW.value) AND json_extract(NEW.value,'$.workspace_id') IS NOT NULL AND (NEW.kind<>'local_operation' OR json_extract(NEW.value,'$.tool') IN ('code_apply_edits','files_sync','terminal_exec','file_upload','file_download'))  BEGIN INSERT INTO work_events(workspace,kind,entity,state,at,detail) VALUES(json_extract(NEW.value,'$.workspace_id'),NEW.kind,NEW.key,COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase')),unixepoch(),json_object('tool',json_extract(NEW.value,'$.tool'),'exit_code',json_extract(NEW.value,'$.exit_code'),'output_complete',json_extract(NEW.value,'$.output_complete'),'error',json_extract(NEW.value,'$.result.error'),'journal_id',json_extract(NEW.value,'$.result.journal_id'))); INSERT INTO work_event_floor(workspace,seq) SELECT json_extract(NEW.value,'$.workspace_id'),COALESCE(MAX(seq),0) FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq NOT IN (SELECT seq FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') ORDER BY seq DESC LIMIT 4096) ON CONFLICT(workspace) DO UPDATE SET seq=MAX(work_event_floor.seq,excluded.seq); DELETE FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq<=(SELECT seq FROM work_event_floor WHERE workspace=json_extract(NEW.value,'$.workspace_id')); END"#,
-        r#"CREATE TRIGGER IF NOT EXISTS work_event_update AFTER UPDATE ON kv WHEN NEW.kind IN ('terminal','transfer_local','local_operation') AND json_valid(NEW.value) AND json_extract(NEW.value,'$.workspace_id') IS NOT NULL AND (NEW.kind<>'local_operation' OR json_extract(NEW.value,'$.tool') IN ('code_apply_edits','files_sync','terminal_exec','file_upload','file_download')) AND (COALESCE(json_extract(OLD.value,'$.state'),json_extract(OLD.value,'$.phase'),'')<>COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase'),'') OR COALESCE(json_extract(OLD.value,'$.output_complete'),0)<>COALESCE(json_extract(NEW.value,'$.output_complete'),0)) BEGIN INSERT INTO work_events(workspace,kind,entity,state,at,detail) VALUES(json_extract(NEW.value,'$.workspace_id'),NEW.kind,NEW.key,COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase')),unixepoch(),json_object('tool',json_extract(NEW.value,'$.tool'),'exit_code',json_extract(NEW.value,'$.exit_code'),'output_complete',json_extract(NEW.value,'$.output_complete'),'error',json_extract(NEW.value,'$.result.error'),'journal_id',json_extract(NEW.value,'$.result.journal_id'))); INSERT INTO work_event_floor(workspace,seq) SELECT json_extract(NEW.value,'$.workspace_id'),COALESCE(MAX(seq),0) FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq NOT IN (SELECT seq FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') ORDER BY seq DESC LIMIT 4096) ON CONFLICT(workspace) DO UPDATE SET seq=MAX(work_event_floor.seq,excluded.seq); DELETE FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq<=(SELECT seq FROM work_event_floor WHERE workspace=json_extract(NEW.value,'$.workspace_id')); END"#,
+        r#"CREATE TRIGGER IF NOT EXISTS work_event_insert AFTER INSERT ON kv WHEN NEW.kind IN ('terminal','transfer_local','local_operation') AND json_valid(NEW.value) AND json_extract(NEW.value,'$.workspace_id') IS NOT NULL AND (NEW.kind<>'local_operation' OR json_extract(NEW.value,'$.tool') IN ('code_apply_edits','change_resume','workspace_gc','files_sync','terminal_exec','file_upload','file_download'))  BEGIN INSERT INTO work_events(workspace,kind,entity,state,at,detail) VALUES(json_extract(NEW.value,'$.workspace_id'),NEW.kind,NEW.key,COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase')),unixepoch(),json_object('tool',json_extract(NEW.value,'$.tool'),'exit_code',json_extract(NEW.value,'$.exit_code'),'output_complete',json_extract(NEW.value,'$.output_complete'),'error',json_extract(NEW.value,'$.result.error'),'journal_id',json_extract(NEW.value,'$.result.journal_id'))); INSERT INTO work_event_floor(workspace,seq) SELECT json_extract(NEW.value,'$.workspace_id'),COALESCE(MAX(seq),0) FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq NOT IN (SELECT seq FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') ORDER BY seq DESC LIMIT 4096) ON CONFLICT(workspace) DO UPDATE SET seq=MAX(work_event_floor.seq,excluded.seq); DELETE FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq<=(SELECT seq FROM work_event_floor WHERE workspace=json_extract(NEW.value,'$.workspace_id')); END"#,
+        r#"CREATE TRIGGER IF NOT EXISTS work_event_update AFTER UPDATE ON kv WHEN NEW.kind IN ('terminal','transfer_local','local_operation') AND json_valid(NEW.value) AND json_extract(NEW.value,'$.workspace_id') IS NOT NULL AND (NEW.kind<>'local_operation' OR json_extract(NEW.value,'$.tool') IN ('code_apply_edits','change_resume','workspace_gc','files_sync','terminal_exec','file_upload','file_download')) AND (COALESCE(json_extract(OLD.value,'$.state'),json_extract(OLD.value,'$.phase'),'')<>COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase'),'') OR COALESCE(json_extract(OLD.value,'$.output_complete'),0)<>COALESCE(json_extract(NEW.value,'$.output_complete'),0)) BEGIN INSERT INTO work_events(workspace,kind,entity,state,at,detail) VALUES(json_extract(NEW.value,'$.workspace_id'),NEW.kind,NEW.key,COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase')),unixepoch(),json_object('tool',json_extract(NEW.value,'$.tool'),'exit_code',json_extract(NEW.value,'$.exit_code'),'output_complete',json_extract(NEW.value,'$.output_complete'),'error',json_extract(NEW.value,'$.result.error'),'journal_id',json_extract(NEW.value,'$.result.journal_id'))); INSERT INTO work_event_floor(workspace,seq) SELECT json_extract(NEW.value,'$.workspace_id'),COALESCE(MAX(seq),0) FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq NOT IN (SELECT seq FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') ORDER BY seq DESC LIMIT 4096) ON CONFLICT(workspace) DO UPDATE SET seq=MAX(work_event_floor.seq,excluded.seq); DELETE FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq<=(SELECT seq FROM work_event_floor WHERE workspace=json_extract(NEW.value,'$.workspace_id')); END"#,
     ] {
-        sqlx::query(statement).execute(&store.pool).await?;
+        sqlx::query(statement).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 pub(crate) async fn read(
@@ -107,7 +118,16 @@ mod tests {
         let v = read(&s, &ws, first["cursor"].as_str(), 1).await.unwrap();
         assert!(v["has_more"].as_bool().unwrap());
         assert!(!v.to_string().contains("secret"));
+        // Reopening re-applies the versioned trigger definition idempotently.
+        // Inspect the stored SQL rather than relying on in-memory assumptions.
         let reopened = Store::open(d.path()).await.unwrap();
+        let (definition,): (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_event_insert'",
+        )
+        .fetch_one(&reopened.pool)
+        .await
+        .unwrap();
+        assert!(definition.contains("change_resume") && definition.contains("workspace_gc"));
         let v2 = read(&reopened, &ws, v["cursor"].as_str(), 10)
             .await
             .unwrap();

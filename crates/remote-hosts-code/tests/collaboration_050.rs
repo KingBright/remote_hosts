@@ -254,6 +254,24 @@ async fn operation_get_observes_terminal_exit_without_new_read_jobs() {
     .await
     .unwrap();
     assert_eq!(observed["terminal_observation"]["stale"], false);
+    assert_eq!(observed["timing"]["clock"], "agent_monotonic");
+    let lifecycle = &observed["operation_lifecycle"]["gateway"];
+    assert_eq!(lifecycle["clock"], "gateway_unix_ms_same_host");
+    assert!(lifecycle["queued_at_ms"].as_i64().is_some());
+    assert!(lifecycle["dispatched_at_ms"].as_i64().is_some());
+    assert!(lifecycle["result_at_ms"].as_i64().is_some());
+    assert!(lifecycle["queue_ms"].as_i64().is_some_and(|v| v >= 0));
+    assert!(
+        lifecycle["dispatch_to_result_ms"]
+            .as_i64()
+            .is_some_and(|v| v >= 0)
+    );
+    assert!(
+        lifecycle["note"]
+            .as_str()
+            .unwrap()
+            .contains("never subtract")
+    );
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM jobs")
         .fetch_one(&f.g.store.pool)
         .await

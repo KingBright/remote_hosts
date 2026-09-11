@@ -9,6 +9,32 @@ pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &
         )
     } else if message.starts_with("invalid_arguments") {
         ("invalid_arguments", "correct_arguments", "not_executed")
+    } else if message.contains("device_feature_unavailable") {
+        (
+            "device_feature_unavailable",
+            "upgrade_selected_device_and_refresh_capabilities",
+            "not_executed",
+        )
+    } else if message.contains("change_set_unavailable")
+        || message.contains("change_set workspace identity conflict")
+    {
+        (
+            "change_set_unavailable",
+            "inspect_workspace_change_sets_and_original_edit",
+            "not_executed",
+        )
+    } else if message.contains("gc_preview_changed") {
+        (
+            "gc_preview_changed",
+            "run_workspace_gc_preview_again_before_apply",
+            "not_executed",
+        )
+    } else if message.contains("operation_unavailable") || message.contains("operation not found") {
+        (
+            "operation_unavailable",
+            "inspect_original_operation_identifiers_without_reexecution",
+            "not_executed",
+        )
     } else if message.contains("version_conflict") || message.contains("unique match") {
         (
             "version_conflict",
@@ -85,6 +111,33 @@ mod tests {
         assert!(!s.contains("command-password"));
         assert_eq!(v["outcome"], "unknown");
         assert_eq!(v["automatic_replay_safe"], false);
+    }
+    #[test]
+    fn workflow_recovery_codes_are_specific() {
+        let change = super::error(
+            "change_resume",
+            "change_set_unavailable: journal missing",
+            None,
+            "agent_execute",
+        );
+        assert_eq!(change["error_code"], "change_set_unavailable");
+        let gc = super::error(
+            "workspace_gc",
+            "gc_preview_changed: run preview again",
+            None,
+            "agent_execute",
+        );
+        assert_eq!(
+            gc["recovery_action"],
+            "run_workspace_gc_preview_again_before_apply"
+        );
+        let feature = super::error(
+            "workspace_gc",
+            "device_feature_unavailable: upgrade",
+            None,
+            "gateway_dispatch",
+        );
+        assert_eq!(feature["outcome"], "not_executed");
     }
     #[test]
     fn conflicts_are_actionable_not_retry_promises() {

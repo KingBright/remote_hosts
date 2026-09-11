@@ -34,6 +34,9 @@ impl RuntimeFeatures {
                 "complete_diff_v1",
                 "terminal_observation_v1",
                 "diagnostics_v1",
+                "operation_lifecycle_v1",
+                "change_set_resume_v1",
+                "workspace_gc_v1",
                 "transfer_recovery_guards_v1",
             ]
             .map(str::to_owned)
@@ -54,11 +57,11 @@ impl RuntimeFeatures {
 pub(crate) fn gateway_manifest(known: Option<&str>) -> Value {
     json!({"version":env!("CARGO_PKG_VERSION"),"tools_sha256":*CATALOG_SHA,
         "tool_count":tools::catalog().len(),"dispatch_protocol":2,"readiness_protocol":1,
-        "observation_protocol":1,"capabilities_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,
+        "observation_protocol":2,"capabilities_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,
         "optional_inputs":{"all_tools":["response_mode"],"operation_get":["operation_ids","wait_ms","cursor","max_bytes"],
             "terminal_exec":["wait_ms"],"code_read":["allow_partial","requests[].line_byte_offset"],
             "devices_list":["known_tools_sha256"],
-            "workspace_context":["active_only","terminal_cursor","transfer_after","cursor","after_event"],"code_diff":["include_untracked","expected_version"],"files_sync":["mode","manifest_id","bundle_path","bundle_sha256"]},
+            "workspace_context":["active_only","terminal_cursor","transfer_after","cursor","after_event"],"code_diff":["include_untracked","expected_version"],"files_sync":["mode","manifest_id","bundle_path","bundle_sha256"],"change_resume":["change_set_id"],"workspace_gc":["action","older_than_seconds","max_items","preview_id"]},
         "client_schema_comparison":match known { None=>"not_provided",Some(s) if s==*CATALOG_SHA=>"match",Some(_)=>"mismatch" },
         "refresh_required":known.is_some_and(|s|s!=*CATALOG_SHA),
         "refresh_guidance":"Compare the supplied client catalog hash. A mismatch needs host-side tool refresh; this server cannot refresh the conversation schema. Agent feature reports are separate."})

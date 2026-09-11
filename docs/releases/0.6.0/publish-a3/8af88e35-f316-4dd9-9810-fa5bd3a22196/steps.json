@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.6.0",
+    "manifest": "c764e2e3e6de699b11b58bd73b7d55a5120d1bce791b4e0e9deab1b64d0f9b88",
+    "config": "6aff31f2eba690da2903fb7484e7cab578ff444c7ab569c2c727dabfa21e4738"
+  },
+  "steps": {
+    "stage": {
+      "state": "completed",
+      "input_sha256": "f60f13e7652ccd5abab8f8882940a15031d65aa0d424db663f7bc184937036c5",
+      "requested_at_epoch": 1789118455.3827782,
+      "result": {
+        "state": "staged",
+        "import_operation": "f268e480-0b36-4bd7-a1c6-9f46a3b24c63",
+        "archive_sha256": "be76ff01d10cd8f2572f386c6939ca388927bd33ac24cc6e8d6135dae7f29e01"
+      }
+    },
+    "launch": {
+      "state": "completed",
+      "input_sha256": "de24aa32159a81a846b7e1ce801e6bc926dc2974e15a2188ab7195e6ca5c9c70",
+      "requested_at_epoch": 1789118498.67794,
+      "result": {
+        "label": "com.remote-hosts.code-upgrade.d9cc315ef92008bb9570a9b0",
+        "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/d9cc315ef92008bb9570a9b0/result.json",
+        "state": "started",
+        "exit_code": 0
+      }
+    },
+    "standard": {
+      "state": "outcome_unknown",
+      "input_sha256": "840f3cbb51106ee1955d18181e459a1e3668fc03618bcfcc39a30a482cae0489",
+      "requested_at_epoch": 1789118648.738656,
+      "failure_type": "CalledProcessError"
+    }
+  },
+  "updated_at_epoch": 1789118665.949574
+}

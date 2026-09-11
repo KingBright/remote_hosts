@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.6.0/check-code-gateway.py", line 254, in <module>
+    main()
+    ~~~~^^
+  File "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.6.0/check-code-gateway.py", line 129, in main
+    assert len(names) == len(set(names)) and set(names) == expected_tools, 'Unexpected tool catalog'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Unexpected tool catalog

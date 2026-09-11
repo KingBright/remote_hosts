@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.6.0",
+    "manifest": "c764e2e3e6de699b11b58bd73b7d55a5120d1bce791b4e0e9deab1b64d0f9b88",
+    "config": "6aff31f2eba690da2903fb7484e7cab578ff444c7ab569c2c727dabfa21e4738"
+  },
+  "steps": {
+    "stage": {
+      "state": "completed",
+      "input_sha256": "c359e35431f8a6ac879febc9e49a44db6ac437f76137b021293a5f2b32493387",
+      "requested_at_epoch": 1789118309.44013,
+      "result": {
+        "state": "staged"
+      }
+    },
+    "upgrade": {
+      "state": "completed",
+      "input_sha256": "c359e35431f8a6ac879febc9e49a44db6ac437f76137b021293a5f2b32493387",
+      "requested_at_epoch": 1789118384.6963341,
+      "result": {
+        "state": "upgraded",
+        "version": "0.6.0",
+        "candidate_sha256": "67dc610a5992fd33332b94091a836ad914fe4e6b919ada772aa7930fdd165a3d",
+        "backup": "/opt/remote-hosts-code/releases/before-0.6.0-20260911T171947",
+        "previous_sha256": "15fbaa239c727b13079a1247773ae051e00c84efabca12b18cad2b5df691d8f6",
+        "pid": 15696,
+        "installed_sha256": "67dc610a5992fd33332b94091a836ad914fe4e6b919ada772aa7930fdd165a3d",
+        "health": {
+          "capabilities_protocol": 1,
+          "change_set_protocol": 1,
+          "checkpoint_bytes": 4194304,
+          "dispatch_protocol": 2,
+          "execution_limits": {
+            "control": 2,
+            "read": 8,
+            "terminal": 4,
+            "transfer": 2,
+            "write": 2
+          },
+          "file_transfer": true,
+          "maintenance_protocol": 1,
+          "max_file_bytes": 67108864,
+          "observation_protocol": 2,
+          "progress_protocol": 1,
+          "readiness_protocol": 1,
+          "resource_dispatch_protocol": 1,
+          "service": "remote-hosts-code",
+          "status": "ok",
+          "storage_gc_protocol": 1,
+          "terminal_observation_protocol": 1,
+          "transfer_protocol": 2,
+          "version": "0.6.0"
+        },
+        "caddy_override_removed": false
+      }
+    }
+  },
+  "updated_at_epoch": 1789118392.271033
+}

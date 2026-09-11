@@ -1,0 +1,53 @@
+{
+  "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+  "name": "MacBook-M2-Max",
+  "state": "needs_recovery",
+  "phase": "functional_acceptance",
+  "launch": {
+    "label": "com.remote-hosts.code-upgrade.33523b2c15ef21048adff3ae",
+    "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/33523b2c15ef21048adff3ae/result.json",
+    "state": "started",
+    "exit_code": 0
+  },
+  "updater": {
+    "version": "0.6.0",
+    "candidate_sha256": "94bad18f2d5049153dcd29832a51a8c19beae13a49e2970bf369ef8642077443",
+    "state": "upgraded",
+    "phase": "completed",
+    "gateway_preflight": {
+      "attempts": 1,
+      "elapsed_ms": 1806
+    },
+    "active_terminals": 0,
+    "active_operations": 0,
+    "backup": "/Users/jinliang/.local/share/remote-hosts-code/releases/before-0.6.0-20260911T172106-44364e72/remote-hosts-code",
+    "previous_sha256": "6bcd4bbcab83cd7542e3205e938cb4696858fc25e6e95d3346ec5f8b18763609",
+    "service_changed": true,
+    "installed_sha256": "94bad18f2d5049153dcd29832a51a8c19beae13a49e2970bf369ef8642077443",
+    "pid": 90703,
+    "started_at": 1789118480,
+    "gateway_verified": true,
+    "readiness": "stable_authenticated_control_plane",
+    "session": "a26f5994090e48fc805ec624e920ab8bce8379293dcd41aa8226653fdebb6a8e",
+    "runs": "660",
+    "stable_seconds": 24.03048695801408,
+    "samples": 10,
+    "gateway_seen_advanced": true,
+    "advanced_lanes": [
+      "control",
+      "read",
+      "terminal",
+      "transfer",
+      "write"
+    ],
+    "all_lanes_verified": true,
+    "functional_acceptance": "separate_required_gate",
+    "maintenance": {
+      "released": true,
+      "protocol": 1
+    },
+    "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/33523b2c15ef21048adff3ae/result-attempts/0e75d70ed3a84844894434bb6148b2ec.json"
+  },
+  "failure_type": "CalledProcessError",
+  "next_action": "inspect original per-target stage and receipts; do not repeat installation"
+}

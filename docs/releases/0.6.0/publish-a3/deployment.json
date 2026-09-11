@@ -1,0 +1,149 @@
+{
+  "version": "0.6.0",
+  "state": "partial",
+  "phase": "finished",
+  "targets": [
+    "ba3bf113-2390-466e-88bc-40d5b4f02884",
+    "8af88e35-f316-4dd9-9810-fa5bd3a22196"
+  ],
+  "manifest_sha256": "c764e2e3e6de699b11b58bd73b7d55a5120d1bce791b4e0e9deab1b64d0f9b88",
+  "tests": {
+    "passed": 343,
+    "failed": 0,
+    "rust_passed": 234,
+    "python_passed": 109,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "agents": {
+    "ba3bf113-2390-466e-88bc-40d5b4f02884": {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "state": "needs_recovery",
+      "phase": "functional_acceptance",
+      "launch": {
+        "label": "com.remote-hosts.code-upgrade.33523b2c15ef21048adff3ae",
+        "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/33523b2c15ef21048adff3ae/result.json",
+        "state": "started",
+        "exit_code": 0
+      },
+      "updater": {
+        "version": "0.6.0",
+        "candidate_sha256": "94bad18f2d5049153dcd29832a51a8c19beae13a49e2970bf369ef8642077443",
+        "state": "upgraded",
+        "phase": "completed",
+        "gateway_preflight": {
+          "attempts": 1,
+          "elapsed_ms": 1806
+        },
+        "active_terminals": 0,
+        "active_operations": 0,
+        "backup": "/Users/jinliang/.local/share/remote-hosts-code/releases/before-0.6.0-20260911T172106-44364e72/remote-hosts-code",
+        "previous_sha256": "6bcd4bbcab83cd7542e3205e938cb4696858fc25e6e95d3346ec5f8b18763609",
+        "service_changed": true,
+        "installed_sha256": "94bad18f2d5049153dcd29832a51a8c19beae13a49e2970bf369ef8642077443",
+        "pid": 90703,
+        "started_at": 1789118480,
+        "gateway_verified": true,
+        "readiness": "stable_authenticated_control_plane",
+        "session": "a26f5994090e48fc805ec624e920ab8bce8379293dcd41aa8226653fdebb6a8e",
+        "runs": "660",
+        "stable_seconds": 24.03048695801408,
+        "samples": 10,
+        "gateway_seen_advanced": true,
+        "advanced_lanes": [
+          "control",
+          "read",
+          "terminal",
+          "transfer",
+          "write"
+        ],
+        "all_lanes_verified": true,
+        "functional_acceptance": "separate_required_gate",
+        "maintenance": {
+          "released": true,
+          "protocol": 1
+        },
+        "attempt_receipt": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/33523b2c15ef21048adff3ae/result-attempts/0e75d70ed3a84844894434bb6148b2ec.json"
+      },
+      "failure_type": "CalledProcessError",
+      "next_action": "inspect original per-target stage and receipts; do not repeat installation"
+    },
+    "8af88e35-f316-4dd9-9810-fa5bd3a22196": {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "name": "Mac-Studio",
+      "state": "needs_recovery",
+      "phase": "functional_acceptance",
+      "launch": {
+        "label": "com.remote-hosts.code-upgrade.d9cc315ef92008bb9570a9b0",
+        "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/d9cc315ef92008bb9570a9b0/result.json",
+        "state": "started",
+        "exit_code": 0
+      },
+      "updater": {
+        "active_operations": 0,
+        "active_terminals": 0,
+        "all_lanes_verified": true,
+        "candidate_sha256": "94bad18f2d5049153dcd29832a51a8c19beae13a49e2970bf369ef8642077443",
+        "gateway_verified": true,
+        "installed_sha256": "94bad18f2d5049153dcd29832a51a8c19beae13a49e2970bf369ef8642077443",
+        "phase": "completed",
+        "pid": 70882,
+        "samples": 8,
+        "service_changed": true,
+        "session": "68ee309b3f224a359ae60d247cb6f3d2b266b8232a0a42dcabc3ad2ccb99bcbd",
+        "stable_seconds": 15.297965915873649,
+        "started_at": 1789118523,
+        "state": "upgraded",
+        "version": "0.6.0"
+      },
+      "failure_type": "CalledProcessError",
+      "next_action": "inspect original per-target stage and receipts; do not repeat installation"
+    }
+  },
+  "all_targets_accepted": false,
+  "gateway": {
+    "state": "upgraded",
+    "version": "0.6.0",
+    "candidate_sha256": "67dc610a5992fd33332b94091a836ad914fe4e6b919ada772aa7930fdd165a3d",
+    "backup": "/opt/remote-hosts-code/releases/before-0.6.0-20260911T171947",
+    "previous_sha256": "15fbaa239c727b13079a1247773ae051e00c84efabca12b18cad2b5df691d8f6",
+    "pid": 15696,
+    "installed_sha256": "67dc610a5992fd33332b94091a836ad914fe4e6b919ada772aa7930fdd165a3d",
+    "health": {
+      "capabilities_protocol": 1,
+      "change_set_protocol": 1,
+      "checkpoint_bytes": 4194304,
+      "dispatch_protocol": 2,
+      "execution_limits": {
+        "control": 2,
+        "read": 8,
+        "terminal": 4,
+        "transfer": 2,
+        "write": 2
+      },
+      "file_transfer": true,
+      "maintenance_protocol": 1,
+      "max_file_bytes": 67108864,
+      "observation_protocol": 2,
+      "progress_protocol": 1,
+      "readiness_protocol": 1,
+      "resource_dispatch_protocol": 1,
+      "service": "remote-hosts-code",
+      "status": "ok",
+      "storage_gc_protocol": 1,
+      "terminal_observation_protocol": 1,
+      "transfer_protocol": 2,
+      "version": "0.6.0"
+    },
+    "caddy_override_removed": false
+  },
+  "source_artifact": {
+    "operation_id": "ae61e74a-191c-4b7a-8c53-9c1c6eacccb5",
+    "sha256": "be76ff01d10cd8f2572f386c6939ca388927bd33ac24cc6e8d6135dae7f29e01",
+    "size": 9069996
+  },
+  "temporary_oauth_revoked": true
+}

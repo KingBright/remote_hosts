@@ -89,7 +89,7 @@ def main():
             'schema_version':1, 'version':args.version,
             'packaged_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'dispatch_protocol':2, 'progress_protocol':1, 'readiness_protocol':1,
-            'resource_dispatch_protocol':1, 'transfer_protocol':2, 'tool_count':19, 'maintenance_protocol':1, 'terminal_observation_protocol':1,
+            'resource_dispatch_protocol':1, 'transfer_protocol':2, 'tool_count':21, 'maintenance_protocol':1, 'terminal_observation_protocol':1, 'observation_protocol':2, 'change_set_protocol':1, 'storage_gc_protocol':1,
             'checkpoint_bytes':4194304, 'snapshot_id':proof.get('snapshot_id'),
             'build_execution_root':str(ROOT),
             'source_verification_sha256':digest(proof_path),

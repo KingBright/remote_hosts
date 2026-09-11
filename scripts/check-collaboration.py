@@ -52,7 +52,33 @@ def main():
             time.sleep(.5)
         else:raise TimeoutError('original terminal status not replicated')
         output=c.tool('terminal_read',{'workspace_id':workspace,'terminal_id':started['terminal_id'],'cursor':0,'max_bytes':1024});assert output['output']=='observed'
-        r['checks']['unified_terminal_observation']={'passed':True,'status_observations':polls,'output_read_calls':1,'exit_code':9}
+        lifecycle=value['operation_lifecycle'];gateway_timing=lifecycle['gateway'];agent_timing=value['timing']
+        assert gateway_timing['clock']=='gateway_unix_ms_same_host' and gateway_timing['queue_ms'] is not None and gateway_timing['dispatch_to_result_ms'] is not None
+        assert agent_timing['clock']=='agent_monotonic' and 'waiting_resource' in agent_timing['phase_ms'] and 'running' in agent_timing['phase_ms']
+        r['checks']['unified_terminal_observation']={'passed':True,'status_observations':polls,'output_read_calls':1,'exit_code':9,
+            'lifecycle':{'gateway_queue_ms':gateway_timing['queue_ms'],'gateway_dispatch_to_result_ms':gateway_timing['dispatch_to_result_ms'],
+                         'agent_phase_ms':agent_timing['phase_ms'],'cross_clock_subtraction_used':False}}
+        phase='change_set_recovery';record()
+        edit=c.tool('code_apply_edits',{'workspace_id':workspace,'idempotency_key':key+'-change-create','files':[
+            {'path':'change/a.txt','expected_version':'absent','action':'create','content':'alpha\n'},
+            {'path':'change/b.txt','expected_version':'absent','action':'create','content':'beta\n'}]})
+        change_id=edit['change_set']['change_set_id'];assert edit['state']=='completed'
+        resumed=c.tool('change_resume',{'workspace_id':workspace,'idempotency_key':key+'-change-resume','change_set_id':change_id})
+        assert resumed['state']=='completed' and resumed['already_applied']==2
+        term(workspace,"import pathlib;pathlib.Path('change/a.txt').write_text('user edit\\n')",'change-user-edit')
+        conflict=c.raw('change_resume',{'workspace_id':workspace,'idempotency_key':key+'-change-conflict','change_set_id':change_id})
+        while conflict.get('pending'):time.sleep(.5);conflict=c.raw('operation_get',{'operation_id':conflict['operation_id']})
+        assert conflict['state']=='partial' and conflict['error_code']=='version_or_io_conflict' and conflict['automatic_replay_safe'] is False
+        assert term(workspace,"import pathlib;print(pathlib.Path('change/a.txt').read_text(),end='')",'change-verify')=='user edit\n'
+        r['checks']['change_set_recovery']={'passed':True,'change_set_id':change_id,'already_applied':2,'concurrent_user_edit_preserved':True,
+            'recovery_action':conflict['recovery_action']}
+        phase='workspace_gc';record()
+        preview=c.tool('workspace_gc',{'workspace_id':workspace,'idempotency_key':key+'-gc-preview','action':'preview','older_than_seconds':3600,'max_items':100})
+        assert preview['state']=='preview' and preview['gc_protocol']==1 and 'local_idempotency_results' in preview['protected']
+        applied_gc=c.tool('workspace_gc',{'workspace_id':workspace,'idempotency_key':key+'-gc-apply','action':'apply','older_than_seconds':3600,'max_items':100,'preview_id':preview['preview_id']})
+        assert applied_gc['state']=='completed' and applied_gc['idempotency_records_preserved'] is True
+        r['checks']['workspace_gc']={'passed':True,'preview_candidates':preview['candidate_count'],'removed_count':applied_gc['removed_count'],
+            'idempotency_records_preserved':True,'policy_bound_by_preview':True}
         phase='event_handoff';record()
         events=c.tool('workspace_context',{'workspace_id':workspace,'after_event':event_cursor,'limit':50})['events'];assert events['items'];assert any(e['entity_id']==applied['operation_id'] and e['state']=='done' for e in events['items'])
         assert 'download_url' not in json.dumps(events);r['checks']['event_replay']={'passed':True,'events':len(events['items']),'same_manifest_completion_present':True}
@@ -67,7 +93,7 @@ def main():
         full_text=sum(len(x.get('text','').encode()) for x in full['content']);compact_text=sum(len(x.get('text','').encode()) for x in compact['content']);assert compact_text<256 and len(compact['structuredContent']['devices'])==len(full['structuredContent']['devices'])
         r['checks']['compact_response']={'passed':True,'text_bytes_full':full_text,'text_bytes_compact':compact_text,'scope':'opt-in text channel only; structured content preserved; not token benchmark'}
         phase='cleanup';record()
-        term(workspace,"import pathlib,hashlib,json;p=pathlib.Path('.');assert {x.name for x in p.iterdir()}=={'.git','dst','bundle.source','bundle.received'};assert {x.name for x in (p/'dst').iterdir()}=={f'f{i}.bin' for i in range(100)}\nfor i in range(100):\n expected=b'user-edit' if i==0 else (bytes([i,1,254])*17 if i<3 else bytes([i,0,255])*17);assert(p/'dst'/f'f{i}.bin').read_bytes()==expected\nassert hashlib.sha256((p/'bundle.received').read_bytes()).hexdigest()=="+repr(bundle['sha256']), 'verify-cleanup')
+        term(workspace,"import pathlib,hashlib,json;p=pathlib.Path('.');assert {x.name for x in p.iterdir()}=={'.git','dst','change','bundle.source','bundle.received'};assert {x.name for x in (p/'dst').iterdir()}=={f'f{i}.bin' for i in range(100)}\nfor i in range(100):\n expected=b'user-edit' if i==0 else (bytes([i,1,254])*17 if i<3 else bytes([i,0,255])*17);assert(p/'dst'/f'f{i}.bin').read_bytes()==expected\nassert (p/'change'/'a.txt').read_text()=='user edit\\n' and (p/'change'/'b.txt').read_text()=='beta\\n';assert hashlib.sha256((p/'bundle.received').read_bytes()).hexdigest()=="+repr(bundle['sha256']), 'verify-cleanup')
         term(agent['workspace_id'],"import pathlib,shutil;p=pathlib.Path("+repr(folder)+");assert p.is_dir() and not p.is_symlink();shutil.rmtree(p)",'cleanup')
         r['fixture_removed']=True;r['state']='passed';phase='complete'
     except Exception as error:r.update(state='failed',failure_type=type(error).__name__,recovery='inspect recorded original operations and fixture; do not reinstall')

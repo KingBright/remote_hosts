@@ -415,21 +415,29 @@ async fn device_binding_terminal_input_cancel_and_restart() {
         a.execute(&input).await.unwrap(),
         a.execute(&input).await.unwrap()
     );
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let output = a
-        .execute(&job(
-            &ca.device_id,
-            "terminal_read",
-            json!({"workspace_id":ws,"terminal_id":tid}),
-        ))
-        .await
-        .unwrap();
-    assert!(
-        output["output"]
-            .as_str()
-            .unwrap()
-            .contains("received:hello")
-    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut cursor = 0u64;
+    let mut observed = String::new();
+    loop {
+        let output = a
+            .execute(&job(
+                &ca.device_id,
+                "terminal_read",
+                json!({"workspace_id":ws,"terminal_id":tid,"cursor":cursor}),
+            ))
+            .await
+            .unwrap();
+        observed.push_str(output["output"].as_str().unwrap());
+        cursor = output["cursor"].as_u64().unwrap();
+        if observed.contains("received:hello") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "terminal input was accepted but expected output never became observable"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     let cancelled = a
         .execute(&job(
             &ca.device_id,

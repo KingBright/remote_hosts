@@ -461,6 +461,175 @@ fn atomic_write(dir: &Dir, path: &str, content: &str) -> Result<()> {
     }
     result
 }
+fn change_summary(journal: &Value) -> Result<Value> {
+    ensure!(
+        journal["schema_version"] == 3,
+        "unsupported change journal schema"
+    );
+    let files = journal["files"]
+        .as_array()
+        .context("invalid change journal files")?;
+    ensure!(
+        !files.is_empty() && files.len() <= 20,
+        "invalid change journal file count"
+    );
+    let mut views = Vec::with_capacity(files.len());
+    for file in files {
+        let path = file["path"].as_str().context("invalid change path")?;
+        relative(path)?;
+        let before = file["before_version"]
+            .as_str()
+            .context("missing before version")?;
+        let after = file["after_version"]
+            .as_str()
+            .context("missing after version")?;
+        ensure!(
+            (before == "absent" || crate::transfers::valid_hash(before))
+                && (after == "absent" || crate::transfers::valid_hash(after)),
+            "invalid change version"
+        );
+        if let Some(content) = file.get("after").and_then(Value::as_str) {
+            ensure!(
+                hash(content) == after,
+                "change journal after content mismatch"
+            );
+        } else {
+            ensure!(after == "absent", "missing change journal after content");
+        }
+        views.push(
+            json!({"path":path,"before_version":before,"after_version":after,
+            "status":file["status"]}),
+        );
+    }
+    Ok(
+        json!({"change_set_id":journal["change_set_id"],"state":journal["status"],"files":views,
+        "recovery_protocol":1,"atomicity":"per_file"}),
+    )
+}
+
+pub fn resume(ws: &Workspace, journal: &Path) -> Result<Value> {
+    let bytes = std::fs::read(journal).context("change_set_unavailable: journal missing")?;
+    ensure!(
+        bytes.len() <= 64 * 1024 * 1024,
+        "change_set journal exceeds recovery budget"
+    );
+    let mut state: Value =
+        serde_json::from_slice(&bytes).context("change_set journal malformed")?;
+    ensure!(
+        state["schema_version"] == 3,
+        "unsupported change journal schema"
+    );
+    let saved: Workspace = serde_json::from_value(state["workspace"].clone())?;
+    ensure!(
+        saved.id == ws.id && saved.device_id == ws.device_id && saved.root == ws.root,
+        "change_set workspace identity conflict"
+    );
+    let total = state["files"]
+        .as_array()
+        .context("invalid change journal files")?
+        .len();
+    ensure!(
+        (1..=20).contains(&total),
+        "invalid change journal file count"
+    );
+    let dir = directory(ws)?;
+    let mut conflicts = Vec::new();
+    let mut newly_applied = 0usize;
+    let mut already_applied = 0usize;
+    for index in 0..total {
+        let entry = state["files"][index].clone();
+        let path = entry["path"]
+            .as_str()
+            .context("invalid change path")?
+            .to_owned();
+        relative(&path)?;
+        let before = entry["before_version"]
+            .as_str()
+            .context("missing before version")?
+            .to_owned();
+        let after = entry["after_version"]
+            .as_str()
+            .context("missing after version")?
+            .to_owned();
+        let next = entry
+            .get("after")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(content) = &next {
+            ensure!(
+                hash(content) == after,
+                "change journal after content mismatch"
+            );
+        } else {
+            ensure!(after == "absent", "missing change journal after content");
+        }
+        let current = if dir.try_exists(&path)? {
+            Some(read_text(&dir, &path)?)
+        } else {
+            None
+        };
+        let version = current
+            .as_ref()
+            .map(hash)
+            .unwrap_or_else(|| "absent".into());
+        if version == after {
+            state["files"][index]["status"] = json!("applied");
+            already_applied += 1;
+        } else if version != before {
+            state["files"][index]["status"] = json!("conflict");
+            conflicts.push(json!({"path":path,"current_version":version,"expected_before":before,"expected_after":after}));
+        } else {
+            let outcome = if let Some(content) = next {
+                atomic_write(&dir, &path, &content)
+            } else {
+                dir.remove_file(&path).map_err(Into::into)
+            };
+            match outcome {
+                Ok(()) => {
+                    let verify = if dir.try_exists(&path)? {
+                        hash(read_text(&dir, &path)?)
+                    } else {
+                        "absent".into()
+                    };
+                    ensure!(verify == after, "change_resume verification failed");
+                    state["files"][index]["status"] = json!("applied");
+                    newly_applied += 1;
+                }
+                Err(_) => {
+                    state["files"][index]["status"] = json!("io_failed");
+                    conflicts.push(json!({"path":path,"current_version":version,"expected_before":before,"expected_after":after,"reason":"io_failed"}));
+                }
+            }
+        }
+        state["status"] = json!(if conflicts.is_empty() {
+            "applying"
+        } else {
+            "partial"
+        });
+        crate::write_private(journal, &serde_json::to_vec(&state)?)?;
+    }
+    state["status"] = json!(if conflicts.is_empty() {
+        "completed"
+    } else {
+        "partial"
+    });
+    crate::write_private(journal, &serde_json::to_vec(&state)?)?;
+    let summary = change_summary(&state)?;
+    if conflicts.is_empty() {
+        Ok(
+            json!({"state":"completed","change_set":summary,"newly_applied":newly_applied,
+            "already_applied":already_applied,"automatic_replay_safe":false}),
+        )
+    } else {
+        Ok(
+            json!({"error":"partial_change_set","error_code":"version_or_io_conflict","state":"partial",
+            "outcome":"partial","change_set":summary,"conflicts":conflicts,"newly_applied":newly_applied,
+            "already_applied":already_applied,"recovery_action":"inspect_and_merge_conflicts_then_call_change_resume_with_a_new_idempotency_key_only_when_recorded_versions_match",
+            "automatic_replay_safe":false}),
+        )
+    }
+}
+
 pub fn apply(ws: &Workspace, v: &Value, journal: &Path) -> Result<Value> {
     let edits: Vec<FileEdit> =
         serde_json::from_value(v.get("files").cloned().context("missing files")?)?;
@@ -531,8 +700,22 @@ pub fn apply(ws: &Workspace, v: &Value, journal: &Path) -> Result<Value> {
             new,
         });
     }
-    let mut journal_data = json!({"schema_version":2,"workspace":ws,"fingerprint":hash(serde_json::to_vec(v)?),"files":prepared.iter().map(|p|json!({"path":p.path,"before":p.old,"after":p.new,"before_version":p.old.as_ref().map(hash).unwrap_or_else(||"absent".into()),"after_version":p.new.as_ref().map(hash).unwrap_or_else(||"absent".into()),"status":"pending"})).collect::<Vec<_>>(),"status":"prepared"});
-    crate::write_private(journal, &serde_json::to_vec(&journal_data)?)?;
+    let change_set_id = journal
+        .file_stem()
+        .context("change journal needs id")?
+        .to_string_lossy()
+        .to_string();
+    uuid::Uuid::parse_str(&change_set_id).context("invalid change_set id")?;
+    let mut journal_data = json!({"schema_version":3,"change_set_id":change_set_id,"workspace":ws,
+        "fingerprint":hash(serde_json::to_vec(v)?),"files":prepared.iter().map(|p|json!({"path":p.path,"after":p.new,
+        "before_version":p.old.as_ref().map(hash).unwrap_or_else(||"absent".into()),
+        "after_version":p.new.as_ref().map(hash).unwrap_or_else(||"absent".into()),"status":"pending"})).collect::<Vec<_>>(),"status":"prepared"});
+    let journal_bytes = serde_json::to_vec(&journal_data)?;
+    ensure!(
+        journal_bytes.len() <= 64 * 1024 * 1024,
+        "change_set journal exceeds 64 MiB budget"
+    );
+    crate::write_private(journal, &journal_bytes)?;
     let mut changed = vec![];
     let mut remaining = 16000;
     for (index, p) in prepared.iter().enumerate() {
@@ -560,8 +743,13 @@ pub fn apply(ws: &Workspace, v: &Value, journal: &Path) -> Result<Value> {
             journal_data["status"] = json!("partial");
             journal_data["files"][index]["status"] = json!("conflicted_or_io_failed");
             crate::write_private(journal, &serde_json::to_vec(&journal_data)?)?;
+            let summary = change_summary(&journal_data)?;
             return Ok(
-                json!({"error":"partial_edit","message":e.to_string(),"changed":changed,"outcome":"partial","journal_id":journal.file_stem().map(|s|s.to_string_lossy()),"failed_index":index,"pending":prepared[index..].iter().map(|p|&p.path).collect::<Vec<_>>(),"recovery":"Inspect code_read/code_diff and local edit journal; do not blindly replay or rollback concurrent work."}),
+                json!({"error":"partial_edit","error_code":"version_or_io_conflict","message":e.to_string(),"changed":changed,
+                    "outcome":"partial","journal_id":journal.file_stem().map(|s|s.to_string_lossy()),"change_set":summary,
+                    "failed_index":index,"pending":prepared[index..].iter().map(|p|&p.path).collect::<Vec<_>>(),
+                    "recovery_action":"use change_resume with the original change_set_id and a new recovery-attempt key after inspecting conflicts",
+                    "automatic_replay_safe":false}),
             );
         }
         journal_data["files"][index]["status"] = json!("applied");
@@ -584,8 +772,10 @@ pub fn apply(ws: &Workspace, v: &Value, journal: &Path) -> Result<Value> {
         remaining = remaining.saturating_sub(preview.len());
         changed.push(json!({"path":p.path,"version":p.new.as_ref().map(hash).unwrap_or_else(||"absent".into()),"diff":preview,"truncated":truncated}));
     }
+    let summary = change_summary(&journal_data)?;
     Ok(
-        json!({"changed":changed,"atomicity":"per_file","journal_id":journal.file_stem().map(|s|s.to_string_lossy())}),
+        json!({"changed":changed,"atomicity":"per_file","journal_id":journal.file_stem().map(|s|s.to_string_lossy()),
+            "change_set":summary,"state":"completed"}),
     )
 }
 
@@ -606,7 +796,8 @@ mod tests {
         let (d, w) = fixture();
         std::fs::write(d.path().join("a"), "alpha\r\nbeta\r\n").unwrap();
         let v = json!({"files":[{"path":"a","expected_version":hash("alpha\r\nbeta\r\n"),"edits":[{"old_text":"beta","new_text":"gamma"}]}]});
-        apply(&w, &v, &d.path().join("journal")).unwrap();
+        let journal = d.path().join(format!("{}.json", uuid::Uuid::new_v4()));
+        apply(&w, &v, &journal).unwrap();
         assert_eq!(
             std::fs::read_to_string(d.path().join("a")).unwrap(),
             "alpha\r\ngamma\r\n"
@@ -633,6 +824,36 @@ mod tests {
         assert_eq!(v["ranges"][0]["text"], "b\n");
         assert!(relative("../secret").is_err());
         assert!(relative("/tmp/a").is_err());
+    }
+    #[test]
+    fn resume_applies_only_safe_versions_and_preserves_user_edits() {
+        let (d, w) = fixture();
+        std::fs::write(d.path().join("a"), "after-a").unwrap();
+        std::fs::write(d.path().join("b"), "before-b").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let journal = d.path().join(format!("{id}.json"));
+        let state = json!({"schema_version":3,"change_set_id":id,"workspace":w,
+        "fingerprint":hash("fixture"),"status":"partial","files":[
+            {"path":"a","after":"after-a","before_version":hash("before-a"),"after_version":hash("after-a"),"status":"publishing"},
+            {"path":"b","after":"after-b","before_version":hash("before-b"),"after_version":hash("after-b"),"status":"pending"}
+        ]});
+        crate::write_private(&journal, &serde_json::to_vec(&state).unwrap()).unwrap();
+        let done = resume(&w, &journal).unwrap();
+        assert_eq!(done["state"], "completed");
+        assert_eq!(done["already_applied"], 1);
+        assert_eq!(done["newly_applied"], 1);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("b")).unwrap(),
+            "after-b"
+        );
+        std::fs::write(d.path().join("a"), "user-edit").unwrap();
+        let partial = resume(&w, &journal).unwrap();
+        assert_eq!(partial["state"], "partial");
+        assert_eq!(partial["conflicts"][0]["path"], "a");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a")).unwrap(),
+            "user-edit"
+        );
     }
     #[cfg(unix)]
     #[test]

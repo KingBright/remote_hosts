@@ -15,6 +15,7 @@ mod progress;
 mod reads;
 mod resumable;
 mod scheduler;
+mod storage_gc;
 pub mod store;
 pub mod terminal;
 mod terminal_output;
@@ -42,6 +43,13 @@ pub fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 pub fn random() -> String {
     format!(

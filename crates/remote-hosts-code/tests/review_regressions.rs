@@ -275,7 +275,7 @@ async fn simultaneous_device_sessions_have_only_one_winner() {
 #[test]
 fn catalog_schema_rejects_nested_unknown_fields_types_and_bounds() {
     use remote_hosts_code::tools::{catalog, validate};
-    assert_eq!(catalog().len(), 19); // Existing tools plus version-bound file-set synchronization.
+    assert_eq!(catalog().len(), 21); // Includes durable change-set recovery and explicit workspace GC.
     let valid = json!({"workspace_id":"w","idempotency_key":"edit","files":[{
         "path":"a.txt","expected_version":"absent","action":"create","content":"hello"
     }]});
@@ -297,6 +297,9 @@ fn catalog_schema_rejects_nested_unknown_fields_types_and_bounds() {
     }
     assert!(validate("code_read", &json!({"workspace_id":"w","requests":[]})).is_err());
     assert!(validate("devices_list", &json!({"unexpected":true})).is_err());
+    validate("change_resume", &json!({"workspace_id":"w","idempotency_key":"r","change_set_id":"00000000-0000-0000-0000-000000000001"})).unwrap();
+    validate("workspace_gc", &json!({"workspace_id":"w","idempotency_key":"g","action":"preview","older_than_seconds":3600,"max_items":100})).unwrap();
+    assert!(validate("workspace_gc", &json!({"workspace_id":"w","idempotency_key":"g","action":"apply","older_than_seconds":60,"max_items":100,"preview_id":"x"})).is_err());
 }
 
 #[test]

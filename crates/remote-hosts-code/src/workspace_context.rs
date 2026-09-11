@@ -112,6 +112,26 @@ pub(crate) async fn read(store: &Store, ws: &Workspace, args: &Value) -> Result<
     let (transfer_count, retained, paused): (i64, i64, i64) = sqlx::query_as(
         "SELECT COUNT(*),COALESCE(SUM(json_extract(value,'$.phase') NOT IN ('completed','cancelled','failed','expired')),0),COALESCE(SUM(json_extract(value,'$.phase') IN ('paused','awaiting_source')),0) FROM kv WHERE kind='transfer_local' AND json_extract(value,'$.workspace_id')=?")
         .bind(&ws.id).fetch_one(&store.pool).await?;
+    let mut change_rows: Vec<(String,String)> = sqlx::query_as(
+        "SELECT key,value FROM kv WHERE kind='local_operation' AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.tool') IN ('code_apply_edits','change_resume') AND json_extract(value,'$.result.change_set.change_set_id') IS NOT NULL ORDER BY COALESCE(json_extract(value,'$.updated_at'),0) DESC,key LIMIT ?")
+        .bind(&ws.id).bind((limit*2) as i64).fetch_all(&store.pool).await?;
+    let mut seen = std::collections::HashSet::new();
+    let mut change_sets = Vec::new();
+    for (_, text) in change_rows.drain(..) {
+        let value: Value = serde_json::from_str(&text)?;
+        let change = value["result"]["change_set"].clone();
+        let Some(id) = change["change_set_id"].as_str() else {
+            continue;
+        };
+        if seen.insert(id.to_owned()) {
+            change_sets.push(json!({"change_set":change,"updated_at":value["updated_at"],
+                "latest_operation_state":value["state"],"recovery_action":value["result"]["recovery_action"]}));
+            if change_sets.len() >= limit {
+                break;
+            }
+        }
+    }
+    let change_set_count = change_sets.len();
     let build = store.get::<Value>("runtime", "build").await?;
     let delivery = store.get::<Value>("runtime", "receipt_delivery").await?;
     let delivery_stale = delivery
@@ -120,9 +140,11 @@ pub(crate) async fn read(store: &Store, ws: &Workspace, args: &Value) -> Result<
     let mut result = json!({"workspace_id":ws.id,"device_id":ws.device_id,"root":ws.root,
         "runtime":build,"receipt_delivery":delivery,"receipt_delivery_stale":delivery_stale,
         "receipt_delivery_scope":"device-wide counts only; no other workspace records",
-        "transfers":transfers,"terminals":terminals,"active_only":active_only,
+        "transfers":transfers,"terminals":terminals,"change_sets":change_sets,"active_only":active_only,
         "summary":{"terminals":terminal_count,"active_terminals":active_terminals,
-            "transfers":transfer_count,"retained_transfers":retained,"paused_transfers":paused},
+            "transfers":transfer_count,"retained_transfers":retained,"paused_transfers":paused,
+            "change_sets":change_set_count},
+        "workspace_gc":{"supported":true,"mode":"explicit_preview_then_apply","automatic":false},
         "transfers_truncated":transfers_truncated,
         "next_transfer_id":if transfers_truncated {transfers.last().map(|v|v["operation_id"].clone())}else{None},
         "terminal_limit":limit,"terminals_truncated":terminals_truncated,"next_terminal_cursor":next_terminal,

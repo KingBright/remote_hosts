@@ -110,7 +110,11 @@ async fn legacy_single_shape_and_batch_order_are_preserved_without_dispatch() {
     assert!(old.get("observation").is_none());
     let batch = call(&g, &p, json!({"operation_ids":[b,a]})).await;
     assert_eq!(batch["operations"][0]["operation_id"], b);
-    assert_eq!(batch["operations"][1], old);
+    assert_eq!(
+        batch["operations"][1], old,
+        "small legacy batch preserves exact per-operation shape"
+    );
+    assert_eq!(batch["observation"]["observation_protocol"], 2);
     assert_eq!(batch["pending_count"], 1);
     assert_eq!(count(&g).await, 2);
 }
@@ -226,6 +230,11 @@ async fn small_results_that_fit_the_budget_are_not_all_omitted() {
             .all(|x| x.get("n").is_some()),
         "20 tiny results fit but were unnecessarily omitted"
     );
+    assert_eq!(out["observation"]["observation_protocol"], 2);
+    assert!(out["operations"].as_array().unwrap().iter().all(|x| {
+        x["operation_lifecycle"].get("available").is_some()
+            || x["operation_lifecycle"].get("queue_ms").is_some()
+    }));
 }
 #[tokio::test]
 async fn expired_artifact_does_not_hide_other_authorized_results() {

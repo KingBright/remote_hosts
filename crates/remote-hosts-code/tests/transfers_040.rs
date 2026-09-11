@@ -182,7 +182,7 @@ async fn value(response: Response) -> Value {
 }
 #[test]
 fn catalog_exposes_three_scoped_workflow_tools_and_refresh_file_parameter() {
-    assert_eq!(tools::catalog().len(), 19);
+    assert_eq!(tools::catalog().len(), 21);
     let catalog = tools::catalog();
     let refresh = catalog
         .iter()

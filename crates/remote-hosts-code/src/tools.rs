@@ -9,8 +9,8 @@ pub fn scope(name: &str) -> Option<&'static str> {
         "devices_list" | "workspace_open" | "code_list" | "code_search" | "code_read"
         | "code_symbols" | "code_diff" | "operation_get" | "terminal_read" | "file_download"
         | "workspace_context" => Some("code:read"),
-        "code_apply_edits" | "files_sync" | "file_upload" | "transfer_cancel"
-        | "transfer_resume" => Some("code:write"),
+        "code_apply_edits" | "change_resume" | "workspace_gc" | "files_sync" | "file_upload"
+        | "transfer_cancel" | "transfer_resume" => Some("code:write"),
         "terminal_exec" | "terminal_input" | "terminal_cancel" => Some("terminal:exec"),
         _ => None,
     }
@@ -173,9 +173,21 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "code_apply_edits",
-        "Apply version-checked precise replacements or a unified patch. All files preflight before changes; each file is atomic, multi-file changes report partial failure. Never guess when a version or unique match conflicts. Reuse the same idempotency_key on retries. Return compact diffs.",
+        "Apply version-checked precise replacements or a unified patch. All files preflight before changes; each file is atomic, and every batch returns a durable change_set_id with before/after versions. Partial or uncertain batches can be inspected and continued with change_resume. Never guess when a version or unique match conflicts. Reuse the same idempotency_key only for an uncertain identical submission. Return compact diffs.",
         json!({"workspace_id":string(),"idempotency_key":string(),"files":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"path":string(),"expected_version":string(),"action":{"type":"string","enum":["edit","create","delete"]},"edits":{"type":"array","maxItems":100,"items":{"type":"object","properties":{"old_text":string(),"new_text":string()},"required":["old_text","new_text"],"additionalProperties":false}},"patch":string(),"content":string()},"required":["path","expected_version"],"additionalProperties":false}}}),
         vec!["workspace_id", "idempotency_key", "files"],
+    );
+    add(
+        "change_resume",
+        "Resume the SAME durable multi-file edit change-set after a partial or uncertain apply. The original change_set_id must belong to this workspace and code_apply_edits. Files already at their recorded after-version are accepted; files still at their recorded before-version may be applied; any third version is preserved as a conflict. Reuse one idempotency_key only for an uncertain identical recovery attempt; after resolving a conflict, start the next recovery attempt with a new key. Never replays shell work or overwrites concurrent edits.",
+        json!({"workspace_id":string(),"idempotency_key":string(),"change_set_id":string()}),
+        vec!["workspace_id", "idempotency_key", "change_set_id"],
+    );
+    add(
+        "workspace_gc",
+        "Preview or apply bounded cleanup of old terminal logs, terminal status rows, finished transfer checkpoints and completed edit journals for this workspace. Active/running work, resumable transfers, partial change-sets, receipt outbox entries and local idempotency results are never deleted. Apply requires preview_id from an unchanged preview plus the same age/max_items policy. Preview and apply are distinct operations, so use distinct idempotency keys.",
+        json!({"workspace_id":string(),"idempotency_key":string(),"action":{"type":"string","enum":["preview","apply"]},"older_than_seconds":integer(3600,2592000),"max_items":integer(1,1000),"preview_id":string()}),
+        vec!["workspace_id", "idempotency_key", "action"],
     );
     add(
         "code_diff",
@@ -209,7 +221,7 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "operation_get",
-        "Observe one operation_id OR 1..20 operation_ids. Optional wait_ms up to 5000 waits for meaningful state/progress changes; cursor is a latest-state fingerprint, not an event replay cursor. Batch returns operations, linked terminal status/exit_code when replicated, and pending_count. It does not read terminal output; use terminal_read once output is needed. Does not queue, retry or cancel work. Query omitted results individually.",
+        "Observe one operation_id OR 1..20 operation_ids. Optional wait_ms up to 5000 waits for meaningful state/progress changes; cursor is a latest-state fingerprint, not an event replay cursor. Results include gateway queue/dispatch/result lifecycle timing, agent monotonic execution phases when available, linked terminal status/exit_code, and transfer progress. Never subtract gateway wall timestamps from agent clocks. It does not read terminal output, queue, retry or cancel work. Query omitted results individually.",
         json!({"operation_id":string(),"operation_ids":{"type":"array","minItems":1,"maxItems":20,"items":string()},"wait_ms":integer(0,5000),"cursor":string(),"max_bytes":integer(4096,131072)}),
         vec![],
     );
@@ -227,7 +239,7 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "workspace_context",
-        "Read bounded workspace transfer/terminal facts, state counts and runtime identity. active_only narrows to unfinished records; terminal_cursor and transfer_after continue independent live pages. Cursors bind the workspace and filters; restart pages for a fresh view after state changes. after_event replays durable workspace transitions from the returned scoped event cursor; expired cursors require a fresh snapshot. No command text or credentials. Device-wide counts are labelled. Not chat-memory or build-verification evidence.",
+        "Read bounded workspace transfer/terminal facts, recent durable change-set summaries, state counts and runtime identity. active_only narrows terminal/transfer facts; terminal_cursor and transfer_after continue independent live pages. Cursors bind the workspace and filters; restart pages for a fresh view after state changes. after_event replays durable workspace transitions from the returned scoped event cursor; expired cursors require a fresh snapshot. Reports whether explicit workspace_gc is available. No command text or credentials. Device-wide counts are labelled. Not chat-memory or build-verification evidence.",
         json!({"workspace_id":string(),"cursor":string(),"limit":integer(1,50),"transfer_after":string(),"terminal_cursor":string(),"active_only":{"type":"boolean"},"after_event":string()}),
         vec!["workspace_id"],
     );

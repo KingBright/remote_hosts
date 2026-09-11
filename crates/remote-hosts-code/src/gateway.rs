@@ -2,7 +2,7 @@
 use crate::{
     GatewayConfig,
     auth::{Auth, Principal},
-    files, hash, now, random,
+    files, hash, now, now_ms, random,
     store::Store,
     tools,
 };
@@ -213,7 +213,7 @@ impl Gateway {
             .merge(crate::maintenance::routes(self.clone()))
             .route(
                 "/healthz",
-                get(|| async { Json(json!({"status":"ok","service":"remote-hosts-code","version":env!("CARGO_PKG_VERSION"),"file_transfer":true,"max_file_bytes":crate::transfers::MAX_BYTES,"dispatch_protocol":2,"progress_protocol":1,"readiness_protocol":1,"observation_protocol":1,"capabilities_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"execution_limits":{"read":8,"write":2,"transfer":2,"terminal":4,"control":2}})) }),
+                get(|| async { Json(json!({"status":"ok","service":"remote-hosts-code","version":env!("CARGO_PKG_VERSION"),"file_transfer":true,"max_file_bytes":crate::transfers::MAX_BYTES,"dispatch_protocol":2,"progress_protocol":1,"readiness_protocol":1,"observation_protocol":2,"capabilities_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"execution_limits":{"read":8,"write":2,"transfer":2,"terminal":4,"control":2}})) }),
             )
             .merge(
                 Router::new()
@@ -341,12 +341,12 @@ impl Gateway {
                 .bind(&idem)
                 .fetch_optional(&self.store.pool)
                 .await?;
-        let id = if let Some((id, fp)) = existing {
+        let (id, created_new) = if let Some((id, fp)) = existing {
             ensure!(
                 fp == fingerprint,
                 "idempotency_conflict: same key used with different arguments"
             );
-            id
+            (id, false)
         } else {
             let maintenance = crate::maintenance::view(self, device).await?;
             ensure!(
@@ -365,14 +365,20 @@ impl Gateway {
                 "device_draining: observe original updater; new execution not queued"
             );
             let online = self.store.get::<Online>("online", device).await?;
-            if name == "files_sync" {
-                ensure!(
-                    online
-                        .as_ref()
-                        .and_then(|o| o.runtime_features.as_ref())
-                        .is_some_and(|f| f.names.iter().any(|n| n == "files_sync_v1")),
-                    "device_feature_unavailable: upgrade selected device before files_sync"
-                );
+            for (tool, feature) in [
+                ("files_sync", "files_sync_v1"),
+                ("change_resume", "change_set_resume_v1"),
+                ("workspace_gc", "workspace_gc_v1"),
+            ] {
+                if name == tool {
+                    ensure!(
+                        online
+                            .as_ref()
+                            .and_then(|o| o.runtime_features.as_ref())
+                            .is_some_and(|f| f.names.iter().any(|n| n == feature)),
+                        "device_feature_unavailable: upgrade selected device before requested workflow"
+                    );
+                }
             }
             ensure!(
                 online.is_some_and(|o| now() - o.last_seen < 45),
@@ -398,8 +404,15 @@ impl Gateway {
                     .fetch_one(&self.store.pool)
                     .await?;
             ensure!(fp == fingerprint, "idempotency_conflict");
-            id
+            (id, true)
         };
+        if created_new {
+            sqlx::query("INSERT OR IGNORE INTO operation_timing(id,queued_ms) VALUES(?,?)")
+                .bind(&id)
+                .bind(now_ms())
+                .execute(&self.store.pool)
+                .await?;
+        }
         if let Some(source) = &source {
             // Also refresh URLs on an exact retry without changing operation identity.
             self.store
@@ -422,6 +435,25 @@ impl Gateway {
                 _ = tokio::time::sleep_until(deadline.min(Instant::now() + RECOVERY_INTERVAL)) => {},
             }
         }
+    }
+    async fn lifecycle(&self, id: &str, device: &str) -> Result<Value> {
+        let timing: Option<(i64, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT queued_ms,dispatched_ms,result_ms FROM operation_timing WHERE id=?",
+        )
+        .bind(id)
+        .fetch_optional(&self.store.pool)
+        .await?;
+        let gateway = timing.map(|(queued,dispatched,result)| {
+            let queue_ms = dispatched.and_then(|v| v.checked_sub(queued)).filter(|v| *v >= 0);
+            let dispatch_to_result_ms = dispatched.zip(result).and_then(|(a,b)| b.checked_sub(a)).filter(|v| *v >= 0);
+            json!({"clock":"gateway_unix_ms_same_host","queued_at_ms":queued,"dispatched_at_ms":dispatched,
+                "result_at_ms":result,"queue_ms":queue_ms,"dispatch_to_result_ms":dispatch_to_result_ms,
+                "note":"gateway segments use one host clock; never subtract these timestamps from agent_monotonic timings"})
+        }).unwrap_or_else(|| json!({"available":false,"reason":"operation_predates_lifecycle_v1"}));
+        let online = self.store.get::<Online>("online", device).await?;
+        Ok(json!({"protocol":1,"gateway":gateway,
+            "device_receipt_delivery":online.as_ref().and_then(|o|o.receipt_delivery.clone()),
+            "receipt_delivery_scope":"device-wide queue snapshot; operation result presence is authoritative for this operation"}))
     }
     pub(crate) async fn result(&self, p: &Principal, id: &str) -> Result<Value> {
         let (request, result, state): (String, Option<String>, String) =
@@ -456,9 +488,11 @@ impl Gateway {
             {
                 result["terminal_observation"] = observed;
             }
+            result["operation_lifecycle"] = self.lifecycle(id, &job.device_id).await?;
             return Ok(result);
         }
         let mut pending = json!({"operation_id":id,"device_id":job.device_id,"state":state,"pending":true,"next_action":"operation_get","retry_after_ms":1000});
+        pending["operation_lifecycle"] = self.lifecycle(id, &job.device_id).await?;
         let receiver = if job.tool == "file_download" {
             self.store.get::<Value>("receive_progress", id).await?
         } else {
@@ -754,12 +788,14 @@ async fn poll(
         let completed = signals.results.notified();
         // Filter before dequeueing: a full transfer lane cannot hide reads behind it.
         // Recheck the session in the atomic claim, including already-waiting polls.
-        let row: Result<Option<(String,)>, _> = sqlx::query_as("UPDATE jobs SET state='dispatched',updated=? WHERE id=(SELECT id FROM jobs WHERE device=? AND (state='queued' OR (state='dispatched' AND updated<?)) AND id NOT IN (SELECT value FROM json_each(?)) AND (json_extract(request,'$.tool') IN ('code_read','code_list','code_search','code_symbols','code_diff','workspace_context','terminal_read','terminal_cancel') OR EXISTS(SELECT 1 FROM kv c WHERE c.kind='transfer_control' AND c.key=jobs.id AND json_extract(c.value,'$.cancel_requested')=1) OR NOT EXISTS(SELECT 1 FROM kv WHERE kind='device_drain' AND key=jobs.device AND expires>unixepoch())) AND (CASE WHEN json_extract(request,'$.tool') IN ('file_upload','file_download') THEN 'transfer' WHEN json_extract(request,'$.tool') IN ('terminal_read','terminal_cancel') THEN 'control' WHEN json_extract(request,'$.tool') IN ('terminal_exec','terminal_input') THEN 'terminal' WHEN json_extract(request,'$.tool') IN ('workspace_open','code_apply_edits','files_sync') THEN 'write' ELSE 'read' END) IN (SELECT value FROM json_each(?)) AND (json_extract(request,'$.tool') NOT IN ('code_apply_edits','files_sync') OR (?=0 AND COALESCE(json_extract(request,'$.arguments.workspace_id'),'') NOT IN (SELECT value FROM json_each(?)))) AND (json_extract(request,'$.tool')<>'terminal_input' OR COALESCE(json_extract(request,'$.arguments.terminal_id'),'') NOT IN (SELECT value FROM json_each(?))) AND EXISTS (SELECT 1 FROM kv WHERE kind='online' AND key=? AND json_extract(value,'$.hello.session')=?) ORDER BY updated,id LIMIT 1) RETURNING request")
+        let row: Result<Option<(String,String)>, _> = sqlx::query_as("UPDATE jobs SET state='dispatched',updated=? WHERE id=(SELECT id FROM jobs WHERE device=? AND (state='queued' OR (state='dispatched' AND updated<?)) AND id NOT IN (SELECT value FROM json_each(?)) AND (json_extract(request,'$.tool') IN ('code_read','code_list','code_search','code_symbols','code_diff','workspace_context','terminal_read','terminal_cancel') OR EXISTS(SELECT 1 FROM kv c WHERE c.kind='transfer_control' AND c.key=jobs.id AND json_extract(c.value,'$.cancel_requested')=1) OR NOT EXISTS(SELECT 1 FROM kv WHERE kind='device_drain' AND key=jobs.device AND expires>unixepoch())) AND (CASE WHEN json_extract(request,'$.tool') IN ('file_upload','file_download') THEN 'transfer' WHEN json_extract(request,'$.tool') IN ('terminal_read','terminal_cancel','workspace_gc') THEN 'control' WHEN json_extract(request,'$.tool') IN ('terminal_exec','terminal_input') THEN 'terminal' WHEN json_extract(request,'$.tool') IN ('workspace_open','code_apply_edits','change_resume','files_sync') THEN 'write' ELSE 'read' END) IN (SELECT value FROM json_each(?)) AND (json_extract(request,'$.tool') NOT IN ('code_apply_edits','change_resume','files_sync') OR (?=0 AND COALESCE(json_extract(request,'$.arguments.workspace_id'),'') NOT IN (SELECT value FROM json_each(?)))) AND (json_extract(request,'$.tool')<>'terminal_input' OR COALESCE(json_extract(request,'$.arguments.terminal_id'),'') NOT IN (SELECT value FROM json_each(?))) AND EXISTS (SELECT 1 FROM kv WHERE kind='online' AND key=? AND json_extract(value,'$.hello.session')=?) ORDER BY updated,id LIMIT 1) RETURNING id,request")
             .bind(now()).bind(&device).bind(now()-30).bind(&active_json).bind(&lanes_json)
             .bind(defer_writes).bind(&filtered_workspaces).bind(&filtered_inputs)
             .bind(&device).bind(&online.hello.session).fetch_optional(&g.store.pool).await;
         match row {
-            Ok(Some((request,))) => {
+            Ok(Some((id, request))) => {
+                let _ = sqlx::query("UPDATE operation_timing SET dispatched_ms=COALESCE(dispatched_ms,?) WHERE id=?")
+                    .bind(now_ms()).bind(&id).execute(&g.store.pool).await;
                 return match serde_json::from_str::<Value>(&request) {
                     Ok(v) => Json(json!({"job":v})).into_response(),
                     Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -854,6 +890,14 @@ async fn receipt(
             }
         }
     };
+    if !duplicate {
+        let _ =
+            sqlx::query("UPDATE operation_timing SET result_ms=COALESCE(result_ms,?) WHERE id=?")
+                .bind(now_ms())
+                .bind(&receipt.operation_id)
+                .execute(&g.store.pool)
+                .await;
+    }
     let _ = sqlx::query("DELETE FROM kv WHERE kind='file_source' AND key=?")
         .bind(&receipt.operation_id)
         .execute(&g.store.pool)

@@ -79,7 +79,7 @@ async fn get(g: &Gateway, path: &str, range: Option<&str>) -> axum::response::Re
 
 #[test]
 fn host_file_parameter_metadata_and_safety_annotations_survive_catalog() {
-    assert_eq!(tools::catalog().len(), 19);
+    assert_eq!(tools::catalog().len(), 21);
     let t = tools::catalog()
         .into_iter()
         .find(|t| t.name == "file_upload")

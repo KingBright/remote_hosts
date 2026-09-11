@@ -39,6 +39,20 @@ def validate_report_scope(report, origin, version, run_id, selected):
         raise ValueError('receipt has duplicate, unselected or wrong-version devices')
 
 
+def expected_tool_names(version):
+    tools = {'devices_list','workspace_open','code_list','code_search','code_read','code_symbols',
+             'code_apply_edits','code_diff','terminal_exec','terminal_read','terminal_input',
+             'terminal_cancel','operation_get','file_upload','file_download'}
+    parsed = tuple(map(int, version.split('.')))
+    if parsed >= (0, 4, 0):
+        tools |= {'workspace_context','transfer_cancel','transfer_resume'}
+    if parsed >= (0, 5, 0):
+        tools |= {'files_sync'}
+    if parsed >= (0, 6, 0):
+        tools |= {'change_resume','workspace_gc'}
+    return tools
+
+
 def acceptance_summary(report):
     selected = report.get('selected_device_ids', [])
     rows = report.get('devices', [])
@@ -121,11 +135,7 @@ def main():
     rpc("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "remote-hosts-live-acceptance", "version": "1"}})
     catalog = rpc("tools/list", {})
     names = [tool['name'] for tool in catalog['tools']]
-    expected_tools = {'devices_list','workspace_open','code_list','code_search','code_read','code_symbols',
-                      'code_apply_edits','code_diff','terminal_exec','terminal_read','terminal_input',
-                      'terminal_cancel','operation_get','file_upload','file_download'}
-    if tuple(map(int, args.expected_version.split('.'))) >= (0, 4, 0):
-        expected_tools |= {'workspace_context','transfer_cancel','transfer_resume'}
+    expected_tools = expected_tool_names(args.expected_version)
     assert len(names) == len(set(names)) and set(names) == expected_tools, 'Unexpected tool catalog'
     upload_descriptor = next(t for t in catalog["tools"] if t["name"] == "file_upload")
     assert upload_descriptor["_meta"]["openai/fileParams"] == ["file"]

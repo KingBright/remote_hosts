@@ -29,8 +29,8 @@ impl Lane {
         match tool {
             "file_upload" | "file_download" => Self::Transfer,
             "terminal_exec" | "terminal_input" => Self::Terminal,
-            "terminal_cancel" | "terminal_read" => Self::Control,
-            "code_apply_edits" | "workspace_open" | "files_sync" => Self::Write,
+            "terminal_cancel" | "terminal_read" | "workspace_gc" => Self::Control,
+            "code_apply_edits" | "change_resume" | "workspace_open" | "files_sync" => Self::Write,
             _ => Self::Read,
         }
     }

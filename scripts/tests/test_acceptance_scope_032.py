@@ -9,6 +9,15 @@ acceptance = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(acceptance)
 
 class ReceiptTests(unittest.TestCase):
+    def test_tool_catalog_tracks_release_features(self):
+        self.assertEqual(len(acceptance.expected_tool_names('0.3.2')), 15)
+        self.assertEqual(len(acceptance.expected_tool_names('0.4.0')), 18)
+        self.assertEqual(len(acceptance.expected_tool_names('0.5.0')), 19)
+        tools = acceptance.expected_tool_names('0.6.0')
+        self.assertEqual(len(tools), 21)
+        self.assertIn('change_resume', tools)
+        self.assertIn('workspace_gc', tools)
+
     def report(self, count=1):
         rows = [{'device_id':str(i),'name':'device-'+str(i),'agent_version':'0.3.2'} for i in range(count)]
         return {'origin':'https://example.invalid','version':'0.3.2','run_id':'test',

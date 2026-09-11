@@ -37,6 +37,8 @@ struct LocalOperation {
     workspace_id: Option<String>,
     #[serde(default)]
     tool: Option<String>,
+    #[serde(default)]
+    updated_at: i64,
 }
 impl Agent {
     pub async fn new(mut config: AgentConfig) -> Result<Self> {
@@ -114,6 +116,7 @@ impl Agent {
                     resumable: crate::durable_transfer::is_file(&job.tool),
                     workspace_id: job.arguments["workspace_id"].as_str().map(str::to_owned),
                     tool: Some(job.tool.clone()),
+                    updated_at: crate::now(),
                 },
                 i64::MAX,
             )
@@ -137,6 +140,7 @@ impl Agent {
                         resumable: true,
                         workspace_id: job.arguments["workspace_id"].as_str().map(str::to_owned),
                         tool: Some(job.tool.clone()),
+                        updated_at: crate::now(),
                     },
                     i64::MAX,
                 )
@@ -156,7 +160,7 @@ impl Agent {
             result["timing"] = progress.timings();
         }
         if serde_json::to_vec(&result)?.len() > 250 * 1024 {
-            result = json!({"error":"response_budget_exceeded","message":"Operation may have completed. Narrow read ranges or inspect the local operation journal; do not repeat a mutation with a new key."});
+            result = json!({"error":"response_budget_exceeded","error_code":"response_budget_exceeded","outcome":"unknown","recovery_action":"inspect_original_operation_without_reexecution","automatic_replay_safe":false,"timing":progress.timings()});
         }
         let completed = LocalOperation {
             fingerprint,
@@ -165,6 +169,7 @@ impl Agent {
             resumable: false,
             workspace_id: job.arguments["workspace_id"].as_str().map(str::to_owned),
             tool: Some(job.tool.clone()),
+            updated_at: crate::now(),
         };
         if let Some(delivery) = delivery {
             delivery.complete(&job.id, &completed, &result).await?;
@@ -226,7 +231,10 @@ impl Agent {
             "workspace root moved or authorization revoked"
         );
         progress.phase("waiting_resource");
-        let _write = if matches!(job.tool.as_str(), "code_apply_edits" | "files_sync") {
+        let _write = if matches!(
+            job.tool.as_str(),
+            "code_apply_edits" | "change_resume" | "files_sync"
+        ) {
             progress.phase("waiting_resource");
             Some(self.scheduler.writes.acquire(&ws.root).await?)
         } else {
@@ -259,11 +267,40 @@ impl Agent {
                 .await
             }
             "workspace_context" => crate::workspace_context::read(&self.store, &ws, v).await,
+            "workspace_gc" => crate::storage_gc::run(&self.config, &self.store, &ws, v).await,
             "terminal_exec" => self.terminals.start(&self.config, &ws, v, &job.id).await,
             "terminal_read" => self.terminals.read(&ws, v).await,
             "terminal_input" => self.terminals.input(&ws, v).await,
             "terminal_cancel" => self.terminals.cancel(&ws, v).await,
             "code_diff" => crate::change_review::read(&ws, v).await,
+            "change_resume" => {
+                let original = files::text(v, "change_set_id")?;
+                uuid::Uuid::parse_str(original).context("invalid change_set_id")?;
+                let op: LocalOperation = self
+                    .store
+                    .get("local_operation", original)
+                    .await?
+                    .context("change_set_unavailable: original local operation not found")?;
+                ensure!(
+                    op.tool.as_deref() == Some("code_apply_edits")
+                        && op.workspace_id.as_deref() == Some(&ws.id),
+                    "change_set_unavailable: original edit belongs to another workspace or tool"
+                );
+                let journal = self
+                    .config
+                    .state_dir
+                    .join("edits")
+                    .join(format!("{original}.json"));
+                let ws = ws.clone();
+                let progress = progress.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _write_guard = _write;
+                    let _execution_permit = permit;
+                    progress.phase("running");
+                    files::resume(&ws, &journal)
+                })
+                .await?
+            }
             name => {
                 let name = name.to_owned();
                 let v = v.clone();
@@ -451,8 +488,10 @@ impl Agent {
     }
     async fn resource_hint(&self, job: &Job) -> ActiveResource {
         let mut resource = ActiveResource::default();
-        if matches!(job.tool.as_str(), "code_apply_edits" | "files_sync")
-            && let Some(id) = job.arguments.get("workspace_id").and_then(Value::as_str)
+        if matches!(
+            job.tool.as_str(),
+            "code_apply_edits" | "change_resume" | "files_sync"
+        ) && let Some(id) = job.arguments.get("workspace_id").and_then(Value::as_str)
             && let Ok(Some(ws)) = self.store.get::<Workspace>("workspace", id).await
             && ws.device_id == self.config.device_id
         {
@@ -593,6 +632,57 @@ mod scheduling_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn change_resume_routes_only_to_original_workspace_change_set() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let device = uuid::Uuid::new_v4().to_string();
+        let a = Agent::new(AgentConfig {
+            gateway_url: "https://example.com:8443".into(),
+            device_id: device.clone(),
+            device_token: crate::random(),
+            state_dir: state.path().into(),
+            roots: vec![root.path().into()],
+            allow_write: true,
+            allow_exec: false,
+            shell: "/bin/sh".into(),
+        })
+        .await
+        .unwrap();
+        let ws = Workspace {
+            id: format!("{}:{}", device, uuid::Uuid::new_v4()),
+            device_id: device.clone(),
+            root: root.path().canonicalize().unwrap(),
+        };
+        a.store
+            .put("workspace", &ws.id, &ws, i64::MAX)
+            .await
+            .unwrap();
+        let original = Job {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: device.clone(),
+            owner: "owner".into(),
+            tool: "code_apply_edits".into(),
+            arguments: json!({"workspace_id":ws.id,"idempotency_key":"edit","files":[{"path":"a.txt","expected_version":"absent","action":"create","content":"hello"}]}),
+        };
+        let first = a.execute(&original).await.unwrap();
+        assert_eq!(first["state"], "completed");
+        assert_eq!(first["change_set"]["change_set_id"], original.id);
+        let resume = Job {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: device,
+            owner: "owner".into(),
+            tool: "change_resume".into(),
+            arguments: json!({"workspace_id":ws.id,"idempotency_key":"resume","change_set_id":original.id}),
+        };
+        let second = a.execute(&resume).await.unwrap();
+        assert_eq!(second["state"], "completed");
+        assert_eq!(second["already_applied"], 1);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "hello"
+        );
+    }
     #[tokio::test]
     async fn deduplicates_mutations_and_rejects_other_devices() {
         let root = tempfile::tempdir().unwrap();

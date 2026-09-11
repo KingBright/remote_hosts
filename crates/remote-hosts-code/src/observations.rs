@@ -18,6 +18,17 @@ fn omitted(id: &str) -> Value {
     json!({"operation_id":id,"result_omitted":true,"reason":"response_budget",
         "next_action":"query_this_operation_individually"})
 }
+fn compact_batch_result(mut result: Value) -> Value {
+    if let Some(lifecycle) = result.get_mut("operation_lifecycle") {
+        let gateway = &lifecycle["gateway"];
+        *lifecycle = if gateway["available"] == false {
+            json!({"available":false})
+        } else {
+            json!({"queue_ms":gateway["queue_ms"],"dispatch_to_result_ms":gateway["dispatch_to_result_ms"]})
+        };
+    }
+    result
+}
 async fn view(g: &Gateway, p: &Principal, ids: &[String]) -> Result<View> {
     let rows = sqlx::query("SELECT j.id,j.device,j.state,json_extract(j.request,'$.owner') AS owner,json_extract(j.request,'$.tool') AS tool,COALESCE(r.value,a.value) AS progress FROM jobs j LEFT JOIN kv a ON a.kind='operation_progress' AND a.key=j.id AND a.expires>? LEFT JOIN kv r ON r.kind='receive_progress' AND r.key=j.id AND r.expires>? AND json_extract(j.request,'$.tool')='file_download' WHERE j.id IN (SELECT value FROM json_each(?))")
         .bind(now()).bind(now()).bind(serde_json::to_string(ids)?).fetch_all(&g.store.pool).await?;
@@ -147,7 +158,7 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
         tokio::select! { _=changed=>{}, _=tokio::time::sleep_until(deadline.min(Instant::now()+Duration::from_millis(500)))=>{} }
     };
     let metadata = json!({"cursor":final_view.cursor,"changed":supplied.is_none_or(|c|c!=final_view.cursor),
-        "waited_ms":started.elapsed().as_millis(),"semantics":"latest_state_not_event_log","snapshot_consistency":"per_operation","observation_protocol":1});
+        "waited_ms":started.elapsed().as_millis(),"semantics":"latest_state_not_event_log","snapshot_consistency":"per_operation","observation_protocol":2});
     // The legacy no-options call returned above retains its exact shape and
     // budget. Explicit observation options honor their requested byte ceiling.
     if let Some(id) = single {
@@ -159,28 +170,56 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
         }
         return Ok(result);
     }
-    // Reserve actual serialized placeholders, not a blanket 512-byte estimate
-    // per item that can hide twenty tiny results even when they all fit.
-    let placeholders: Vec<Value> = ids.iter().map(|id| omitted(id)).collect();
-    let mut output = json!({"operations":placeholders,"pending_count":final_view.pending,"observation":metadata});
-    ensure!(
-        serde_json::to_vec(&output)?.len() <= budget,
-        "observation_response_budget: query fewer operations"
-    );
-    for (index, id) in ids.iter().enumerate() {
+    // First preserve exact legacy per-operation shapes when the whole batch fits.
+    // Only compact lifecycle metadata as a second representation when the
+    // requested response budget actually requires it.
+    let mut full = Vec::with_capacity(ids.len());
+    for id in &ids {
         // view() authorizes the entire batch before returning any output. An
         // expired artifact/result-decoration failure is not a new execution and
         // must not discard independent authorized results. Omit error details
         // that could contain URLs or private state; retain the original ID.
-        let result = match g.result(p, id).await {
+        full.push(match g.result(p, id).await {
             Ok(result) => result,
             Err(_) => json!({"operation_id":id,"observation_error":{"code":"result_unavailable"},
                 "next_action":"inspect_original_operation_without_reexecution"}),
-        };
-        let previous = std::mem::replace(&mut output["operations"][index], result);
-        if serde_json::to_vec(&output)?.len() > budget {
-            output["operations"][index] = previous;
+        });
+    }
+    let output =
+        json!({"operations":full,"pending_count":final_view.pending,"observation":metadata});
+    if serde_json::to_vec(&output)?.len() <= budget {
+        return Ok(output);
+    }
+    let compact: Vec<Value> = output["operations"]
+        .as_array()
+        .expect("batch operations array")
+        .iter()
+        .cloned()
+        .map(compact_batch_result)
+        .collect();
+    let compact_output = json!({"operations":compact,"pending_count":final_view.pending,"observation":output["observation"]});
+    if serde_json::to_vec(&compact_output)?.len() <= budget {
+        return Ok(compact_output);
+    }
+    // Finally reserve actual serialized placeholders and admit compact results
+    // individually. This keeps large siblings from hiding independent small ones.
+    let placeholders: Vec<Value> = ids.iter().map(|id| omitted(id)).collect();
+    let mut bounded = json!({"operations":placeholders,"pending_count":final_view.pending,"observation":compact_output["observation"]});
+    ensure!(
+        serde_json::to_vec(&bounded)?.len() <= budget,
+        "observation_response_budget: query fewer operations"
+    );
+    for (index, result) in compact_output["operations"]
+        .as_array()
+        .expect("batch operations array")
+        .iter()
+        .cloned()
+        .enumerate()
+    {
+        let previous = std::mem::replace(&mut bounded["operations"][index], result);
+        if serde_json::to_vec(&bounded)?.len() > budget {
+            bounded["operations"][index] = previous;
         }
     }
-    Ok(output)
+    Ok(bounded)
 }
