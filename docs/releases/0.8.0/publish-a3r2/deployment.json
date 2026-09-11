@@ -1,0 +1,67 @@
+{
+  "version": "0.8.0",
+  "state": "running",
+  "phase": "independent_agent_pipelines",
+  "targets": [
+    "ba3bf113-2390-466e-88bc-40d5b4f02884",
+    "8af88e35-f316-4dd9-9810-fa5bd3a22196"
+  ],
+  "manifest_sha256": "9ddff2f112a878d38373723f9942a88f2e431b8653f2b66146d75bae750658b0",
+  "tests": {
+    "passed": 361,
+    "failed": 0,
+    "rust_passed": 239,
+    "python_passed": 122,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "agents": {},
+  "all_targets_accepted": false,
+  "gateway": {
+    "state": "upgraded",
+    "version": "0.8.0",
+    "candidate_sha256": "9dd60368165b12ff42114528ee189c46eac8a6ea00e359616727b4ff5b09b091",
+    "backup": "/opt/remote-hosts-code/releases/before-0.8.0-20260912T020205",
+    "previous_sha256": "e940cb24d09fdc9cdb8d8ecdad60324c54b8492d829f8713f26f392973d2257d",
+    "pid": 14928,
+    "installed_sha256": "9dd60368165b12ff42114528ee189c46eac8a6ea00e359616727b4ff5b09b091",
+    "health": {
+      "capabilities_protocol": 1,
+      "change_set_protocol": 1,
+      "checkpoint_bytes": 4194304,
+      "default_file_bytes": 67108864,
+      "dispatch_protocol": 2,
+      "execution_limits": {
+        "control": 2,
+        "read": 8,
+        "terminal": 4,
+        "transfer": 2,
+        "write": 2
+      },
+      "file_transfer": true,
+      "maintenance_protocol": 1,
+      "max_file_bytes": 268435456,
+      "observation_protocol": 2,
+      "progress_protocol": 1,
+      "readiness_protocol": 1,
+      "resource_dispatch_protocol": 1,
+      "schema_diagnostics_protocol": 1,
+      "service": "remote-hosts-code",
+      "status": "ok",
+      "storage_gc_protocol": 1,
+      "storage_reserve_bytes": 268435456,
+      "terminal_observation_protocol": 1,
+      "transfer_limits_protocol": 1,
+      "transfer_protocol": 2,
+      "version": "0.8.0"
+    },
+    "caddy_override_removed": false
+  },
+  "source_artifact": {
+    "operation_id": "61e6896e-d2ec-41c2-b0ee-d39685a00747",
+    "sha256": "094aefb51c1b1592f0662b31245f929f1c59ed30a62d741fe7e295af1fd43694",
+    "size": 9087785
+  }
+}

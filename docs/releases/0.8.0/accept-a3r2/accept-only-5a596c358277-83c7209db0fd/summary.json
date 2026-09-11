@@ -1,0 +1,29 @@
+{
+  "version": "0.8.0",
+  "state": "running",
+  "mode": "accept_only",
+  "revision": "5a596c358277-83c7209db0fd",
+  "agents": {
+    "8af88e35-f316-4dd9-9810-fa5bd3a22196": {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "name": "Mac-Studio",
+      "state": "needs_recovery",
+      "phase": "standard",
+      "failure_type": "CalledProcessError",
+      "recovery": "inspect this acceptance-only journal; do not reinstall"
+    },
+    "ba3bf113-2390-466e-88bc-40d5b4f02884": {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "state": "needs_recovery",
+      "phase": "collaboration",
+      "standard": {
+        "state": "passed",
+        "report": "/Users/jinliang/Workspace/remote_hosts/docs/releases/0.8.0/accept-a3r2/accept-only-5a596c358277-83c7209db0fd/ba3bf113-2390-466e-88bc-40d5b4f02884/standard.json"
+      },
+      "failure_type": "CalledProcessError",
+      "recovery": "inspect this acceptance-only journal; do not reinstall"
+    }
+  },
+  "all_targets_accepted": false
+}

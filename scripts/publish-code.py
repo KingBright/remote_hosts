@@ -93,6 +93,15 @@ def stage_remote_artifact(run, ssh, scp, host, local, dest, expected, attempts=3
     raise RuntimeError('gateway staging failed after bounded retries: '+str(last_error))
 
 
+def acceptance_scripts(root):
+    """Acceptance-only recovery uses the currently validated controller scripts.
+
+    The runtime package remains immutable; acceptance logic may be fixed and
+    revalidated independently without rebuilding or reinstalling the service.
+    """
+    return root/'scripts'/'check-code-gateway.py', root/'scripts'/'check-collaboration.py'
+
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--config',required=True,type=pathlib.Path);p.add_argument('--pipeline',required=True,type=pathlib.Path);p.add_argument('--report-dir',required=True,type=pathlib.Path);p.add_argument('--version',required=True);p.add_argument('--apply',action='store_true');p.add_argument('--accept-only',action='store_true',help='rerun acceptance for already verified installed agents; never install or restart');args=p.parse_args()
     config=validate(json.loads(args.config.read_text()));root=pathlib.Path(config.get('project_root',pathlib.Path(__file__).resolve().parents[1])).resolve(strict=True);plan=rr.verified_build(args.pipeline,args.version)
@@ -108,7 +117,8 @@ def main():
     manifest=json.loads((package/'manifest.json').read_text());sha=manifest['artifacts']['remote-hosts-code-macos-arm64']['sha256']
     if args.accept_only:
         if not args.apply:raise ValueError('--accept-only requires --apply; it is a bounded live acceptance action')
-        revision=(rr.digest(package/'check-code-gateway.py')[:12]+'-'+rr.digest(package/'check-collaboration.py')[:12])
+        standard_script,collaboration_script=acceptance_scripts(root)
+        revision=(rr.digest(standard_script)[:12]+'-'+rr.digest(collaboration_script)[:12])
         recovery=directory/('accept-only-'+revision);recovery.mkdir(parents=True,exist_ok=True)
         client=Client(config['origin'],pathlib.Path(config['password_file']));summary={'version':args.version,'state':'running','mode':'accept_only','revision':revision,'agents':{},'all_targets_accepted':False};accept_lock=threading.Lock()
         def save_recovery():rr.atomic_json(recovery/'summary.json',summary)
@@ -126,14 +136,14 @@ def main():
                 try:
                     with rr.StepJournal(ad/'steps.json',{**binding,'device':ident}) as journal:
                         def standard():
-                            report=ad/'standard.json';log=ad/'standard.log';cmd=['/opt/homebrew/bin/python3',str(package/'check-code-gateway.py'),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(report),'--run-id',acceptance_run_id(args.version,ident)+'-'+revision[:8],'--expected-version',args.version,'--dispatch-protocol','2','--device-id',ident]
+                            report=ad/'standard.json';log=ad/'standard.log';cmd=['/opt/homebrew/bin/python3',str(standard_script),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(report),'--run-id',acceptance_run_id(args.version,ident)+'-'+revision[:8],'--expected-version',args.version,'--dispatch-protocol','2','--device-id',ident]
                             with log.open('x') as out:subprocess.run(cmd,cwd=root,stdout=out,stderr=subprocess.STDOUT,check=True,timeout=1200)
                             value=json.loads(report.read_text());
                             if value.get('state')!='passed' or value.get('test_oauth_grant_revoked') is not True:raise RuntimeError('standard acceptance incomplete')
                             return {'state':'passed','report':str(report)}
                         result['standard']=journal.step('standard',binding,standard);result['phase']='collaboration';rr.atomic_json(ad/'status.json',result)
                         def collaboration():
-                            report=ad/'collaboration.json';log=ad/'collaboration.log';cmd=['/opt/homebrew/bin/python3',str(package/'check-collaboration.py'),'--config',str(args.config.resolve()),'--device-id',ident,'--version',args.version,'--report',str(report)]
+                            report=ad/'collaboration.json';log=ad/'collaboration.log';cmd=['/opt/homebrew/bin/python3',str(collaboration_script),'--config',str(args.config.resolve()),'--device-id',ident,'--version',args.version,'--report',str(report)]
                             with log.open('x') as out:subprocess.run(cmd,cwd=root,stdout=out,stderr=subprocess.STDOUT,check=True,timeout=1200)
                             value=json.loads(report.read_text());
                             if value.get('state')!='passed' or value.get('temporary_oauth_revoked') is not True:raise RuntimeError('collaboration acceptance incomplete')

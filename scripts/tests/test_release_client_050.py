@@ -50,6 +50,12 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(result['state'],'staged');self.assertEqual(result['attempts'],2)
         self.assertEqual(len(scp_calls),2);self.assertEqual(remote[dest],expected);self.assertNotIn(temp,remote)
 
+    def test_accept_only_uses_current_controller_acceptance_scripts(self):
+        path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_080_scripts',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        standard,collaboration=m.acceptance_scripts(pathlib.Path('/project'))
+        self.assertEqual(standard,pathlib.Path('/project/scripts/check-code-gateway.py'))
+        self.assertEqual(collaboration,pathlib.Path('/project/scripts/check-collaboration.py'))
+
     def test_accept_only_requires_verified_installed_runtime(self):
         path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_080_accept',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
         sha='a'*64

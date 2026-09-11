@@ -1,0 +1,20 @@
+{
+  "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+  "name": "Mac-Studio",
+  "state": "running",
+  "phase": "observe_original_updater",
+  "launch": {
+    "label": "com.remote-hosts.code-upgrade.07d4f7729c5b23dc5ef1d790",
+    "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/07d4f7729c5b23dc5ef1d790/result.json",
+    "state": "started",
+    "exit_code": 0
+  },
+  "updater": {
+    "active_operations": 0,
+    "active_terminals": 0,
+    "candidate_sha256": "90aea8db952140921190bfa8483b3735a80a7b0dde591a923df893189f14a901",
+    "phase": "installing",
+    "state": "preflight",
+    "version": "0.8.0"
+  }
+}

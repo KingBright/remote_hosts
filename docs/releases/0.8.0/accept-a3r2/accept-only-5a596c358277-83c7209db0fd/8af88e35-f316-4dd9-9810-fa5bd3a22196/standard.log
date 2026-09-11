@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.8.0/check-code-gateway.py", line 278, in <module>
+    main()
+    ~~~~^^
+  File "/Users/jinliang/Workspace/remote_hosts/dist/remote-hosts-code-0.8.0/check-code-gateway.py", line 260, in main
+    assert tool("file_upload", imported_args) == imported, "import retry must reuse original receipt"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: import retry must reuse original receipt

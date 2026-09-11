@@ -1,0 +1,40 @@
+{
+  "state": "upgraded",
+  "version": "0.8.0",
+  "candidate_sha256": "9dd60368165b12ff42114528ee189c46eac8a6ea00e359616727b4ff5b09b091",
+  "backup": "/opt/remote-hosts-code/releases/before-0.8.0-20260912T020205",
+  "previous_sha256": "e940cb24d09fdc9cdb8d8ecdad60324c54b8492d829f8713f26f392973d2257d",
+  "pid": 14928,
+  "installed_sha256": "9dd60368165b12ff42114528ee189c46eac8a6ea00e359616727b4ff5b09b091",
+  "health": {
+    "capabilities_protocol": 1,
+    "change_set_protocol": 1,
+    "checkpoint_bytes": 4194304,
+    "default_file_bytes": 67108864,
+    "dispatch_protocol": 2,
+    "execution_limits": {
+      "control": 2,
+      "read": 8,
+      "terminal": 4,
+      "transfer": 2,
+      "write": 2
+    },
+    "file_transfer": true,
+    "maintenance_protocol": 1,
+    "max_file_bytes": 268435456,
+    "observation_protocol": 2,
+    "progress_protocol": 1,
+    "readiness_protocol": 1,
+    "resource_dispatch_protocol": 1,
+    "schema_diagnostics_protocol": 1,
+    "service": "remote-hosts-code",
+    "status": "ok",
+    "storage_gc_protocol": 1,
+    "storage_reserve_bytes": 268435456,
+    "terminal_observation_protocol": 1,
+    "transfer_limits_protocol": 1,
+    "transfer_protocol": 2,
+    "version": "0.8.0"
+  },
+  "caddy_override_removed": false
+}

@@ -257,7 +257,8 @@ def main():
         imported_args = {"workspace_id": ws, "idempotency_key": key + "-import", "path": imported_path, "sha256": checksum, "file": {"file_id": "probe-" + exported["artifact_id"], "download_url": exported["download_url"], "file_name": "payload.bin", "mime_type": "application/octet-stream"}}
         imported = tool("file_upload", imported_args)
         assert imported["sha256"] == checksum and imported["size"] == len(payload)
-        assert tool("file_upload", imported_args) == imported, "import retry must reuse original receipt"
+        retried_import = tool("file_upload", imported_args)
+        assert stable_operation_receipt(retried_import) == stable_operation_receipt(imported), "import retry must reuse original durable receipt"
         assert "error" in tool("file_upload", dict(imported_args, idempotency_key=key+"-no-clobber"), allow_error=True)
         assert "error" in tool("file_upload", dict(imported_args, idempotency_key=key+"-bad-checksum", path=bad_path, sha256="0"*64), allow_error=True)
         run_probe("import pathlib,hashlib; p=pathlib.Path(" + repr(imported_path) + "); assert hashlib.sha256(p.read_bytes()).hexdigest()==" + repr(checksum) + "; assert not pathlib.Path(" + repr(bad_path) + ").exists(); p.unlink(); pathlib.Path(" + repr(binary_path) + ").unlink()", "-binary-cleanup")

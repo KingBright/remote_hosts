@@ -1,0 +1,8 @@
+{
+  "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+  "name": "Mac-Studio",
+  "state": "needs_recovery",
+  "phase": "standard",
+  "failure_type": "CalledProcessError",
+  "recovery": "inspect this acceptance-only journal; do not reinstall"
+}

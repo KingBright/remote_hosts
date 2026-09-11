@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.8.0",
+    "manifest": "9ddff2f112a878d38373723f9942a88f2e431b8653f2b66146d75bae750658b0",
+    "config": "6aff31f2eba690da2903fb7484e7cab578ff444c7ab569c2c727dabfa21e4738"
+  },
+  "steps": {
+    "launch": {
+      "state": "completed",
+      "input_sha256": "95815b8f341a1fa2d197dd7cc4f2ea10c999a4e99a271fcdd4213f6ff3e8e6fd",
+      "requested_at_epoch": 1789149777.331594,
+      "result": {
+        "label": "com.remote-hosts.code-upgrade.2573587f7ad6c530eb4d9bbf",
+        "result": "/Users/jinliang/.local/share/remote-hosts-code/releases/upgrade-jobs/2573587f7ad6c530eb4d9bbf/result.json",
+        "state": "started",
+        "exit_code": 0
+      }
+    }
+  },
+  "updated_at_epoch": 1789149777.656775
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.8.0",
+    "manifest": "9ddff2f112a878d38373723f9942a88f2e431b8653f2b66146d75bae750658b0",
+    "acceptance_revision": "5a596c358277-83c7209db0fd",
+    "device": "8af88e35-f316-4dd9-9810-fa5bd3a22196"
+  },
+  "steps": {
+    "standard": {
+      "state": "outcome_unknown",
+      "input_sha256": "1323167e36b3ce65c0a0cc222a328d0d6858f83e0c11b730c08c34f0f593a3f9",
+      "requested_at_epoch": 1789150037.25854,
+      "failure_type": "CalledProcessError"
+    }
+  },
+  "updated_at_epoch": 1789150171.93282
+}

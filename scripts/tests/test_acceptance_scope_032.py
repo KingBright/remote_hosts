@@ -33,6 +33,11 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotEqual(acceptance.stable_operation_receipt(base), acceptance.stable_operation_receipt(changed))
         self.assertIn('operation_lifecycle', base)
 
+    def test_file_upload_retry_uses_durable_receipt_comparison(self):
+        source=(pathlib.Path(__file__).resolve().parents[1]/'check-code-gateway.py').read_text()
+        self.assertIn('stable_operation_receipt(retried_import) == stable_operation_receipt(imported)', source)
+        self.assertNotIn('tool("file_upload", imported_args) == imported', source)
+
     def test_one_device_summary_never_claims_two(self):
         report=self.report()
         message=acceptance.acceptance_summary(report)
