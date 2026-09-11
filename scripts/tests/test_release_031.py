@@ -68,6 +68,49 @@ class ReadyTests(unittest.TestCase):
         self.assertTrue(result['all_lanes_verified'])
         self.assertEqual(result['functional_acceptance'], 'separate_required_gate')
 
+    def test_brief_gateway_outage_preserves_candidate_identity_but_requires_fresh_progress(self):
+        clock = [0.0]
+        def advancing_local(_base):
+            value = copy.deepcopy(self.local)
+            value['readiness']['lanes'] = {lane: 120+int(clock[0]) for lane in support.LANES}
+            return value
+        def intermittent_remote(_config, **_options):
+            if 2 <= clock[0] < 5:
+                raise support.GatewayObservationError({'stage':'gateway_readiness','category':'network_timeout',
+                    'retryable':True,'attempts':1,'next_action':'retry_same_readonly_probe_with_backoff'})
+            return dict(self.remote, last_seen=120+int(clock[0]), observed_at=120+int(clock[0]))
+        with mock.patch.object(support.time, 'monotonic', side_effect=lambda: clock[0]), \
+             mock.patch.object(support.time, 'time', side_effect=lambda: 120+int(clock[0])), \
+             mock.patch.object(support.time, 'sleep', side_effect=lambda dt: clock.__setitem__(0, clock[0]+dt)), \
+             mock.patch.object(support, 'local_observation', side_effect=advancing_local), \
+             mock.patch.object(support, 'gateway_observation', side_effect=intermittent_remote):
+            result = support.wait_ready(pathlib.Path('/unused'), {}, '0.3.1', 100, 99,
+                                        timeout=20, stable_seconds=5, transient_grace_seconds=5)
+        self.assertEqual(result['transient_interruptions'], 1)
+        self.assertGreaterEqual(result['max_transient_gap_seconds'], 3)
+        self.assertEqual(result['last_transient_category'], 'network_timeout')
+        self.assertTrue(result['all_lanes_verified'])
+
+    def test_stopped_candidate_fails_before_long_network_deadline(self):
+        clock = [0.0]
+        def local(_base):
+            value = copy.deepcopy(self.local)
+            value['readiness']['lanes'] = {lane: 120+int(clock[0]) for lane in support.LANES}
+            if clock[0] >= 2:
+                value['running'] = False
+            return value
+        def remote(_config, **_options):
+            return dict(self.remote, last_seen=120+int(clock[0]), observed_at=120+int(clock[0]))
+        with mock.patch.object(support.time, 'monotonic', side_effect=lambda: clock[0]), \
+             mock.patch.object(support.time, 'time', side_effect=lambda: 120+int(clock[0])), \
+             mock.patch.object(support.time, 'sleep', side_effect=lambda dt: clock.__setitem__(0, clock[0]+dt)), \
+             mock.patch.object(support, 'local_observation', side_effect=local), \
+             mock.patch.object(support, 'gateway_observation', side_effect=remote):
+            with self.assertRaisesRegex(support.CandidateProcessError, 'candidate_not_running'):
+                support.wait_ready(pathlib.Path('/unused'), {}, '0.3.1', 100, 99,
+                                   timeout=30, stable_seconds=5, dead_process_grace_seconds=2)
+        self.assertLess(clock[0], 10)
+
     def test_changing_pid_session_times_out_instead_of_flapping_success(self):
         clock = [0.0]
         def changing(_base):

@@ -220,7 +220,7 @@ impl Gateway {
             .merge(crate::maintenance::routes(self.clone()))
             .route(
                 "/healthz",
-                get(|| async { Json(json!({"status":"ok","service":"remote-hosts-code","version":env!("CARGO_PKG_VERSION"),"file_transfer":true,"default_file_bytes":crate::transfers::DEFAULT_MAX_BYTES,"max_file_bytes":crate::transfers::MAX_BYTES,"storage_reserve_bytes":crate::transfers::STORAGE_RESERVE_BYTES,"transfer_limits_protocol":1,"dispatch_protocol":2,"progress_protocol":1,"readiness_protocol":1,"observation_protocol":2,"capabilities_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"execution_limits":{"read":8,"write":2,"transfer":2,"terminal":4,"control":2}})) }),
+                get(|| async { Json(json!({"status":"ok","service":"remote-hosts-code","version":env!("CARGO_PKG_VERSION"),"file_transfer":true,"default_file_bytes":crate::transfers::DEFAULT_MAX_BYTES,"max_file_bytes":crate::transfers::MAX_BYTES,"storage_reserve_bytes":crate::transfers::STORAGE_RESERVE_BYTES,"transfer_limits_protocol":1,"dispatch_protocol":2,"progress_protocol":1,"readiness_protocol":1,"observation_protocol":2,"capabilities_protocol":1,"schema_diagnostics_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"execution_limits":{"read":8,"write":2,"transfer":2,"terminal":4,"control":2}})) }),
             )
             .merge(
                 Router::new()
@@ -836,8 +836,11 @@ async fn poll(
             .bind(&device).bind(&online.hello.session).fetch_optional(&g.store.pool).await;
         match row {
             Ok(Some((id, request))) => {
-                let _ = sqlx::query("UPDATE operation_timing SET dispatched_ms=COALESCE(dispatched_ms,?) WHERE id=?")
-                    .bind(now_ms()).bind(&id).execute(&g.store.pool).await;
+                if sqlx::query("UPDATE operation_timing SET dispatched_ms=COALESCE(dispatched_ms,?) WHERE id=?")
+                    .bind(now_ms()).bind(&id).execute(&g.store.pool).await.is_err()
+                {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
                 return match serde_json::from_str::<Value>(&request) {
                     Ok(v) => Json(json!({"job":v})).into_response(),
                     Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

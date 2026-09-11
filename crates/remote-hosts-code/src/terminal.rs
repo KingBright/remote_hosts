@@ -11,7 +11,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     path::PathBuf,
     sync::{Arc, LazyLock, Mutex},
@@ -66,6 +66,60 @@ impl Terminals {
             secret,
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
         })
+    }
+    /// Reconcile durable terminal rows that can no longer be owned by this runtime.
+    /// A grace window prevents racing a freshly inserted `starting` row before its
+    /// child handle reaches `live`. This never kills an OS process; unknown prior-
+    /// runtime descendants are reported as ownership loss rather than guessed dead.
+    pub async fn reconcile_orphans(&self, grace_seconds: i64) -> Result<usize> {
+        ensure!(
+            (5..=3600).contains(&grace_seconds),
+            "invalid terminal reconcile grace"
+        );
+        let cutoff = now() - grace_seconds;
+        let owned: HashSet<String> = self
+            .live
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?
+            .keys()
+            .cloned()
+            .collect();
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key,value FROM kv WHERE kind='terminal' AND json_extract(value,'$.state') IN ('running','starting') AND COALESCE(json_extract(value,'$.created_at'),0)<=?",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.store.pool)
+        .await?;
+        let mut reconciled = 0usize;
+        for (id, text) in rows {
+            if owned.contains(&id) {
+                continue;
+            }
+            let mut status: Status = serde_json::from_str(&text)?;
+            status.state = "runtime_lost".into();
+            status.output_complete = true;
+            status.output_error = Some("terminal_runtime_ownership_lost".into());
+            let saved = sqlx::query(
+                "UPDATE kv SET value=? WHERE kind='terminal' AND key=? AND json_extract(value,'$.state') IN ('running','starting') AND COALESCE(json_extract(value,'$.created_at'),0)<=?",
+            )
+            .bind(serde_json::to_string(&status)?)
+            .bind(&id)
+            .bind(cutoff)
+            .execute(&self.store.pool)
+            .await?;
+            if saved.rows_affected() == 0 {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE kv SET value=json_set(value,'$.state','unknown','$.updated_at',?) WHERE kind='local_operation' AND key=? AND json_extract(value,'$.state')='running' AND json_extract(value,'$.tool')='terminal_exec'",
+            )
+            .bind(now())
+            .bind(&id)
+            .execute(&self.store.pool)
+            .await?;
+            reconciled += 1;
+        }
+        Ok(reconciled)
     }
     pub async fn start(
         &self,
@@ -524,4 +578,81 @@ fn pty_eof(error: &std::io::Error, interactive: bool) -> bool {
 }
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(id: &str, created_at: i64) -> Status {
+        Status {
+            id: id.into(),
+            workspace_id: "workspace".into(),
+            state: "running".into(),
+            exit_code: None,
+            output_truncated: false,
+            created_at,
+            pty: false,
+            log_format: 1,
+            output_complete: false,
+            output_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_closes_only_old_unowned_terminal_state() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(d.path()).await.unwrap();
+        let terminals = Terminals::new(
+            store.clone(),
+            d.path().join("terminals"),
+            "synthetic-terminal-secret-0123456789".into(),
+        )
+        .await
+        .unwrap();
+        let old = uuid::Uuid::new_v4().to_string();
+        let recent = uuid::Uuid::new_v4().to_string();
+        store
+            .put("terminal", &old, &status(&old, now() - 120), i64::MAX)
+            .await
+            .unwrap();
+        store
+            .put("terminal", &recent, &status(&recent, now()), i64::MAX)
+            .await
+            .unwrap();
+        store
+            .put(
+                "local_operation",
+                &old,
+                &json!({"state":"running","tool":"terminal_exec","updated_at":now()-120}),
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(terminals.reconcile_orphans(30).await.unwrap(), 1);
+        let old_status = store
+            .get::<Status>("terminal", &old)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_status.state, "runtime_lost");
+        assert!(old_status.output_complete);
+        assert_eq!(
+            old_status.output_error.as_deref(),
+            Some("terminal_runtime_ownership_lost")
+        );
+        let recent_status = store
+            .get::<Status>("terminal", &recent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recent_status.state, "running");
+        let op = store
+            .get::<Value>("local_operation", &old)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(op["state"], "unknown");
+    }
 }

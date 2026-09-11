@@ -102,6 +102,9 @@ async fn apply(g: &Gateway, device: &str, r: &Request) -> Result<Value> {
             "all_lanes_verified",
             "active_terminals",
             "active_operations",
+            "transient_interruptions",
+            "max_transient_gap_seconds",
+            "last_transient_category",
         ] {
             if let Some(value) = input.get(k) {
                 receipt[k] = value.clone();

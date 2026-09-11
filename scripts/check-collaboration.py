@@ -24,6 +24,18 @@ def main():
             assert limits and limits['protocol']==1 and limits['default_max_bytes']==67108864 and limits['hard_max_bytes']==268435456 and limits['checkpoint_bytes']==4194304
             assert 'large_file_transfer_v1' in features and 'source_authorization_status_v1' in features
             r['checks']['negotiated_transfer_limits']={'passed':True,'default_max_bytes':limits['default_max_bytes'],'hard_max_bytes':limits['hard_max_bytes'],'checkpoint_bytes':limits['checkpoint_bytes']}
+        if version >= (0,8,0):
+            gateway=inventory['gateway'];constraints=gateway.get('tool_constraints',{})
+            assert gateway.get('schema_diagnostics_protocol')==1
+            assert gateway.get('host_schema_status') in ('unknown_not_reported','current','stale')
+            for name in ('file_upload','file_download'):
+                limit=constraints[name]
+                assert limit['default_max_bytes']==67108864 and limit['hard_max_bytes']==268435456
+                assert limit['over_default_requires_agent_feature']=='large_file_transfer_v1'
+            assert 'terminal_reconcile_v1' in features
+            r['checks']['schema_diagnostics']={'passed':True,'gateway_tool_count':gateway['tool_count'],
+                'host_schema_status':gateway['host_schema_status'],'file_default_max_bytes':67108864,
+                'file_hard_max_bytes':268435456,'terminal_reconcile_reported':True}
         phase='fixture';record()
         term(agent['workspace_id'],"import pathlib,subprocess,os;p=pathlib.Path("+repr(folder)+");p.mkdir(exist_ok=False);subprocess.run(['git','init','-q',str(p)],env=dict(os.environ,GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1'),check=True)",'fixture')
         workspace=c.tool('workspace_open',{'device_id':args.device_id,'root':agent['root']+'/'+folder,'idempotency_key':key+'-open'})['workspace']['id'];r['workspace_id']=workspace;record()

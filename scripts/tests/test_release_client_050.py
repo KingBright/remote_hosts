@@ -24,6 +24,23 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(value,'release-0-5-0-00000000-0000-0000-0000-000000000001')
         self.assertTrue(value.replace('-','').isalnum())
 
+    def test_accept_only_requires_verified_installed_runtime(self):
+        path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_080_accept',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        sha='a'*64
+        device={'online':True,'capabilities':{'version':'0.8.0'},'maintenance':{'state':'open'},
+                'upgrade':{'receipt':{'state':'upgraded','version':'0.8.0','candidate_sha256':sha,
+                'installed_sha256':sha,'gateway_verified':True,'all_lanes_verified':True,'stable_seconds':15.1}}}
+        self.assertTrue(m.acceptance_ready(device,'0.8.0',sha))
+        for mutation in ('offline','version','maintenance','sha','lanes','stability'):
+            changed=json.loads(json.dumps(device))
+            if mutation=='offline':changed['online']=False
+            elif mutation=='version':changed['capabilities']['version']='0.7.1'
+            elif mutation=='maintenance':changed['maintenance']['state']='draining'
+            elif mutation=='sha':changed['upgrade']['receipt']['installed_sha256']='b'*64
+            elif mutation=='lanes':changed['upgrade']['receipt']['all_lanes_verified']=False
+            else:changed['upgrade']['receipt']['stable_seconds']=14.9
+            self.assertFalse(m.acceptance_ready(changed,'0.8.0',sha),mutation)
+
     def test_target_config_disallows_option_injection_and_duplicate_device(self):
         path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_050',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
         config={'agents':[{'device_id':'00000000-0000-0000-0000-000000000001','workspace_id':'00000000-0000-0000-0000-000000000001:w','home':'/home/test'}],'gateway':{'ssh_host':'-oProxyCommand=bad','ssh_port':22,'root':'/opt/test'}}

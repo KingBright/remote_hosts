@@ -26,6 +26,16 @@ def acceptance_run_id(version, device_id):
     if not value or not value.replace('-','').isalnum():raise ValueError('invalid acceptance run id')
     return value
 
+def acceptance_ready(device, version, sha):
+    receipt=(device.get('upgrade') or {}).get('receipt') or {}
+    return (device.get('online') is True and device.get('capabilities',{}).get('version')==version
+            and device.get('maintenance',{}).get('state')=='open'
+            and receipt.get('state')=='upgraded' and receipt.get('version')==version
+            and receipt.get('candidate_sha256')==sha and receipt.get('installed_sha256')==sha
+            and receipt.get('gateway_verified') is True and receipt.get('all_lanes_verified') is True
+            and receipt.get('stable_seconds',0)>=15)
+
+
 def validate(config):
     if not config['agents'] or len(config['agents'])>8:raise ValueError('bounded explicit agent set required')
     seen=set()
@@ -40,7 +50,7 @@ def validate(config):
     return config
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--config',required=True,type=pathlib.Path);p.add_argument('--pipeline',required=True,type=pathlib.Path);p.add_argument('--report-dir',required=True,type=pathlib.Path);p.add_argument('--version',required=True);p.add_argument('--apply',action='store_true');args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--config',required=True,type=pathlib.Path);p.add_argument('--pipeline',required=True,type=pathlib.Path);p.add_argument('--report-dir',required=True,type=pathlib.Path);p.add_argument('--version',required=True);p.add_argument('--apply',action='store_true');p.add_argument('--accept-only',action='store_true',help='rerun acceptance for already verified installed agents; never install or restart');args=p.parse_args()
     config=validate(json.loads(args.config.read_text()));root=pathlib.Path(config.get('project_root',pathlib.Path(__file__).resolve().parents[1])).resolve(strict=True);plan=rr.verified_build(args.pipeline,args.version)
     directory=args.report_dir.resolve();directory.mkdir(parents=True,exist_ok=True);package=root/'dist'/('remote-hosts-code-'+args.version)
     if not args.apply:print(json.dumps({'state':'verified_plan','version':args.version,'devices':[x['device_id'] for x in config['agents']],'manifest_sha256':plan['manifest_sha256']}));return
@@ -52,6 +62,52 @@ def main():
     for name,info in plan['artifacts'].items():
         if rr.digest(package/name)!=info['sha256']:raise ValueError('artifact changed before publishing')
     manifest=json.loads((package/'manifest.json').read_text());sha=manifest['artifacts']['remote-hosts-code-macos-arm64']['sha256']
+    if args.accept_only:
+        if not args.apply:raise ValueError('--accept-only requires --apply; it is a bounded live acceptance action')
+        revision=(rr.digest(package/'check-code-gateway.py')[:12]+'-'+rr.digest(package/'check-collaboration.py')[:12])
+        recovery=directory/('accept-only-'+revision);recovery.mkdir(parents=True,exist_ok=True)
+        client=Client(config['origin'],pathlib.Path(config['password_file']));summary={'version':args.version,'state':'running','mode':'accept_only','revision':revision,'agents':{},'all_targets_accepted':False};accept_lock=threading.Lock()
+        def save_recovery():rr.atomic_json(recovery/'summary.json',summary)
+        try:
+            client.login();inventory=client.tool('devices_list',{})
+            if inventory.get('gateway',{}).get('version')!=args.version:raise RuntimeError('gateway version does not match acceptance target')
+            current={d['device_id']:d for d in inventory['devices']}
+            binding={'version':args.version,'manifest':plan['manifest_sha256'],'acceptance_revision':revision}
+            def accept(ident):
+                agent=next(a for a in config['agents'] if a['device_id']==ident);device=current.get(ident)
+                if not device or not acceptance_ready(device,args.version,sha):
+                    return {'device_id':ident,'name':agent['name'],'state':'needs_recovery','phase':'preflight','recovery':'verify original updater/runtime; accept-only never installs'}
+                ad=recovery/ident;ad.mkdir(exist_ok=True);result={'device_id':ident,'name':agent['name'],'state':'running','phase':'standard'}
+                rr.atomic_json(ad/'status.json',result)
+                try:
+                    with rr.StepJournal(ad/'steps.json',{**binding,'device':ident}) as journal:
+                        def standard():
+                            report=ad/'standard.json';log=ad/'standard.log';cmd=['/opt/homebrew/bin/python3',str(package/'check-code-gateway.py'),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(report),'--run-id',acceptance_run_id(args.version,ident)+'-'+revision[:8],'--expected-version',args.version,'--dispatch-protocol','2','--device-id',ident]
+                            with log.open('x') as out:subprocess.run(cmd,cwd=root,stdout=out,stderr=subprocess.STDOUT,check=True,timeout=1200)
+                            value=json.loads(report.read_text());
+                            if value.get('state')!='passed' or value.get('test_oauth_grant_revoked') is not True:raise RuntimeError('standard acceptance incomplete')
+                            return {'state':'passed','report':str(report)}
+                        result['standard']=journal.step('standard',binding,standard);result['phase']='collaboration';rr.atomic_json(ad/'status.json',result)
+                        def collaboration():
+                            report=ad/'collaboration.json';log=ad/'collaboration.log';cmd=['/opt/homebrew/bin/python3',str(package/'check-collaboration.py'),'--config',str(args.config.resolve()),'--device-id',ident,'--version',args.version,'--report',str(report)]
+                            with log.open('x') as out:subprocess.run(cmd,cwd=root,stdout=out,stderr=subprocess.STDOUT,check=True,timeout=1200)
+                            value=json.loads(report.read_text());
+                            if value.get('state')!='passed' or value.get('temporary_oauth_revoked') is not True:raise RuntimeError('collaboration acceptance incomplete')
+                            return {'state':'passed','report':str(report)}
+                        result['collaboration']=journal.step('collaboration',binding,collaboration)
+                    result.update(state='accepted',phase='complete');rr.atomic_json(ad/'status.json',result);return result
+                except Exception as error:
+                    result.update(state='needs_recovery',failure_type=type(error).__name__,recovery='inspect this acceptance-only journal; do not reinstall');rr.atomic_json(ad/'status.json',result);return result
+            def update_accept(ident,value):
+                with accept_lock:summary['agents'][ident]=value;save_recovery()
+            outcomes=selected([a['device_id'] for a in config['agents']],accept,update_accept);summary['all_targets_accepted']=outcomes['all_targets_accepted'];summary['state']='accepted' if outcomes['all_targets_accepted'] else 'partial'
+        finally:
+            try:summary['temporary_oauth_revoked']=client.close()
+            except Exception:summary['temporary_oauth_revoked']=False;summary['all_targets_accepted']=False;summary['state']='partial'
+            save_recovery()
+        print(json.dumps({'state':summary['state'],'mode':'accept_only','all_targets_accepted':summary['all_targets_accepted'],'report':str(recovery/'summary.json')}),flush=True)
+        if not summary['all_targets_accepted']:raise SystemExit(1)
+        return
     state={'version':args.version,'state':'running','phase':'verified_inputs','targets':[x['device_id'] for x in config['agents']], 'manifest_sha256':plan['manifest_sha256'],'tests':plan['tests'],'agents':{},'all_targets_accepted':False};lock=threading.Lock()
     def save():rr.atomic_json(directory/'deployment.json',state)
     def command(argv,timeout=180):return subprocess.run(argv,cwd=root,check=True,capture_output=True,text=True,timeout=timeout).stdout

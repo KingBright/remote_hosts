@@ -55,6 +55,11 @@ class IterationPolicyTests(unittest.TestCase):
                 (iteration.ROOT/'artifact.tgz').write_bytes(b'x')
                 with self.assertRaisesRegex(ValueError, 'artifact'):
                     iteration.audit_commit_scope(['artifact.tgz'])
+                (iteration.ROOT/'Cargo.lock').write_text('version = 4')
+                iteration.audit_commit_scope(['Cargo.lock'])
+                (iteration.ROOT/'publish.lock').write_text('temporary')
+                with self.assertRaisesRegex(ValueError, 'artifact'):
+                    iteration.audit_commit_scope(['publish.lock'])
                 (iteration.ROOT/'evidence.json').write_text(
                     '{"download_url":"https://example.test/files/'+'a'*64+'/x"}')
                 with self.assertRaisesRegex(ValueError, 'bearer'):

@@ -75,11 +75,12 @@ def check_json(paths):
 
 def audit_commit_scope(paths):
     """Reject common generated release blobs and private bearer capabilities."""
-    forbidden_suffixes = ('.tgz', '.tar.gz', '.lock', '.sqlite', '.sqlite3')
+    forbidden_suffixes = ('.tgz', '.tar.gz', '.sqlite', '.sqlite3')
     bearer = re.compile(r"https://[^\s\"'<>]+/files/[0-9a-f]{24,}(?:/|$)", re.IGNORECASE)
     for name in paths:
         lower = name.lower()
-        if lower.endswith(forbidden_suffixes) or 'agent-package.tgz' in lower:
+        if (lower.endswith(forbidden_suffixes) or 'agent-package.tgz' in lower
+                or (lower.endswith('.lock') and pathlib.PurePosixPath(name).name != 'Cargo.lock')):
             raise ValueError('generated/private release artifact must not be committed: '+name)
         path = ROOT/name
         if not path.is_file() or path.stat().st_size > 2*1024*1024:

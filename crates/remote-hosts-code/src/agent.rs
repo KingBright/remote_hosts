@@ -455,8 +455,19 @@ impl Agent {
     }
     async fn heartbeat_loop(&self, client: &reqwest::Client, hello: &DeviceHello) -> Result<()> {
         let mut acknowledged_terminal_fingerprint = String::new();
+        let mut last_reconcile = tokio::time::Instant::now() - Duration::from_secs(30);
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            if last_reconcile.elapsed() >= Duration::from_secs(15) {
+                match self.terminals.reconcile_orphans(30).await {
+                    Ok(count) if count > 0 => {
+                        tracing::warn!(count, "reconciled orphaned terminal state")
+                    }
+                    Ok(_) => {}
+                    Err(_) => tracing::warn!("terminal state reconciliation failed; will retry"),
+                }
+                last_reconcile = tokio::time::Instant::now();
+            }
             let active = self.active.list()?;
             let terminals = crate::terminal_sync::collect(&self.store)
                 .await

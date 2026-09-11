@@ -23,6 +23,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class CandidateProcessError(RuntimeError):
+    """The selected candidate process stopped or changed identity during readiness."""
+
+
 class GatewayObservationError(RuntimeError):
     """Only allowlisted diagnostics, never request URLs, headers or exception text."""
     def __init__(self, diagnostic):
@@ -153,34 +157,76 @@ def sample_identity(local, remote, version, after, gateway_baseline, require_lan
     return local['pid'], remote['session'], local.get('runs')
 
 
-def wait_ready(base, config, version, after, gateway_baseline, timeout=120,
-               stable_seconds=15, require_lanes=True, previous_session=None):
-    """Require stable identity AND continuing remote/local poll progress.
+def _same_local_candidate(local, identity, version, after):
+    if identity is None:
+        return False
+    build = local.get('build', {})
+    ready = local.get('readiness', {})
+    return (local.get('running') is True and local.get('pid') == identity[0]
+            and build.get('pid') == identity[0] and build.get('version') == version
+            and type(build.get('started_at')) is int and build['started_at'] >= after
+            and ready.get('pid') == identity[0] and ready.get('session') == identity[1]
+            and ready.get('version') == version)
 
-    Observing one cached successful sample repeatedly does not prove health.
-    Every lane must acknowledge another poll within the same identity window.
+
+def wait_ready(base, config, version, after, gateway_baseline, timeout=240,
+               stable_seconds=15, require_lanes=True, previous_session=None,
+               transient_grace_seconds=45, dead_process_grace_seconds=10):
+    """Require stable identity and continued poll progress without flapping on brief outages.
+
+    Cached samples never count as progress. Once a candidate identity has been
+    observed, a bounded transient transport/poll gap may preserve that identity;
+    final success still requires fresh gateway and lane advancement afterwards.
+    A genuinely stopped/replaced candidate fails much earlier than the overall
+    network grace window, while rollback remains the caller's responsibility.
     """
-    if timeout <= stable_seconds or stable_seconds < 1:
+    if (timeout <= stable_seconds or stable_seconds < 1
+            or transient_grace_seconds < 0 or dead_process_grace_seconds < 1):
         raise ValueError('invalid readiness time bounds')
+    room = max(1, timeout-stable_seconds-1)
+    transient_grace_seconds = min(transient_grace_seconds, room)
+    dead_process_grace_seconds = min(dead_process_grace_seconds, room)
     deadline = time.monotonic() + timeout
     stable_since = previous = first_seen = None
     first_lanes = {}
     samples = 0
     last_error = 'not_ready'
+    interruption_since = dead_since = None
+    transient_interruptions = 0
+    max_transient_gap = 0.0
+    last_transient_category = None
     while time.monotonic() < deadline:
+        now_mono = time.monotonic()
         try:
             local = local_observation(base)
+            if previous is not None and local.get('running') is not True:
+                dead_since = dead_since or now_mono
+                last_error = 'candidate_process_not_running'
+                if now_mono-dead_since >= dead_process_grace_seconds:
+                    raise CandidateProcessError('readiness_candidate_not_running')
+                time.sleep(1)
+                continue
+            dead_since = None
             remote = gateway_observation(config, attempts=1)
             identity = sample_identity(local, remote, version, after, gateway_baseline,
                                        require_lanes, previous_session=previous_session)
             if identity is not None:
                 lanes = local.get('readiness', {}).get('lanes', {})
                 if identity != previous:
-                    stable_since = time.monotonic()
+                    stable_since = now_mono
                     samples = 0
                     first_seen = remote['last_seen']
                     first_lanes = dict(lanes)
+                elif interruption_since is not None:
+                    gap = now_mono-interruption_since
+                    max_transient_gap = max(max_transient_gap, gap)
+                    if gap > transient_grace_seconds:
+                        stable_since = now_mono
+                        samples = 0
+                        first_seen = remote['last_seen']
+                        first_lanes = dict(lanes)
                 previous = identity
+                interruption_since = None
                 samples += 1
                 advanced_lanes = sorted(lane for lane in LANES
                     if lanes.get(lane, 0) > first_lanes.get(lane, 0))
@@ -194,20 +240,49 @@ def wait_ready(base, config, version, after, gateway_baseline, timeout=120,
                             'stable_seconds': time.monotonic()-stable_since, 'samples': samples,
                             'gateway_seen_advanced': True, 'advanced_lanes': advanced_lanes,
                             'all_lanes_verified': require_lanes,
+                            'transient_interruptions': transient_interruptions,
+                            'max_transient_gap_seconds': max_transient_gap,
+                            'last_transient_category': last_transient_category,
                             'functional_acceptance': 'separate_required_gate'}
                 last_error = 'waiting_for_continued_poll_progress'
+            elif previous is not None and _same_local_candidate(local, previous, version, after):
+                if interruption_since is None:
+                    interruption_since = now_mono
+                    transient_interruptions += 1
+                if now_mono-interruption_since > transient_grace_seconds:
+                    previous = stable_since = None
+                    samples = 0
+                last_error = 'candidate_alive_waiting_for_poll_recovery'
             else:
                 previous = stable_since = None
+                interruption_since = None
                 samples = 0
                 last_error = 'pid_session_or_poll_acknowledgements_not_ready'
         except GatewayObservationError as error:
-            previous = stable_since = None
-            samples = 0
             last_error = 'gateway_'+error.diagnostic['category']
             if not error.diagnostic['retryable']:
                 raise
+            last_transient_category = error.diagnostic['category']
+            if previous is not None:
+                try:
+                    local = local_observation(base)
+                except Exception:
+                    local = {}
+                if _same_local_candidate(local, previous, version, after):
+                    if interruption_since is None:
+                        interruption_since = now_mono
+                        transient_interruptions += 1
+                    if now_mono-interruption_since <= transient_grace_seconds:
+                        time.sleep(1)
+                        continue
+            previous = stable_since = None
+            interruption_since = None
+            samples = 0
+        except CandidateProcessError:
+            raise
         except Exception:
             previous = stable_since = None
+            interruption_since = None
             samples = 0
             last_error = 'local_observation_unavailable'
         time.sleep(1)
