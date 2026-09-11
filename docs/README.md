@@ -11,7 +11,7 @@
 - [ChatGPT Code Gateway](chatgpt-code-gateway.md)：OAuth/MCP 网关、设备 Agent、代码/终端/文件能力。
 - [产品迭代流程](product/README.md)：问题清单、验证、自动发布与验收纪律。
 - [统一问题清单](product/BACKLOG.md)：所有 RH 编号问题的阅读版，事实源是 `product/backlog.json`。
-- [0.5.0 路线图](product/ROADMAP-0.5.0.md)：协作效率、独立发布、变更集、批量同步和宿主能力闭环。
+- [0.5.0 路线图](product/ROADMAP-0.5.0.md)：历史规划与设计依据；当前执行重点见 `product/NEXT.md`。
 
 ## 平台与基础设施
 
@@ -28,7 +28,7 @@
 - `deployment*.json`：真实安装/运行/验收状态。
 - 设备子目录：该目标的升级器、验收和恢复证据。
 
-当前代码网关版本为 **0.5.0**，NAS、MacBook 与 Mac Studio 均已在线运行 0.5.0。固定源码快照通过 338 项测试；首次自动标准验收因 run-id 格式 bug 未执行，该 bug 已修复并有回归测试。完整验收重跑仍必须以实际执行回执为准。
+当前代码网关版本为 **0.7.1**，NAS、MacBook 与 Mac Studio 均已在线运行 0.7.1。固定源码快照通过 **348 项测试、0 失败**；两台 Mac 的原生代码/终端验收通过，9,089,298 字节真实文件通道往返验证了 4 MiB checkpoint 恢复。当前宿主 `file_*` schema 仍限制 64 MiB，因此 >64 MiB 的宿主原生现场往返仍单独保留为未验收边界。详见 [0.7.1 发布证据](releases/0.7.1/RELEASE.md)。
 
 ## 文档纪律
 

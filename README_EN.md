@@ -21,7 +21,7 @@ The project optimizes for four things: **low interaction cost, recoverable execu
 
 The `remote-hosts-code` service runs a NAS-side OAuth/MCP gateway plus outbound agents on selected computers. The gateway never exposes a local operator API directly; each device owns its own credential and permitted roots.
 
-Current 0.5.0 capabilities include:
+Current 0.7.1 capabilities include:
 
 - Version-bound workspaces, bounded code listing/search/reads and syntax-tree symbol ranges.
 - Optimistic, journaled multi-file text edits with conflict detection.
@@ -32,10 +32,13 @@ Current 0.5.0 capabilities include:
 - **Workspace event handoff**: bounded per-workspace state transitions with replay cursors, plus terminal/transfer summaries for reconnecting conversations.
 - **Maintenance drain protocol** for upgrades: stop admitting new execution while status/control/result delivery remains available; existing work is allowed to drain instead of being killed.
 - Stable structured diagnostics with an error code, stage, outcome and recovery action rather than opaque `tool_failed` text.
+- **Durable change sets and safe recovery**: multi-file edits retain before/after versions and `change_resume` continues only files whose state is still provably safe.
+- **Explicit workspace GC**: preview is bound to a candidate fingerprint before apply; active work and small idempotency records remain protected.
+- **Negotiated large-file capability**: the default stays 64 MiB, while 0.7+ agents can explicitly negotiate requests up to 256 MiB with a 256 MiB local free-space reserve. Source authorization reports available / expired / required states.
 - Capability/schema fingerprints so clients can detect that their cached tool catalog is stale.
 - Optional compact text responses while structured content remains complete.
 
-The server currently advertises 19 code-gateway tools. A ChatGPT conversation can still expose fewer tools when the host keeps an older approved schema snapshot; server capability and host-visible capability are intentionally reported separately.
+The server currently advertises 21 code-gateway tools. A ChatGPT conversation can still expose fewer tools when the host keeps an older approved schema snapshot; server capability and host-visible capability are intentionally reported separately.
 
 ## Architecture
 
@@ -111,11 +114,13 @@ Remote Hosts treats an acknowledgement, an execution result, an installation, an
 
 ## Current release
 
-The validated 0.5.0 source snapshot passed **338 tests (230 Rust + 108 Python, 0 failed)** plus formatting, strict Clippy, workspace checks and both release builds. The NAS gateway, MacBook and Mac Studio are currently online and report **0.5.0**.
+The validated 0.7.1 source snapshot passed **348 tests (238 Rust + 110 Python, 0 failed)** plus formatting, strict Clippy, workspace checks and both release builds. The NAS gateway, MacBook and Mac Studio are online and report **0.7.1**.
 
-The first automated standard-acceptance pass did not run because the publisher generated a run ID containing dots from semantic version `0.5.0`, while the acceptance tool permits only alphanumeric characters and hyphens. The generator is fixed and covered by a regression test. A later attempt to run the full acceptance bundle from this conversation was blocked by the host before execution, so the release record correctly distinguishes **running 0.5.0** from **fully accepted 0.5.0**.
+The live rollout found a real cross-version receiver bug: an older 0.6 agent could write chunk bytes successfully, then receive permanent HTTP 409 when durable offset persistence failed. 0.7.1 maps database/IO persistence failures to retryable 5xx while retaining 409 for true integrity conflicts. A subsequent **9,089,298-byte** live export retried once, resumed from the **4 MiB checkpoint**, reached the exact SHA-256, and was then imported successfully to Studio.
 
-See [0.5.0 release evidence](docs/releases/0.5.0/RELEASE.md).
+Both Macs passed native code create/read/symbol/idempotent-edit/terminal/cleanup checks. The automated acceptance script also had an obsolete whole-object idempotency assertion that included live `operation_lifecycle`; that harness bug is fixed and **112 Python tests** pass. A full wrapper rerun from this conversation was blocked by the host before execution, so it is not counted as passed. This conversation's host-visible `file_*` schema still caps requests at 64 MiB, leaving a native host **>64 MiB live round trip** as a separate next gate.
+
+See [0.7.1 release evidence](docs/releases/0.7.1/RELEASE.md).
 
 ## Development and release
 
@@ -167,7 +172,7 @@ Start from [Documentation Index](docs/README.md). Important references:
 - [Product Backlog](docs/product/BACKLOG.md)
 - [Product Workflow](docs/product/README.md)
 - [0.5.0 Roadmap](docs/product/ROADMAP-0.5.0.md)
-- [0.5.0 Release Evidence](docs/releases/0.5.0/RELEASE.md)
+- [0.7.1 Release Evidence](docs/releases/0.7.1/RELEASE.md)
 - [Windows Installation and Operations](docs/windows.md)
 
 ## Security summary

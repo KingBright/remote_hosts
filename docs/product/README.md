@@ -20,9 +20,9 @@ python3 scripts/product-backlog.py --render --check
 
 ## 当前版本边界
 
-0.5.0 是当前主版本：在 0.4.x 已完成的双向持久续传、授权刷新、取消和 `workspace_context` 基础上，进一步加入按目标独立发布/排空、终端状态复制、Workspace 事件接续、完整变更审查、Manifest 文件集同步、结构化诊断与 compact response。
+0.7.1 是当前主版本：在 0.5 的独立发布、Workspace 事件、完整 diff 和 Manifest 同步基础上，0.6 加入 operation lifecycle、持久 change-set / `change_resume` 与显式 `workspace_gc`；0.7 再加入默认 64 MiB、显式协商最高 256 MiB 的传输能力和文件源授权状态。
 
-0.5.0 固定源码快照通过 338 项测试、0 失败，NAS、MacBook 与 Mac Studio 均已实际运行 0.5.0。首次自动标准验收因发布器 `run-id` 含语义版本点号而在验收器入口失败；该生成逻辑已修复并通过专门回归测试。后续完整验收从当前对话发起时被宿主在执行前拦截，因此运行状态与完整现场验收状态继续分开记录。
+0.7.1 固定源码快照通过 348 项测试、0 失败，NAS、MacBook 与 Mac Studio 均实际运行 0.7.1。发布现场抓到并修复了旧 Agent → 新 Gateway 的暂态持久化错误被误报永久 409 的问题；修复后真实 9,089,298 字节导出发生一次 checkpoint 恢复并最终 SHA 一致。两台 Mac 的原生代码/终端验收通过；当前宿主 schema 尚未暴露 >64 MiB 文件参数，因此该项继续作为明确未验收边界。
 
 目标版本永远是规划，不是完成承诺。已知数据损坏、身份隔离、错误副作用重放或不可恢复发布风险属于上线阻塞项；明确的非阻塞功能缺口可以留在 backlog 中继续迭代。
 
@@ -36,18 +36,24 @@ python3 scripts/product-backlog.py --render --check
 
 ## 稳定构建与发布入口
 
-先使用 `scripts/source_snapshot.py` 建立本轮固定快照，再用 `scripts/release-code.py --snapshot <快照目录> --report <本轮报告.json>` 在稳定构建槽中依次验证、构建和打包。获取进度时使用 `--status --report <原报告.json>`，不要重复启动整条命令。
+默认从 `scripts/iteration-code.py` 进入。它根据变更路径自动选择 `docs / release_python / runtime` 三档门禁，记录统一 iteration report；只有 runtime 变化才创建固定源码快照并调用 `release-code.py` 的完整 Rust/Python/workspace + 双平台 release 流水线。验证通过后默认直接 commit + push `main`，再按显式配置调用 `publish-code.py`。
 
-同一报告不覆盖，同槽忙时返回原持有者。首次独立缓存需要冷构建，缓存复用不等于跳过测试。构建完成后由 `scripts/publish-code.py` 读取已验证 pipeline 和显式部署配置，先升级网关，再并行推进每台 Agent 的独立发布状态机。一个目标失败只影响自己的验收状态。
+```sh
+python3 scripts/iteration-code.py --report target/iteration-runs/<id>/iteration.json --commit-message 'feat(code): ...'
+```
 
-源码必须有可追溯 Git 基线；固定源码归档不是长期替代 Git 的理由。发布配置、密码、运行数据库、缓存和大型临时二进制不应进入提交。下一轮功能优先级见 `NEXT.md`；实际状态以 `backlog.json` 为准。
+获取进度使用同一个 report 的 `--status`，需要时附 `--publish-status-dir`；不要重新启动原 build/publish。底层 `source_snapshot.py`、`release-code.py` 和 `publish-code.py` 仍保留为可独立诊断的分层组件。同一报告不覆盖，同槽忙时返回原持有者，缓存复用不等于跳过测试。
+
+完整复盘和新纪律见 [`ITERATION-EFFICIENCY.md`](ITERATION-EFFICIENCY.md)。
+
+源码必须有可追溯 Git 基线；固定源码归档不是长期替代 Git 的理由。发布配置、密码、运行数据库、缓存和大型临时二进制不应进入提交。功能范围先锁定、最终候选再改版本号，避免每个小补丁都触发无意义的全量重链接。下一轮功能优先级见 `NEXT.md`；实际状态以 `backlog.json` 为准。
 
 ## 发布证据
 
-当前版本说明：`docs/releases/0.5.0/RELEASE.md`。
-固定输入/构建流水线：`target/iteration-050-s5/pipeline.json`，正式提交只保存可长期复现的源码与必要文档，不依赖 target 目录作为长期事实源。
-运行发布：`docs/releases/0.5.0/publish-s5/deployment.json`，分别记录网关、MacBook、Studio 的真实安装/验收状态。
-源码交付基线：`e6b68417f01850e37b5c53394002670dffadbf6c`；后续文档/修复另行提交，不改写历史提交。
+当前版本说明：`docs/releases/0.7.1/RELEASE.md`。
+固定输入/构建流水线：`target/iteration-071-a2/pipeline.json`，长期事实以源码提交、manifest 哈希和 `docs/releases/0.7.1/` 证据为准，不依赖 target 目录永久存在。
+最终运行状态：`docs/releases/0.7.1/deployment-final.json`；原 publisher 的 partial 记录仍保留为历史证据，不覆盖失败过程。
+源码提交：`1bbaf74`（0.7.0 主线）、`7071d9d`（0.7.1 receiver hotfix）、`2b1619c`（验收器动态 lifecycle 修复）。
 现场验收只有实际执行成功才可标 passed；宿主在执行前拦截、run-id 参数验证失败等情况必须保持未执行/失败状态。
 
 工具平台拒绝某个操作时，记录为“未执行/外部阻塞”，不把它记为测试失败，也不通过改名或包装等价操作绕过。其余独立、正常授权的工作仍可继续。

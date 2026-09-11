@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "version": "0.7.1",
+  "state": "selected_targets_deployed_native_acceptance_passed",
+  "manifest_sha256": "5945696eba2a1ecc19a2a3da74e1b1706ef83c6d404b8e36d42ba69d2aafca36",
+  "snapshot_id": "c10c0d4e424b2b2f410fa57b065ac01b4c10903915ad79c8cda9f4a77b4d1312",
+  "validation": {
+    "passed": 348,
+    "failed": 0,
+    "rust_passed": 238,
+    "python_passed": 110,
+    "format": "passed",
+    "strict_clippy": "passed",
+    "workspace_check": "passed",
+    "macos_release": "passed",
+    "linux_release": "passed"
+  },
+  "gateway": {
+    "version": "0.7.1",
+    "pid": 9557,
+    "installed_sha256": "e940cb24d09fdc9cdb8d8ecdad60324c54b8492d829f8713f26f392973d2257d",
+    "transfer_limits_protocol": 1,
+    "default_file_bytes": 67108864,
+    "max_file_bytes": 268435456,
+    "storage_reserve_bytes": 268435456
+  },
+  "agents": {
+    "MacBook-M2-Max": {
+      "version": "0.7.1",
+      "pid": 58852,
+      "installed_sha256": "c1fb187610e97e01e6e5a5ea2019f9c412aed86101b3c9bdde9318c1b2ed7bb4",
+      "samples": 10,
+      "stable_seconds": 22.575340708019212,
+      "all_lanes_verified": true,
+      "maintenance_released": true,
+      "native_acceptance": "passed"
+    },
+    "Mac-Studio": {
+      "version": "0.7.1",
+      "pid": 54296,
+      "installed_sha256": "c1fb187610e97e01e6e5a5ea2019f9c412aed86101b3c9bdde9318c1b2ed7bb4",
+      "samples": 9,
+      "stable_seconds": 22.260773500427604,
+      "all_lanes_verified": true,
+      "maintenance_released": true,
+      "native_acceptance": "passed",
+      "recovery_notes": [
+        "initial publisher updater stopped before install because a stale browser-test terminal was still marked running",
+        "first fresh retry hit a transient all-lane polling outage and rolled back successfully",
+        "next fresh one-shot updater completed normally"
+      ]
+    }
+  },
+  "transfer_live_acceptance": {
+    "bytes": 9089298,
+    "sha256": "dc4b0ddecc55110be8aab02049ab6b89bcfdfdbfe41046cbafc8e546242fd059",
+    "device_to_gateway_operation": "9e1717bf-20be-4b9f-9fa8-e8219d842cbf",
+    "gateway_to_studio_operation": "c7784092-8680-4a48-ab7c-9e0eaf7640f4",
+    "checkpoint_resume_observed": true,
+    "resumed_bytes": 4194304,
+    "retry_count": 1
+  },
+  "explicit_nonclaims": [
+    "the full OAuth/MCP wrapper rerun was blocked before execution by the host safety check",
+    "the current host-visible file tool schema still caps max_bytes at 64 MiB, so a native host >64 MiB roundtrip is not claimed"
+  ]
+}

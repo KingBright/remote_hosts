@@ -1,12 +1,12 @@
 # ChatGPT unified code gateway
 
-**2026-09-11 current release status:** the NAS gateway, MacBook and Mac Studio are all online and report **0.5.0**. The fixed 0.5.0 source snapshot passed 230 Rust and 108 Python tests, 338 total with 0 failures, plus format, strict Clippy, workspace checks and both release builds.
+**2026-09-11 current release status:** the NAS gateway, MacBook and Mac Studio are all online and report **0.7.1**. The fixed 0.7.1 source snapshot passed 238 Rust and 110 Python tests, **348 total with 0 failures**, plus format, strict Clippy, workspace checks and both release builds.
 
-0.5.0 adds independent per-target release/drain, terminal status replication into operation observation, bounded workspace event replay, complete Git/untracked review, manifested file-set synchronization, structured recovery diagnostics, compact text responses and explicit host/schema capability reporting. See `docs/releases/0.5.0/RELEASE.md` and `docs/product/ROADMAP-0.5.0.md`.
+0.6 adds operation lifecycle timing, durable change-set recovery and bounded workspace GC. 0.7 adds negotiated transfer limits (64 MiB default, up to 256 MiB on capable agents), explicit source-authorization state and disk-reserve guards. 0.7.1 fixes a live cross-version receiver failure where internal persistence errors were incorrectly treated as permanent HTTP 409 conflicts. See `docs/releases/0.7.1/RELEASE.md`.
 
-The first automated standard-acceptance attempt failed before the test body because the publisher used semantic version `0.5.0` inside a run ID whose validator permits only alphanumeric characters and hyphens. The run-ID generator is now fixed and has a regression test. A later full acceptance invocation from the current conversation was blocked by the host before execution, so running 0.5.0 is not silently promoted to fully accepted 0.5.0.
+Live release evidence includes a 9,089,298-byte device→Gateway transfer that retried once and resumed from a 4 MiB checkpoint, followed by an exact-SHA Gateway→Studio import. Both Macs also passed native create/read/symbol/idempotent-edit/terminal/cleanup probes. The full OAuth/MCP wrapper rerun was blocked before execution by the host safety check, so that wrapper is not claimed as passed.
 
-The current ChatGPT conversation may still retain an older input schema. Native `devices_list` reports the server catalog as 19 tools, while a host can expose fewer tools from a cached approved snapshot. Direct MCP support and host-visible support are separate facts; a missing client catalog hash is not proof of compatibility, and the server cannot force the host to refresh its tool snapshot.
+The current ChatGPT conversation still exposes an older file-tool parameter cap: native `devices_list` reports a 21-tool server catalog and 256 MiB negotiated hard limit, while the host-visible `file_upload/file_download.max_bytes` remains capped at 64 MiB. Server capability, agent capability and host-visible schema are separate facts; the server cannot force the host to refresh its tool snapshot.
 
 Remote Hosts now includes the `remote-hosts-code` executable with two roles:
 

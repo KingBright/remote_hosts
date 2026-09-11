@@ -2,11 +2,11 @@
 
 > 唯一事实源：`docs/product/backlog.json`。本页由 `scripts/product-backlog.py --render` 生成。
 
-更新日期：2026-09-11。共 50 项。
+更新日期：2026-09-11。共 52 项。
 
 已验证候选不等于线上修复；部分修复不能关闭整项。关闭必须附本项验收证据。
 
-状态汇总：未修复 11；部分修复 19；候选已验证 12；外部阻塞 1；已验收关闭 7。
+状态汇总：未修复 10；部分修复 21；候选已验证 13；外部阻塞 1；已验收关闭 7。
 
 ## 版本规划
 
@@ -29,6 +29,12 @@
 **0.3.6**：隔离验证强制中断后的构建清理；启动文件跨进程恢复主线，避免继续扩大构建框架
 
 **0.4.1**：恢复控制、授权刷新与回执代际、准确取消进度、范围下载、工作区分页、发布输入/原回执门禁
+
+**0.6.0**：统一任务生命周期观察、持久change-set安全恢复与可预览Workspace GC。
+
+**0.7.0**：文件通道大步升级：协商式大文件、授权状态、存储余量保护与真实传输验收。
+
+**0.7.1**：修复跨版本接收端暂态持久化错误被误报永久409；补齐发布/验收器动态观察字段边界。
 
 ## 问题索引
 
@@ -56,7 +62,7 @@
 | RH-020 | P1 | 已验收关闭 | 0.3.1 | 超长单行读取无法推进及部分读取可用性 |
 | RH-021 | P2 | 未修复 | 0.5.0 | 搜索分页与语法范围缺少增量缓存 |
 | RH-022 | P1 | 候选已验证 | 0.3.3 | Store.list固定1000上限没有完整性提示 |
-| RH-023 | P1 | 未修复 | 0.4.0 | 过期对象与崩溃staging的清理/容量 |
+| RH-023 | P1 | 部分修复 | 0.6.0 | 过期对象与崩溃staging的清理/容量 |
 | RH-024 | P1 | 部分修复 | 0.3.4 | 任务回执outbox及dispatch会话fencing |
 | RH-025 | P1 | 部分修复 | 0.3.1 | 源码/构建/已安装/实际运行版本未统一 |
 | RH-026 | P1 | 已验收关闭 | 0.3.3 | 验证证据自动生成并绑定源码 |
@@ -66,11 +72,11 @@
 | RH-030 | P0 | 外部阻塞 | 0.3.3 | 工具平台安全拦截的可见性与授权边界 |
 | RH-031 | P1 | 未修复 | 0.3.1 | CI故障注入、跨平台和原生网页验收门禁 |
 | RH-032 | P2 | 未修复 | 0.5.0 | 快照和重复hash读取成本、内容寻址缓存 |
-| RH-033 | P2 | 未修复 | 0.5.0 | 64 MiB限制提高与动态容量协商 |
+| RH-033 | P2 | 部分修复 | 0.7.1 | 64 MiB限制提高与动态容量协商 |
 | RH-034 | P1 | 未修复 | 0.3.1 | 过程反馈与产品负责人使用纪律 |
 | RH-035 | P1 | 部分修复 | 0.3.2 | 工具与协议能力发现、schema变更兼容 |
 | RH-036 | P1 | 未修复 | 0.4.0 | 源码脚本与安全策略的真实边界 |
-| RH-037 | P1 | 未修复 | 0.4.0 | 多文件改动的部分失败和恢复记录 |
+| RH-037 | P1 | 候选已验证 | 0.6.0 | 多文件改动的部分失败和恢复记录 |
 | RH-038 | P1 | 已验收关闭 | 0.3.5 | 构建资源竞争与长编译无进展反馈 |
 | RH-039 | P1 | 部分修复 | 0.4.0 | 任务取消/终端结束和清理结果混淆 |
 | RH-040 | P2 | 部分修复 | 0.4.1 | SQLite热点及轮询调度索引精修 |
@@ -84,6 +90,8 @@
 | RH-049 | P1 | 候选已验证 | 0.5.0 | code_diff未明确未跟踪文件的审查缺口 |
 | RH-050 | P1 | 候选已验证 | 0.5.0 | 缺少有清单、预览与逐文件回执的批量文件集同步 |
 | RH-047 | P0 | 部分修复 | 0.4.2 | 发布等待器缺少构建任务身份核对，启动确认被误当作交付进展 |
+| RH-051 | P1 | 未修复 | 0.8.0 | 终端进程与持久状态失配会长期阻塞升级排空 |
+| RH-052 | P1 | 未修复 | 0.8.0 | 升级就绪把短时全lane网络故障误判成候选失败 |
 
 ## 逐项验收
 
@@ -401,15 +409,15 @@
 
 ### RH-023 · 过期对象与崩溃staging的清理/容量
 
-**P1 / 未修复 / 0.4.0**
+**P1 / 部分修复 / 0.6.0**
 
 现象与范围：当前惰性清理，原始日志有长期保留；部分跨进程staging可能遗留；慢活跃对象不能被清理误删。
 
-当前处理：显式保留策略、活动租约保护、字节/对象/临时文件配额、可预览GC。
+当前处理：0.6.0已实现workspace_gc preview/apply、preview_id绑定、活动/可恢复对象保护和legacy记录保护；固定快照回归验证通过。断电遗留、长期配额和更多生产清理矩阵仍需继续验收，因此保持partial。
 
 验收：空闲后可回收过期对象；活跃慢传输不误删；断电遗留可识别；隐私说明不承诺物理擦除。
 
-证据或实现位置：`crates/remote-hosts-code/src/transfers.rs`、`crates/remote-hosts-code/src/store.rs`
+证据或实现位置：`crates/remote-hosts-code/src/transfers.rs`、`crates/remote-hosts-code/src/store.rs`、`crates/remote-hosts-code/src/storage_gc.rs`、`docs/releases/0.7.1/RELEASE.md`
 
 依赖：RH-007
 
@@ -547,15 +555,15 @@
 
 ### RH-033 · 64 MiB限制提高与动态容量协商
 
-**P2 / 未修复 / 0.5.0**
+**P2 / 部分修复 / 0.7.1**
 
 现象与范围：当前单文件64MiB、网关512MiB；直接提高会放大恢复和磁盘问题。
 
-当前处理：续传与GC稳定后按设备协商256MiB或更高，默认值和错误返回一致。
+当前处理：0.7.1已实现默认64MiB、capable Agent显式协商最高256MiB、4MiB checkpoint和256MiB本地存储余量门禁；Gateway与两台Agent均现场上报能力。当前ChatGPT会话宿主file工具schema仍把max_bytes限制在64MiB，故>64MiB宿主原生现场往返尚未完成，不能关闭。
 
 验收：低速大文件+断线+并发+低磁盘可靠通过；不可仅提高schema常数。
 
-证据或实现位置：`crates/remote-hosts-code/src/tools.rs`、`crates/remote-hosts-code/src/transfers.rs`
+证据或实现位置：`crates/remote-hosts-code/src/tools.rs`、`crates/remote-hosts-code/src/transfers.rs`、`crates/remote-hosts-code/tests/support/scale_070.rs`、`docs/releases/0.7.1/native-acceptance.json`、`docs/releases/0.7.1/deployment-final.json`
 
 依赖：RH-007、RH-023
 
@@ -579,11 +587,11 @@
 
 现象与范围：ChatGPT工具目录可能仍缓存旧描述；包版本不能表达所有功能/限制。
 
-当前处理：devices_list已现场返回网关工具目录SHA及可选入参，客户端旧hash比较正确提示mismatch；Agent功能单独鉴权上报，Studio旧版明确not_reported。宿主刷新不能由服务器强制，未提供hash时不能解读成schema匹配。
+当前处理：Gateway当前报告21项工具、工具SHA和可选入参，两台0.7.1 Agent独立上报runtime features与transfer_limits。当前宿主仍暴露file_*的64MiB旧参数上限，因此server catalog / Agent capability / host-visible schema三者已能明确区分，但宿主刷新仍不能由服务器强制。
 
 验收：新Gateway旧Agent与新Agent旧Gateway行为明确；无静默忽略lane导致错调度。
 
-证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`crates/remote-hosts-code/src/gateway.rs`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`
+证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`crates/remote-hosts-code/src/gateway.rs`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`、`docs/releases/0.7.1/native-acceptance.json`、`docs/releases/0.7.1/RELEASE.md`
 
 依赖：无
 
@@ -603,15 +611,15 @@
 
 ### RH-037 · 多文件改动的部分失败和恢复记录
 
-**P1 / 未修复 / 0.4.0**
+**P1 / 候选已验证 / 0.6.0**
 
 现象与范围：当前逐文件原子但不是整批事务；异常后的恢复计划依赖模型读journal。
 
-当前处理：继续预检与版本保护，返回结构化已完成/未完成项和恢复动作，不能默认全回滚覆盖外部改动。
+当前处理：0.6.0已把多文件编辑变成持久change-set：记录before/after版本、已应用项和冲突；change_resume只在目标仍等于before时继续，等于after视为已完成，第三种版本保留用户修改并标冲突。重启/部分失败回归已进入完整验证。
 
 验收：第N文件失败时先前结果准确；重试不覆盖并发用户编辑；恢复证据可机器判断。
 
-证据或实现位置：`crates/remote-hosts-code/src/files.rs`
+证据或实现位置：`crates/remote-hosts-code/src/files.rs`、`docs/releases/0.7.1/RELEASE.md`
 
 依赖：无
 
@@ -798,5 +806,33 @@
 验收：发布入口必须绑定实际构建任务标识或已经校验的产物；缺少生产者时立即返回明确needs_build，不对不存在的结果无意义等待一小时。；分别记录格式、静态检查、功能测试、构建、安装和现场验收；未运行门禁不得显示通过，started不得映射为upgraded。；格式修正后从新固定快照通过全部门禁，发布网关与两台Mac并核对每台实际版本和验收回执，不重复安装已成功目标。
 
 证据或实现位置：`target/iteration-040-n2/publish.py`、`docs/releases/0.4.0/deployment-n2.json`、`target/iteration-040-p1/pipeline.json`、`target/iteration-040-p1/pipeline-logs/verification.json`、`docs/releases/0.4.0/verify-p1/verification.json`、`docs/releases/0.4.0/verify-p1/VERIFICATION.md`、`docs/releases/0.4.0/deployment.json`、`docs/releases/0.4.0/verification-q1.json`、`docs/releases/0.4.0/deployment-q1-before-receipt-recovery.json`、`docs/releases/0.4.0/workflow-acceptance-q1.json`、`target/iteration-040-q1/accept-completed-upgrades.py`、`docs/releases/0.4.1/verification.json`、`docs/releases/0.4.1/deployment.json`、`docs/releases/0.4.1/incidents.json`
+
+依赖：无
+
+### RH-051 · 终端进程与持久状态失配会长期阻塞升级排空
+
+**P1 / 未修复 / 0.8.0**
+
+现象与范围：Studio发布时网关任务已完成，但本地terminal仍长期标记running，maintenance drain因此认为设备持续繁忙并拒绝安装。
+
+当前处理：本轮通过精确识别原terminal并使用terminal_cancel安全收口后完成升级。下一版需在Agent启动/周期对账中识别已死亡、孤儿化或网关已终态的terminal并安全封口，避免依赖人工诊断。
+
+验收：进程已退出或对应网关任务已终态时，陈旧running terminal在有界时间内自动对账；仍真实运行的terminal绝不误杀；升级排空不被历史幽灵状态永久阻塞。
+
+证据或实现位置：`docs/releases/0.7.1/RELEASE.md`、`docs/releases/0.7.1/deployment-final.json`
+
+依赖：无
+
+### RH-052 · 升级就绪把短时全lane网络故障误判成候选失败
+
+**P1 / 未修复 / 0.8.0**
+
+现象与范围：Studio候选0.7.1已切换服务后，五个lane短时均无法poll Gateway，updater等待continued poll progress超时并回滚；网络恢复后同SHA fresh job正常升级。
+
+当前处理：现有回滚机制有效且保住0.6.0。下一版要区分候选进程失败与Gateway/网络暂时不可达，记录每lane最近成功/错误类别，在有界总时长内允许短时网络抖动。
+
+验收：候选进程崩溃仍快速失败并回滚；Gateway/网络短暂不可达不会过早判定候选坏；持续不可达最终仍有界失败；回执记录每lane最近成功、失败类别与时间。
+
+证据或实现位置：`docs/releases/0.7.1/RELEASE.md`、`docs/releases/0.7.1/deployment-final.json`
 
 依赖：无

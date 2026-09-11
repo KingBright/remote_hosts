@@ -21,7 +21,7 @@ Remote Hosts 是一套面向 AI Agent 与人类运维者的远程操作与代码
 
 `remote-hosts-code` 由 NAS 上的 OAuth/MCP Gateway 和各电脑上的出站 Agent 组成。Gateway 不直接暴露本机 operator API；每台设备都有自己的身份、授权根目录和运行能力。
 
-0.5.0 已包含这些核心能力：
+0.7.1 已包含这些核心能力：
 
 - 绑定设备的持久 Workspace，支持受限代码列表、搜索、批量读取和语法树符号范围。
 - 带版本检查和本地 journal 的多文件精确编辑。
@@ -32,10 +32,13 @@ Remote Hosts 是一套面向 AI Agent 与人类运维者的远程操作与代码
 - **Workspace 事件接续**：按工作区保存有限的状态转换记录，支持断线后通过 cursor 补读，同时提供终端/传输摘要。
 - **升级排空协议**：更新前停止领取新的执行/写入/传输任务，但状态读取、取消和回执补送继续工作；已有任务先自然排空，不粗暴中断。
 - **结构化错误与恢复动作**：返回稳定的 `error_code / stage / outcome / recovery_action`，而不是只给一条模糊 `tool_failed`。
+- **持久 change-set 与安全恢复**：多文件编辑记录 before/after 版本，通过 `change_resume` 只继续仍可证明安全的文件，不覆盖并发用户修改。
+- **显式 Workspace GC**：`workspace_gc` 先 preview、绑定候选指纹，再 apply；活动任务和幂等记录受保护。
+- **协商式大文件能力**：默认仍为 64 MiB；0.7+ Agent 显式上报能力后可请求最高 256 MiB，并保留 256 MiB 本地磁盘余量保护。文件源授权状态可观测为 available / expired / required。
 - 工具 schema 指纹与 Agent feature 上报，可以区分“服务器已支持”与“当前 ChatGPT 会话实际暴露了什么”。
 - 可选 compact 文本响应，同时保留完整 structured content。
 
-当前服务端目录包含 **19 个 code gateway 工具**。ChatGPT 某个已存在会话仍可能因为宿主缓存旧 schema 而只看到其中一部分，这种差异会被单独报告，不会被解释成服务器没有升级。
+当前服务端目录包含 **21 个 code gateway 工具**。ChatGPT 某个已存在会话仍可能因为宿主缓存旧 schema 而只看到其中一部分，这种差异会被单独报告，不会被解释成服务器没有升级。
 
 ## 架构
 
@@ -111,17 +114,19 @@ Remote Hosts 明确区分：**请求已接收、执行已完成、版本已安�
 
 ## 当前版本
 
-0.5.0 固定源码快照通过 **338 项测试：230 Rust + 108 Python，0 失败**，并通过格式检查、严格 Clippy、workspace check 和 macOS/Linux 两平台 release 构建。
+0.7.1 固定源码快照通过 **348 项测试：238 Rust + 110 Python，0 失败**，并通过格式检查、严格 Clippy、workspace check 和 macOS/Linux 两平台 release 构建。
 
 当前最后核对状态：
 
-- NAS Gateway：**0.5.0**。
-- MacBook-M2-Max：**0.5.0**。
-- Mac Studio：**0.5.0**。
+- NAS Gateway：**0.7.1**。
+- MacBook-M2-Max：**0.7.1**。
+- Mac Studio：**0.7.1**。
 
-首次自动标准验收没有真正运行：发布器把语义版本直接放进 `run-id`，生成了 `release-0.5.0-...`，而验收器只允许字母数字和连字符。这个 bug 已修成 `release-0-5-0-...` 并增加回归测试。之后从当前对话补跑完整验收组合命令时，宿主在执行前进行了安全拦截，因此文档仍准确区分“**三端正在运行 0.5.0**”与“**0.5.0 完整自动验收已通过**”。
+现场发布抓到并修复了一个真实跨版本问题：0.6 Agent 向 0.7 Gateway 发送文件时，数据已经写入 staging、但 offset 提交失败会被错误映射成永久 HTTP 409。0.7.1 将数据库/IO 持久化故障改成可重试 5xx；随后同类 **9,089,298 字节**导出实际发生 1 次重试，并从 **4 MiB checkpoint** 恢复到完整 SHA，再成功导入 Studio。
 
-详见 [0.5.0 发布证据](docs/releases/0.5.0/RELEASE.md)。
+两台 Mac 均通过原生代码创建/读取/符号解析/幂等编辑/终端执行和清理验收。自动标准验收器还暴露出“把实时 `operation_lifecycle` 纳入幂等结果全对象比较”的旧断言，该断言已修复并通过 **112 项 Python 测试**；从本对话重跑整包验收命令被宿主在执行前拦截，因此不把它虚报为通过。当前会话的宿主 `file_*` schema 仍显示 64 MiB 上限，所以 **>64 MiB 的宿主原生现场往返**仍是下一轮独立门禁。
+
+详见 [0.7.1 发布证据](docs/releases/0.7.1/RELEASE.md)。
 
 ## 开发与发布
 
@@ -175,7 +180,7 @@ docs/                       架构、运维、发布证据和产品问题清单
 - [产品问题清单](docs/product/BACKLOG.md)
 - [持续迭代流程](docs/product/README.md)
 - [0.5.0 路线图](docs/product/ROADMAP-0.5.0.md)
-- [0.5.0 发布证据](docs/releases/0.5.0/RELEASE.md)
+- [0.7.1 发布证据](docs/releases/0.7.1/RELEASE.md)
 - [Windows 安装与运维](docs/windows.md)
 
 ## 安全边界

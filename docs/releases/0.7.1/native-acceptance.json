@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "version": "0.7.1",
+  "state": "passed_with_explicit_host_boundary",
+  "native_code_acceptance": {
+    "MacBook-M2-Max": {
+      "create_operation": "52bce757-0d97-4080-8241-371d342aaa72",
+      "edit_operation": "f6f5cba3-add4-4e32-831c-f190885bf3e5",
+      "terminal_operation": "3a4e9b03-1358-40b9-b298-5a3bfda0e637",
+      "cleanup_operation": "dae30ca0-bbfb-490c-a4ec-1a08f5a9fa89",
+      "idempotent_replay_same_operation": true,
+      "terminal_output": "42",
+      "fixture_removed": true
+    },
+    "Mac-Studio": {
+      "create_operation": "3da9683e-75b6-43ca-9dd5-c7f349180284",
+      "edit_operation": "a653c0df-d76a-448f-a18b-22071c7e991d",
+      "terminal_operation": "f05b60dc-d9ba-4fe5-bed7-a9f9bc11a644",
+      "cleanup_operation": "1c128d1f-6b3e-4aa0-a3e9-8b4915f08081",
+      "idempotent_replay_same_operation": true,
+      "terminal_output": "42",
+      "fixture_removed": true
+    }
+  },
+  "transfer_acceptance": {
+    "device_to_gateway": {
+      "operation_id": "9e1717bf-20be-4b9f-9fa8-e8219d842cbf",
+      "bytes": 9089298,
+      "sha256": "dc4b0ddecc55110be8aab02049ab6b89bcfdfdbfe41046cbafc8e546242fd059",
+      "checkpoint_bytes": 4194304,
+      "resumed_bytes": 4194304,
+      "retry_count": 1,
+      "state": "completed"
+    },
+    "gateway_to_studio": {
+      "operation_id": "c7784092-8680-4a48-ab7c-9e0eaf7640f4",
+      "bytes": 9089298,
+      "sha256": "dc4b0ddecc55110be8aab02049ab6b89bcfdfdbfe41046cbafc8e546242fd059",
+      "checkpoint_bytes": 4194304,
+      "retry_count": 0,
+      "state": "completed"
+    },
+    "same_sha256": true
+  },
+  "acceptance_harness": {
+    "stale_lifecycle_assertion_fixed": true,
+    "python_tests_passed": 112,
+    "python_tests_failed": 0,
+    "python_tests_skipped": 1,
+    "full_wrapper_rerun": "blocked_before_execution_by_host_safety_check"
+  },
+  "host_boundary": {
+    "server_negotiated_hard_max_bytes": 268435456,
+    "server_default_max_bytes": 67108864,
+    "host_visible_file_tool_max_bytes": 67108864,
+    "native_over_64_mib_roundtrip": "not_executed_until_host_schema_refresh"
+  }
+}

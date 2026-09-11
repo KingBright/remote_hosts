@@ -12,11 +12,11 @@
     "closed": "已满足该项验收且附证据；代码存在不能关闭"
   },
   "release_policy": {
-    "current_candidate": "0.5.0",
-    "last_observed_agents": "NAS gateway, MacBook-M2-Max and Mac-Studio are online and report 0.5.0",
-    "publication_evidence": "docs/releases/0.5.0/RELEASE.md",
-    "candidate_validation": "338 tests passed on the fixed 0.5.0 source snapshot; both release builds passed. All three selected targets run 0.5.0. Initial automated standard acceptance did not execute because of an invalid run-id format; the generator is fixed and regression-tested. Full acceptance rerun from this conversation was blocked before execution.",
-    "current_candidate_evidence": "docs/releases/0.5.0/verification.json",
+    "current_candidate": "0.7.1",
+    "last_observed_agents": "NAS gateway, MacBook-M2-Max and Mac-Studio are online and report 0.7.1",
+    "publication_evidence": "docs/releases/0.7.1/RELEASE.md",
+    "candidate_validation": "0.7.1 fixed source snapshot passed 348 tests (238 Rust + 110 Python, 0 failed), format, strict Clippy, workspace check and both release builds. NAS and both Macs run 0.7.1. Native code/terminal probes passed on both Macs. A 9,089,298-byte live transfer retried once from a 4 MiB checkpoint and completed with the expected SHA; the current host-visible file schema still caps max_bytes at 64 MiB, so a host-native >64 MiB roundtrip remains unclaimed.",
+    "current_candidate_evidence": "docs/releases/0.7.1/deployment-final.json",
     "close_only_with_acceptance_evidence": true,
     "all_known_issues_must_be_fixed_before_every_release": false,
     "rule": "发布允许明确列出的非阻塞遗留项；新风险须判断是否阻塞本次发布，不能用版本号冒充全部修复。",
@@ -71,6 +71,18 @@
     {
       "version": "0.4.1",
       "goal": "恢复控制、授权刷新与回执代际、准确取消进度、范围下载、工作区分页、发布输入/原回执门禁"
+    },
+    {
+      "version": "0.6.0",
+      "goal": "统一任务生命周期观察、持久change-set安全恢复与可预览Workspace GC。"
+    },
+    {
+      "version": "0.7.0",
+      "goal": "文件通道大步升级：协商式大文件、授权状态、存储余量保护与真实传输验收。"
+    },
+    {
+      "version": "0.7.1",
+      "goal": "修复跨版本接收端暂态持久化错误被误报永久409；补齐发布/验收器动态观察字段边界。"
     }
   ],
   "items": [
@@ -619,25 +631,27 @@
     {
       "id": "RH-023",
       "priority": "P1",
-      "status": "open",
-      "target_version": "0.4.0",
+      "status": "partial",
+      "target_version": "0.6.0",
       "title": "过期对象与崩溃staging的清理/容量",
       "discovery": "code_review",
       "problem": "当前惰性清理，原始日志有长期保留；部分跨进程staging可能遗留；慢活跃对象不能被清理误删。",
-      "current_resolution": "显式保留策略、活动租约保护、字节/对象/临时文件配额、可预览GC。",
+      "current_resolution": "0.6.0已实现workspace_gc preview/apply、preview_id绑定、活动/可恢复对象保护和legacy记录保护；固定快照回归验证通过。断电遗留、长期配额和更多生产清理矩阵仍需继续验收，因此保持partial。",
       "acceptance": [
         "空闲后可回收过期对象；活跃慢传输不误删；断电遗留可识别；隐私说明不承诺物理擦除。"
       ],
       "evidence": [
         "crates/remote-hosts-code/src/transfers.rs",
-        "crates/remote-hosts-code/src/store.rs"
+        "crates/remote-hosts-code/src/store.rs",
+        "crates/remote-hosts-code/src/storage_gc.rs",
+        "docs/releases/0.7.1/RELEASE.md"
       ],
       "depends_on": [
         "RH-007"
       ],
       "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
       "introduced_or_observed": "0.2.0 or 0.3.0 candidate",
-      "last_reviewed": "2026-09-10",
+      "last_reviewed": "2026-09-11",
       "closure_evidence": []
     },
     {
@@ -941,18 +955,21 @@
     {
       "id": "RH-033",
       "priority": "P2",
-      "status": "open",
-      "target_version": "0.5.0",
+      "status": "partial",
+      "target_version": "0.7.1",
       "title": "64 MiB限制提高与动态容量协商",
       "discovery": "user_request",
       "problem": "当前单文件64MiB、网关512MiB；直接提高会放大恢复和磁盘问题。",
-      "current_resolution": "续传与GC稳定后按设备协商256MiB或更高，默认值和错误返回一致。",
+      "current_resolution": "0.7.1已实现默认64MiB、capable Agent显式协商最高256MiB、4MiB checkpoint和256MiB本地存储余量门禁；Gateway与两台Agent均现场上报能力。当前ChatGPT会话宿主file工具schema仍把max_bytes限制在64MiB，故>64MiB宿主原生现场往返尚未完成，不能关闭。",
       "acceptance": [
         "低速大文件+断线+并发+低磁盘可靠通过；不可仅提高schema常数。"
       ],
       "evidence": [
         "crates/remote-hosts-code/src/tools.rs",
-        "crates/remote-hosts-code/src/transfers.rs"
+        "crates/remote-hosts-code/src/transfers.rs",
+        "crates/remote-hosts-code/tests/support/scale_070.rs",
+        "docs/releases/0.7.1/native-acceptance.json",
+        "docs/releases/0.7.1/deployment-final.json"
       ],
       "depends_on": [
         "RH-007",
@@ -960,7 +977,7 @@
       ],
       "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
       "introduced_or_observed": "0.2.0 or 0.3.0 candidate",
-      "last_reviewed": "2026-09-10",
+      "last_reviewed": "2026-09-11",
       "closure_evidence": []
     },
     {
@@ -992,7 +1009,7 @@
       "title": "工具与协议能力发现、schema变更兼容",
       "discovery": "code_review",
       "problem": "ChatGPT工具目录可能仍缓存旧描述；包版本不能表达所有功能/限制。",
-      "current_resolution": "devices_list已现场返回网关工具目录SHA及可选入参，客户端旧hash比较正确提示mismatch；Agent功能单独鉴权上报，Studio旧版明确not_reported。宿主刷新不能由服务器强制，未提供hash时不能解读成schema匹配。",
+      "current_resolution": "Gateway当前报告21项工具、工具SHA和可选入参，两台0.7.1 Agent独立上报runtime features与transfer_limits。当前宿主仍暴露file_*的64MiB旧参数上限，因此server catalog / Agent capability / host-visible schema三者已能明确区分，但宿主刷新仍不能由服务器强制。",
       "acceptance": [
         "新Gateway旧Agent与新Agent旧Gateway行为明确；无静默忽略lane导致错调度。"
       ],
@@ -1003,12 +1020,14 @@
         "docs/releases/0.3.1/deployment.json",
         "docs/releases/0.3.2/RELEASE.md",
         "docs/releases/0.3.2/deployment.json",
-        "docs/releases/0.3.2/verification-final.json"
+        "docs/releases/0.3.2/verification-final.json",
+        "docs/releases/0.7.1/native-acceptance.json",
+        "docs/releases/0.7.1/RELEASE.md"
       ],
       "depends_on": [],
       "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
       "introduced_or_observed": "0.2.0 or 0.3.0 candidate",
-      "last_reviewed": "2026-09-10",
+      "last_reviewed": "2026-09-11",
       "closure_evidence": []
     },
     {
@@ -1036,22 +1055,23 @@
     {
       "id": "RH-037",
       "priority": "P1",
-      "status": "open",
-      "target_version": "0.4.0",
+      "status": "candidate_verified",
+      "target_version": "0.6.0",
       "title": "多文件改动的部分失败和恢复记录",
       "discovery": "code_review",
       "problem": "当前逐文件原子但不是整批事务；异常后的恢复计划依赖模型读journal。",
-      "current_resolution": "继续预检与版本保护，返回结构化已完成/未完成项和恢复动作，不能默认全回滚覆盖外部改动。",
+      "current_resolution": "0.6.0已把多文件编辑变成持久change-set：记录before/after版本、已应用项和冲突；change_resume只在目标仍等于before时继续，等于after视为已完成，第三种版本保留用户修改并标冲突。重启/部分失败回归已进入完整验证。",
       "acceptance": [
         "第N文件失败时先前结果准确；重试不覆盖并发用户编辑；恢复证据可机器判断。"
       ],
       "evidence": [
-        "crates/remote-hosts-code/src/files.rs"
+        "crates/remote-hosts-code/src/files.rs",
+        "docs/releases/0.7.1/RELEASE.md"
       ],
       "depends_on": [],
       "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
       "introduced_or_observed": "0.2.0 or 0.3.0 candidate",
-      "last_reviewed": "2026-09-10",
+      "last_reviewed": "2026-09-11",
       "closure_evidence": []
     },
     {
@@ -1448,6 +1468,50 @@
       "depends_on": [],
       "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
       "introduced_or_observed": "0.4.0 n2 publication verification",
+      "last_reviewed": "2026-09-11",
+      "closure_evidence": []
+    },
+    {
+      "id": "RH-051",
+      "priority": "P1",
+      "status": "open",
+      "target_version": "0.8.0",
+      "title": "终端进程与持久状态失配会长期阻塞升级排空",
+      "discovery": "0.7.1_live_release",
+      "problem": "Studio发布时网关任务已完成，但本地terminal仍长期标记running，maintenance drain因此认为设备持续繁忙并拒绝安装。",
+      "current_resolution": "本轮通过精确识别原terminal并使用terminal_cancel安全收口后完成升级。下一版需在Agent启动/周期对账中识别已死亡、孤儿化或网关已终态的terminal并安全封口，避免依赖人工诊断。",
+      "acceptance": [
+        "进程已退出或对应网关任务已终态时，陈旧running terminal在有界时间内自动对账；仍真实运行的terminal绝不误杀；升级排空不被历史幽灵状态永久阻塞。"
+      ],
+      "evidence": [
+        "docs/releases/0.7.1/RELEASE.md",
+        "docs/releases/0.7.1/deployment-final.json"
+      ],
+      "depends_on": [],
+      "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
+      "introduced_or_observed": "0.7.1 Studio upgrade",
+      "last_reviewed": "2026-09-11",
+      "closure_evidence": []
+    },
+    {
+      "id": "RH-052",
+      "priority": "P1",
+      "status": "open",
+      "target_version": "0.8.0",
+      "title": "升级就绪把短时全lane网络故障误判成候选失败",
+      "discovery": "0.7.1_live_release",
+      "problem": "Studio候选0.7.1已切换服务后，五个lane短时均无法poll Gateway，updater等待continued poll progress超时并回滚；网络恢复后同SHA fresh job正常升级。",
+      "current_resolution": "现有回滚机制有效且保住0.6.0。下一版要区分候选进程失败与Gateway/网络暂时不可达，记录每lane最近成功/错误类别，在有界总时长内允许短时网络抖动。",
+      "acceptance": [
+        "候选进程崩溃仍快速失败并回滚；Gateway/网络短暂不可达不会过早判定候选坏；持续不可达最终仍有界失败；回执记录每lane最近成功、失败类别与时间。"
+      ],
+      "evidence": [
+        "docs/releases/0.7.1/RELEASE.md",
+        "docs/releases/0.7.1/deployment-final.json"
+      ],
+      "depends_on": [],
+      "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
+      "introduced_or_observed": "0.7.1 Studio upgrade",
       "last_reviewed": "2026-09-11",
       "closure_evidence": []
     }

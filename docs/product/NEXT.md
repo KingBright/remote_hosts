@@ -1,53 +1,39 @@
-# 0.5.0 之后的优先迭代
+# 0.7.1 之后的优先迭代
 
-0.5.0 已完成大部分原路线图能力：按目标独立发布/排空、终端状态复制、Workspace 事件接续、完整变更审查、Manifest 文件集同步、结构化诊断与 compact response。NAS、MacBook、Mac Studio 当前均运行 0.5.0；固定源码快照 338 项测试通过。
+0.7.1 已把 0.6.x 的恢复/GC 主线和 0.7.0 的文件通道升级一起落地：服务端 21 个工具、持久 change-set、显式 Workspace GC、文件源授权状态，以及“默认 64 MiB、显式协商最高 256 MiB”的传输能力。NAS、MacBook、Mac Studio 当前均运行 0.7.1；固定源码快照 348 项测试通过。
 
-当前重点不再是继续堆功能，而是把这些能力真正变成“少调用、好恢复、可持续运维”的稳定日常工作流。
+下一轮仍以“少往返、可恢复、真实宿主可用”为准，不以继续增加工具数量为目标。迭代流程本身已开始收敛到 `scripts/iteration-code.py` 单入口，详见 [`ITERATION-EFFICIENCY.md`](ITERATION-EFFICIENCY.md)；后续应优先修产品问题，而不是反复人工拼接验证/发布命令。
 
-## P0：补齐 0.5.0 现场验收闭环
+## P0：宿主 schema 与 >64 MiB 原生闭环
 
-首次自动标准验收因为发布器生成的 run-id 含 `0.5.0` 点号，在验收器参数校验阶段立即退出。生成逻辑已经修复并有回归测试；完整标准/协作验收仍需在正常获准的执行环境补跑。
+Gateway 和两台 Agent 已报告 `transfer_limits_protocol=1`、默认 64 MiB、上限 256 MiB，但当前已有 ChatGPT 会话的宿主工具 schema 仍把 `file_upload/file_download.max_bytes` 固定在 64 MiB。
 
-验收只针对当前已安装 0.5.0，不重新安装健康服务。必须分别保存 MacBook 和 Studio 的标准代码/终端/文件往返、`files_sync`、完整 diff、Workspace 事件与 terminal observation 证据。
+下一轮要把 server catalog / Agent feature / host-visible schema 三者做成可直接诊断的状态，并在宿主真正刷新后执行至少 65 MiB 的原生双向往返、Range、断线恢复和 SHA 校验。不能用服务器自报 256 MiB 代替宿主现场验收。
 
-## P0/P1：宿主工具 schema 闭环（RH-035）
+## P0/P1：升级就绪对网络抖动更稳健
 
-服务端已报告 19 项工具，而当前已有 ChatGPT 会话仍可能只暴露旧工具集合。下一轮要把“server catalog / Agent feature / host-visible tool set”三者的差异做成明确诊断和刷新指引。
+Studio 0.7.1 一次 fresh retry 在所有 lane 暂时无法 poll Gateway 时触发 `readiness_timeout`，随后自动回滚成功；网络恢复后的下一次 fresh job 正常升级并通过九次稳定采样。
 
-目标不是绕过宿主审核，而是让 Agent 一眼知道：服务端已有功能、宿主尚未加载，还是目标 Agent 版本确实不支持。
+继续改进 updater：区分“候选进程崩溃”和“网关/网络暂时不可达”，记录每 lane 最近一次成功与错误类别；在保持有界总时长的前提下允许短暂网络抖动，而不是过早判候选失败。回滚仍必须保留。
 
-## P1：统一观察与错误耗时（RH-016 / RH-017 / RH-024）
+## P1：接收端事务与故障注入
 
-继续减少为了知道一个任务状态而产生的多层查询。`operation_get` 应能够覆盖原任务的执行状态、终端退出状态、传输进度和回执投递状态，输出仍使用独立字节游标。
+0.7.1 已修复“chunk bytes 已落盘但 offset/进度持久化失败却返回永久 409”的问题，并在真实 0.6 Agent → 0.7.1 Gateway 发布链路观察到一次 4 MiB checkpoint 重试成功。
 
-错误继续收敛到稳定 `error_code / stage / outcome / recovery_action`。补齐 queue / resource_wait / execute / delivery 分段耗时，不能用跨机器墙钟直接相减。
+下一步把 DB busy、fsync、rename、complete metadata commit、低磁盘、Gateway restart 等故障加入明确注入矩阵；409 仅用于可证明的身份/offset/checksum 冲突，内部暂态错误必须可安全观察和重试。
 
-## P1：多文件变更集的完整恢复（RH-037）
+## P1：发布/验收器与动态观察字段分层
 
-0.5.0 已有完整 untracked review 与 `files_sync`，下一步把普通多文件编辑也提升为持久 change-set：记录每个文件 before/after hash、已应用项、冲突项和关联验证回执。
+标准验收器已修复：幂等业务回执比较不再把实时 `operation_lifecycle` 当成持久结果的一部分。继续把 durable receipt / live observation / device-wide queue snapshot 三层在 schema 和文档里标清，避免调用者对动态字段做不合理全对象比较。
 
-目标场景：10 文件改到第 7 个失败，前 6 个准确记录；用户随后修改第 3 个文件，恢复动作不会覆盖它；重启后只继续能够证明安全的剩余项。
+发布器应能在某个目标验收脚本失败时继续保留其他目标的成功结果，并提供独立的“仅重跑验收、不重装服务”路径。
 
-## P1：长期存储与 GC（RH-023 / RH-024）
+## P1：终端陈旧状态自动对账
 
-增加可预览的过期对象统计与有界清理，覆盖传输检查点、完整文件产物、终端日志、阻塞回执和幂等凭证。
-
-活动慢传输、正在下载的对象、可恢复任务不能被误删；删除大数据后仍要保留足以防止旧副作用再次执行的小型幂等记录。默认单文件 64 MiB 暂不扩大。
-
-## P1/P2：文件容量与批量同步性能（RH-033 / RH-050）
-
-先用真实数据测 `files_sync` 的 100/1000 文件清单、少量变化、断线恢复、低磁盘和两设备并发。达到门槛后再把 256 MiB 作为显式协商能力，不只修改 schema 常数。
-
-重点指标：只改 3/100 文件时只传 3 个文件内容；恢复同 manifest 不重复传已确认内容；代码读取和终端在大文件同步期间仍能工作。
-
-## P1：Git / CI 交付纪律（RH-048 / RH-049）
-
-0.5.0 核心源码已经进入 `main` 基线提交，后续每次发布继续保持“固定源码快照 + Git commit + 验证回执 + manifest + 运行版本”关联。
-
-生成发布包、缓存、数据库、临时锁和源码归档不进 Git；可长期复现的 JSON/Markdown 证据进入版本库。提交前继续做敏感信息扫描。
+本轮 Studio 升级被一条已经完成网关任务、但本地仍标记 running 的旧浏览器测试 terminal 阻塞。下一轮补齐 terminal 进程/状态的启动与周期对账，自动收口已死亡或孤儿化状态，同时绝不误杀仍真实运行的任务。
 
 ## 发布纪律
 
-验证通过且满足既有门禁后，直接发布 NAS 与两台 Mac 并验收，不逐版等待确认。一台设备有真实任务时，只延期该目标，其他目标继续完成。
+固定规则继续保持：开发 → 按改动范围选最小安全门禁；runtime 候选再固定源码快照并跑完整门禁 → commit + push `main` → 三端发布 → 每目标现场验收。验证通过后不逐版等待人工确认。release-Python 或 docs-only 修复不再无条件重编 Rust，但任何 runtime 输入变化仍必须重新完成全量发布门禁。
 
-任何 `started`、候选测试通过或版本字符串都不能单独代表发布成功；最终状态必须来自运行身份、升级回执和对应现场验收。
+任何 `started`、版本字符串、候选测试通过或单个健康检查都不等同于发布完成；最终结论来自运行身份、升级回执、传输/功能现场证据以及明确记录的未验收边界。
