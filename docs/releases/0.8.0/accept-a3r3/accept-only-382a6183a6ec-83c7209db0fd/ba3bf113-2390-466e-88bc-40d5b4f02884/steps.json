@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.8.0",
+    "manifest": "9ddff2f112a878d38373723f9942a88f2e431b8653f2b66146d75bae750658b0",
+    "acceptance_revision": "382a6183a6ec-83c7209db0fd",
+    "device": "ba3bf113-2390-466e-88bc-40d5b4f02884"
+  },
+  "steps": {
+    "standard": {
+      "state": "completed",
+      "input_sha256": "394891033bd668e7bf7a1ec4032625170864b7bf1ca964c83fa6fae3797e6321",
+      "requested_at_epoch": 1789150836.298295,
+      "result": {
+        "state": "passed",
+        "report": "/Users/jinliang/Workspace/remote_hosts/docs/releases/0.8.0/accept-a3r3/accept-only-382a6183a6ec-83c7209db0fd/ba3bf113-2390-466e-88bc-40d5b4f02884/standard.json"
+      }
+    },
+    "collaboration": {
+      "state": "outcome_unknown",
+      "input_sha256": "394891033bd668e7bf7a1ec4032625170864b7bf1ca964c83fa6fae3797e6321",
+      "requested_at_epoch": 1789151026.268672,
+      "failure_type": "CalledProcessError"
+    }
+  },
+  "updated_at_epoch": 1789151057.084075
+}

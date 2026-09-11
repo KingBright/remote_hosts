@@ -7,6 +7,10 @@ from unittest import mock
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
 from release_client import Client
 
+COLLAB_PATH=pathlib.Path(__file__).resolve().parents[1]/'check-collaboration.py'
+COLLAB_SPEC=importlib.util.spec_from_file_location('check_collaboration_080',COLLAB_PATH)
+check_collaboration=importlib.util.module_from_spec(COLLAB_SPEC);COLLAB_SPEC.loader.exec_module(check_collaboration)
+
 class ClientTests(unittest.TestCase):
     def test_complete_process_still_drains_buffered_output(self):
         c=Client('https://example.test',access='fixture')
@@ -55,6 +59,15 @@ class ClientTests(unittest.TestCase):
         standard,collaboration=m.acceptance_scripts(pathlib.Path('/project'))
         self.assertEqual(standard,pathlib.Path('/project/scripts/check-code-gateway.py'))
         self.assertEqual(collaboration,pathlib.Path('/project/scripts/check-collaboration.py'))
+
+    def test_collaboration_attempt_identity_is_stable_unique_and_gitignored(self):
+        a=check_collaboration.acceptance_identity('release-0-8-0-device-attempt-a','12345678-device')
+        b=check_collaboration.acceptance_identity('release-0-8-0-device-attempt-b','12345678-device')
+        self.assertEqual(a,check_collaboration.acceptance_identity('release-0-8-0-device-attempt-a','12345678-device'))
+        self.assertNotEqual(a,b)
+        self.assertTrue(a[0].startswith('target/remote-hosts-accept/12345678-'))
+        self.assertLessEqual(len(a[1]),64)
+        with self.assertRaises(ValueError):check_collaboration.acceptance_identity('../bad','12345678-device')
 
     def test_accept_only_requires_verified_installed_runtime(self):
         path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_080_accept',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)

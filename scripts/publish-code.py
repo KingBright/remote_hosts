@@ -119,31 +119,33 @@ def main():
         if not args.apply:raise ValueError('--accept-only requires --apply; it is a bounded live acceptance action')
         standard_script,collaboration_script=acceptance_scripts(root)
         revision=(rr.digest(standard_script)[:12]+'-'+rr.digest(collaboration_script)[:12])
-        recovery=directory/('accept-only-'+revision);recovery.mkdir(parents=True,exist_ok=True)
-        client=Client(config['origin'],pathlib.Path(config['password_file']));summary={'version':args.version,'state':'running','mode':'accept_only','revision':revision,'agents':{},'all_targets_accepted':False};accept_lock=threading.Lock()
+        attempt=rr.identity({'report_dir':str(directory),'revision':revision})[:12]
+        recovery=directory/('accept-only-'+revision+'-'+attempt);recovery.mkdir(parents=True,exist_ok=True)
+        client=Client(config['origin'],pathlib.Path(config['password_file']));summary={'version':args.version,'state':'running','mode':'accept_only','revision':revision,'attempt':attempt,'agents':{},'all_targets_accepted':False};accept_lock=threading.Lock()
         def save_recovery():rr.atomic_json(recovery/'summary.json',summary)
         try:
             client.login();inventory=client.tool('devices_list',{})
             if inventory.get('gateway',{}).get('version')!=args.version:raise RuntimeError('gateway version does not match acceptance target')
             current={d['device_id']:d for d in inventory['devices']}
-            binding={'version':args.version,'manifest':plan['manifest_sha256'],'acceptance_revision':revision}
+            binding={'version':args.version,'manifest':plan['manifest_sha256'],'acceptance_revision':revision,'acceptance_attempt':attempt}
             def accept(ident):
                 agent=next(a for a in config['agents'] if a['device_id']==ident);device=current.get(ident)
                 if not device or not acceptance_ready(device,args.version,sha):
                     return {'device_id':ident,'name':agent['name'],'state':'needs_recovery','phase':'preflight','recovery':'verify original updater/runtime; accept-only never installs'}
                 ad=recovery/ident;ad.mkdir(exist_ok=True);result={'device_id':ident,'name':agent['name'],'state':'running','phase':'standard'}
+                run_id=acceptance_run_id(args.version,ident)+'-'+attempt[:8]
                 rr.atomic_json(ad/'status.json',result)
                 try:
                     with rr.StepJournal(ad/'steps.json',{**binding,'device':ident}) as journal:
                         def standard():
-                            report=ad/'standard.json';log=ad/'standard.log';cmd=['/opt/homebrew/bin/python3',str(standard_script),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(report),'--run-id',acceptance_run_id(args.version,ident)+'-'+revision[:8],'--expected-version',args.version,'--dispatch-protocol','2','--device-id',ident]
+                            report=ad/'standard.json';log=ad/'standard.log';cmd=['/opt/homebrew/bin/python3',str(standard_script),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(report),'--run-id',run_id,'--expected-version',args.version,'--dispatch-protocol','2','--device-id',ident]
                             with log.open('x') as out:subprocess.run(cmd,cwd=root,stdout=out,stderr=subprocess.STDOUT,check=True,timeout=1200)
                             value=json.loads(report.read_text());
                             if value.get('state')!='passed' or value.get('test_oauth_grant_revoked') is not True:raise RuntimeError('standard acceptance incomplete')
                             return {'state':'passed','report':str(report)}
                         result['standard']=journal.step('standard',binding,standard);result['phase']='collaboration';rr.atomic_json(ad/'status.json',result)
                         def collaboration():
-                            report=ad/'collaboration.json';log=ad/'collaboration.log';cmd=['/opt/homebrew/bin/python3',str(collaboration_script),'--config',str(args.config.resolve()),'--device-id',ident,'--version',args.version,'--report',str(report)]
+                            report=ad/'collaboration.json';log=ad/'collaboration.log';cmd=['/opt/homebrew/bin/python3',str(collaboration_script),'--config',str(args.config.resolve()),'--device-id',ident,'--version',args.version,'--run-id',run_id,'--report',str(report)]
                             with log.open('x') as out:subprocess.run(cmd,cwd=root,stdout=out,stderr=subprocess.STDOUT,check=True,timeout=1200)
                             value=json.loads(report.read_text());
                             if value.get('state')!='passed' or value.get('temporary_oauth_revoked') is not True:raise RuntimeError('collaboration acceptance incomplete')
@@ -162,7 +164,8 @@ def main():
         print(json.dumps({'state':summary['state'],'mode':'accept_only','all_targets_accepted':summary['all_targets_accepted'],'report':str(recovery/'summary.json')}),flush=True)
         if not summary['all_targets_accepted']:raise SystemExit(1)
         return
-    state={'version':args.version,'state':'running','phase':'verified_inputs','targets':[x['device_id'] for x in config['agents']], 'manifest_sha256':plan['manifest_sha256'],'tests':plan['tests'],'agents':{},'all_targets_accepted':False};lock=threading.Lock()
+    publication_attempt=rr.identity({'report_dir':str(directory),'manifest':plan['manifest_sha256']})[:12]
+    state={'version':args.version,'state':'running','phase':'verified_inputs','targets':[x['device_id'] for x in config['agents']], 'manifest_sha256':plan['manifest_sha256'],'tests':plan['tests'],'publication_attempt':publication_attempt,'agents':{},'all_targets_accepted':False};lock=threading.Lock()
     def save():rr.atomic_json(directory/'deployment.json',state)
     def command(argv,timeout=180):return subprocess.run(argv,cwd=root,check=True,capture_output=True,text=True,timeout=timeout).stdout
     binding={'version':args.version,'manifest':plan['manifest_sha256'],'config':rr.identity(config)}
@@ -248,7 +251,8 @@ def main():
                         time.sleep(2)
                     else:raise RuntimeError('original updater outcome pending; inspect saved result path without reinstalling')
                     rr.atomic_json(ad/'updater.json',receipt);phase='functional_acceptance';record()
-                    cmd=['/opt/homebrew/bin/python3',str(package/'check-code-gateway.py'),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(ad/'acceptance.json'),'--run-id',acceptance_run_id(args.version,ident),'--expected-version',args.version,'--dispatch-protocol','2','--device-id',ident]
+                    run_id=acceptance_run_id(args.version,ident)+'-'+publication_attempt[:8]
+                    cmd=['/opt/homebrew/bin/python3',str(package/'check-code-gateway.py'),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(ad/'acceptance.json'),'--run-id',run_id,'--expected-version',args.version,'--dispatch-protocol','2','--device-id',ident]
                     def standard():
                         with (ad/'acceptance.log').open('x') as log:subprocess.run(cmd,cwd=root,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=1200)
                         value=json.loads((ad/'acceptance.json').read_text())
@@ -256,7 +260,7 @@ def main():
                         return {'state':'passed','report':str(ad/'acceptance.json')}
                     result['standard']=journal.step('standard',{'version':args.version,'device':ident},standard)
                     phase='collaboration_acceptance';record()
-                    cmd=['/opt/homebrew/bin/python3',str(package/'check-collaboration.py'),'--config',str(args.config.resolve()),'--device-id',ident,'--version',args.version,'--report',str(ad/'collaboration.json')]
+                    cmd=['/opt/homebrew/bin/python3',str(package/'check-collaboration.py'),'--config',str(args.config.resolve()),'--device-id',ident,'--version',args.version,'--run-id',run_id,'--report',str(ad/'collaboration.json')]
                     def features():
                         with (ad/'collaboration.log').open('x') as log:subprocess.run(cmd,cwd=root,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=1200)
                         value=json.loads((ad/'collaboration.json').read_text())

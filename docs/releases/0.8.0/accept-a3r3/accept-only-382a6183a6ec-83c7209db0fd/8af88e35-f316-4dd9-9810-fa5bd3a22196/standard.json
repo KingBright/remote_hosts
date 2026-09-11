@@ -1,0 +1,38 @@
+{
+  "origin": "https://mcp.hackerlife.fun",
+  "version": "0.8.0",
+  "run_id": "release-0-8-0-8af88e35-f316-4dd9-9810-fa5bd3a22196-382a6183",
+  "selected_device_ids": [
+    "8af88e35-f316-4dd9-9810-fa5bd3a22196"
+  ],
+  "dispatch_protocol": 2,
+  "oauth": "passed",
+  "mcp_tool_count": 21,
+  "devices": [
+    {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "name": "Mac-Studio",
+      "workspace_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196:90dcdaff-0ba1-4c98-8e8c-fb93a89b8c9c",
+      "range_read": "passed",
+      "syntax_tree": "passed",
+      "precise_edit": "passed",
+      "duplicate_edit": "passed",
+      "stale_version_rejected": true,
+      "search": "passed",
+      "terminal_test_exit_code": 0,
+      "probe_file_removed": true,
+      "agent_version": "0.8.0",
+      "binary_transfer_bytes": 2097152,
+      "binary_sha256": "91d3beb88a9b2f778a6c44a1c53b63d3c79931845a9aef84b3fb414610bd1938",
+      "download": "passed",
+      "upload": "passed",
+      "http_range": "passed",
+      "upload_retry": "passed",
+      "overwrite_rejected": true,
+      "checksum_mismatch_rejected": true
+    }
+  ],
+  "test_oauth_grant_revoked": true,
+  "state": "passed",
+  "summary": "Public TLS/OAuth/MCP and 1 selected device(s) passed: Mac-Studio; version 0.8.0; temporary OAuth grant revoked"
+}

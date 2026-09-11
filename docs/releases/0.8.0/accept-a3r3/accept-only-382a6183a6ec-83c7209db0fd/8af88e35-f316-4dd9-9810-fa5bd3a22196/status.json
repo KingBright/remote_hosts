@@ -1,0 +1,14 @@
+{
+  "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+  "name": "Mac-Studio",
+  "state": "accepted",
+  "phase": "complete",
+  "standard": {
+    "state": "passed",
+    "report": "/Users/jinliang/Workspace/remote_hosts/docs/releases/0.8.0/accept-a3r3/accept-only-382a6183a6ec-83c7209db0fd/8af88e35-f316-4dd9-9810-fa5bd3a22196/standard.json"
+  },
+  "collaboration": {
+    "state": "passed",
+    "report": "/Users/jinliang/Workspace/remote_hosts/docs/releases/0.8.0/accept-a3r3/accept-only-382a6183a6ec-83c7209db0fd/8af88e35-f316-4dd9-9810-fa5bd3a22196/collaboration.json"
+  }
+}

@@ -9,11 +9,21 @@ import time
 from release_client import Client
 from release_receipts import atomic_json
 
+
+def acceptance_identity(run_id, device_id):
+    if (not run_id or len(run_id)>120 or not run_id.replace('-','').isalnum()
+            or len(device_id)<8):
+        raise ValueError('invalid collaboration acceptance identity')
+    tag=hashlib.sha256(run_id.encode()).hexdigest()[:16]
+    return 'target/remote-hosts-accept/'+device_id[:8]+'-'+tag, 'collab-'+device_id[:8]+'-'+tag
+
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--config',type=pathlib.Path,required=True);p.add_argument('--device-id',required=True);p.add_argument('--version',required=True);p.add_argument('--report',type=pathlib.Path,required=True);args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--config',type=pathlib.Path,required=True);p.add_argument('--device-id',required=True);p.add_argument('--version',required=True);p.add_argument('--run-id',required=True);p.add_argument('--report',type=pathlib.Path,required=True);args=p.parse_args()
     if args.report.exists():raise SystemExit('existing probe retained; inspect original result')
     config=json.loads(args.config.read_text());agent=next(a for a in config['agents'] if a['device_id']==args.device_id)
-    c=Client(config['origin'],config['password_file']);r={'version':args.version,'device_id':args.device_id,'state':'running','checks':{},'operation_ids':[]};phase='login';folder='remote_hosts_accept_070_'+args.device_id[:8];key='collab-'+args.version+'-'+args.device_id;version=tuple(map(int,args.version.split('.')))
+    folder,key=acceptance_identity(args.run_id,args.device_id)
+    c=Client(config['origin'],config['password_file']);r={'version':args.version,'device_id':args.device_id,'run_id':args.run_id,'state':'running','checks':{},'operation_ids':[]};phase='login';version=tuple(map(int,args.version.split('.')))
     def record():r['phase']=phase;atomic_json(args.report,r)
     def term(ws,code,stage):return c.terminal(ws,'/opt/homebrew/bin/python3 -c '+shlex.quote(code),key+'-'+stage,60)
     try:
@@ -37,7 +47,7 @@ def main():
                 'host_schema_status':gateway['host_schema_status'],'file_default_max_bytes':67108864,
                 'file_hard_max_bytes':268435456,'terminal_reconcile_reported':True}
         phase='fixture';record()
-        term(agent['workspace_id'],"import pathlib,subprocess,os;p=pathlib.Path("+repr(folder)+");p.mkdir(exist_ok=False);subprocess.run(['git','init','-q',str(p)],env=dict(os.environ,GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1'),check=True)",'fixture')
+        term(agent['workspace_id'],"import pathlib,subprocess,os;p=pathlib.Path("+repr(folder)+");p.mkdir(parents=True,exist_ok=False);subprocess.run(['git','init','-q',str(p)],env=dict(os.environ,GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1'),check=True)",'fixture')
         workspace=c.tool('workspace_open',{'device_id':args.device_id,'root':agent['root']+'/'+folder,'idempotency_key':key+'-open'})['workspace']['id'];r['workspace_id']=workspace;record()
         files=json.loads(term(workspace,"import pathlib,json,hashlib;d=pathlib.Path('dst');d.mkdir();files=[]\nfor i in range(100):\n old=bytes([i,0,255])*17;new=bytes([i,1,254])*17 if i<3 else old;p=d/f'f{i}.bin';p.write_bytes(old);files.append({'path':str(p),'sha256':hashlib.sha256(new).hexdigest(),'size':len(new),'executable':False})\nprint(json.dumps(files))",'files'))
         before=c.tool('workspace_context',{'workspace_id':workspace,'limit':50});event_cursor=before['events']['cursor']

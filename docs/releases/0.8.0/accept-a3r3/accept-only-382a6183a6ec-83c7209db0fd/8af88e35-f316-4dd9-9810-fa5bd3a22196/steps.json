@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "version": "0.8.0",
+    "manifest": "9ddff2f112a878d38373723f9942a88f2e431b8653f2b66146d75bae750658b0",
+    "acceptance_revision": "382a6183a6ec-83c7209db0fd",
+    "device": "8af88e35-f316-4dd9-9810-fa5bd3a22196"
+  },
+  "steps": {
+    "standard": {
+      "state": "completed",
+      "input_sha256": "394891033bd668e7bf7a1ec4032625170864b7bf1ca964c83fa6fae3797e6321",
+      "requested_at_epoch": 1789150836.29817,
+      "result": {
+        "state": "passed",
+        "report": "/Users/jinliang/Workspace/remote_hosts/docs/releases/0.8.0/accept-a3r3/accept-only-382a6183a6ec-83c7209db0fd/8af88e35-f316-4dd9-9810-fa5bd3a22196/standard.json"
+      }
+    },
+    "collaboration": {
+      "state": "completed",
+      "input_sha256": "394891033bd668e7bf7a1ec4032625170864b7bf1ca964c83fa6fae3797e6321",
+      "requested_at_epoch": 1789151026.404778,
+      "result": {
+        "state": "passed",
+        "report": "/Users/jinliang/Workspace/remote_hosts/docs/releases/0.8.0/accept-a3r3/accept-only-382a6183a6ec-83c7209db0fd/8af88e35-f316-4dd9-9810-fa5bd3a22196/collaboration.json"
+      }
+    }
+  },
+  "updated_at_epoch": 1789151421.588075
+}
