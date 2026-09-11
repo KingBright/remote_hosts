@@ -53,6 +53,13 @@ def expected_tool_names(version):
     return tools
 
 
+def stable_operation_receipt(value):
+    """Compare durable operation content, not live observation snapshots."""
+    stable = dict(value)
+    stable.pop('operation_lifecycle', None)
+    return stable
+
+
 def acceptance_summary(report):
     selected = report.get('selected_device_ids', [])
     rows = report.get('devices', [])
@@ -203,7 +210,9 @@ def main():
         assert outline["kind"] == "syntax_tree" and outline["symbols"][0]["name"] == "answer"
         edit = {"workspace_id": ws, "idempotency_key": key + "-edit", "files": [{"path": path, "expected_version": version, "edits": [{"old_text": "return 41", "new_text": "return 42"}]}]}
         edited = tool("code_apply_edits", edit)
-        assert tool("code_apply_edits", edit) == edited, "Duplicate edit must return original receipt"
+        replayed = tool("code_apply_edits", edit)
+        assert replayed["operation_id"] == edited["operation_id"], "Duplicate edit must keep operation identity"
+        assert stable_operation_receipt(replayed) == stable_operation_receipt(edited), "Duplicate edit must keep durable receipt"
         stale = dict(edit, idempotency_key=key + "-stale")
         assert "error" in tool("code_apply_edits", stale, allow_error=True)
         found = tool("code_search", {"workspace_id": ws, "query": "return 42", "glob": path, "max_bytes": 4096})

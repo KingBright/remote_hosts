@@ -24,6 +24,15 @@ class ReceiptTests(unittest.TestCase):
                 'selected_device_ids':sorted(d['device_id'] for d in rows), 'devices':rows,
                 'test_oauth_grant_revoked':True}
 
+    def test_stable_operation_receipt_ignores_only_live_lifecycle(self):
+        base={'operation_id':'op','state':'completed','changed':[{'path':'a'}],
+              'operation_lifecycle':{'protocol':1,'device_receipt_delivery':{'pending':0}}}
+        replay=copy.deepcopy(base);replay['operation_lifecycle']['device_receipt_delivery']['pending']=1
+        self.assertEqual(acceptance.stable_operation_receipt(base), acceptance.stable_operation_receipt(replay))
+        changed=copy.deepcopy(replay);changed['changed'][0]['path']='b'
+        self.assertNotEqual(acceptance.stable_operation_receipt(base), acceptance.stable_operation_receipt(changed))
+        self.assertIn('operation_lifecycle', base)
+
     def test_one_device_summary_never_claims_two(self):
         report=self.report()
         message=acceptance.acceptance_summary(report)
