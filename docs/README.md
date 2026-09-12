@@ -9,6 +9,7 @@
 - [架构与运行模型](architecture-and-runtime.md)：SSH 连接复用、Workspace、PTY、资源协调、传输、安全边界。
 - [部署与运维](deployment-and-operations.md)：服务安装、更新、路径、诊断和故障恢复。
 - [ChatGPT Code Gateway](chatgpt-code-gateway.md)：OAuth/MCP 网关、设备 Agent、代码/终端/文件能力。
+- [Code Gateway 从零部署与新设备接入](code-gateway-deployment.md)：Gateway、公网/Cloudflare、ChatGPT OAuth、Linux/macOS/Windows 新设备加入、验收与安全注意事项。
 - [产品迭代流程](product/README.md)：问题清单、验证、自动发布与验收纪律。
 - [统一问题清单](product/BACKLOG.md)：所有 RH 编号问题的阅读版，事实源是 `product/backlog.json`。
 - [0.5.0 路线图](product/ROADMAP-0.5.0.md)：历史规划与设计依据；当前执行重点见 `product/NEXT.md`。
@@ -28,7 +29,7 @@
 - `deployment*.json`：真实安装/运行/验收状态。
 - 设备子目录：该目标的升级器、验收和恢复证据。
 
-当前代码网关版本为 **0.7.1**，NAS、MacBook 与 Mac Studio 均已在线运行 0.7.1。固定源码快照通过 **348 项测试、0 失败**；两台 Mac 的原生代码/终端验收通过，9,089,298 字节真实文件通道往返验证了 4 MiB checkpoint 恢复。当前宿主 `file_*` schema 仍限制 64 MiB，因此 >64 MiB 的宿主原生现场往返仍单独保留为未验收边界。详见 [0.7.1 发布证据](releases/0.7.1/RELEASE.md)。
+当前仓库代码网关发布版本为 **0.9.0**。固定源码 pipeline 通过 **372 项测试：239 Rust + 133 Python，0 失败**，并完成 macOS ARM64 与 Linux x86_64-musl release 构建；package manifest SHA-256 为 `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`。仓库 release、已生成 package 与各现场设备实际安装版本必须分开表述；NAS、Mac 或其他设备的当前运行版本以 deployment receipt、服务状态或 `devices_list` 现场结果为准，不能由仓库版本推断。
 
 ## 文档纪律
 

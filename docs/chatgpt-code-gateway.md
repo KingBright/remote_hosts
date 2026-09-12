@@ -1,12 +1,10 @@
 # ChatGPT unified code gateway
 
-**2026-09-11 current release status:** the NAS gateway, MacBook and Mac Studio are all online and report **0.7.1**. The fixed 0.7.1 source snapshot passed 238 Rust and 110 Python tests, **348 total with 0 failures**, plus format, strict Clippy, workspace checks and both release builds.
+**2026-09-12 repository release status:** the current repository release is **0.9.0**. Its fixed-source pipeline passed **372 tests (239 Rust + 133 Python, 0 failures)**, strict format/Clippy/workspace gates, and both macOS ARM64 and Linux x86_64-musl release builds. The immutable package manifest SHA-256 is `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`.
 
-0.6 adds operation lifecycle timing, durable change-set recovery and bounded workspace GC. 0.7 adds negotiated transfer limits (64 MiB default, up to 256 MiB on capable agents), explicit source-authorization state and disk-reserve guards. 0.7.1 fixes a live cross-version receiver failure where internal persistence errors were incorrectly treated as permanent HTTP 409 conflicts. See `docs/releases/0.7.1/RELEASE.md`.
+Repository release, generated package, installed version, running process and live acceptance are intentionally separate states. Do not infer that a NAS or workstation is already running 0.9.0 from this document; verify the specific target through deployment receipts, service state or `devices_list`. Historical release evidence remains under `docs/releases/`.
 
-Live release evidence includes a 9,089,298-byte device→Gateway transfer that retried once and resumed from a 4 MiB checkpoint, followed by an exact-SHA Gateway→Studio import. Both Macs also passed native create/read/symbol/idempotent-edit/terminal/cleanup probes. The full OAuth/MCP wrapper rerun was blocked before execution by the host safety check, so that wrapper is not claimed as passed.
-
-The current ChatGPT conversation still exposes an older file-tool parameter cap: native `devices_list` reports a 21-tool server catalog and 256 MiB negotiated hard limit, while the host-visible `file_upload/file_download.max_bytes` remains capped at 64 MiB. Server capability, agent capability and host-visible schema are separate facts; the server cannot force the host to refresh its tool snapshot.
+0.9.0 adds stable macOS updater/code identity foundations, native `russh` PTY resize/signal delivery, pooled port forwarding, Linux systemd user-service support, real-SSHD regressions including a verified 1 GiB transfer, and a two-process MCP regression proving Workspace/PTY isolation plus write-lease handoff over one pooled SSH transport.
 
 Remote Hosts now includes the `remote-hosts-code` executable with two roles:
 
@@ -68,6 +66,8 @@ after one hour, refresh tokens rotate and expire after 30 days, and refresh-toke
 replay revokes the token family. Authentication endpoints are rate limited.
 
 ## Installation
+
+如果是第一次搭建 Gateway、需要配置 Cloudflare/公网入口，或者要向现有 Gateway 增加 Linux/macOS/Windows 设备，先按 [Code Gateway 从零部署与新设备接入](code-gateway-deployment.md) 操作。本节保留协议实现和现有 NAS 部署的低层细节。
 
 Build using the workspace Rust toolchain:
 

@@ -90,7 +90,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ### ChatGPT Code Gateway
 
-先阅读 [ChatGPT Code Gateway](docs/chatgpt-code-gateway.md)。正常协作流程是：
+首次搭建 Gateway、配置 Cloudflare/公网入口或向现有 Gateway 添加新设备时，先阅读 [Code Gateway 从零部署与新设备接入](docs/code-gateway-deployment.md)；协议、OAuth/MCP 和运行机制详见 [ChatGPT Code Gateway](docs/chatgpt-code-gateway.md)。正常协作流程是：
 
 1. `devices_list`：明确选择授权设备，不做隐式 failover。
 2. `workspace_open`：打开一次并复用设备绑定的 Workspace。
@@ -114,19 +114,11 @@ Remote Hosts 明确区分：**请求已接收、执行已完成、版本已安�
 
 ## 当前版本
 
-0.7.1 固定源码快照通过 **348 项测试：238 Rust + 110 Python，0 失败**，并通过格式检查、严格 Clippy、workspace check 和 macOS/Linux 两平台 release 构建。
+当前仓库发布版本为 **0.9.0**。0.9.0 固定源码 pipeline 通过 **372 项测试：239 Rust + 133 Python，0 失败**，并通过格式检查、严格 Clippy、workspace check、macOS ARM64 release 构建和 Linux x86_64-musl release 构建。正式 package manifest SHA-256 为 `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`。
 
-当前最后核对状态：
+0.9.0 进一步加入 native `russh` PTY resize/signal、pooled port forwarding、真实 SSHD/1 GiB 回归、双 MCP Agent Session 的 Workspace/PTY 隔离与 write-lease handoff、Linux systemd user service，以及 macOS 稳定 updater/code identity 基础。多进程真实 SSH 黑盒确认两个 Agent Session 共用一个 pooled transport，只有一次认证握手并发生多次安全复用。
 
-- NAS Gateway：**0.7.1**。
-- MacBook-M2-Max：**0.7.1**。
-- Mac Studio：**0.7.1**。
-
-现场发布抓到并修复了一个真实跨版本问题：0.6 Agent 向 0.7 Gateway 发送文件时，数据已经写入 staging、但 offset 提交失败会被错误映射成永久 HTTP 409。0.7.1 将数据库/IO 持久化故障改成可重试 5xx；随后同类 **9,089,298 字节**导出实际发生 1 次重试，并从 **4 MiB checkpoint** 恢复到完整 SHA，再成功导入 Studio。
-
-两台 Mac 均通过原生代码创建/读取/符号解析/幂等编辑/终端执行和清理验收。自动标准验收器还暴露出“把实时 `operation_lifecycle` 纳入幂等结果全对象比较”的旧断言，该断言已修复并通过 **112 项 Python 测试**；从本对话重跑整包验收命令被宿主在执行前拦截，因此不把它虚报为通过。当前会话的宿主 `file_*` schema 仍显示 64 MiB 上限，所以 **>64 MiB 的宿主原生现场往返**仍是下一轮独立门禁。
-
-详见 [0.7.1 发布证据](docs/releases/0.7.1/RELEASE.md)。
+**仓库发布版本、已生成 release package 和现场已部署版本是不同状态。** 不要根据本 README 推断 NAS、Mac 或其他设备已经完成 0.9.0 安装；现场版本应以对应 deployment receipt、服务状态或 `devices_list` 实际结果为准。历史版本的发布证据仍保存在 `docs/releases/`。
 
 ## 开发与发布
 
@@ -177,6 +169,7 @@ docs/                       架构、运维、发布证据和产品问题清单
 - [架构与运行模型](docs/architecture-and-runtime.md)
 - [部署与运维](docs/deployment-and-operations.md)
 - [ChatGPT Code Gateway](docs/chatgpt-code-gateway.md)
+- [Code Gateway 从零部署与新设备接入](docs/code-gateway-deployment.md)
 - [产品问题清单](docs/product/BACKLOG.md)
 - [持续迭代流程](docs/product/README.md)
 - [0.5.0 路线图](docs/product/ROADMAP-0.5.0.md)
