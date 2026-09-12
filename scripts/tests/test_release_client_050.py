@@ -69,6 +69,13 @@ class ClientTests(unittest.TestCase):
         self.assertLessEqual(len(a[1]),64)
         with self.assertRaises(ValueError):check_collaboration.acceptance_identity('../bad','12345678-device')
 
+    def test_collaboration_files_sync_replay_ignores_only_live_lifecycle(self):
+        base={'state':'completed','changed_files':3,'operation_id':'op','operation_lifecycle':{'gateway':{'queue_ms':1}}}
+        replay=json.loads(json.dumps(base));replay['operation_lifecycle']['gateway']['queue_ms']=2
+        self.assertEqual(check_collaboration.stable_operation_receipt(base),check_collaboration.stable_operation_receipt(replay))
+        replay['changed_files']=4
+        self.assertNotEqual(check_collaboration.stable_operation_receipt(base),check_collaboration.stable_operation_receipt(replay))
+
     def test_collaboration_workspace_open_has_bounded_same_key_retry(self):
         source=(pathlib.Path(__file__).resolve().parents[1]/'check-collaboration.py').read_text()
         self.assertIn("'idempotency_key':key+'-open'",source)

@@ -10,6 +10,12 @@ from release_client import Client
 from release_receipts import atomic_json
 
 
+def stable_operation_receipt(value):
+    stable=dict(value)
+    stable.pop('operation_lifecycle',None)
+    return stable
+
+
 def acceptance_identity(run_id, device_id):
     if (not run_id or len(run_id)>120 or not run_id.replace('-','').isalnum()
             or len(device_id)<8):
@@ -74,7 +80,8 @@ def main():
         apply={'workspace_id':workspace,'idempotency_key':key+'-apply','mode':'apply','files':plan['files'],'manifest_id':plan['manifest_id'],'bundle_path':'bundle.received','bundle_sha256':bundle['sha256']}
         applied=c.tool('files_sync',apply);r['operation_ids'].append(applied['operation_id'])
         assert applied['state']=='completed' and applied['changed_files']==3 and applied['reused_files']==97 and applied['bytes_written']==153
-        assert c.tool('files_sync',apply)==applied
+        replayed=c.tool('files_sync',apply)
+        assert stable_operation_receipt(replayed)==stable_operation_receipt(applied)
         r['checks']['delta_sync']={'passed':True,'manifest_files':100,'changed_files':3,'reused_files':97,'content_bytes_written':153,'network_bundle_bytes':bundle['size'],'same_key_replay_unchanged':True};record()
         if version >= (0,7,0):
             phase='large_file_roundtrip';record();large_size=64*1024*1024+1024*1024
