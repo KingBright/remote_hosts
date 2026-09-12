@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
@@ -501,12 +501,9 @@ fn spawn(
         let reader = pair.master.try_clone_reader()?;
         let input = pair.master.take_writer()?;
         let mut cmd = CommandBuilder::new(&config.shell);
-        cmd.arg("-lc");
-        cmd.arg(if command.is_empty() {
-            format!("exec {} -l", shell_quote(&config.shell.to_string_lossy()))
-        } else {
-            command.into()
-        });
+        for arg in shell_args(&config.shell, command, true) {
+            cmd.arg(arg);
+        }
         cmd.cwd(&ws.root);
         cmd.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cmd)?;
@@ -522,7 +519,7 @@ fn spawn(
         // It is intentionally a combined stream, not falsely labeled stdout-only.
         let (reader, writer) = std::io::pipe()?;
         let mut cmd = std::process::Command::new(&config.shell);
-        cmd.args(["-lc", command])
+        cmd.args(shell_args(&config.shell, command, false))
             .current_dir(&ws.root)
             .stdin(std::process::Stdio::null())
             .stdout(writer.try_clone()?)
@@ -576,6 +573,42 @@ fn pty_eof(error: &std::io::Error, interactive: bool) -> bool {
         false
     }
 }
+fn shell_args(shell: &Path, command: &str, interactive: bool) -> Vec<String> {
+    let shell_text = shell.to_string_lossy();
+    let name = shell_text
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    ) {
+        let mut args = vec!["-NoLogo".into(), "-NoProfile".into()];
+        if !interactive {
+            args.push("-NonInteractive".into());
+        }
+        if !command.is_empty() {
+            args.push("-Command".into());
+            args.push(command.into());
+        }
+        return args;
+    }
+    if matches!(name.as_str(), "cmd" | "cmd.exe") {
+        if command.is_empty() {
+            return vec!["/D".into()];
+        }
+        return vec!["/D".into(), "/S".into(), "/C".into(), command.into()];
+    }
+    vec![
+        "-lc".into(),
+        if interactive && command.is_empty() {
+            format!("exec {} -l", shell_quote(&shell.to_string_lossy()))
+        } else {
+            command.into()
+        },
+    ]
+}
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -583,6 +616,40 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_arguments_are_native_for_windows_and_unix_shells() {
+        assert_eq!(
+            shell_args(
+                Path::new(r"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+                "Write-Output ok",
+                false
+            ),
+            vec![
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output ok"
+            ]
+        );
+        assert_eq!(
+            shell_args(Path::new("pwsh.exe"), "Write-Output ok", true),
+            vec!["-NoLogo", "-NoProfile", "-Command", "Write-Output ok"]
+        );
+        assert_eq!(
+            shell_args(Path::new("cmd.exe"), "echo ok", false),
+            vec!["/D", "/S", "/C", "echo ok"]
+        );
+        assert_eq!(
+            shell_args(Path::new("/bin/zsh"), "printf ok", false),
+            vec!["-lc", "printf ok"]
+        );
+        assert_eq!(
+            shell_args(Path::new("/bin/zsh"), "", true),
+            vec!["-lc", "exec '/bin/zsh' -l"]
+        );
+    }
 
     fn status(id: &str, created_at: i64) -> Status {
         Status {

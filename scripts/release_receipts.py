@@ -15,7 +15,7 @@ import tempfile
 import time
 
 GATES = {'fmt', 'clippy', 'rust_tests', 'python_tests', 'workspace'}
-STAGES = {'verification', 'macos_release', 'linux_release', 'package'}
+STAGES = {'verification', 'macos_release', 'linux_release', 'windows_release', 'package'}
 
 class ReleaseError(RuntimeError):
     def __init__(self, code, recovery, target=None):
@@ -84,7 +84,7 @@ def verified_build(report, expected_version):
         raise ReleaseError('verification_incomplete', 'complete the original fixed-input verification before publication')
     artifacts = m.get('artifacts', {})
     required = {'remote-hosts-code-macos-arm64','remote-hosts-code-linux-amd64',
-                'upgrade-code-agent.py','agent_upgrade_support.py','launch-code-upgrade.py',
+                'remote-hosts-code-windows-amd64.exe','upgrade-code-agent.py','agent_upgrade_support.py','launch-code-upgrade.py',
                 'code_upgrade_runner.py','macos_code_identity.py',
                 'upgrade-code-gateway.py','check-code-gateway.py'}
     if not required.issubset(artifacts):

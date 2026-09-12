@@ -198,7 +198,8 @@ def run_pipeline(snapshot, report, slot, verify_only=False):
                                      'tests': proof['functional_tests']}
             if not verify_only:
                 for name, args in [('macos_release', ['cargo', 'build', '-p', 'remote-hosts-code', '--release', '--locked']),
-                                   ('linux_release', ['cargo', 'zigbuild', '-p', 'remote-hosts-code', '--release', '--locked', '--target', 'x86_64-unknown-linux-musl'])]:
+                                   ('linux_release', ['cargo', 'zigbuild', '-p', 'remote-hosts-code', '--release', '--locked', '--target', 'x86_64-unknown-linux-musl']),
+                                   ('windows_release', ['cargo', 'xwin', 'build', '-p', 'remote-hosts-code', '--release', '--locked', '--target', 'x86_64-pc-windows-msvc'])]:
                     run_stage(name, args, checkout, directory, report, state, env)
                 run_stage('package', [sys.executable, 'scripts/package-code-release.py', '--version', version,
                                      '--verification', str(directory/'verification.json')], checkout, directory, report, state, env)

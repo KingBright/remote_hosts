@@ -142,6 +142,8 @@ fn output_entries(dir: &Dir, e: &[Entry]) -> Result<(Vec<Entry>, Vec<Value>)> {
     Ok((bound, result))
 }
 fn publish(dir: &Dir, path: &str, data: &[u8], executable: bool, expected: &str) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = executable;
     guarded(dir, path)?;
     let p = Path::new(path);
     let parent = p

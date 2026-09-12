@@ -50,6 +50,7 @@ def main():
     files = {
         'remote-hosts-code-macos-arm64': target/'release/remote-hosts-code',
         'remote-hosts-code-linux-amd64': target/'x86_64-unknown-linux-musl/release/remote-hosts-code',
+        'remote-hosts-code-windows-amd64.exe': target/'x86_64-pc-windows-msvc/release/remote-hosts-code.exe',
         'upgrade-code-agent.py': ROOT/'scripts/upgrade-code-agent.py',
         'agent_upgrade_support.py': ROOT/'scripts/agent_upgrade_support.py',
         'launch-code-upgrade.py': ROOT/'scripts/launch-code-upgrade.py',
@@ -71,6 +72,8 @@ def main():
     actual = subprocess.check_output([str(files['remote-hosts-code-macos-arm64']), '--version'], text=True).strip()
     if actual != 'remote-hosts-code ' + args.version:
         raise SystemExit('native artifact version mismatch')
+    if files['remote-hosts-code-windows-amd64.exe'].read_bytes()[:2] != b'MZ':
+        raise SystemExit('Windows artifact is not a PE executable')
     # Compile helper source without importing it or running any deployment action.
     for path in files.values():
         if path.suffix == '.py':

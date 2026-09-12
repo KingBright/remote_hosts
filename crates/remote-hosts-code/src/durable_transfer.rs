@@ -374,11 +374,14 @@ fn clean_publication(config: &AgentConfig, j: &Journal) -> Result<()> {
             j.publication_identity == Some((meta.dev(), meta.ino())),
             "publication cleanup identity conflict"
         );
+        dir.remove_file(name)?;
+        Ok(())
     }
     #[cfg(not(unix))]
-    anyhow::bail!("publication cleanup needs platform file identity");
-    dir.remove_file(name)?;
-    Ok(())
+    {
+        let _ = dir;
+        anyhow::bail!("publication cleanup needs platform file identity")
+    }
 }
 async fn cleanup(
     config: &AgentConfig,

@@ -13038,9 +13038,14 @@ mod tests {
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(format!("real SSH PTY did not emit expected marker: {expected}; output={output:?}").into());
+                return Err(format!(
+                    "real SSH PTY did not emit expected marker: {expected}; output={output:?}"
+                )
+                .into());
             }
-            let wait = deadline.saturating_duration_since(now).min(Duration::from_millis(500));
+            let wait = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(500));
             match tokio::time::timeout(wait, channel.wait()).await {
                 Ok(Some(ChannelMsg::Data { data }))
                 | Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
@@ -13051,7 +13056,10 @@ mod tests {
                 }
                 Ok(Some(_)) | Err(_) => {}
                 Ok(None) => {
-                    return Err(format!("real SSH PTY closed before marker {expected}; output={output:?}").into());
+                    return Err(format!(
+                        "real SSH PTY closed before marker {expected}; output={output:?}"
+                    )
+                    .into());
                 }
             }
         }
@@ -13478,7 +13486,8 @@ mod tests {
 
         let session = transport.session().await?;
         let mut pty = session.channel_open_session().await?;
-        pty.request_pty(false, "xterm-256color", 80, 24, 0, 0, &[]).await?;
+        pty.request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
+            .await?;
         let pty_probe = r#"sh -c 'trap "printf RH_SIGNAL_USR1\\n" USR1; stty size | sed "s/^/RH_SIZE_1 /"; printf "RH_READY_1\\n"; read _; stty size | sed "s/^/RH_SIZE_2 /"; printf "RH_READY_2\\n"; while :; do sleep 1; done'"#;
         pty.exec(true, pty_probe).await?;
         let initial_size = wait_real_pty_text(&mut pty, "RH_SIZE_1 24 80").await?;
@@ -20482,7 +20491,9 @@ mod tests {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err("operation did not reach expected state before five-second deadline".into());
+                return Err(
+                    "operation did not reach expected state before five-second deadline".into(),
+                );
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
