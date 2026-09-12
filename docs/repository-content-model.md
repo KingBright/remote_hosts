@@ -36,10 +36,10 @@ Remote Hosts 的公共仓库、某一套真实部署的配置，以及实时运�
 - Cloudflare zone/account/record/Tunnel/Origin Rule 的实例配置；
 - NAS/VPS 主机名、SSH 地址、用户名、管理端口；
 - 实际 UID/GID、绝对安装目录和存储路径；
-- 真实设备名称、device UUID、workspace ID；
+- 真实设备名称、稳定的 device UUID；
 - 每台设备授权的真实 root；
 - Gateway/Agent service override；
-- `gateway.json`、`agent.json`、owner password、device token 等配置或 secret reference；
+- `gateway.json` / `agent.json` 所需的部署参数与 secret reference；这些文件本身含敏感材料时不进入 Git；
 - 组织自己的发布目标清单和回滚目标。
 
 建议私有 ops 仓库采用类似结构：
@@ -61,7 +61,7 @@ remote-hosts-ops/                 # private repository
   runbooks/
 ```
 
-密码、token、私钥、Cloudflare API token 等仍放密码管理器、Vault、OS keychain 或 CI secret store，私有 Git 只保存引用。
+密码、token、私钥、Cloudflare API token、`gateway.json`/`agent.json` 中的敏感字段等仍放密码管理器、Vault、OS keychain 或 CI secret store，私有 Git 只保存引用。Workspace/operation/PTy 等运行时 ID 也不应写入私有 Git，而应在运行时动态获取。
 
 ### C. Live runtime state
 
@@ -75,7 +75,7 @@ remote-hosts-ops/                 # private repository
 - 当前安装/运行版本；
 - PID、service state、readiness；
 - OAuth client/session/token family 状态；
-- Workspace、PTY、operation、write lease；
+- Workspace/Workspace ID、PTY、operation/operation ID、write lease；
 - 当前 transport handshake/reuse；
 - 正在进行的升级、drain、rollback；
 - 某次现场 acceptance/deployment receipt。

@@ -9203,9 +9203,9 @@ mod tests {
             "risk_level": "development",
             "tags": ["windows", "builder"],
             "access": {
-                "address": "hackerlife.fun",
+                "address": "builder.example.test",
                 "port": 3333,
-                "username": "liang",
+                "username": "fixture-user",
                 "environment_name": "public-internet",
                 "environment_kind": "public_internet",
                 "trust_level": "untrusted",
@@ -9219,7 +9219,10 @@ mod tests {
         assert_eq!(created["credential_created"], json!(true));
         assert_eq!(created["access_path_created"], json!(true));
         assert_eq!(created["host"]["name"], json!("cubex"));
-        assert_eq!(created["access_path"]["address"], json!("hackerlife.fun"));
+        assert_eq!(
+            created["access_path"]["address"],
+            json!("builder.example.test")
+        );
         assert_eq!(created["access_path"]["port"], json!(3333));
         assert_eq!(created["duplicate_signals"], json!([]));
         assert_eq!(
@@ -9244,9 +9247,9 @@ mod tests {
                 "risk_level": "development",
                 "tags": ["release"],
                 "access": {
-                    "address": "HACKERLIFE.FUN",
+                    "address": "BUILDER.EXAMPLE.TEST",
                     "port": 3333,
-                    "username": "Liang",
+                    "username": "Fixture-User",
                     "environment_name": "public-internet",
                     "environment_kind": "public_internet",
                     "trust_level": "untrusted",
@@ -9275,9 +9278,9 @@ mod tests {
                 "kind": "windows",
                 "risk_level": "development",
                 "access": {
-                    "address": "hackerlife.fun",
+                    "address": "builder.example.test",
                     "port": 3333,
-                    "username": "liang",
+                    "username": "fixture-user",
                     "environment_name": "public-internet",
                     "environment_kind": "public_internet",
                     "trust_level": "untrusted",

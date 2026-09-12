@@ -105,6 +105,8 @@ class ClientTests(unittest.TestCase):
 
     def test_target_config_disallows_option_injection_and_duplicate_device(self):
         path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_050',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
-        config={'agents':[{'device_id':'00000000-0000-0000-0000-000000000001','workspace_id':'00000000-0000-0000-0000-000000000001:w','home':'/home/test'}],'gateway':{'ssh_host':'-oProxyCommand=bad','ssh_port':22,'root':'/opt/test'}}
+        config={'controller_device_id':'00000000-0000-0000-0000-000000000001',
+                'agents':[{'device_id':'00000000-0000-0000-0000-000000000001','home':'/home/test','root':'/home/test/projects'}],
+                'gateway':{'ssh_host':'-oProxyCommand=bad','ssh_port':22,'root':'/opt/test','binary_path':'/opt/test/remote-hosts-code','config_path':'/opt/test/gateway.json','backup_root':'/opt/test/releases'}}
         with self.assertRaises(ValueError):m.validate(config)
         config['gateway']['ssh_host']='test@host';self.assertIs(m.validate(config),config)

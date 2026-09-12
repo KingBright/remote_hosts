@@ -6,24 +6,24 @@ Use this when configuring MCP or checking whether the local Remote Hosts service
 
 Expected paths:
 
-- Binary: `/Users/jinliang/.local/bin/remote-hosts`
-- Service helper: `/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service`
-- Config: `/Users/jinliang/.config/remote-hosts/service.env`
-- Local vault key: `/Users/jinliang/.config/remote-hosts/vault-master-password` (generated automatically, mode `0600`)
-- Database URL: `sqlite:///Users/jinliang/.local/share/remote-hosts/remote-hosts.sqlite`
+- Binary: `/Users/YOUR_USER/.local/bin/remote-hosts`
+- Service helper: `/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service`
+- Config: `/Users/YOUR_USER/.config/remote-hosts/service.env`
+- Local vault key: `/Users/YOUR_USER/.config/remote-hosts/vault-master-password` (generated automatically, mode `0600`)
+- Database URL: `sqlite:///Users/YOUR_USER/.local/share/remote-hosts/remote-hosts.sqlite`
 - HTTP API: `http://127.0.0.1:8787`
-- Logs: `/Users/jinliang/.local/state/remote-hosts/logs`
-- Output artifacts: `/Users/jinliang/.local/share/remote-hosts/artifacts`
+- Logs: `/Users/YOUR_USER/.local/state/remote-hosts/logs`
+- Output artifacts: `/Users/YOUR_USER/.local/share/remote-hosts/artifacts`
 
 Useful commands:
 
 ```bash
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service status
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service stage
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service update
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service restart
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service ui
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service logs
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service status
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service stage
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service update
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service restart
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service ui
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service logs
 curl -sS http://127.0.0.1:8787/v1/command-profiles
 curl -sS http://127.0.0.1:8787/v1/admin/overview
 ```
@@ -55,7 +55,7 @@ fallback, and key bootstrap. The OpenSSH native-mux compatibility backend is Uni
 Agents should launch the stdio MCP server on demand:
 
 ```bash
-/Users/jinliang/.local/bin/remote-hosts mcp-stdio --database-url sqlite:///Users/jinliang/.local/share/remote-hosts/remote-hosts.sqlite --tool-profile agent --vault-master-password-file /Users/jinliang/.config/remote-hosts/vault-master-password --artifact-root /Users/jinliang/.local/share/remote-hosts/artifacts --agent-client-kind codex
+/Users/YOUR_USER/.local/bin/remote-hosts mcp-stdio --database-url sqlite:///Users/YOUR_USER/.local/share/remote-hosts/remote-hosts.sqlite --tool-profile agent --vault-master-password-file /Users/YOUR_USER/.config/remote-hosts/vault-master-password --artifact-root /Users/YOUR_USER/.local/share/remote-hosts/artifacts --agent-client-kind codex
 ```
 
 Do not run MCP stdio as a launchd daemon or Scheduled Task. Keep API and connector in the platform
@@ -123,8 +123,8 @@ Expected `~/.codex/config.toml` entry:
 
 ```toml
 [mcp_servers.remote-hosts]
-command = "/Users/jinliang/.local/bin/remote-hosts"
-args = ["mcp-stdio", "--database-url", "sqlite:///Users/jinliang/.local/share/remote-hosts/remote-hosts.sqlite", "--tool-profile", "agent", "--vault-master-password-file", "/Users/jinliang/.config/remote-hosts/vault-master-password", "--artifact-root", "/Users/jinliang/.local/share/remote-hosts/artifacts", "--agent-client-kind", "codex"]
+command = "/Users/YOUR_USER/.local/bin/remote-hosts"
+args = ["mcp-stdio", "--database-url", "sqlite:///Users/YOUR_USER/.local/share/remote-hosts/remote-hosts.sqlite", "--tool-profile", "agent", "--vault-master-password-file", "/Users/YOUR_USER/.config/remote-hosts/vault-master-password", "--artifact-root", "/Users/YOUR_USER/.local/share/remote-hosts/artifacts", "--agent-client-kind", "codex"]
 startup_timeout_sec = 30
 ```
 
@@ -148,17 +148,17 @@ Expected `~/.gemini/config/mcp_config.json` entry:
   "mcpServers": {
     "remote-hosts": {
       "$typeName": "exa.cascade_plugins_pb.CascadePluginCommandTemplate",
-      "command": "/Users/jinliang/.local/bin/remote-hosts",
+      "command": "/Users/YOUR_USER/.local/bin/remote-hosts",
       "args": [
         "mcp-stdio",
         "--database-url",
-        "sqlite:///Users/jinliang/.local/share/remote-hosts/remote-hosts.sqlite",
+        "sqlite:///Users/YOUR_USER/.local/share/remote-hosts/remote-hosts.sqlite",
         "--tool-profile",
         "agent",
         "--vault-master-password-file",
-        "/Users/jinliang/.config/remote-hosts/vault-master-password",
+        "/Users/YOUR_USER/.config/remote-hosts/vault-master-password",
         "--artifact-root",
-        "/Users/jinliang/.local/share/remote-hosts/artifacts",
+        "/Users/YOUR_USER/.local/share/remote-hosts/artifacts",
         "--agent-client-kind",
         "antigravity"
       ],

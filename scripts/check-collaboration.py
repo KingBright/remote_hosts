@@ -60,7 +60,8 @@ def main():
                 'host_schema_status':gateway['host_schema_status'],'file_default_max_bytes':67108864,
                 'file_hard_max_bytes':268435456,'terminal_reconcile_reported':True}
         phase='fixture';record()
-        term(agent['workspace_id'],"import pathlib,subprocess,os;p=pathlib.Path("+repr(folder)+");p.mkdir(parents=True,exist_ok=False);subprocess.run(['git','init','-q',str(p)],env=dict(os.environ,GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1'),check=True)",'fixture')
+        base_workspace=c.tool('workspace_open',{'device_id':args.device_id,'root':agent['root'],'idempotency_key':key+'-base-open'})['workspace']['id']
+        term(base_workspace,"import pathlib,subprocess,os;p=pathlib.Path("+repr(folder)+");p.mkdir(parents=True,exist_ok=False);subprocess.run(['git','init','-q',str(p)],env=dict(os.environ,GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1'),check=True)",'fixture')
         workspace=open_workspace();r['workspace_id']=workspace;record()
         files=json.loads(term(workspace,"import pathlib,json,hashlib;d=pathlib.Path('dst');d.mkdir();files=[]\nfor i in range(100):\n old=bytes([i,0,255])*17;new=bytes([i,1,254])*17 if i<3 else old;p=d/f'f{i}.bin';p.write_bytes(old);files.append({'path':str(p),'sha256':hashlib.sha256(new).hexdigest(),'size':len(new),'executable':False})\nprint(json.dumps(files))",'files'))
         before=c.tool('workspace_context',{'workspace_id':workspace,'limit':50});event_cursor=before['events']['cursor']
@@ -146,7 +147,7 @@ def main():
         phase='cleanup';record()
         expected_names={'.git','dst','change','bundle.source','bundle.received'}|({'large.source','large.received'} if version >= (0,7,0) else set())
         term(workspace,"import pathlib,hashlib,json;p=pathlib.Path('.');assert {x.name for x in p.iterdir()}=="+repr(expected_names)+";assert {x.name for x in (p/'dst').iterdir()}=={f'f{i}.bin' for i in range(100)}\nfor i in range(100):\n expected=b'user-edit' if i==0 else (bytes([i,1,254])*17 if i<3 else bytes([i,0,255])*17);assert(p/'dst'/f'f{i}.bin').read_bytes()==expected\nassert (p/'change'/'a.txt').read_text()=='user edit\\n' and (p/'change'/'b.txt').read_text()=='beta\\n';assert hashlib.sha256((p/'bundle.received').read_bytes()).hexdigest()=="+repr(bundle['sha256']), 'verify-cleanup')
-        term(agent['workspace_id'],"import pathlib,shutil;p=pathlib.Path("+repr(folder)+");assert p.is_dir() and not p.is_symlink();shutil.rmtree(p)",'cleanup')
+        term(base_workspace,"import pathlib,shutil;p=pathlib.Path("+repr(folder)+");assert p.is_dir() and not p.is_symlink();shutil.rmtree(p)",'cleanup')
         r['fixture_removed']=True;r['state']='passed';phase='complete'
     except Exception as error:r.update(state='failed',failure_type=type(error).__name__,recovery='inspect recorded original operations and fixture; do not reinstall')
     finally:

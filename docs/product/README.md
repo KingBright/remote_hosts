@@ -46,11 +46,9 @@ python3 scripts/iteration-code.py --report target/iteration-runs/<id>/iteration.
 
 ## 发布证据
 
-当前版本说明：`docs/releases/0.7.1/RELEASE.md`。
-固定输入/构建流水线：`target/iteration-071-a2/pipeline.json`，长期事实以源码提交、manifest 哈希和 `docs/releases/0.7.1/` 证据为准，不依赖 target 目录永久存在。
-最终运行状态：`docs/releases/0.7.1/deployment-final.json`；原 publisher 的 partial 记录仍保留为历史证据，不覆盖失败过程。
-源码提交：`1bbaf74`（0.7.0 主线）、`7071d9d`（0.7.1 receiver hotfix）、`2b1619c`（验收器动态 lifecycle 修复）。
-现场验收只有实际执行成功才可标 passed；宿主在执行前拦截、run-id 参数验证失败等情况必须保持未执行/失败状态。
+公共仓库只保存 repository/release evidence：固定源码身份、测试门禁、artifact manifest/SHA、平台矩阵和已知限制。当前 repository release 以源码 package version 与对应固定验证结果为准。
+
+早期 `docs/releases/` 中同时存在 release verification 与真实部署 acceptance/deployment 记录；这些现场记录现在统一视为 **legacy deployment evidence**，不能用来推断当前在线设备或运行版本。新的真实发布目标、installed/running/accepted 状态和现场 receipts 进入独立 private ops/runtime 系统。现场验收只有实际执行成功才可标 passed；宿主在执行前拦截、参数验证失败等情况必须保持未执行/失败状态。
 
 工具平台拒绝某个操作时，记录为“未执行/外部阻塞”，不把它记为测试失败，也不通过改名或包装等价操作绕过。其余独立、正常授权的工作仍可继续。
 

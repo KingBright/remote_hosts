@@ -114,11 +114,11 @@ Remote Hosts 明确区分：**请求已接收、执行已完成、版本已安�
 
 ## 当前版本
 
-当前仓库发布版本为 **0.9.0**。0.9.0 固定源码 pipeline 通过 **372 项测试：239 Rust + 133 Python，0 失败**，并通过格式检查、严格 Clippy、workspace check、macOS ARM64 release 构建和 Linux x86_64-musl release 构建。正式 package manifest SHA-256 为 `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`。
+当前最近一次不可变 packaged release 为 **0.9.0**。该 0.9.0 固定源码 pipeline 通过 **372 项测试：239 Rust + 133 Python，0 失败**，并通过格式检查、严格 Clippy、workspace check、macOS ARM64 release 构建和 Linux x86_64-musl release 构建。正式 package manifest SHA-256 为 `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`。
 
 0.9.0 进一步加入 native `russh` PTY resize/signal、pooled port forwarding、真实 SSHD/1 GiB 回归、双 MCP Agent Session 的 Workspace/PTY 隔离与 write-lease handoff、Linux systemd user service，以及 macOS 稳定 updater/code identity 基础。多进程真实 SSH 黑盒确认两个 Agent Session 共用一个 pooled transport，只有一次认证握手并发生多次安全复用。
 
-**仓库发布版本、已生成 release package 和现场已部署版本是不同状态。** 不要根据本 README 推断 NAS、Mac 或其他设备已经完成 0.9.0 安装；现场版本应以对应 deployment receipt、服务状态或 `devices_list` 实际结果为准。历史版本的发布证据仍保存在 `docs/releases/`。
+**当前 `main` 可以包含 0.9.0 之后尚未重新打包的源码改动；repository HEAD、已生成 release package 和现场已部署版本是不同状态。** 不要根据本 README 推断 NAS、Mac 或其他设备已经完成 0.9.0 安装；现场版本应以对应 deployment receipt、服务状态或 `devices_list` 实际结果为准。历史版本的发布证据仍保存在 `docs/releases/`。
 
 ## 开发与发布
 

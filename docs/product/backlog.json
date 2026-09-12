@@ -12,24 +12,15 @@
     "closed": "已满足该项验收且附证据；代码存在不能关闭"
   },
   "release_policy": {
-    "current_candidate": "0.7.1",
-    "last_observed_agents": "NAS gateway, MacBook-M2-Max and Mac-Studio are online and report 0.7.1",
-    "publication_evidence": "docs/releases/0.7.1/RELEASE.md",
-    "candidate_validation": "0.7.1 fixed source snapshot passed 348 tests (238 Rust + 110 Python, 0 failed), format, strict Clippy, workspace check and both release builds. NAS and both Macs run 0.7.1. Native code/terminal probes passed on both Macs. A 9,089,298-byte live transfer retried once from a 4 MiB checkpoint and completed with the expected SHA; the current host-visible file schema still caps max_bytes at 64 MiB, so a host-native >64 MiB roundtrip remains unclaimed.",
-    "current_candidate_evidence": "docs/releases/0.7.1/deployment-final.json",
+    "package_manifest_sha256": "8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2",
+    "deployment_state_source": "private deployment/runtime system; not this public backlog",
     "close_only_with_acceptance_evidence": true,
     "all_known_issues_must_be_fixed_before_every_release": false,
-    "rule": "发布允许明确列出的非阻塞遗留项；新风险须判断是否阻塞本次发布，不能用版本号冒充全部修复。",
-    "isolated_iteration_evidence": "docs/iterations/2026-09-10-f2/verification.json",
-    "selected_release_targets": [
-      "NAS gateway",
-      "MacBook-M2-Max",
-      "Mac-Studio"
-    ],
-    "studio_policy": "selected release target; per-target drain defers only when real active work is present",
-    "auto_publish_after_validation": true,
-    "per_version_confirmation_required": false,
-    "continue_priority_work_within_current_session": true
+    "rule": "公共 backlog 记录产品问题和 repository/release facts；真实 release targets、installed/running/accepted 状态和现场 receipts 属于 private deployment/runtime system。",
+    "last_packaged_release": "0.9.0",
+    "last_packaged_validation": "0.9.0 fixed-source pipeline passed 372 tests (239 Rust + 133 Python, 0 failed), format, strict Clippy, workspace check, macOS ARM64 release build and Linux x86_64-musl release build.",
+    "current_main_state": "post-0.9.0 unreleased source changes",
+    "current_source_validation": "379 passed / 0 failed (239 Rust + 140 Python), plus fmt, strict Clippy and workspace check; no new immutable package was produced by this separation refactor."
   },
   "milestones": [
     {

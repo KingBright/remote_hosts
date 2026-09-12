@@ -1,9 +1,6 @@
-mcp.hackerlife.fun {
-    import cloudflare_dns
-    reverse_proxy 127.0.0.1:18787 {
+{{PUBLIC_HOST}} {
+    reverse_proxy {{GATEWAY_BIND}} {
         flush_interval -1
-        header_up Host mcp.hackerlife.fun
-        header_down Referrer-Policy same-origin
-        header_down Content-Security-Policy "default-src 'none'; form-action 'self' https://chatgpt.com; frame-ancestors 'none'; base-uri 'none'"
+        header_up Host {{PUBLIC_HOST}}
     }
 }

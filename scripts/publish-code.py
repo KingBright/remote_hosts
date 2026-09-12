@@ -54,13 +54,33 @@ def validate(config):
     seen=set()
     for agent in config['agents']:
         uuid.UUID(agent['device_id'])
-        if agent['device_id'] in seen or not agent['workspace_id'].startswith(agent['device_id']+':'):raise ValueError('device/workspace identity conflict')
+        if agent['device_id'] in seen:raise ValueError('duplicate device identity')
         seen.add(agent['device_id'])
-        if not pathlib.PurePosixPath(agent['home']).is_absolute():raise ValueError('absolute home required')
+        for key in ('home','root'):
+            if key not in agent or not pathlib.PurePosixPath(agent[key]).is_absolute():raise ValueError('absolute agent '+key+' required')
+    controller=config.get('controller_device_id')
+    uuid.UUID(controller)
+    if controller not in seen:raise ValueError('controller_device_id must select one configured agent')
     gateway=config['gateway']
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*',gateway['ssh_host']) or not 1<=gateway['ssh_port']<=65535:raise ValueError('invalid SSH target')
-    if not pathlib.PurePosixPath(gateway['root']).is_absolute():raise ValueError('absolute gateway root required')
+    for key in ('root','binary_path','config_path','backup_root'):
+        if key not in gateway or not pathlib.PurePosixPath(gateway[key]).is_absolute():
+            raise ValueError('absolute gateway '+key+' required')
+    service=gateway.get('service_name','remote-hosts-code-gateway.service')
+    if '/' in service or not service.endswith('.service'):raise ValueError('invalid gateway service name')
+    bind=gateway.get('gateway_bind','127.0.0.1:18787')
+    host,sep,port=bind.rpartition(':')
+    if not sep or not host or not port.isdigit() or not 1<=int(port)<=65535:raise ValueError('invalid gateway bind')
     return config
+
+
+def open_workspace(client, device_id, root, key):
+    arguments={'device_id':device_id,'root':root,'idempotency_key':key}
+    for attempt in range(3):
+        try:return client.tool('workspace_open',arguments)['workspace']['id']
+        except RuntimeError:
+            if attempt==2:raise
+            time.sleep(.5*(attempt+1))
 
 def stage_remote_artifact(run, ssh, scp, host, local, dest, expected, attempts=3):
     """Stage one immutable artifact with bounded retry and atomic publication.
@@ -204,7 +224,14 @@ def main():
                 return {'state':'staged','artifacts':staged}
             journal.step('stage',binding,stage_gateway)
             def update_gateway():
-                argv=['python3',remote+'/upgrade-code-gateway.py','--candidate',remote+'/remote-hosts-code-linux-amd64','--sha256',manifest['artifacts']['remote-hosts-code-linux-amd64']['sha256'],'--version',args.version,'--result',remote+'/deployment.json']
+                argv=['python3',remote+'/upgrade-code-gateway.py',
+                      '--candidate',remote+'/remote-hosts-code-linux-amd64',
+                      '--sha256',manifest['artifacts']['remote-hosts-code-linux-amd64']['sha256'],
+                      '--version',args.version,'--result',remote+'/deployment.json',
+                      '--binary-path',gateway['binary_path'],'--config-path',gateway['config_path'],
+                      '--backup-root',gateway['backup_root'],
+                      '--service-name',gateway.get('service_name','remote-hosts-code-gateway.service'),
+                      '--gateway-bind',gateway.get('gateway_bind','127.0.0.1:18787')]
                 command(ssh+[shlex.join(argv)],180)
                 value=json.loads(command(ssh+['cat '+shlex.quote(remote+'/deployment.json')]))
                 if value.get('state')!='upgraded' or value['installed_sha256']!=manifest['artifacts']['remote-hosts-code-linux-amd64']['sha256']:raise ValueError('gateway not verified')
@@ -218,9 +245,12 @@ def main():
             with tarfile.open(archive,'x:gz') as t:
                 for name in sorted(names):t.add(package/name,arcname=name)
         archive_sha=rr.digest(archive)
+        # Resolve a fresh controller Workspace from stable device/root identity.
+        # Workspace ids are live runtime state and never belong in deployment Git.
+        controller_workspace=open_workspace(main_client,config['controller_device_id'],str(root),'release-'+args.version+'-controller-open')
         # Snapshot/export the shared candidate before ANY local updater drains
         # the controller. Healthy peers no longer depend on its execution lane.
-        exported=main_client.tool('file_download',{'workspace_id':config['controller_workspace'],'path':str(archive.relative_to(root)),'expected_version':archive_sha,'idempotency_key':'release-'+args.version+'-common-export','max_bytes':67108864})
+        exported=main_client.tool('file_download',{'workspace_id':controller_workspace,'path':str(archive.relative_to(root)),'expected_version':archive_sha,'idempotency_key':'release-'+args.version+'-common-export','max_bytes':67108864})
         if exported.get('state')!='completed' or exported.get('sha256')!=archive_sha:raise RuntimeError('common artifact export not verified')
         state['source_artifact']={'operation_id':exported['operation_id'],'sha256':archive_sha,'size':exported['size']};save()
         def run_agent(ident):
@@ -234,17 +264,18 @@ def main():
                     else:
                         destination=agent['home']+'/.local/share/remote-hosts-code/releases/'+args.version
                         remote_archive='.remote-hosts-release-staging-'+args.version+'/agent-package.tgz'
+                        remote_workspace=open_workspace(c,ident,agent['root'],'release-'+args.version+'-workspace-'+ident)
                         def stage_agent():
-                            imported=c.tool('file_upload',{'workspace_id':agent['workspace_id'],'path':remote_archive,'expected_version':'absent','sha256':archive_sha,'idempotency_key':'release-'+args.version+'-import-'+ident,'file':{'file_id':exported['artifact_id'],'download_url':exported['download_url'],'file_name':'agent-package.tgz'}})
+                            imported=c.tool('file_upload',{'workspace_id':remote_workspace,'path':remote_archive,'expected_version':'absent','sha256':archive_sha,'idempotency_key':'release-'+args.version+'-import-'+ident,'file':{'file_id':exported['artifact_id'],'download_url':exported['download_url'],'file_name':'agent-package.tgz'}})
                             if imported['state']!='completed' or imported['sha256']!=archive_sha:raise RuntimeError('staging transfer not completed; observe original operation')
                             code="import pathlib,tarfile,hashlib,json\np=pathlib.Path("+repr(remote_archive)+");assert hashlib.sha256(p.read_bytes()).hexdigest()=="+repr(archive_sha)+"\nr=pathlib.Path("+repr(destination)+");r.mkdir(parents=True,exist_ok=True)\nwith tarfile.open(p) as t:\n assert set(t.getnames())=="+repr(names)+" and all(x.isfile() for x in t.getmembers())\n payload={n:t.extractfile(n).read() for n in t.getnames()}\n assert hashlib.sha256(payload['manifest.json']).hexdigest()=="+repr(plan['manifest_sha256'])+"\n manifest=json.loads(payload['manifest.json'])\n for n,b in payload.items():\n  if n!='manifest.json':assert hashlib.sha256(b).hexdigest()==manifest['artifacts'][n]['sha256']\n  q=r/n\n  if q.exists():assert q.read_bytes()==b\n  else:\n   with q.open('xb') as f:f.write(b)\n  q.chmod(0o755 if n=='remote-hosts-code-macos-arm64' else 0o600)\nprint('staged')"
-                            c.terminal(agent['workspace_id'],'/opt/homebrew/bin/python3 -c '+shlex.quote(code),'release-'+args.version+'-extract-'+ident,60)
+                            c.terminal(remote_workspace,'/opt/homebrew/bin/python3 -c '+shlex.quote(code),'release-'+args.version+'-extract-'+ident,60)
                             return {'state':'staged','import_operation':imported['operation_id'],'archive_sha256':archive_sha}
                         journal.step('stage',{'archive':archive_sha},stage_agent);local_package=pathlib.Path(destination)
                     phase='launch_updater';record()
                     def launch():
                         argv=['/opt/homebrew/bin/python3',str(local_package/'launch-code-upgrade.py'),'--candidate',str(local_package/'remote-hosts-code-macos-arm64'),'--sha256',sha,'--version',args.version,'--start']
-                        output=command(argv,30) if agent.get('local') else c.terminal(agent['workspace_id'],shlex.join(argv),'release-'+args.version+'-launch-'+ident,30)
+                        output=command(argv,30) if agent.get('local') else c.terminal(remote_workspace,shlex.join(argv),'release-'+args.version+'-launch-'+ident,30)
                         value=json.loads(output)
                         if value.get('state') not in ('started','already_requested','authorization_required'):raise RuntimeError('updater launch not accepted')
                         return value

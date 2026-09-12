@@ -25,7 +25,7 @@
 
 版本目录位于 `docs/releases/`。新的公共 release evidence 只应保存固定输入、测试门禁、artifact manifest/SHA 和不绑定具体实例的发布说明。早期版本目录中还保留了一批真实部署 acceptance/deployment/targets 记录，它们属于历史 **legacy evidence**，不是当前推荐的数据模型，也不能作为实时状态事实源；后续应在保留审计链的前提下迁往私有 ops/archive。
 
-当前仓库代码网关发布版本为 **0.9.0**。固定源码 pipeline 通过 **372 项测试：239 Rust + 133 Python，0 失败**，并完成 macOS ARM64 与 Linux x86_64-musl release 构建；package manifest SHA-256 为 `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`。这些都是 repository/release facts，不描述任何一套实例当前 installed/running/accepted 状态。
+当前最近一次不可变 packaged release 为 **0.9.0**。该固定源码 pipeline 通过 **372 项测试：239 Rust + 133 Python，0 失败**，并完成 macOS ARM64 与 Linux x86_64-musl release 构建；package manifest SHA-256 为 `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`。这些都是 release facts；当前 `main` 还可以包含尚未重新打包的后续源码改动，也不描述任何一套实例当前 installed/running/accepted 状态。
 
 ## 文档纪律
 

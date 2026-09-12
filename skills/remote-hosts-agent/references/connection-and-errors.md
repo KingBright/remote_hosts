@@ -76,9 +76,9 @@ Stop and diagnose instead of retrying when you see:
 Local macOS service commands:
 
 ```bash
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service status
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service logs
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service restart
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service status
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service logs
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service restart
 ```
 
 Local Windows service commands:

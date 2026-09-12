@@ -45,11 +45,11 @@ Use this skill to interact with the user's Remote Hosts service instead of openi
 The local Remote Hosts service is expected to be installed through the platform service manager.
 On the owner's current macOS workstation:
 
-- Binary: `/Users/jinliang/.local/bin/remote-hosts`
-- Database: `sqlite:///Users/jinliang/.local/share/remote-hosts/remote-hosts.sqlite`
+- Binary: `/Users/YOUR_USER/.local/bin/remote-hosts`
+- Database: `sqlite:///Users/YOUR_USER/.local/share/remote-hosts/remote-hosts.sqlite`
 - HTTP API: `http://127.0.0.1:8787`
-- Service helper: `/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service`
-- Output artifacts: `/Users/jinliang/.local/share/remote-hosts/artifacts`
+- Service helper: `/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service`
+- Output artifacts: `/Users/YOUR_USER/.local/share/remote-hosts/artifacts`
 
 On Windows, the release defaults to:
 
@@ -68,7 +68,7 @@ stdio without a persistent PowerShell proxy.
 If MCP tools are unavailable, first check whether the service is running:
 
 ```bash
-/Users/jinliang/Workspace/remote_hosts/scripts/remote-hosts-service status
+/Users/YOUR_USER/Workspace/remote_hosts/scripts/remote-hosts-service status
 curl -sS http://127.0.0.1:8787/v1/command-profiles
 ```
 

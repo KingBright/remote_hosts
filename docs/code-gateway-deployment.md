@@ -365,6 +365,22 @@ sudo systemctl status remote-hosts-code-gateway.service
 
 Gateway 默认应只监听 loopback `127.0.0.1:18787`。
 
+#### 使用仓库通用 installer（可选）
+
+如果已经准备好 binary、`gateway.json`、service user 和 Caddy，可以让仓库模板生成 systemd unit 与 Caddy site，而不是复制某个维护者实例的文件：
+
+```bash
+sudo python3 scripts/install-code-gateway.py \
+  --binary /usr/local/bin/remote-hosts-code \
+  --config /etc/remote-hosts-code/gateway.json \
+  --state-dir /var/lib/remote-hosts-code \
+  --public-host mcp.example.com \
+  --service-user remote-hosts-code \
+  --service-group remote-hosts-code
+```
+
+这个 installer 的域名、service user/group、状态目录、binary/config 路径、Caddy 路径和 Gateway bind 都是部署参数；公共仓库不再为任何具体 NAS/VPS 写死这些值。首次执行默认拒绝覆盖已有不同 unit/site；确认内容完全一致时才使用 `--resume`。不使用 Caddy 时可传 `--skip-caddy`。
+
 ### 5.5 Caddy 反向代理
 
 当前仓库的生产配置思路：
@@ -374,14 +390,11 @@ mcp.example.com {
     reverse_proxy 127.0.0.1:18787 {
         flush_interval -1
         header_up Host mcp.example.com
-        header_down Referrer-Policy same-origin
-        header_down Content-Security-Policy "default-src 'none'; form-action 'self' https://chatgpt.com; frame-ancestors 'none'; base-uri 'none'"
     }
 }
 ```
 
-`header_up Host` 很重要，因为 Gateway 会按 `public_url` 校验 authority。修改 Caddy 前先 validate，
-验证通过再 reload，不要为了部署 MCP 把其他站点覆盖掉。
+`header_up Host` 很重要，因为 Gateway 会按 `public_url` 校验 authority。OAuth 页面需要的 `Referrer-Policy`、CSP、`Cache-Control` 等安全响应头由 Gateway 自己生成，反向代理不要再维护一份容易漂移的重复策略。修改 Caddy 前先 validate，验证通过再 reload，不要为了部署 MCP 把其他站点覆盖掉。
 
 ### 5.6 Gateway 基础健康检查
 

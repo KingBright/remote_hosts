@@ -1,8 +1,8 @@
 # ChatGPT unified code gateway
 
-**2026-09-12 repository release status:** the current repository release is **0.9.0**. Its fixed-source pipeline passed **372 tests (239 Rust + 133 Python, 0 failures)**, strict format/Clippy/workspace gates, and both macOS ARM64 and Linux x86_64-musl release builds. The immutable package manifest SHA-256 is `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`.
+**2026-09-12 release status:** the latest immutable packaged release is **0.9.0**. Its fixed-source pipeline passed **372 tests (239 Rust + 133 Python, 0 failures)**, strict format/Clippy/workspace gates, and both macOS ARM64 and Linux x86_64-musl release builds. The immutable package manifest SHA-256 is `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`.
 
-Repository release, generated package, installed version, running process and live acceptance are intentionally separate states. This public document records only repository/release facts. A specific deployment's installed/running/accepted state belongs to its private ops/runtime system. See [Repository Content Model](repository-content-model.md).
+Repository HEAD, generated package, installed version, running process and live acceptance are intentionally separate states. `main` may contain post-0.9.0 changes that have not yet been repackaged. This public document records only repository/release facts. A specific deployment's installed/running/accepted state belongs to its private ops/runtime system. See [Repository Content Model](repository-content-model.md).
 
 0.9.0 adds stable macOS updater/code identity foundations, native `russh` PTY resize/signal delivery, pooled port forwarding, Linux systemd user-service support, real-SSHD regressions including a verified 1 GiB transfer, and a two-process MCP regression proving Workspace/PTY isolation plus write-lease handoff over one pooled SSH transport.
 
