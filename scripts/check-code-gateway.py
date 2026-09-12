@@ -162,11 +162,13 @@ def main():
         if value is None:
             value = json.loads(result["content"][0]["text"]) if not result.get("isError") else {"error": "tool_failed", "message": result["content"][0]["text"]}
         deadline = time.monotonic() + 300
-        while value.get("pending") and time.monotonic() < deadline:
+        def needs_operation_poll(v):
+            return bool(v.get("pending")) or v.get("next_action") == "operation_get"
+        while needs_operation_poll(value) and time.monotonic() < deadline:
             time.sleep(0.5)
             polled = rpc("tools/call", {"name": "operation_get", "arguments": {"operation_id": value["operation_id"]}})
             value = polled.get("structuredContent") or {"error": "poll_failed"}
-        if value.get("pending"):
+        if needs_operation_poll(value):
             raise RuntimeError("Operation pending: " + value["operation_id"])
         if "error" in value and not allow_error:
             raise RuntimeError(name + ": " + str(value.get("message", value["error"]))[:300])
