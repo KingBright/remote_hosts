@@ -20,8 +20,8 @@ pub use connector_state::{ConnectorHeartbeatOutcome, ConnectorStateTracker};
 pub use policy::{ProtectionDecision, ServerProtectionPolicy};
 pub use pty_interaction::detect_pty_interaction;
 pub use pty_session::{
-    PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionInputPlan, PtySessionOpenCommand,
-    PtySessionSupervisor, PtySessionSupervisorError,
+    PtySessionControlCommand, PtySessionHeartbeatCommand, PtySessionInputCommand,
+    PtySessionInputPlan, PtySessionOpenCommand, PtySessionSupervisor, PtySessionSupervisorError,
 };
 pub use redaction::SecretRedactor;
 pub use resolver::{AccessCandidate, AccessResolution, AccessResolutionError, AccessResolver};

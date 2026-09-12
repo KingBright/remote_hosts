@@ -22,7 +22,8 @@ class Receipts(unittest.TestCase):
     def build(self):
         pkg = self.root/'package'; pkg.mkdir()
         files = {'remote-hosts-code-macos-arm64','remote-hosts-code-linux-amd64','upgrade-code-agent.py',
-                 'agent_upgrade_support.py','launch-code-upgrade.py','upgrade-code-gateway.py','check-code-gateway.py'}
+                 'agent_upgrade_support.py','launch-code-upgrade.py','code_upgrade_runner.py','macos_code_identity.py',
+                 'upgrade-code-gateway.py','check-code-gateway.py'}
         artifacts = {}
         for name in files:
             p=pkg/name;p.write_bytes(b'fixture')

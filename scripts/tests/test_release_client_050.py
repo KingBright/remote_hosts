@@ -85,9 +85,13 @@ class ClientTests(unittest.TestCase):
     def test_accept_only_requires_verified_installed_runtime(self):
         path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_080_accept',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
         sha='a'*64
+        certificate='c'*40
+        signing={'state':'ready','certificate_sha1':certificate,'code_identifier':'com.remote-hosts.code-agent',
+                 'designated_requirement':f'identifier "com.remote-hosts.code-agent" and certificate leaf = H"{certificate}"',
+                 'installed_sha256':sha}
         device={'online':True,'capabilities':{'version':'0.8.0'},'maintenance':{'state':'open'},
                 'upgrade':{'receipt':{'state':'upgraded','version':'0.8.0','candidate_sha256':sha,
-                'installed_sha256':sha,'gateway_verified':True,'all_lanes_verified':True,'stable_seconds':15.1}}}
+                'installed_sha256':sha,'signing':signing,'gateway_verified':True,'all_lanes_verified':True,'stable_seconds':15.1}}}
         self.assertTrue(m.acceptance_ready(device,'0.8.0',sha))
         for mutation in ('offline','version','maintenance','sha','lanes','stability'):
             changed=json.loads(json.dumps(device))

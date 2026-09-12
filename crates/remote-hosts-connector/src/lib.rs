@@ -15,7 +15,10 @@ use std::{num::NonZeroUsize, process::Stdio as ProcessStdio};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 #[cfg(unix)]
-use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder, Stdio as OpenSshStdio};
+use openssh::{
+    ControlPersist, ForwardType as OpenSshForwardType, KnownHosts, Session, SessionBuilder,
+    Socket as OpenSshSocket, Stdio as OpenSshStdio,
+};
 #[cfg(unix)]
 use openssh_sftp_client::{
     Error as OpenSshSftpError, Sftp as OpenSshSftp, SftpOptions,
@@ -41,17 +44,18 @@ use remote_hosts_domain::{
     ConnectionSession, ConnectorId, EntityState, HostId, HostKind, HostWriteLease, OperationId,
     OperationOutputArtifact, OperationOutputArtifactId, OperationOutputChunk,
     OperationOutputChunkId, OperationRun, OperationState, OutputStream, PtyBackendCapabilities,
-    PtyBackendState, PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyInputPayloadKind,
-    PtyOutputChunk, PtyOutputChunkId, PtySession, PtySessionId, RouteType, SessionId,
-    SshChannelKind, SshChannelTransportEvidence, SshFileTransferMode, SshTransportBackend,
-    SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId, SshTransportRuntimeState,
-    SshTransportTelemetry, StateReasonCode, WorkspaceId, WorkspaceState, now_utc,
+    PtyBackendState, PtyControlPayload, PtyInputEvent, PtyInputEventId, PtyInputEventState,
+    PtyInputPayloadKind, PtyOutputChunk, PtyOutputChunkId, PtySession, PtySessionId, RouteType,
+    SessionId, SshChannelKind, SshChannelTransportEvidence, SshFileTransferMode,
+    SshTransportBackend, SshTransportCapabilities, SshTransportRuntime, SshTransportRuntimeId,
+    SshTransportRuntimeState, SshTransportTelemetry, StateReasonCode, WorkspaceId, WorkspaceState,
+    now_utc,
 };
 use remote_hosts_vault::{CredentialSecret, CredentialVault, EncryptedCredentialBlob};
 
 pub mod minio_relay;
 use russh::{
-    ChannelMsg, client,
+    ChannelMsg, Sig, client,
     keys::{
         PrivateKeyWithHashAlg,
         agent::{AgentIdentity, client::AgentClient},
@@ -74,6 +78,7 @@ use sha2::{Digest, Sha256};
 use tokio::process::{Child as LocalChild, Command as LocalCommand};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpListener,
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time::{Duration, Instant},
@@ -519,13 +524,39 @@ impl RemoteTransport for OpenSshTransport {
             .map_err(|_| TransportError::Timeout)?
     }
 
-    async fn open_forward(
-        &self,
-        _request: ForwardRequest,
-    ) -> Result<ForwardHandle, TransportError> {
-        Err(TransportError::Backend(
-            "OpenSSH port forwarding is not implemented yet".to_owned(),
-        ))
+    async fn open_forward(&self, request: ForwardRequest) -> Result<ForwardHandle, TransportError> {
+        request.validate()?;
+        let session = self.session().await?;
+        session
+            .request_port_forward(
+                OpenSshForwardType::Local,
+                OpenSshSocket::new(request.bind_address.clone(), request.local_port),
+                OpenSshSocket::new(request.target_host.clone(), request.target_port),
+            )
+            .await
+            .map_err(|error| {
+                TransportError::Backend(format!("open local port forward: {error}"))
+            })?;
+        Ok(ForwardHandle {
+            session_id: SessionId::new(),
+            forward_id: request.operation_id,
+            bind_address: request.bind_address,
+            local_port: request.local_port,
+            target_host: request.target_host,
+            target_port: request.target_port,
+        })
+    }
+
+    async fn close_forward(&self, handle: ForwardHandle) -> Result<(), TransportError> {
+        let session = self.session().await?;
+        session
+            .close_port_forward(
+                OpenSshForwardType::Local,
+                OpenSshSocket::new(handle.bind_address, handle.local_port),
+                OpenSshSocket::new(handle.target_host, handle.target_port),
+            )
+            .await
+            .map_err(|error| TransportError::Backend(format!("close local port forward: {error}")))
     }
 }
 
@@ -1130,6 +1161,7 @@ pub struct PtyBackendOutput {
 /// Running managed PTY process handles.
 pub struct ManagedPtyProcess {
     input_tx: mpsc::Sender<String>,
+    control_tx: Option<mpsc::Sender<PtyControlPayload>>,
     output_rx: mpsc::Receiver<PtyBackendOutput>,
     close_tx: oneshot::Sender<()>,
     transport_telemetry: Option<SshTransportTelemetry>,
@@ -1146,12 +1178,20 @@ impl ManagedPtyProcess {
     ) -> Self {
         Self {
             input_tx,
+            control_tx: None,
             output_rx,
             close_tx,
             transport_telemetry: None,
             transport_evidence: None,
             channel_permit: None,
         }
+    }
+
+    /// Attaches the backend-native resize/signal control channel.
+    #[must_use]
+    pub fn with_control_sender(mut self, control_tx: mpsc::Sender<PtyControlPayload>) -> Self {
+        self.control_tx = Some(control_tx);
+        self
     }
 
     /// Attaches SSH transport telemetry and evidence observed while opening the PTY channel.
@@ -2240,6 +2280,7 @@ pub struct RusshTransport<C> {
     authorized_key_bootstrap: AuthorizedKeyBootstrapRepository,
     session: Mutex<Option<Arc<client::Handle<RusshClientHandler>>>>,
     pty_channel_lifecycle: Mutex<RusshPtyChannelLifecycle>,
+    forward_closers: Mutex<BTreeMap<OperationId, oneshot::Sender<()>>>,
     handshake_limiter: HandshakeLimiter,
     channel_semaphore: Arc<Semaphore>,
     telemetry: TransportTelemetryTracker,
@@ -2278,6 +2319,7 @@ impl<C> RusshTransport<C> {
             authorized_key_bootstrap,
             session: Mutex::new(None),
             pty_channel_lifecycle: Mutex::new(RusshPtyChannelLifecycle::default()),
+            forward_closers: Mutex::new(BTreeMap::new()),
             handshake_limiter,
             channel_semaphore: Arc::new(Semaphore::new(channel_limit)),
             telemetry: TransportTelemetryTracker::new(
@@ -2669,13 +2711,99 @@ where
         }
     }
 
-    async fn open_forward(
-        &self,
-        _request: ForwardRequest,
-    ) -> Result<ForwardHandle, TransportError> {
-        Err(TransportError::Backend(
-            "russh port forwarding is not implemented yet".to_owned(),
-        ))
+    async fn open_forward(&self, request: ForwardRequest) -> Result<ForwardHandle, TransportError> {
+        request.validate()?;
+        if self
+            .forward_closers
+            .lock()
+            .await
+            .contains_key(&request.operation_id)
+        {
+            return Err(TransportError::PolicyDenied(
+                "port forward operation id is already active".to_owned(),
+            ));
+        }
+        let listener = TcpListener::bind((request.bind_address.as_str(), request.local_port))
+            .await
+            .map_err(|error| {
+                TransportError::Backend(format!("bind local port forward: {error}"))
+            })?;
+        let session = self.session().await?;
+        let (close_tx, close_rx) = oneshot::channel();
+        self.forward_closers
+            .lock()
+            .await
+            .insert(request.operation_id, close_tx);
+        let target_host = request.target_host.clone();
+        let target_port = request.target_port;
+        let channel_semaphore = Arc::clone(&self.channel_semaphore);
+        tokio::spawn(run_russh_local_forward(
+            listener,
+            session,
+            channel_semaphore,
+            target_host,
+            target_port,
+            close_rx,
+        ));
+        Ok(ForwardHandle {
+            session_id: SessionId::new(),
+            forward_id: request.operation_id,
+            bind_address: request.bind_address,
+            local_port: request.local_port,
+            target_host: request.target_host,
+            target_port: request.target_port,
+        })
+    }
+
+    async fn close_forward(&self, handle: ForwardHandle) -> Result<(), TransportError> {
+        let Some(close_tx) = self.forward_closers.lock().await.remove(&handle.forward_id) else {
+            return Err(TransportError::Backend(
+                "port forward is not active".to_owned(),
+            ));
+        };
+        let _ = close_tx.send(());
+        Ok(())
+    }
+}
+
+async fn run_russh_local_forward(
+    listener: TcpListener,
+    session: Arc<client::Handle<RusshClientHandler>>,
+    channel_semaphore: Arc<Semaphore>,
+    target_host: String,
+    target_port: u16,
+    mut close_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut close_rx => break,
+            accepted = listener.accept() => {
+                let Ok((mut stream, peer)) = accepted else {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                };
+                let session = Arc::clone(&session);
+                let channel_semaphore = Arc::clone(&channel_semaphore);
+                let target_host = target_host.clone();
+                tokio::spawn(async move {
+                    let Ok(_permit) = channel_semaphore.acquire_owned().await else { return; };
+                    let Ok(channel) = session
+                        .channel_open_direct_tcpip(
+                            target_host,
+                            u32::from(target_port),
+                            peer.ip().to_string(),
+                            u32::from(peer.port()),
+                        )
+                        .await
+                    else {
+                        return;
+                    };
+                    let mut remote = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut remote).await;
+                    let _ = remote.shutdown().await;
+                });
+            }
+        }
     }
 }
 
@@ -5267,6 +5395,7 @@ where
         };
 
         let (input_tx, input_rx) = mpsc::channel::<String>(64);
+        let (control_tx, control_rx) = mpsc::channel::<PtyControlPayload>(32);
         let (output_tx, output_rx) = mpsc::channel::<PtyBackendOutput>(128);
         let (close_tx, close_rx) = oneshot::channel::<()>();
         let initial_input = shell_change_dir_input(request.cwd.as_deref());
@@ -5275,12 +5404,14 @@ where
             session,
             channel,
             input_rx,
+            control_rx,
             output_tx,
             close_rx,
             initial_input,
         ));
 
         Ok(ManagedPtyProcess::new(input_tx, output_rx, close_tx)
+            .with_control_sender(control_tx)
             .with_channel_permit(channel_permit)
             .with_transport_observation(before.as_ref(), transport.transport_telemetry()))
     }
@@ -5870,6 +6001,7 @@ async fn run_russh_pty_channel<C>(
     session: Arc<client::Handle<RusshClientHandler>>,
     channel: russh::Channel<client::Msg>,
     input_rx: mpsc::Receiver<String>,
+    control_rx: mpsc::Receiver<PtyControlPayload>,
     output_tx: mpsc::Sender<PtyBackendOutput>,
     close_rx: oneshot::Receiver<()>,
     initial_input: Option<String>,
@@ -5881,6 +6013,7 @@ async fn run_russh_pty_channel<C>(
         &session,
         channel,
         input_rx,
+        control_rx,
         output_tx,
         close_rx,
         initial_input,
@@ -5894,6 +6027,7 @@ async fn drive_russh_pty_channel<C>(
     session: &Arc<client::Handle<RusshClientHandler>>,
     mut channel: russh::Channel<client::Msg>,
     mut input_rx: mpsc::Receiver<String>,
+    mut control_rx: mpsc::Receiver<PtyControlPayload>,
     output_tx: mpsc::Sender<PtyBackendOutput>,
     mut close_rx: oneshot::Receiver<()>,
     initial_input: Option<String>,
@@ -5915,6 +6049,7 @@ async fn drive_russh_pty_channel<C>(
     }
 
     let mut input_closed = false;
+    let mut control_closed = false;
     loop {
         tokio::select! {
             _ = &mut close_rx => {
@@ -5942,6 +6077,31 @@ async fn drive_russh_pty_channel<C>(
                     let _ = channel.eof().await;
                 }
             }
+            control = control_rx.recv(), if !control_closed => {
+                if let Some(control) = control {
+                    let result = match control {
+                        PtyControlPayload::Resize { columns, rows, pixel_width, pixel_height } => {
+                            channel.window_change(columns, rows, pixel_width, pixel_height).await
+                        }
+                        PtyControlPayload::Signal { signal } => {
+                            channel.signal(pty_signal(&signal)).await
+                        }
+                    };
+                    if let Err(error) = result {
+                        transport.invalidate_session(session).await;
+                        let _ = send_pty_backend_output(
+                            &output_tx,
+                            OutputStream::System,
+                            format!("russh pty control failed: {error}"),
+                        )
+                        .await;
+                        let _ = channel.close().await;
+                        break;
+                    }
+                } else {
+                    control_closed = true;
+                }
+            }
             message = channel.wait() => {
                 let Some(message) = message else {
                     break;
@@ -5954,6 +6114,18 @@ async fn drive_russh_pty_channel<C>(
                 }
             }
         }
+    }
+}
+
+fn pty_signal(signal: &str) -> Sig {
+    match signal {
+        "HUP" => Sig::HUP,
+        "INT" => Sig::INT,
+        "QUIT" => Sig::QUIT,
+        "KILL" => Sig::KILL,
+        "TERM" => Sig::TERM,
+        "USR1" => Sig::USR1,
+        _ => Sig::Custom(signal.to_owned()),
     }
 }
 
@@ -6457,6 +6629,12 @@ pub enum ConnectorPtyError {
     /// PTY input could not be delivered.
     #[error("pty input channel is closed")]
     InputClosed,
+    /// Active backend does not expose the requested native control channel.
+    #[error("pty backend does not expose native resize/signal control")]
+    ControlUnsupported,
+    /// Queued PTY control payload is malformed or does not match its public kind.
+    #[error("pty control payload is invalid")]
+    InvalidControlPayload,
     /// A vault-backed sudo response was requested when no live sudo prompt remains.
     #[error("stored sudo password injection requires a live sudo password prompt")]
     StoredSudoPromptUnavailable,
@@ -6556,6 +6734,7 @@ const VERIFIED_NESTED_SUDO_COMMANDS: [&str; 3] = [
 
 struct ActivePtyHandle {
     input_tx: mpsc::Sender<String>,
+    control_tx: Option<mpsc::Sender<PtyControlPayload>>,
     close_tx: Option<oneshot::Sender<()>>,
     _channel_permit: Option<OwnedSemaphorePermit>,
     transfer_lock: Arc<Mutex<()>>,
@@ -6920,6 +7099,29 @@ where
         })
     }
 
+    /// Sends one validated native control to an active PTY backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PTY is inactive or its backend has no native control channel.
+    pub async fn control_pty(
+        &self,
+        pty_session_id: PtySessionId,
+        control: PtyControlPayload,
+    ) -> Result<(), ConnectorPtyError> {
+        let control_tx = {
+            let active = self.active.lock().await;
+            active
+                .get(&pty_session_id)
+                .and_then(|handle| handle.control_tx.clone())
+                .ok_or(ConnectorPtyError::ControlUnsupported)?
+        };
+        control_tx
+            .send(control)
+            .await
+            .map_err(|_| ConnectorPtyError::ControlUnsupported)
+    }
+
     async fn clear_interaction_after_input(&self, pty_session_id: PtySessionId) {
         let observed_at = now_utc();
         let session = match self.repositories.pty_sessions.get(pty_session_id).await {
@@ -7036,6 +7238,22 @@ where
                 self.deliver_stored_target_sudo_password(&claimed.event, &claimed.input_text)
                     .await
             }
+            PtyInputPayloadKind::Resize => {
+                self.deliver_pty_control(
+                    pty_session_id,
+                    &claimed.input_text,
+                    PtyInputPayloadKind::Resize,
+                )
+                .await
+            }
+            PtyInputPayloadKind::Signal => {
+                self.deliver_pty_control(
+                    pty_session_id,
+                    &claimed.input_text,
+                    PtyInputPayloadKind::Signal,
+                )
+                .await
+            }
         };
         match delivery {
             Ok(_) => {
@@ -7078,6 +7296,34 @@ where
                 }))
             }
         }
+    }
+
+    async fn deliver_pty_control(
+        &self,
+        pty_session_id: PtySessionId,
+        payload: &str,
+        expected_kind: PtyInputPayloadKind,
+    ) -> Result<ConnectorPtyInputOutcome, ConnectorPtyError> {
+        let control: PtyControlPayload =
+            serde_json::from_str(payload).map_err(|_| ConnectorPtyError::InvalidControlPayload)?;
+        let kind_matches = matches!(
+            (&expected_kind, &control),
+            (
+                PtyInputPayloadKind::Resize,
+                PtyControlPayload::Resize { .. }
+            ) | (
+                PtyInputPayloadKind::Signal,
+                PtyControlPayload::Signal { .. }
+            )
+        );
+        if !kind_matches {
+            return Err(ConnectorPtyError::InvalidControlPayload);
+        }
+        self.control_pty(pty_session_id, control).await?;
+        Ok(ConnectorPtyInputOutcome {
+            pty_session_id,
+            byte_len: 0,
+        })
     }
 
     async fn acquire_pty_input_write_lease(
@@ -7954,6 +8200,7 @@ where
     async fn register_active_process(&self, pty_session: &PtySession, process: ManagedPtyProcess) {
         let ManagedPtyProcess {
             input_tx,
+            control_tx,
             output_rx,
             close_tx,
             transport_telemetry: _,
@@ -7965,6 +8212,7 @@ where
             pty_session.pty_session_id,
             ActivePtyHandle {
                 input_tx,
+                control_tx,
                 close_tx: Some(close_tx),
                 _channel_permit: channel_permit,
                 transfer_lock: Arc::new(Mutex::new(())),
@@ -8298,6 +8546,8 @@ where
             | ConnectorPtyError::InputNotAllowed
             | ConnectorPtyError::InvalidInput(_)
             | ConnectorPtyError::InputClosed
+            | ConnectorPtyError::ControlUnsupported
+            | ConnectorPtyError::InvalidControlPayload
             | ConnectorPtyError::StoredSudoPromptUnavailable
             | ConnectorPtyError::StoredSudoPasswordUnavailable
             | ConnectorPtyError::StoredSshPromptUnavailable
@@ -11886,7 +12136,7 @@ mod tests {
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use async_trait::async_trait;
@@ -11914,6 +12164,7 @@ mod tests {
         SshTransportTelemetry, StateReasonCode, StoredCredential, TrustLevel, WorkspaceId,
         WorkspaceState, now_utc,
     };
+    use russh::{ChannelMsg, Sig, client};
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use tokio::sync::{mpsc, oneshot, watch};
@@ -12771,6 +13022,56 @@ mod tests {
         }
     }
 
+    struct RealSshCredentialProvider {
+        private_key_pem: String,
+    }
+
+    async fn wait_real_pty_text(
+        channel: &mut russh::Channel<client::Msg>,
+        expected: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = String::new();
+        loop {
+            if output.contains(expected) {
+                return Ok(output);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!("real SSH PTY did not emit expected marker: {expected}; output={output:?}").into());
+            }
+            let wait = deadline.saturating_duration_since(now).min(Duration::from_millis(500));
+            match tokio::time::timeout(wait, channel.wait()).await {
+                Ok(Some(ChannelMsg::Data { data }))
+                | Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                    output.push_str(&String::from_utf8_lossy(&data));
+                }
+                Ok(Some(ChannelMsg::ExitStatus { exit_status })) => {
+                    return Err(format!("real SSH PTY exited before marker {expected}: {exit_status}; output={output:?}").into());
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => {
+                    return Err(format!("real SSH PTY closed before marker {expected}; output={output:?}").into());
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SshCredentialProvider for RealSshCredentialProvider {
+        async fn credential_for(
+            &self,
+            _access_path_id: AccessPathId,
+        ) -> Result<super::SshCredentialSecret, super::SshCredentialError> {
+            Ok(super::SshCredentialSecret {
+                password: None,
+                private_key_pem: Some(SecretString::from(self.private_key_pem.clone())),
+                private_key_passphrase: None,
+                use_ssh_agent: false,
+            })
+        }
+    }
+
     struct UnusedSshCredentialProvider;
 
     #[async_trait]
@@ -13111,6 +13412,192 @@ mod tests {
                 requires_tty: false,
             },
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/run-real-sshd-regression.py"]
+    async fn real_sshd_russh_reuses_transport_sftp_and_forward()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let port: u16 = std::env::var("REMOTE_HOSTS_REAL_SSH_PORT")?.parse()?;
+        let username = std::env::var("REMOTE_HOSTS_REAL_SSH_USER")?;
+        let private_key_pem = std::fs::read_to_string(std::env::var("REMOTE_HOSTS_REAL_SSH_KEY")?)?;
+        let large_bytes: u64 = std::env::var("REMOTE_HOSTS_REAL_SSH_LARGE_BYTES")
+            .ok()
+            .map(|value| value.parse())
+            .transpose()?
+            .unwrap_or(2 * 1024 * 1024);
+        let pool = connect_sqlite("sqlite::memory:").await?;
+        migrate(&pool).await?;
+        let repositories = Repositories::new(pool);
+        let access_path_id = AccessPathId::new();
+        let transport = super::RusshTransport::new(
+            super::RusshTransportConfig {
+                access_path_id,
+                address: "127.0.0.1".to_owned(),
+                port,
+                username: username.clone(),
+                windows: false,
+                use_exec_file_transfer: false,
+                allow_exec_file_transfer_fallback: false,
+                host_key_policy: HostKeyPolicy::Accept,
+                known_hosts_path: None,
+                connect_timeout_seconds: 10,
+                inactivity_timeout_seconds: 30,
+                idle_ttl_seconds: 300,
+                keepalive_seconds: 10,
+                max_concurrent_channels: 8,
+                max_new_connections_per_minute: 8,
+                max_new_ssh_handshakes_per_10_min: 16,
+            },
+            Arc::new(RealSshCredentialProvider { private_key_pem }),
+            repositories.authorized_key_bootstrap.clone(),
+        );
+
+        let host_id = HostId::new();
+        let exec = || ExecRequest {
+            operation_id: OperationId::new(),
+            host_id,
+            access_path_id,
+            profile: CommandProfile {
+                name: "real-sshd-whoami".to_owned(),
+                program: "whoami".to_owned(),
+                args: Vec::new(),
+                class: CommandClass::ReadOnly,
+                timeout_seconds: 30,
+                output_limit_bytes: 4096,
+                requires_tty: false,
+            },
+        };
+        assert_eq!(transport.exec(exec()).await?.stdout.trim(), username);
+        assert_eq!(transport.exec(exec()).await?.stdout.trim(), username);
+        let telemetry = transport.transport_telemetry().ok_or("missing telemetry")?;
+        assert_eq!(telemetry.successful_handshake_count, 1);
+        assert!(telemetry.reuse_count >= 1);
+
+        let session = transport.session().await?;
+        let mut pty = session.channel_open_session().await?;
+        pty.request_pty(false, "xterm-256color", 80, 24, 0, 0, &[]).await?;
+        let pty_probe = r#"sh -c 'trap "printf RH_SIGNAL_USR1\\n" USR1; stty size | sed "s/^/RH_SIZE_1 /"; printf "RH_READY_1\\n"; read _; stty size | sed "s/^/RH_SIZE_2 /"; printf "RH_READY_2\\n"; while :; do sleep 1; done'"#;
+        pty.exec(true, pty_probe).await?;
+        let initial_size = wait_real_pty_text(&mut pty, "RH_SIZE_1 24 80").await?;
+        assert!(initial_size.contains("RH_SIZE_1 24 80"));
+        pty.window_change(132, 43, 0, 0).await?;
+        pty.data_bytes(b"continue\n".to_vec()).await?;
+        let resized = wait_real_pty_text(&mut pty, "RH_SIZE_2 43 132").await?;
+        assert!(resized.contains("RH_SIZE_2 43 132"));
+        wait_real_pty_text(&mut pty, "RH_READY_2").await?;
+        pty.signal(Sig::USR1).await?;
+        let signalled = wait_real_pty_text(&mut pty, "RH_SIGNAL_USR1").await?;
+        assert!(signalled.contains("RH_SIGNAL_USR1"));
+        pty.close().await?;
+
+        let directory = tempfile::tempdir()?;
+        let local_source = directory.path().join("upload.bin");
+        let local_download = directory.path().join("download.bin");
+        {
+            let file = std::fs::File::create(&local_source)?;
+            file.set_len(large_bytes)?;
+        }
+        let digest = {
+            use std::io::Read as _;
+            let mut file = std::fs::File::open(&local_source)?;
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+            }
+            format!("{:x}", hasher.finalize())
+        };
+        let remote_path = format!("/tmp/remote-hosts-real-{}.bin", OperationId::new());
+        let common = |direction, local_path: &std::path::Path| SftpRequest {
+            operation_id: OperationId::new(),
+            host_id,
+            access_path_id,
+            spec: FileTransferSpec {
+                direction,
+                local_path: local_path.to_string_lossy().into_owned(),
+                remote_path: remote_path.clone(),
+                overwrite: SftpOverwritePolicy::Replace,
+                mode: Some(0o600),
+                max_size_bytes: large_bytes + 1024,
+                expected_sha256: Some(digest.clone()),
+                timeout_seconds: if large_bytes >= 1024 * 1024 * 1024 {
+                    1800
+                } else {
+                    120
+                },
+            },
+            progress_tx: None,
+        };
+        let uploaded = transport
+            .sftp(common(SftpDirection::Upload, &local_source))
+            .await?;
+        assert_eq!(uploaded.bytes_transferred, large_bytes);
+        let downloaded = transport
+            .sftp(common(SftpDirection::Download, &local_download))
+            .await?;
+        assert_eq!(downloaded.sha256, digest);
+        assert_eq!(std::fs::metadata(&local_download)?.len(), large_bytes);
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let target_port = target.local_addr()?.port();
+        let echo = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = target.accept().await {
+                let mut data = [0_u8; 4];
+                if socket.read_exact(&mut data).await.is_ok() && &data == b"ping" {
+                    let _ = socket.write_all(b"pong").await;
+                }
+            }
+        });
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let local_port = reservation.local_addr()?.port();
+        drop(reservation);
+        let forward = transport
+            .open_forward(ForwardRequest {
+                operation_id: OperationId::new(),
+                host_id,
+                access_path_id,
+                bind_address: "127.0.0.1".to_owned(),
+                local_port,
+                target_host: "127.0.0.1".to_owned(),
+                target_port,
+            })
+            .await?;
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", local_port)).await?;
+        client.write_all(b"ping").await?;
+        let mut response = [0_u8; 4];
+        client.read_exact(&mut response).await?;
+        assert_eq!(&response, b"pong");
+        transport.close_forward(forward).await?;
+        echo.await?;
+
+        let cleanup = ExecRequest {
+            operation_id: OperationId::new(),
+            host_id,
+            access_path_id,
+            profile: CommandProfile {
+                name: "shell.posix".to_owned(),
+                program: "sh".to_owned(),
+                args: vec!["-lc".to_owned(), format!("rm -f -- {remote_path}")],
+                class: CommandClass::Sensitive,
+                timeout_seconds: 30,
+                output_limit_bytes: 4096,
+                requires_tty: false,
+            },
+        };
+        assert_eq!(transport.exec(cleanup).await?.exit_code, Some(0));
+        let telemetry = transport
+            .transport_telemetry()
+            .ok_or("missing final telemetry")?;
+        assert_eq!(telemetry.successful_handshake_count, 1);
+        assert!(telemetry.reuse_count >= 4);
+        Ok(())
     }
 
     #[test]
@@ -15724,6 +16211,12 @@ mod tests {
         assert_eq!(chunks[0].stream, OutputStream::Stdout);
         assert!(!chunks[0].redacted_text.contains("hunter2"));
         assert!(chunks[0].redacted_text.contains("<redacted>"));
+        let segments_before_rapid = fixture
+            .repositories
+            .pty_output_chunks
+            .storage_stats()
+            .await?
+            .compressed_segments;
 
         let mut expected_rapid_output = String::new();
         for index in 0..2_000 {
@@ -15764,9 +16257,12 @@ mod tests {
             .storage_stats()
             .await?;
         assert_eq!(storage.compressed_chunks, u64::try_from(chunks.len())?);
+        let rapid_segments = storage
+            .compressed_segments
+            .saturating_sub(segments_before_rapid);
         assert!(
-            storage.compressed_segments <= 3,
-            "rapid output should be persisted in a bounded number of compressed segments"
+            rapid_segments <= 3,
+            "rapid output should add at most three compressed segments; observed {rapid_segments}"
         );
 
         let closed = manager
@@ -19553,7 +20049,7 @@ mod tests {
         let transport = ConcurrencyTrackingTransport {
             active,
             max_active: Arc::clone(&max_active),
-            delay: Duration::from_millis(250),
+            delay: Duration::from_secs(2),
         };
         let daemon = ConnectorDaemon::new(
             fixture.repositories.clone(),
@@ -19573,13 +20069,15 @@ mod tests {
         let (stop_tx, stop_rx) = watch::channel(false);
         let handle = tokio::spawn(async move { daemon.run_until_stopped(stop_rx).await });
 
-        for _ in 0..50 {
-            if max_active.load(Ordering::SeqCst) == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        let overlap_deadline = Instant::now() + Duration::from_secs(1);
+        while max_active.load(Ordering::SeqCst) != 2 && Instant::now() < overlap_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            2,
+            "two readonly operations should overlap before either two-second fixture completes"
+        );
         let concurrent_channels: u32 = fixture
             .repositories
             .connection_sessions
@@ -19624,7 +20122,7 @@ mod tests {
         let fixture = WorkerFixture::new().await?;
         let daemon = ConnectorDaemon::new(
             fixture.repositories.clone(),
-            StaticTransportProvider::new(SlowTransport(Duration::from_millis(150))),
+            StaticTransportProvider::new(SlowTransport(Duration::from_secs(2))),
             ConnectorOperationWorkerConfig {
                 connector_id: fixture.connector_id,
                 lease_seconds: 300,
@@ -19659,18 +20157,24 @@ mod tests {
             .await?
             .and_then(|connector| connector.last_seen_at)
             .ok_or("connector heartbeat should exist")?;
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        let second_seen_at = fixture
-            .repositories
-            .connectors
-            .get(fixture.connector_id)
-            .await?
-            .and_then(|connector| connector.last_seen_at)
-            .ok_or("connector heartbeat should still exist")?;
+        let heartbeat_deadline = Instant::now() + Duration::from_secs(1);
+        let second_seen_at = loop {
+            let observed = fixture
+                .repositories
+                .connectors
+                .get(fixture.connector_id)
+                .await?
+                .and_then(|connector| connector.last_seen_at)
+                .ok_or("connector heartbeat should still exist")?;
+            if observed > first_seen_at || Instant::now() >= heartbeat_deadline {
+                break observed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
 
         assert!(
             second_seen_at > first_seen_at,
-            "connector heartbeat must advance while a remote operation is still running"
+            "connector heartbeat must advance while the two-second remote operation is still running"
         );
 
         wait_for_operation_state(
@@ -19967,7 +20471,8 @@ mod tests {
         operation_id: OperationId,
         expected: OperationState,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        for _ in 0..100 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
             let operation = repositories
                 .operations
                 .get(operation_id)
@@ -19976,9 +20481,11 @@ mod tests {
             if operation.state == expected {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            if Instant::now() >= deadline {
+                return Err("operation did not reach expected state before five-second deadline".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        Err("operation did not reach expected state".into())
     }
 
     async fn wait_for_pty_output(

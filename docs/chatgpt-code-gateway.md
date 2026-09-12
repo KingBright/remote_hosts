@@ -264,6 +264,29 @@ output. Expired OAuth data can be pruned without deleting active work; historica
 operation and artifact retention requires an explicit operator policy and is not
 automatically destructive.
 
+## macOS stable code identity and upgrade authorization
+
+Release 0.9.0 migrates the macOS code agent away from ad-hoc signing. Ad-hoc signatures have a
+designated requirement tied to one concrete binary, so replacing the executable can make macOS
+privacy and code-signing policy treat the next build as a different program. The 0.9.0 updater
+creates one private, per-host Remote Hosts code-signing identity under
+`~/.local/share/remote-hosts-code/signing`, keeps the signing key local, and signs only a verified
+install copy. The immutable release artifact and its published checksum are never rewritten.
+
+The installed agent uses the stable identifier `com.remote-hosts.code-agent` and an explicit
+designated requirement bound to the persistent certificate fingerprint. Trust is scoped to the
+macOS `codeSign` policy. The first migration may therefore require one logged-in-user confirmation
+on each Mac; an unattended timeout remains `authorization_required` and does not restart or replace
+the active agent. After that one migration, later releases reuse the same certificate, identifier,
+designated requirement, binary path, launchd agent label, updater label
+`com.remote-hosts.code-upgrade`, and stable updater runner path. A release is not accepted when the
+reported installed signing identity differs from the per-host identity.
+
+Do not regenerate a partially present identity to escape an authorization problem. A missing key,
+certificate, or fingerprint mismatch is recovery work, not an invitation to mint a new identity,
+because changing the signing identity would recreate the very permission churn this mechanism is
+intended to eliminate.
+
 ## September 2026 review changes (source; deployment is separate)
 
 The 2026-09-09 review replaces fixed 250 ms job / 100 ms result polling with

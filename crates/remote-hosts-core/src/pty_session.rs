@@ -2,8 +2,9 @@
 
 use remote_hosts_domain::{
     AccessPathId, AgentWorkspace, ConnectionSession, EntityState, PtyBackendCapabilities,
-    PtyBackendState, PtyInputEvent, PtyInputEventId, PtyInputEventState, PtyInputPayloadKind,
-    PtyInteractionKind, PtySession, PtySessionId, SessionId, WorkspaceState, now_utc,
+    PtyBackendState, PtyControlPayload, PtyInputEvent, PtyInputEventId, PtyInputEventState,
+    PtyInputPayloadKind, PtyInteractionKind, PtySession, PtySessionId, SessionId, WorkspaceState,
+    now_utc,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,6 +54,17 @@ pub struct PtySessionInputCommand {
     pub idempotency_key: Option<String>,
 }
 
+/// Request to queue an ordered PTY control operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PtySessionControlCommand {
+    /// Typed control delivered only to a backend that advertises support.
+    pub control: PtyControlPayload,
+    /// Optional requester label for audit.
+    pub requested_by: Option<String>,
+    /// Optional retry key scoped to the workspace's agent session.
+    pub idempotency_key: Option<String>,
+}
+
 /// Plan returned after PTY input passes policy and can be queued.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PtySessionInputPlan {
@@ -91,6 +103,15 @@ pub enum PtySessionSupervisorError {
     /// PTY input payload is invalid.
     #[error("pty input must be non-empty, at most {0} bytes, and must not contain NUL bytes")]
     InvalidInput(usize),
+    /// PTY backend does not support the requested native control.
+    #[error("pty backend does not support requested control")]
+    ControlUnsupported,
+    /// PTY resize dimensions are outside the accepted bounds.
+    #[error("pty resize requires columns and rows in 1..=4096 and pixel dimensions <= 262144")]
+    InvalidResize,
+    /// PTY signal is not in the bounded allowlist.
+    #[error("pty signal must be one of HUP, INT, QUIT, KILL, TERM, USR1")]
+    InvalidSignal,
     /// A stored sudo password can be injected only for a live recognized sudo prompt.
     #[error("stored sudo password injection requires a live sudo password prompt")]
     StoredSudoPromptUnavailable,
@@ -246,6 +267,96 @@ impl PtySessionSupervisor {
                 last_error: None,
             },
             input_text: command.input,
+        })
+    }
+
+    /// Validates and plans a durable PTY resize or signal control event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PTY is inactive, the backend capability is absent, or the
+    /// requested dimensions/signal are outside the bounded control surface.
+    pub fn queue_control(
+        &self,
+        session: &PtySession,
+        workspace: &AgentWorkspace,
+        next_sequence: u64,
+        command: PtySessionControlCommand,
+    ) -> Result<PtySessionInputPlan, PtySessionSupervisorError> {
+        ensure_input_target(session, workspace)?;
+        if session.backend_state != PtyBackendState::Active {
+            return Err(PtySessionSupervisorError::ControlUnsupported);
+        }
+        validate_visible_text(command.requested_by.as_deref(), 128)
+            .map_err(|()| PtySessionSupervisorError::InvalidRequestedBy)?;
+        let (payload_kind, summary) = match &command.control {
+            PtyControlPayload::Resize {
+                columns,
+                rows,
+                pixel_width,
+                pixel_height,
+            } => {
+                if !session.backend_capabilities.supports_window_resize {
+                    return Err(PtySessionSupervisorError::ControlUnsupported);
+                }
+                if *columns == 0
+                    || *columns > 4096
+                    || *rows == 0
+                    || *rows > 4096
+                    || *pixel_width > 262_144
+                    || *pixel_height > 262_144
+                {
+                    return Err(PtySessionSupervisorError::InvalidResize);
+                }
+                (
+                    PtyInputPayloadKind::Resize,
+                    format!("pty resize queued: {columns}x{rows}"),
+                )
+            }
+            PtyControlPayload::Signal { signal } => {
+                if !session.backend_capabilities.supports_signal {
+                    return Err(PtySessionSupervisorError::ControlUnsupported);
+                }
+                if !matches!(
+                    signal.as_str(),
+                    "HUP" | "INT" | "QUIT" | "KILL" | "TERM" | "USR1"
+                ) {
+                    return Err(PtySessionSupervisorError::InvalidSignal);
+                }
+                (
+                    PtyInputPayloadKind::Signal,
+                    format!("pty signal queued: {signal}"),
+                )
+            }
+        };
+        let payload = serde_json::to_string(&command.control)
+            .map_err(|_| PtySessionSupervisorError::ControlUnsupported)?;
+        let now = now_utc();
+        Ok(PtySessionInputPlan {
+            event: PtyInputEvent {
+                id: PtyInputEventId::new(),
+                pty_session_id: session.pty_session_id,
+                workspace_id: session.workspace_id,
+                connector_id: workspace.connector_id,
+                host_id: workspace.host_id,
+                agent_session_id: workspace.agent_session_id,
+                idempotency_key: command.idempotency_key,
+                payload_kind,
+                input_fingerprint: Some(format!("{:x}", Sha256::digest(payload.as_bytes()))),
+                state: PtyInputEventState::Queued,
+                sequence: next_sequence,
+                redacted_input_summary: summary,
+                byte_len: 0,
+                requested_by: command.requested_by,
+                created_at: now,
+                claimed_at: None,
+                lease_expires_at: None,
+                delivered_at: None,
+                failed_at: None,
+                attempt_count: 0,
+                last_error: None,
+            },
+            input_text: payload,
         })
     }
 
@@ -598,13 +709,13 @@ fn ensure_input_target(
 mod tests {
     use remote_hosts_domain::{
         AccessPathId, AgentWorkspace, ConnectionSession, ConnectorId, EntityState, HostId,
-        PtyInputPayloadKind, PtyInteraction, PtyInteractionKind, SessionId, WorkspaceId,
-        WorkspaceState, now_utc,
+        PtyBackendCapabilities, PtyBackendState, PtyControlPayload, PtyInputPayloadKind,
+        PtyInteraction, PtyInteractionKind, SessionId, WorkspaceId, WorkspaceState, now_utc,
     };
 
     use crate::{
-        PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionOpenCommand,
-        PtySessionSupervisor,
+        PtySessionControlCommand, PtySessionHeartbeatCommand, PtySessionInputCommand,
+        PtySessionOpenCommand, PtySessionSupervisor, PtySessionSupervisorError,
     };
 
     fn workspace(state: WorkspaceState) -> AgentWorkspace {
@@ -718,6 +829,144 @@ mod tests {
         assert_eq!(plan.event.byte_len, 11);
         assert_eq!(plan.event.redacted_input_summary, "echo hello\n");
         assert!(plan.event.redacted_input_summary.contains("echo hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn queues_native_pty_resize_and_signal_without_exposing_private_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let supervisor = PtySessionSupervisor::default();
+        let workspace = workspace(WorkspaceState::Working);
+        let connection = connection(&workspace, EntityState::Connected);
+        let mut session = supervisor.open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: connection.session_id,
+                cwd: None,
+                coordination_scopes: None,
+            },
+        )?;
+        session.backend_state = PtyBackendState::Active;
+        session.backend_capabilities = PtyBackendCapabilities::russh_native_pty();
+
+        let resize = supervisor.queue_control(
+            &session,
+            &workspace,
+            8,
+            PtySessionControlCommand {
+                control: PtyControlPayload::Resize {
+                    columns: 132,
+                    rows: 43,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                requested_by: Some("agent".to_owned()),
+                idempotency_key: Some("resize-1".to_owned()),
+            },
+        )?;
+        assert_eq!(resize.event.payload_kind, PtyInputPayloadKind::Resize);
+        assert_eq!(resize.event.sequence, 8);
+        assert_eq!(resize.event.byte_len, 0);
+        assert_eq!(
+            resize.event.redacted_input_summary,
+            "pty resize queued: 132x43"
+        );
+        assert!(!resize.event.redacted_input_summary.contains("pixel_width"));
+        assert!(resize.input_text.contains("132"));
+
+        let signal = supervisor.queue_control(
+            &session,
+            &workspace,
+            9,
+            PtySessionControlCommand {
+                control: PtyControlPayload::Signal {
+                    signal: "INT".to_owned(),
+                },
+                requested_by: Some("agent".to_owned()),
+                idempotency_key: Some("signal-1".to_owned()),
+            },
+        )?;
+        assert_eq!(signal.event.payload_kind, PtyInputPayloadKind::Signal);
+        assert_eq!(
+            signal.event.redacted_input_summary,
+            "pty signal queued: INT"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_native_pty_controls_when_backend_or_payload_is_unsupported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let supervisor = PtySessionSupervisor::default();
+        let workspace = workspace(WorkspaceState::Working);
+        let connection = connection(&workspace, EntityState::Connected);
+        let mut session = supervisor.open_session(
+            &workspace,
+            &connection,
+            0,
+            PtySessionOpenCommand {
+                session_id: connection.session_id,
+                cwd: None,
+                coordination_scopes: None,
+            },
+        )?;
+        session.backend_state = PtyBackendState::Active;
+        session.backend_capabilities = PtyBackendCapabilities::openssh_pipe_shell();
+        let unsupported = supervisor.queue_control(
+            &session,
+            &workspace,
+            1,
+            PtySessionControlCommand {
+                control: PtyControlPayload::Signal {
+                    signal: "INT".to_owned(),
+                },
+                requested_by: None,
+                idempotency_key: None,
+            },
+        );
+        assert!(matches!(
+            unsupported,
+            Err(PtySessionSupervisorError::ControlUnsupported)
+        ));
+
+        session.backend_capabilities = PtyBackendCapabilities::russh_native_pty();
+        let bad_resize = supervisor.queue_control(
+            &session,
+            &workspace,
+            2,
+            PtySessionControlCommand {
+                control: PtyControlPayload::Resize {
+                    columns: 0,
+                    rows: 24,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                requested_by: None,
+                idempotency_key: None,
+            },
+        );
+        assert!(matches!(
+            bad_resize,
+            Err(PtySessionSupervisorError::InvalidResize)
+        ));
+        let bad_signal = supervisor.queue_control(
+            &session,
+            &workspace,
+            3,
+            PtySessionControlCommand {
+                control: PtyControlPayload::Signal {
+                    signal: "STOP".to_owned(),
+                },
+                requested_by: None,
+                idempotency_key: None,
+            },
+        );
+        assert!(matches!(
+            bad_signal,
+            Err(PtySessionSupervisorError::InvalidSignal)
+        ));
         Ok(())
     }
 

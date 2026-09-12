@@ -12,9 +12,9 @@ use remote_hosts_core::{
     AccessCandidate, AccessResolutionError, AccessResolver, CommandProfileCatalog,
     ConnectorStateTracker, DEFAULT_SFTP_MAX_SIZE_BYTES, DEFAULT_SFTP_TIMEOUT_SECONDS,
     FileTransferSpec, HostStateAggregator, HostStateInput, OperationCoordinationMode,
-    PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionOpenCommand,
-    PtySessionSupervisor, SecretRedactor, ServerProtectionPolicy, SftpDirection,
-    SftpOverwritePolicy, WorkspaceCreateCommand, WorkspaceFileTransfer,
+    PtySessionControlCommand, PtySessionHeartbeatCommand, PtySessionInputCommand,
+    PtySessionOpenCommand, PtySessionSupervisor, SecretRedactor, ServerProtectionPolicy,
+    SftpDirection, SftpOverwritePolicy, WorkspaceCreateCommand, WorkspaceFileTransfer,
     WorkspaceOperationSupervisor, WorkspaceRunCommand, WorkspaceSupervisor,
     common_coordination_scope, resolve_operation_coordination_scopes,
 };
@@ -27,9 +27,9 @@ use remote_hosts_domain::{
     EnvironmentKind, FactSource, Host, HostFact, HostFactId, HostId, HostKind, HostWriteLease,
     InstancePeerId, InstanceSyncCollection, KnowledgeItem, KnowledgeItemId, OperationId,
     OperationOutputArtifactId, OperationOutputChunk, OperationRun, OperationState, OperationType,
-    Protocol, PtyBackendState, PtyInputEvent, PtySession, PtySessionId, RiskLevel, RouteType,
-    SessionId, SoftwareInstallId, StateReasonCode, StateSnapshot, StoredCredential, TrustLevel,
-    WorkspaceId, WorkspaceState, now_utc,
+    Protocol, PtyBackendState, PtyControlPayload, PtyInputEvent, PtySession, PtySessionId,
+    RiskLevel, RouteType, SessionId, SoftwareInstallId, StateReasonCode, StateSnapshot,
+    StoredCredential, TrustLevel, WorkspaceId, WorkspaceState, now_utc,
 };
 use remote_hosts_sync::InstanceSyncService;
 use rmcp::{
@@ -127,6 +127,8 @@ pub mod tools {
     pub const READ_PTY_OUTPUT: &str = "remote_hosts_read_pty_output";
     /// Queue PTY input.
     pub const QUEUE_PTY_INPUT: &str = "remote_hosts_queue_pty_input";
+    /// Queue native PTY resize or signal control.
+    pub const CONTROL_PTY: &str = "remote_hosts_control_pty";
     /// List PTY input events.
     pub const LIST_PTY_INPUT_EVENTS: &str = "remote_hosts_list_pty_input_events";
     /// Close a PTY session.
@@ -177,6 +179,7 @@ const AGENT_TOOL_NAMES: &[&str] = &[
     tools::OPEN_WORKSPACE_PTY_SESSION,
     tools::HEARTBEAT_PTY_SESSION,
     tools::QUEUE_PTY_INPUT,
+    tools::CONTROL_PTY,
     tools::READ_PTY_OUTPUT,
     tools::CLOSE_PTY_SESSION,
     tools::GET_AGENT_WORK_CONTEXT,
@@ -900,6 +903,27 @@ pub struct QueuePtyInputRequest {
     /// Optional requester label.
     pub requested_by: Option<String>,
     /// Stable retry key. Reusing it in this conversation returns the original input event.
+    pub idempotency_key: Option<String>,
+}
+
+/// Queue a native PTY resize or signal operation.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ControlPtyRequest {
+    /// PTY session id as UUID string.
+    pub pty_session_id: String,
+    /// Terminal columns. Must be supplied together with `rows`; mutually exclusive with `signal`.
+    pub columns: Option<u32>,
+    /// Terminal rows. Must be supplied together with `columns`; mutually exclusive with `signal`.
+    pub rows: Option<u32>,
+    /// Optional pixel width for a resize request.
+    pub pixel_width: Option<u32>,
+    /// Optional pixel height for a resize request.
+    pub pixel_height: Option<u32>,
+    /// Bounded SSH signal name, for example `INT` or `TERM`; mutually exclusive with resize.
+    pub signal: Option<String>,
+    /// Optional requester label for audit.
+    pub requested_by: Option<String>,
+    /// Stable retry key scoped to this Agent Session.
     pub idempotency_key: Option<String>,
 }
 
@@ -5508,6 +5532,130 @@ impl RemoteHostsMcpServer {
         }))
     }
 
+    /// Queue one ordered native PTY resize or signal operation.
+    #[tool(
+        name = "remote_hosts_control_pty",
+        description = "Queue one native PTY control through the connector-owned durable PTY stream. Supply either columns+rows for resize or signal for a bounded RFC 4254 signal. Only backends that advertise the corresponding capability accept the request.",
+        annotations(
+            title = "Control PTY",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn control_pty(
+        &self,
+        Parameters(request): Parameters<ControlPtyRequest>,
+    ) -> Result<Json<PtyInputEventOutput>, String> {
+        let pty_session_id = parse_pty_session_id(&request.pty_session_id)?;
+        let pty_session = self.pty_session_for_tool(pty_session_id).await?;
+        let workspace = self.workspace_for_tool(pty_session.workspace_id).await?;
+        let idempotency_key = normalize_idempotency_key(request.idempotency_key)?;
+        let control = match (request.columns, request.rows, request.signal.as_deref()) {
+            (Some(columns), Some(rows), None) => PtyControlPayload::Resize {
+                columns,
+                rows,
+                pixel_width: request.pixel_width.unwrap_or(0),
+                pixel_height: request.pixel_height.unwrap_or(0),
+            },
+            (None, None, Some(signal))
+                if request.pixel_width.is_none() && request.pixel_height.is_none() =>
+            {
+                PtyControlPayload::Signal {
+                    signal: signal.trim().to_ascii_uppercase(),
+                }
+            }
+            _ => {
+                return Err(
+                    "supply exactly one PTY control mode: columns+rows (optional pixel dimensions) or signal"
+                        .to_owned(),
+                );
+            }
+        };
+        let next_sequence = self
+            .repositories
+            .pty_input_events
+            .next_sequence(pty_session_id)
+            .await
+            .map_err(|error| tool_error(&error))?;
+        let plan = PtySessionSupervisor::default()
+            .queue_control(
+                &pty_session,
+                &workspace,
+                next_sequence,
+                PtySessionControlCommand {
+                    control,
+                    requested_by: request.requested_by,
+                    idempotency_key,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        if let (Some(agent_session_id), Some(idempotency_key)) = (
+            plan.event.agent_session_id,
+            plan.event.idempotency_key.as_deref(),
+        ) && let Some(existing) = self
+            .repositories
+            .pty_input_events
+            .get_by_agent_session_and_idempotency_key(agent_session_id, idempotency_key)
+            .await
+            .map_err(|error| tool_error(&error))?
+        {
+            ensure_matching_pty_idempotent_request(&existing, &plan.event, idempotency_key)?;
+            return Ok(Json(PtyInputEventOutput {
+                input_event: to_json_value(&existing)?,
+                idempotency_reused: true,
+            }));
+        }
+        if let Err(error) = self
+            .repositories
+            .pty_input_events
+            .insert(&plan.event, &plan.input_text)
+            .await
+        {
+            if let (Some(agent_session_id), Some(idempotency_key)) = (
+                plan.event.agent_session_id,
+                plan.event.idempotency_key.as_deref(),
+            ) && let Some(existing) = self
+                .repositories
+                .pty_input_events
+                .get_by_agent_session_and_idempotency_key(agent_session_id, idempotency_key)
+                .await
+                .map_err(|lookup_error| tool_error(&lookup_error))?
+            {
+                ensure_matching_pty_idempotent_request(&existing, &plan.event, idempotency_key)?;
+                return Ok(Json(PtyInputEventOutput {
+                    input_event: to_json_value(&existing)?,
+                    idempotency_reused: true,
+                }));
+            }
+            return Err(tool_error(&error));
+        }
+        if let Some(agent_session_id) = plan.event.agent_session_id {
+            let observed_at = now_utc();
+            let leases = pty_coordination_scopes(&pty_session, &workspace)
+                .into_iter()
+                .map(|coordination_scope| HostWriteLease {
+                    host_id: plan.event.host_id,
+                    coordination_scope,
+                    holder_agent_session_id: agent_session_id,
+                    holder_workspace_id: plan.event.workspace_id,
+                    acquired_at: observed_at,
+                    heartbeat_at: observed_at,
+                    expires_at: observed_at + time::Duration::seconds(WRITE_LEASE_SECONDS),
+                })
+                .collect::<Vec<_>>();
+            self.repositories
+                .host_write_leases
+                .try_acquire_many(&leases, observed_at)
+                .await
+                .map_err(|error| tool_error(&error))?;
+        }
+        Ok(Json(PtyInputEventOutput {
+            input_event: to_json_value(&plan.event)?,
+            idempotency_reused: false,
+        }))
+    }
+
     /// List queued and delivered PTY input event metadata.
     #[tool(
         name = "remote_hosts_list_pty_input_events",
@@ -9015,8 +9163,9 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(agent_names.len(), 22);
+        assert_eq!(agent_names.len(), 23);
         assert!(agent_names.contains(tools::GET_AGENT_WORK_CONTEXT));
+        assert!(agent_names.contains(tools::CONTROL_PTY));
         assert!(agent_names.contains("remote_hosts_ensure_host"));
         assert!(agent_names.contains(tools::STORE_HOST_CREDENTIAL));
         assert!(agent_names.contains(tools::PREPARE_WORKSPACE));
@@ -9032,7 +9181,7 @@ mod tests {
         assert!(admin_names.contains(tools::UPSERT_HOST));
         assert!(admin_names.contains(tools::FIND_HOST_DUPLICATES));
         assert!(admin_names.len() < full.tool_router.list_all().len());
-        assert_eq!(full.tool_router.list_all().len(), 48);
+        assert_eq!(full.tool_router.list_all().len(), 49);
         let Err(hidden_error) = call_tool_raw(agent, tools::UPSERT_HOST, None).await else {
             return Err("agent profile unexpectedly exposed an admin tool".into());
         };

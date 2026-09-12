@@ -137,7 +137,17 @@ class UpdaterDiagnosticTests(unittest.TestCase):
             result=base/'result.json'
             args=argparse.Namespace(candidate=candidate,sha256=updater.sha(candidate),version='0.3.4',result=result,idle_timeout=0)
             error=support.GatewayObservationError({'stage':'gateway_readiness','category':'network_timeout','retryable':True,'attempts':3,'next_action':'retry_same_readonly_probe_with_backoff'})
-            with mock.patch.object(updater,'gateway_observation',side_effect=error),mock.patch.object(updater.subprocess,'check_output',return_value='remote-hosts-code 0.3.4'),mock.patch.object(updater.subprocess,'run') as run,contextlib.redirect_stdout(io.StringIO()):
+            signing={'state':'ready','certificate_name':'Remote Hosts Local Code Signing','certificate_sha1':'a'*40,
+                     'code_identifier':'com.remote-hosts.code-agent','designated_requirement':'identifier "com.remote-hosts.code-agent" and certificate leaf = H"'+'a'*40+'"'}
+            def sign_copy(source,destination,_base):
+                pathlib.Path(destination).write_bytes(pathlib.Path(source).read_bytes());pathlib.Path(destination).chmod(0o755)
+                return {**signing,'installed_sha256':updater.sha(pathlib.Path(destination))}
+            with mock.patch.object(updater.macos_code_identity,'status',return_value=signing),\
+                 mock.patch.object(updater.macos_code_identity,'installed_metadata',return_value=None),\
+                 mock.patch.object(updater.macos_code_identity,'sign_copy',side_effect=sign_copy),\
+                 mock.patch.object(updater,'gateway_observation',side_effect=error),\
+                 mock.patch.object(updater.subprocess,'check_output',return_value='remote-hosts-code 0.3.4'),\
+                 mock.patch.object(updater.subprocess,'run') as run,contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaises(SystemExit):updater.perform_upgrade(args,base)
             proof=json.loads(result.read_text())
             self.assertEqual(proof['phase'],'gateway_preflight');self.assertFalse(proof['service_changed'])

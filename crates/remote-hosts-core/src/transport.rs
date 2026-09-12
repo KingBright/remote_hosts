@@ -234,24 +234,73 @@ pub struct SftpResult {
     pub warnings: Vec<String>,
 }
 
-/// Port-forward request placeholder.
+/// Local TCP port-forward request over the selected pooled SSH transport.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForwardRequest {
-    /// Operation id.
+    /// Operation id and durable forward identity.
     pub operation_id: OperationId,
     /// Host id.
     pub host_id: HostId,
     /// Access path id.
     pub access_path_id: AccessPathId,
+    /// Connector-local listen address. Only loopback addresses are accepted.
+    pub bind_address: String,
+    /// Connector-local listen port. Must be non-zero.
+    pub local_port: u16,
+    /// Destination resolved from the SSH server side.
+    pub target_host: String,
+    /// Destination TCP port.
+    pub target_port: u16,
 }
 
-/// Port-forward handle.
+impl ForwardRequest {
+    /// Validates the bounded local-forward contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-loopback listeners, invalid target names, or zero ports.
+    pub fn validate(&self) -> Result<(), TransportError> {
+        if !matches!(
+            self.bind_address.as_str(),
+            "127.0.0.1" | "::1" | "localhost"
+        ) {
+            return Err(TransportError::PolicyDenied(
+                "port forwards may listen only on connector loopback".to_owned(),
+            ));
+        }
+        if self.local_port == 0 || self.target_port == 0 {
+            return Err(TransportError::PolicyDenied(
+                "port forward ports must be non-zero".to_owned(),
+            ));
+        }
+        if self.target_host.is_empty()
+            || self.target_host.len() > 253
+            || self.target_host.chars().any(char::is_control)
+            || self.target_host.chars().any(char::is_whitespace)
+        {
+            return Err(TransportError::PolicyDenied(
+                "invalid port forward target host".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Active local port-forward handle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForwardHandle {
-    /// Session id.
+    /// Logical forward session id.
     pub session_id: SessionId,
+    /// Durable operation/forward id.
+    pub forward_id: OperationId,
+    /// Loopback listen address.
+    pub bind_address: String,
     /// Local port.
     pub local_port: u16,
+    /// Remote-side destination host.
+    pub target_host: String,
+    /// Remote-side destination port.
+    pub target_port: u16,
 }
 
 /// Remote transport abstraction.
@@ -273,6 +322,13 @@ pub trait RemoteTransport: Send + Sync {
 
     /// Opens a port forward.
     async fn open_forward(&self, request: ForwardRequest) -> Result<ForwardHandle, TransportError>;
+
+    /// Closes a previously opened port forward.
+    async fn close_forward(&self, _handle: ForwardHandle) -> Result<(), TransportError> {
+        Err(TransportError::Backend(
+            "port-forward close is not implemented by this transport".to_owned(),
+        ))
+    }
 }
 
 fn validate_local_path(value: &str) -> Result<(), FileTransferValidationError> {

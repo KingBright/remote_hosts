@@ -26,12 +26,25 @@ def acceptance_run_id(version, device_id):
     if not value or not value.replace('-','').isalnum():raise ValueError('invalid acceptance run id')
     return value
 
+def signed_install_ready(receipt):
+    signing=receipt.get('signing') or {}
+    installed=receipt.get('installed_sha256','')
+    certificate=signing.get('certificate_sha1','')
+    requirement=signing.get('designated_requirement','')
+    return (re.fullmatch(r'[0-9a-f]{64}',installed) is not None
+            and signing.get('state')=='ready'
+            and signing.get('installed_sha256')==installed
+            and re.fullmatch(r'[0-9a-f]{40}',certificate) is not None
+            and signing.get('code_identifier')=='com.remote-hosts.code-agent'
+            and requirement==f'identifier "com.remote-hosts.code-agent" and certificate leaf = H"{certificate}"')
+
+
 def acceptance_ready(device, version, sha):
     receipt=(device.get('upgrade') or {}).get('receipt') or {}
     return (device.get('online') is True and device.get('capabilities',{}).get('version')==version
             and device.get('maintenance',{}).get('state')=='open'
             and receipt.get('state')=='upgraded' and receipt.get('version')==version
-            and receipt.get('candidate_sha256')==sha and receipt.get('installed_sha256')==sha
+            and receipt.get('candidate_sha256')==sha and signed_install_ready(receipt)
             and receipt.get('gateway_verified') is True and receipt.get('all_lanes_verified') is True
             and receipt.get('stable_seconds',0)>=15)
 
@@ -233,9 +246,13 @@ def main():
                         argv=['/opt/homebrew/bin/python3',str(local_package/'launch-code-upgrade.py'),'--candidate',str(local_package/'remote-hosts-code-macos-arm64'),'--sha256',sha,'--version',args.version,'--start']
                         output=command(argv,30) if agent.get('local') else c.terminal(agent['workspace_id'],shlex.join(argv),'release-'+args.version+'-launch-'+ident,30)
                         value=json.loads(output)
-                        if value.get('state') not in ('started','already_requested'):raise RuntimeError('updater launch not accepted')
+                        if value.get('state') not in ('started','already_requested','authorization_required'):raise RuntimeError('updater launch not accepted')
                         return value
-                    launched=journal.step('launch',{'candidate':sha},launch);result['launch']=launched;phase='observe_original_updater';record()
+                    launched=journal.step('launch',{'candidate':sha},launch);result['launch']=launched
+                    if launched.get('state')=='authorization_required':
+                        result.update(state='needs_user_authorization',signing=launched.get('signing'),
+                                      next_action=launched.get('next_action'));phase='signing_authorization';record();return result
+                    phase='observe_original_updater';record()
                     deadline=time.monotonic()+390
                     while time.monotonic()<deadline:
                         inventory=c.tool('devices_list',{});device=next(d for d in inventory['devices'] if d['device_id']==ident)
@@ -246,7 +263,7 @@ def main():
                             if receipt.get('state')=='failed':
                                 result['state']='deferred_busy' if receipt.get('error_code')=='device_busy' or 'active work' in receipt.get('error','') else 'upgrade_failed';record();return result
                             if receipt.get('state')=='upgraded' and device.get('maintenance',{}).get('state')=='open':
-                                if not(receipt.get('installed_sha256')==sha and receipt.get('gateway_verified') and receipt.get('all_lanes_verified') and receipt.get('stable_seconds',0)>=15):raise RuntimeError('updater readiness mismatch')
+                                if not(signed_install_ready(receipt) and receipt.get('gateway_verified') and receipt.get('all_lanes_verified') and receipt.get('stable_seconds',0)>=15):raise RuntimeError('updater readiness mismatch')
                                 if device['online'] and device['capabilities']['version']==args.version and device['capabilities']['session']==receipt['session']:break
                         time.sleep(2)
                     else:raise RuntimeError('original updater outcome pending; inspect saved result path without reinstalling')

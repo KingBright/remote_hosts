@@ -584,6 +584,32 @@ pub enum PtyInputPayloadKind {
     /// The connector resolves another registered SSH route's dedicated sudo password only when
     /// delivering the event to a verified nested sudo prompt.
     StoredTargetSudoPassword,
+    /// Resize the live native SSH PTY. The private queue payload contains dimensions only.
+    Resize,
+    /// Deliver an SSH signal request to the live native SSH PTY.
+    Signal,
+}
+
+/// Durable control payload for a live PTY backend.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PtyControlPayload {
+    /// Change terminal character and pixel dimensions.
+    Resize {
+        /// Terminal columns.
+        columns: u32,
+        /// Terminal rows.
+        rows: u32,
+        /// Optional pixel width. Zero means unspecified.
+        pixel_width: u32,
+        /// Optional pixel height. Zero means unspecified.
+        pixel_height: u32,
+    },
+    /// Deliver a standard SSH signal name such as `INT` or `TERM`.
+    Signal {
+        /// Upper-case RFC 4254 signal name.
+        signal: String,
+    },
 }
 
 /// State values visible to agents.

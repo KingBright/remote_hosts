@@ -137,6 +137,9 @@ class LauncherTests(unittest.TestCase):
             self.assertNotIn(key, value)
         self.assertEqual(value['ProgramArguments'][0], '/absolute/python')
         self.assertNotIn('sh', value['ProgramArguments'])
+        stable = launcher.stable_plist(p/'python', {'runner':p/'runner','request':p/'request','directory':p})
+        self.assertIs(stable['RunAtLoad'], False)
+        self.assertEqual(stable['Label'], 'com.remote-hosts.code-upgrade')
 
     def test_prepare_snapshots_updater_and_reuses_same_job(self):
         with tempfile.TemporaryDirectory() as d:
@@ -148,6 +151,7 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(record, launcher.prepare(args, base))
             directory = pathlib.Path(record['directory'])
             self.assertEqual((directory/'upgrade-code-agent.py').read_bytes(), (SCRIPTS/'upgrade-code-agent.py').read_bytes())
+            self.assertEqual((directory/'macos_code_identity.py').read_bytes(), (SCRIPTS/'macos_code_identity.py').read_bytes())
             (directory/'upgrade-code-agent.py').write_text('changed')
             with self.assertRaisesRegex(ValueError, 'changed'):
                 launcher.prepare(args, base)
@@ -157,21 +161,28 @@ class LauncherTests(unittest.TestCase):
             candidate = pathlib.Path(d)/'candidate'
             candidate.write_bytes(b'fixture')
             record = launcher.prepare(argparse.Namespace(candidate=candidate, sha256=launcher.sha(candidate), version='0.3.1'), pathlib.Path(d))
-            with mock.patch.object(launcher.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
-                self.assertEqual(launcher.start_once(record)['state'], 'started')
+            unloaded={'loaded':False,'running':False,'service':'gui/501/com.remote-hosts.code-upgrade'}
+            with mock.patch.object(launcher, 'service_state', side_effect=[unloaded, unloaded]), \
+                 mock.patch.object(launcher, 'cleanup_legacy_jobs', return_value=0), \
+                 mock.patch.object(launcher.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+                self.assertEqual(launcher.start_once(record, require_identity=False)['state'], 'started')
                 pathlib.Path(record['result']).write_text('{"state":"upgraded"}')
-                self.assertEqual(launcher.start_once(record)['state'], 'already_requested')
-            run.assert_called_once()
-            self.assertEqual(run.call_args.args[0][1], 'bootstrap')
+                self.assertEqual(launcher.start_once(record, require_identity=False)['state'], 'already_requested')
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[0].args[0][1], 'bootstrap')
+            self.assertEqual(run.call_args_list[1].args[0][1], 'kickstart')
 
     def test_uncertain_bootstrap_outcome_is_not_automatically_replayed(self):
         with tempfile.TemporaryDirectory() as d:
             candidate = pathlib.Path(d)/'candidate'
             candidate.write_bytes(b'fixture')
             record = launcher.prepare(argparse.Namespace(candidate=candidate, sha256=launcher.sha(candidate), version='0.3.1'), pathlib.Path(d))
-            with mock.patch.object(launcher.subprocess, 'run', side_effect=subprocess.TimeoutExpired('launchctl', 10)) as run:
-                self.assertEqual(launcher.start_once(record)['state'], 'bootstrap_outcome_unknown')
-                self.assertEqual(launcher.start_once(record)['state'], 'already_requested')
+            unloaded={'loaded':False,'running':False,'service':'gui/501/com.remote-hosts.code-upgrade'}
+            with mock.patch.object(launcher, 'service_state', side_effect=[unloaded, unloaded]), \
+                 mock.patch.object(launcher, 'cleanup_legacy_jobs', return_value=0), \
+                 mock.patch.object(launcher.subprocess, 'run', side_effect=subprocess.TimeoutExpired('launchctl', 10)) as run:
+                self.assertEqual(launcher.start_once(record, require_identity=False)['state'], 'kickstart_outcome_unknown')
+                self.assertEqual(launcher.start_once(record, require_identity=False)['state'], 'already_requested')
             run.assert_called_once()
 
 

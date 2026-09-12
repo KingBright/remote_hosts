@@ -78,12 +78,15 @@ class LauncherGuardrails(unittest.TestCase):
     def test_bootstrap_timeout_has_durable_unknown_result_and_is_not_replayed(self):
         with tempfile.TemporaryDirectory() as tmp:
             record = self.prepared(pathlib.Path(tmp))
-            with mock.patch.object(launcher.subprocess, 'run', side_effect=subprocess.TimeoutExpired('launchctl', 10)) as run:
-                result = launcher.start_once(record)
-                self.assertEqual(result['state'], 'bootstrap_outcome_unknown')
+            unloaded={'loaded':False,'running':False,'service':'gui/501/com.remote-hosts.code-upgrade'}
+            with mock.patch.object(launcher, 'service_state', side_effect=[unloaded, unloaded]), \
+                 mock.patch.object(launcher, 'cleanup_legacy_jobs', return_value=0), \
+                 mock.patch.object(launcher.subprocess, 'run', side_effect=subprocess.TimeoutExpired('launchctl', 10)) as run:
+                result = launcher.start_once(record, require_identity=False)
+                self.assertEqual(result['state'], 'kickstart_outcome_unknown')
                 saved = json.loads((pathlib.Path(record['directory'])/'bootstrap-result.json').read_text())
-                self.assertEqual(saved['state'], 'bootstrap_outcome_unknown')
-                self.assertEqual(launcher.start_once(record)['state'], 'already_requested')
+                self.assertEqual(saved['state'], 'kickstart_outcome_unknown')
+                self.assertEqual(launcher.start_once(record, require_identity=False)['state'], 'already_requested')
             run.assert_called_once()
 
     def test_changed_plist_cannot_be_started_after_prepare(self):
@@ -99,10 +102,25 @@ class LauncherGuardrails(unittest.TestCase):
     def test_failed_bootstrap_is_not_reported_as_started(self):
         with tempfile.TemporaryDirectory() as tmp:
             record = self.prepared(pathlib.Path(tmp))
-            with mock.patch.object(launcher.subprocess, 'run', return_value=subprocess.CompletedProcess([], 5)) as run:
-                self.assertEqual(launcher.start_once(record)['state'], 'bootstrap_failed')
-                self.assertEqual(launcher.start_once(record)['state'], 'already_requested')
+            unloaded={'loaded':False,'running':False,'service':'gui/501/com.remote-hosts.code-upgrade'}
+            with mock.patch.object(launcher, 'service_state', side_effect=[unloaded, unloaded]), \
+                 mock.patch.object(launcher, 'cleanup_legacy_jobs', return_value=0), \
+                 mock.patch.object(launcher.subprocess, 'run', return_value=subprocess.CompletedProcess([], 5)) as run:
+                self.assertEqual(launcher.start_once(record, require_identity=False)['state'], 'bootstrap_failed')
+                self.assertEqual(launcher.start_once(record, require_identity=False)['state'], 'already_requested')
             run.assert_called_once()
+
+    def test_missing_signing_authorization_never_writes_launch_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.prepared(pathlib.Path(tmp))
+            signing={'state':'authorization_required','certificate_sha1':'a'*40}
+            with mock.patch.object(launcher.macos_code_identity, 'status', return_value=signing), \
+                 mock.patch.object(launcher.subprocess, 'run') as run:
+                result = launcher.start_once(record)
+            self.assertEqual(result['state'], 'authorization_required')
+            self.assertEqual(result['signing'], signing)
+            self.assertFalse((pathlib.Path(record['directory'])/'start-requested.json').exists())
+            run.assert_not_called()
 
 
 if __name__ == '__main__':

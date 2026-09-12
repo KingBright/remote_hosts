@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Linux" && "${REMOTE_HOSTS_ALLOW_NON_LINUX_TEST:-0}" != "1" ]]; then
+  echo "remote-hosts-systemd-service requires Linux" >&2
+  exit 64
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CONFIG_DIR="${REMOTE_HOSTS_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/remote-hosts}"
+CONFIG_FILE="${REMOTE_HOSTS_SERVICE_ENV:-${CONFIG_DIR}/service.env}"
+DATA_DIR="${REMOTE_HOSTS_DATA_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/remote-hosts}"
+STATE_DIR="${REMOTE_HOSTS_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/remote-hosts}"
+BIN_DIR="${REMOTE_HOSTS_BIN_DIR:-${HOME}/.local/bin}"
+BIN_PATH="${BIN_DIR}/remote-hosts"
+RUN_DIR="${DATA_DIR}/run"
+LOG_DIR="${STATE_DIR}/logs"
+UNIT_DIR="${REMOTE_HOSTS_SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user}"
+API_UNIT="${UNIT_DIR}/remote-hosts-api.service"
+CONNECTOR_UNIT="${UNIT_DIR}/remote-hosts-connector.service"
+SYSTEMCTL="${REMOTE_HOSTS_SYSTEMCTL:-systemctl}"
+JOURNALCTL="${REMOTE_HOSTS_JOURNALCTL:-journalctl}"
+DEFAULT_VAULT_MASTER_PASSWORD_FILE="${CONFIG_DIR}/vault-master-password"
+
+usage() {
+  cat <<EOF
+Usage: scripts/remote-hosts-systemd-service <command>
+
+Commands:
+  install       build/install/migrate, write user units, enable and start
+  stage         build/install/migrate and refresh units without restart
+  start         start both user services
+  stop          stop both user services
+  restart       restart both user services
+  status        show both user service states
+  logs          follow both user journals
+  migrate       run database migrations
+  doctor        run remote-hosts doctor
+  print-config  print resolved paths
+  render        only render config/wrappers/units; intended for packaging tests
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "${CONFIG_DIR}" "${DATA_DIR}" "${STATE_DIR}" "${BIN_DIR}" "${RUN_DIR}" "${LOG_DIR}" "${UNIT_DIR}"
+  chmod 0700 "${CONFIG_DIR}" "${DATA_DIR}" "${STATE_DIR}" "${RUN_DIR}"
+}
+
+uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr '[:upper:]' '[:lower:]';
+  else python3 -c 'import uuid; print(uuid.uuid4())'; fi
+}
+
+write_default_config() {
+  ensure_dirs
+  [[ -f "${CONFIG_FILE}" ]] && return
+  local connector_id environment_id
+  connector_id="$(uuid)"; environment_id="$(uuid)"
+  cat >"${CONFIG_FILE}" <<EOF
+REMOTE_HOSTS_CONFIG_VERSION=3
+REMOTE_HOSTS_BIN=${BIN_PATH}
+REMOTE_HOSTS_DATABASE_URL=sqlite://${DATA_DIR}/remote-hosts.sqlite
+REMOTE_HOSTS_BIND=127.0.0.1:8787
+REMOTE_HOSTS_PEER_SYNC_BIND=
+REMOTE_HOSTS_ARTIFACT_ROOT=${DATA_DIR}/artifacts
+REMOTE_HOSTS_CONNECTOR_ID=${connector_id}
+REMOTE_HOSTS_CONNECTOR_NAME=local-linux-connector
+REMOTE_HOSTS_ENVIRONMENT_ID=${environment_id}
+REMOTE_HOSTS_ENVIRONMENT_NAME=local-linux
+REMOTE_HOSTS_CURRENT_NETWORK=local
+REMOTE_HOSTS_HOST_KEY_POLICY=add
+REMOTE_HOSTS_CONNECT_TIMEOUT_SECONDS=10
+REMOTE_HOSTS_SSH_BACKEND=russh
+REMOTE_HOSTS_PTY_BACKEND_MODE=auto
+REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE=${DEFAULT_VAULT_MASTER_PASSWORD_FILE}
+REMOTE_HOSTS_KNOWN_HOSTS_PATH=
+REMOTE_HOSTS_RUSSH_INACTIVITY_TIMEOUT_SECONDS=30
+REMOTE_HOSTS_PTY_IDLE_TTL_SECONDS=3600
+REMOTE_HOSTS_PTY_BUSY_TTL_SECONDS=86400
+REMOTE_HOSTS_LOG=remote_hosts=info,remote_hosts_cli=info
+EOF
+  chmod 0600 "${CONFIG_FILE}"
+}
+
+load_config() {
+  write_default_config
+  set -a
+  # shellcheck disable=SC1090
+  . "${CONFIG_FILE}"
+  set +a
+}
+
+ensure_vault() {
+  load_config
+  mkdir -p "$(dirname "${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}")"
+  if [[ ! -s "${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}" ]]; then
+    (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(48))' >"${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}")
+  fi
+  chmod 0600 "${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}"
+}
+
+build_release() {
+  if [[ -n "${REMOTE_HOSTS_PREBUILT_BINARY:-}" ]]; then return; fi
+  cargo build --release -p remote-hosts-cli --bin remote-hosts
+}
+
+release_binary() {
+  if [[ -n "${REMOTE_HOSTS_PREBUILT_BINARY:-}" ]]; then printf '%s\n' "${REMOTE_HOSTS_PREBUILT_BINARY}"; return; fi
+  cargo metadata --no-deps --format-version=1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"]+"/release/remote-hosts")'
+}
+
+install_binary() {
+  local source
+  source="$(release_binary)"
+  [[ -x "${source}" ]] || { echo "release binary missing: ${source}" >&2; exit 1; }
+  install -m 0755 "${source}" "${BIN_PATH}"
+}
+
+write_wrappers() {
+  load_config
+  cat >"${RUN_DIR}/remote-hosts-api" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+set -a; . "${CONFIG_FILE}"; set +a
+export RUST_LOG="\${REMOTE_HOSTS_LOG:-remote_hosts=info,remote_hosts_cli=info}"
+args=(serve --database-url "\${REMOTE_HOSTS_DATABASE_URL}" --bind "\${REMOTE_HOSTS_BIND:-127.0.0.1:8787}")
+[[ -n "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE:-}" ]] && args+=(--vault-master-password-file "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}")
+[[ -n "\${REMOTE_HOSTS_PEER_SYNC_BIND:-}" ]] && args+=(--peer-sync-bind "\${REMOTE_HOSTS_PEER_SYNC_BIND}")
+exec "\${REMOTE_HOSTS_BIN}" "\${args[@]}"
+EOF
+  cat >"${RUN_DIR}/remote-hosts-connector" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+set -a; . "${CONFIG_FILE}"; set +a
+export RUST_LOG="\${REMOTE_HOSTS_LOG:-remote_hosts=info,remote_hosts_cli=info}"
+args=(worker-daemon --database-url "\${REMOTE_HOSTS_DATABASE_URL}" --connector-id "\${REMOTE_HOSTS_CONNECTOR_ID}" --current-network "\${REMOTE_HOSTS_CURRENT_NETWORK:-local}" --host-key-policy "\${REMOTE_HOSTS_HOST_KEY_POLICY:-add}" --connect-timeout-seconds "\${REMOTE_HOSTS_CONNECT_TIMEOUT_SECONDS:-10}" --ssh-backend "\${REMOTE_HOSTS_SSH_BACKEND:-russh}" --pty-backend-mode "\${REMOTE_HOSTS_PTY_BACKEND_MODE:-auto}" --russh-inactivity-timeout-seconds "\${REMOTE_HOSTS_RUSSH_INACTIVITY_TIMEOUT_SECONDS:-30}" --pty-idle-ttl-seconds "\${REMOTE_HOSTS_PTY_IDLE_TTL_SECONDS:-3600}" --pty-busy-ttl-seconds "\${REMOTE_HOSTS_PTY_BUSY_TTL_SECONDS:-86400}" --artifact-root "\${REMOTE_HOSTS_ARTIFACT_ROOT}")
+[[ -n "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE:-}" ]] && args+=(--vault-master-password-file "\${REMOTE_HOSTS_VAULT_MASTER_PASSWORD_FILE}")
+[[ -n "\${REMOTE_HOSTS_KNOWN_HOSTS_PATH:-}" ]] && args+=(--known-hosts-path "\${REMOTE_HOSTS_KNOWN_HOSTS_PATH}")
+exec "\${REMOTE_HOSTS_BIN}" "\${args[@]}"
+EOF
+  chmod 0755 "${RUN_DIR}/remote-hosts-api" "${RUN_DIR}/remote-hosts-connector"
+}
+
+write_units() {
+  ensure_dirs
+  cat >"${API_UNIT}" <<EOF
+[Unit]
+Description=Remote Hosts API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${RUN_DIR}/remote-hosts-api
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
+EOF
+  cat >"${CONNECTOR_UNIT}" <<EOF
+[Unit]
+Description=Remote Hosts Connector
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${RUN_DIR}/remote-hosts-connector
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
+EOF
+  chmod 0644 "${API_UNIT}" "${CONNECTOR_UNIT}"
+}
+
+migrate() {
+  load_config
+  "${BIN_PATH}" migrate --database-url "${REMOTE_HOSTS_DATABASE_URL}"
+}
+
+bootstrap_connector() {
+  load_config
+  mkdir -p "${REMOTE_HOSTS_ARTIFACT_ROOT}"
+  "${BIN_PATH}" bootstrap-connector --database-url "${REMOTE_HOSTS_DATABASE_URL}" --connector-id "${REMOTE_HOSTS_CONNECTOR_ID}" --connector-name "${REMOTE_HOSTS_CONNECTOR_NAME:-local-linux-connector}" --environment-id "${REMOTE_HOSTS_ENVIRONMENT_ID}" --environment-name "${REMOTE_HOSTS_ENVIRONMENT_NAME:-local-linux}" --environment-kind home-lan --trust-level owned --environment-description "Local Linux systemd user environment" --environment-notes "Created by scripts/remote-hosts-systemd-service" --current-network "${REMOTE_HOSTS_CURRENT_NETWORK:-local}" >/dev/null
+}
+
+reload_units() { "${SYSTEMCTL}" --user daemon-reload; }
+
+stage() {
+  ensure_dirs; write_default_config; ensure_vault; build_release; install_binary
+  migrate; bootstrap_connector; write_wrappers; write_units; reload_units
+}
+
+command="${1:-}"
+case "${command}" in
+  install)
+    stage
+    "${SYSTEMCTL}" --user enable --now remote-hosts-api.service remote-hosts-connector.service
+    ;;
+  stage) stage ;;
+  render) ensure_dirs; write_default_config; ensure_vault; write_wrappers; write_units ;;
+  start) reload_units; "${SYSTEMCTL}" --user start remote-hosts-api.service remote-hosts-connector.service ;;
+  stop) "${SYSTEMCTL}" --user stop remote-hosts-connector.service remote-hosts-api.service ;;
+  restart) reload_units; "${SYSTEMCTL}" --user restart remote-hosts-api.service remote-hosts-connector.service ;;
+  status) "${SYSTEMCTL}" --user --no-pager status remote-hosts-api.service remote-hosts-connector.service ;;
+  logs) exec "${JOURNALCTL}" --user -f -u remote-hosts-api.service -u remote-hosts-connector.service ;;
+  migrate) load_config; migrate ;;
+  doctor) load_config; exec "${BIN_PATH}" doctor --database-url "${REMOTE_HOSTS_DATABASE_URL}" ;;
+  print-config)
+    write_default_config
+    printf 'config=%s\ndata=%s\nstate=%s\nbinary=%s\nunit_dir=%s\n' "${CONFIG_FILE}" "${DATA_DIR}" "${STATE_DIR}" "${BIN_PATH}" "${UNIT_DIR}"
+    ;;
+  *) usage; exit 64 ;;
+esac

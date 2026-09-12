@@ -50,6 +50,29 @@ Use a trusted LAN, VPN, or an SSH tunnel for the peer listener. Use HTTPS before
 any routed or public network. Leave the setting empty when no direct peer needs to reach the
 instance; that remains the default on macOS and Windows.
 
+## Linux systemd User Services
+
+Linux uses the repository-owned `scripts/remote-hosts-systemd-service` manager. It installs the same
+`remote-hosts` CLI/API/connector stack as the macOS service manager into the current user's XDG
+configuration, data, and state directories, then renders `remote-hosts-api.service` and
+`remote-hosts-connector.service` under the user's systemd unit directory. The generated API remains
+loopback-only by default, service files use `NoNewPrivileges=true`, `PrivateTmp=true`, and `UMask=0077`,
+and the vault key is created with mode `0600`. No root or system-wide unit is required.
+
+```bash
+scripts/remote-hosts-systemd-service install
+scripts/remote-hosts-systemd-service stage
+scripts/remote-hosts-systemd-service status
+scripts/remote-hosts-systemd-service logs
+scripts/remote-hosts-systemd-service restart
+scripts/remote-hosts-systemd-service stop
+```
+
+`stage` builds and installs the current CLI, runs migrations and connector bootstrap, refreshes the
+wrappers and user units, then performs `systemctl --user daemon-reload` without restarting running
+services. `install` additionally enables and starts both units. Packaging tests use the side-effect
+bounded `render` command with temporary XDG directories; it never installs a system unit.
+
 ## Windows Services
 
 The Windows package runs the same API, connector, SQLite database, encrypted vault, admin UI, and

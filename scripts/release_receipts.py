@@ -85,6 +85,7 @@ def verified_build(report, expected_version):
     artifacts = m.get('artifacts', {})
     required = {'remote-hosts-code-macos-arm64','remote-hosts-code-linux-amd64',
                 'upgrade-code-agent.py','agent_upgrade_support.py','launch-code-upgrade.py',
+                'code_upgrade_runner.py','macos_code_identity.py',
                 'upgrade-code-gateway.py','check-code-gateway.py'}
     if not required.issubset(artifacts):
         raise ReleaseError('package_incomplete', 'use the complete immutable release package')

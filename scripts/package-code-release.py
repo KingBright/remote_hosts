@@ -53,6 +53,8 @@ def main():
         'upgrade-code-agent.py': ROOT/'scripts/upgrade-code-agent.py',
         'agent_upgrade_support.py': ROOT/'scripts/agent_upgrade_support.py',
         'launch-code-upgrade.py': ROOT/'scripts/launch-code-upgrade.py',
+        'code_upgrade_runner.py': ROOT/'scripts/code_upgrade_runner.py',
+        'macos_code_identity.py': ROOT/'scripts/macos_code_identity.py',
         'upgrade-code-gateway.py': ROOT/'scripts/upgrade-code-gateway.py',
         'check-code-gateway.py': ROOT/'scripts/check-code-gateway.py',
         'release_receipts.py': ROOT/'scripts/release_receipts.py',

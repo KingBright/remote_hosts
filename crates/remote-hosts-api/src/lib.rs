@@ -18,10 +18,10 @@ use axum::{
 use remote_hosts_core::{
     AccessCandidate, AccessResolutionError, AccessResolver, CommandProfileCatalog,
     ConnectorStateTracker, HostStateAggregator, HostStateInput, OperationCoordinationMode,
-    ProtectionDecision, PtySessionHeartbeatCommand, PtySessionInputCommand, PtySessionOpenCommand,
-    PtySessionSupervisor, PtySessionSupervisorError, SecretRedactor, WorkspaceCreateCommand,
-    WorkspaceOperationError, WorkspaceOperationSupervisor, WorkspaceRunCommand,
-    WorkspaceSupervisor, WorkspaceSupervisorError,
+    ProtectionDecision, PtySessionControlCommand, PtySessionHeartbeatCommand,
+    PtySessionInputCommand, PtySessionOpenCommand, PtySessionSupervisor, PtySessionSupervisorError,
+    SecretRedactor, WorkspaceCreateCommand, WorkspaceOperationError, WorkspaceOperationSupervisor,
+    WorkspaceRunCommand, WorkspaceSupervisor, WorkspaceSupervisorError,
 };
 use remote_hosts_db::{DbError, Repositories, retry_sqlite_contention};
 use remote_hosts_domain::{
@@ -29,10 +29,11 @@ use remote_hosts_domain::{
     ConnectionSession, Connector, ConnectorId, CredentialBinding, CredentialBindingId,
     CredentialBindingView, CredentialKind, CredentialMetadata, EntityState, Host, HostFact, HostId,
     OperationId, OperationOutputArtifact, OperationOutputArtifactId, OperationOutputChunk,
-    OperationRun, OperationState, PtyInputEvent, PtyOutputChunk, PtySession, PtySessionId,
-    SequencedStateEvent, SessionId, StateEvent, StateSnapshot, StoredCredential, TopologyEdge,
-    TopologyEdgeId, TopologyNode, TopologyNodeId, TopologyNodeKind, TopologyNodeStatus,
-    TopologyRelation, TopologySyncRun, TopologySyncRunId, WorkspaceId, WorkspaceState, now_utc,
+    OperationRun, OperationState, PtyControlPayload, PtyInputEvent, PtyOutputChunk, PtySession,
+    PtySessionId, SequencedStateEvent, SessionId, StateEvent, StateSnapshot, StoredCredential,
+    TopologyEdge, TopologyEdgeId, TopologyNode, TopologyNodeId, TopologyNodeKind,
+    TopologyNodeStatus, TopologyRelation, TopologySyncRun, TopologySyncRunId, WorkspaceId,
+    WorkspaceState, now_utc,
 };
 use remote_hosts_mcp::{RemoteHostsMcpServer, ToolProfile};
 use remote_hosts_sync::{
@@ -171,6 +172,10 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/v1/pty-sessions/{pty_session_id}/input-events",
             get(list_pty_input_events),
+        )
+        .route(
+            "/v1/pty-sessions/{pty_session_id}/control",
+            post(queue_pty_control),
         )
         .route(
             "/v1/pty-sessions/{pty_session_id}/close",
@@ -1721,6 +1726,73 @@ async fn queue_pty_input(
     Ok((StatusCode::ACCEPTED, Json(plan.event)))
 }
 
+async fn queue_pty_control(
+    State(state): State<ApiState>,
+    Path(pty_session_id): Path<String>,
+    Json(request): Json<QueuePtyControlRequest>,
+) -> Result<(StatusCode, Json<PtyInputEvent>), ApiError> {
+    let pty_session_id = parse_pty_session_id(&pty_session_id)?;
+    let pty_session = state
+        .repositories
+        .pty_sessions
+        .get(pty_session_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let workspace = state
+        .repositories
+        .workspaces
+        .get(pty_session.workspace_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let next_sequence = state
+        .repositories
+        .pty_input_events
+        .next_sequence(pty_session_id)
+        .await?;
+    let (control, requested_by) = match request {
+        QueuePtyControlRequest::Resize {
+            columns,
+            rows,
+            pixel_width,
+            pixel_height,
+            requested_by,
+        } => (
+            PtyControlPayload::Resize {
+                columns,
+                rows,
+                pixel_width: pixel_width.unwrap_or(0),
+                pixel_height: pixel_height.unwrap_or(0),
+            },
+            requested_by,
+        ),
+        QueuePtyControlRequest::Signal {
+            signal,
+            requested_by,
+        } => (
+            PtyControlPayload::Signal {
+                signal: signal.trim().to_ascii_uppercase(),
+            },
+            requested_by,
+        ),
+    };
+    let plan = PtySessionSupervisor::default().queue_control(
+        &pty_session,
+        &workspace,
+        next_sequence,
+        PtySessionControlCommand {
+            control,
+            requested_by,
+            idempotency_key: None,
+        },
+    )?;
+    state
+        .repositories
+        .pty_input_events
+        .insert(&plan.event, &plan.input_text)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(plan.event)))
+}
+
 async fn list_pty_input_events(
     State(state): State<ApiState>,
     Path(pty_session_id): Path<String>,
@@ -2733,6 +2805,32 @@ pub struct QueuePtyInputRequest {
     pub input: String,
     /// Optional requester label.
     pub requested_by: Option<String>,
+}
+
+/// Queue one native PTY control operation.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QueuePtyControlRequest {
+    /// Resize a backend that advertises native window-change support.
+    Resize {
+        /// Terminal columns.
+        columns: u32,
+        /// Terminal rows.
+        rows: u32,
+        /// Optional pixel width.
+        pixel_width: Option<u32>,
+        /// Optional pixel height.
+        pixel_height: Option<u32>,
+        /// Optional requester label.
+        requested_by: Option<String>,
+    },
+    /// Deliver a bounded RFC 4254 signal to a backend that advertises signal support.
+    Signal {
+        /// Signal name, for example `INT` or `TERM`.
+        signal: String,
+        /// Optional requester label.
+        requested_by: Option<String>,
+    },
 }
 
 /// List PTY input events query.

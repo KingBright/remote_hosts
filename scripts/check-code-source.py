@@ -47,6 +47,10 @@ def inputs(root):
                 raise ValueError('linked directory cannot be omitted from verification: '+str(directory))
             paths.update(pathlib.Path(directory)/n for n in files)
     paths.update((root/'scripts').glob('*.py'))
+    for name in ('remote-hosts-service', 'remote-hosts-systemd-service', 'remote-hosts-service.ps1'):
+        path = root/'scripts'/name
+        if path.is_file():
+            paths.add(path)
     paths.update((root/'scripts/tests').rglob('*.py'))
     result = {}
     for path in sorted(paths):

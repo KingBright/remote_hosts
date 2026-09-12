@@ -58,7 +58,7 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 - [x] Snapshot-first MCP runtime view across connector, access path, SSH session, workspace, PTY, and recent operation state.
 - [x] Shared OpenSSH transport pool injected into daemon operation and PTY backends.
 - [x] Monotonic runtime state-event cursors with explicit `live_only`/`after_cursor` HTTP and MCP waits.
-- [x] MCP `agent`/`admin`/`full` tool profiles with an 18-tool default agent surface.
+- [x] MCP `agent`/`admin`/`full` tool profiles with a bounded task-oriented default agent surface.
 - [x] Agent-profile encrypted credential capture for registration and existing-host credential rotation.
 - [x] Native key-first authentication with bounded SSH-agent/default-key attempts, password fallback, and idempotent POSIX/Windows public-key bootstrap.
 - [x] Persistent authorized-key bootstrap state with independent timeout, crash cooldown, bounded retry suppression, permanent-failure classification, key-fingerprint reset, and agent-visible recovery hints.
@@ -117,15 +117,15 @@ Build the production-grade Rust implementation of the remote host knowledge, acc
 
 - [ ] Add a real gateway/SSHD regression suite for pooled arbitrary commands, session invalidation, one bounded reconnect, cross-workspace reuse, SFTP and exec-channel file transfer, 1 GiB files, complete Artifact reads, and gateways that drop stdin/EOF/stdout/exit-status signals. The local shell regression already covers disconnect-equivalent stateless chunk continuation, duplicate chunk replies, and already-placed destination recovery.
 - [ ] Add local SSHD integration tests for `control-master-tty` and native `russh` PTY backend.
-- [ ] Add a multi-process MCP integration test that drives two Agent Sessions through one real pooled SSH transport while proving workspace/PTY isolation and write-lease handoff.
+- [x] Add a multi-process MCP integration test that drives two Agent Sessions through one real pooled SSH transport while proving workspace/PTY isolation and write-lease handoff.
 - [x] Persist authoritative connection, workspace, operation, PTY, input, and transfer lifecycle transitions through a same-transaction durable outbox; publish them idempotently into the general runtime event log without coupling publisher failure to remote work.
 - [x] Add Agent Work Context v1 as a session-scoped snapshot/wait explain contract with one deterministic primary action.
 - [ ] Add a target-side worker mode for true PTY/process continuity across connector restarts.
-- [ ] Add HTTP/MCP control methods for native `russh` PTY resize and signal delivery.
-- [ ] Implement port forwarding behind the existing pooled transport trait.
+- [x] Add HTTP/MCP control methods for native `russh` PTY resize and signal delivery.
+- [x] Implement port forwarding behind the existing pooled transport trait.
 - [ ] Define a typed proxy-chain schema and implement verified multi-hop routing without exposing jump-host credentials or bypassing route intent.
 - [ ] Expand HTTP API endpoints for registry mutation, knowledge search, and operations.
-- [ ] Add Linux systemd packaging and service templates.
+- [x] Add Linux systemd packaging and service templates.
 - [ ] Add first-class CLI registry mutation commands for hosts/environments/connectors/access paths.
 - [ ] Add opt-in topology discovery adapters for nginx/Caddy/Traefik, Docker/Podman, systemd, Kubernetes, and common middleware; adapters should emit the existing topology snapshot contract instead of adding product-specific graph tables.
 

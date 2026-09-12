@@ -36,6 +36,19 @@ class UpdaterTests(unittest.TestCase):
         self.checksum = UPGRADE.sha(self.candidate)
         self.args = argparse.Namespace(candidate=self.candidate, sha256=self.checksum,
                                        version='0.3.1', result=self.result, idle_timeout=0)
+        self.signing = {'state':'ready','certificate_name':'Remote Hosts Local Code Signing',
+                        'certificate_sha1':'a'*40,'code_identifier':'com.remote-hosts.code-agent',
+                        'designated_requirement':'identifier "com.remote-hosts.code-agent" and certificate leaf = H"'+'a'*40+'"'}
+        self.installed_meta = {'version':'0.3.1','candidate_sha256':self.checksum,
+                               'installed_sha256':UPGRADE.sha(self.binary),'certificate_sha1':'a'*40}
+        self.signing_status_patch=mock.patch.object(UPGRADE.macos_code_identity,'status',return_value=self.signing)
+        self.installed_meta_patch=mock.patch.object(UPGRADE.macos_code_identity,'installed_metadata',return_value=self.installed_meta)
+        def sign_copy(source,destination,_base):
+            pathlib.Path(destination).write_bytes(pathlib.Path(source).read_bytes());pathlib.Path(destination).chmod(0o755)
+            return {**self.signing,'installed_sha256':UPGRADE.sha(pathlib.Path(destination))}
+        self.sign_copy_patch=mock.patch.object(UPGRADE.macos_code_identity,'sign_copy',side_effect=sign_copy)
+        self.save_meta_patch=mock.patch.object(UPGRADE.macos_code_identity,'save_installed_metadata')
+        self.signing_status_patch.start();self.installed_meta_patch.start();self.sign_copy_patch.start();self.save_meta_patch.start()
         self.mask = os.umask(0o077)
         self.gateway_patch = mock.patch.object(UPGRADE, 'gateway_observation', return_value={'last_seen':0})
         self.readiness_patch = mock.patch.object(UPGRADE, 'wait_ready', return_value={'pid':2020,'started_at':100,
@@ -47,6 +60,7 @@ class UpdaterTests(unittest.TestCase):
         self.maintenance_mock.return_value.close.return_value={"released":True}
 
     def tearDown(self):
+        self.save_meta_patch.stop();self.sign_copy_patch.stop();self.installed_meta_patch.stop();self.signing_status_patch.stop()
         self.maintenance_patch.stop()
         self.gateway_patch.stop()
         self.readiness_patch.stop()
@@ -109,7 +123,8 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(self.binary.read_bytes(), b'new-candidate-fixture')
 
     def test_version_mismatch_never_restarts_service(self):
-        with mock.patch.object(UPGRADE.subprocess, 'check_output', return_value='remote-hosts-code 9.9.9'), \
+        with mock.patch.object(UPGRADE.macos_code_identity, 'installed_metadata', return_value=None), \
+             mock.patch.object(UPGRADE.subprocess, 'check_output', return_value='remote-hosts-code 9.9.9'), \
              mock.patch.object(UPGRADE.subprocess, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit):
                 self.invoke()

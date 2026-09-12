@@ -24,6 +24,7 @@ import time
 import uuid
 from agent_upgrade_support import GatewayObservationError, gateway_observation, wait_ready
 from maintenance_client import MaintenanceLease
+import macos_code_identity
 
 
 @contextlib.contextmanager
@@ -122,23 +123,37 @@ def perform_upgrade(args, base):
     changed = False
     old_version = None
     maintenance = None
+    signed_candidate = None
     try:
         if sha(args.candidate) != args.sha256:
             raise RuntimeError('candidate checksum mismatch')
-        version = subprocess.check_output([str(args.candidate), '--version'], text=True, timeout=10).strip()
-        if version != 'remote-hosts-code ' + args.version:
-            raise RuntimeError('candidate version mismatch')
+        signing = macos_code_identity.status(base)
+        if signing.get('state') != 'ready':
+            raise RuntimeError('local signing identity is not ready')
+        signing_receipt = {key: signing[key] for key in
+                           ('state', 'certificate_name', 'certificate_sha1', 'code_identifier', 'designated_requirement')}
+        record['signing'] = signing_receipt.copy()
         installed = sha(binary)
-        if installed == args.sha256:
-            # Re-entry is not permission to restart an unhealthy service. Preserve
-            # the last install/rollback receipt instead of reporting a fake upgrade.
+        installed_meta = macos_code_identity.installed_metadata(base)
+        if (installed_meta and installed_meta.get('version') == args.version
+                and installed_meta.get('candidate_sha256') == args.sha256
+                and installed_meta.get('installed_sha256') == installed
+                and installed_meta.get('certificate_sha1') == signing['certificate_sha1']):
             record.update(state='no_change', installed_sha256=installed,
                           service_changed=False, health='not_evaluated',
                           latest_receipt_preserved=args.result.exists())
+            record['signing'].update(installed_sha256=installed)
             if not args.result.exists():
                 save_attempt(args.result, record)
             print(json.dumps(record), flush=True)
             return
+        with tempfile.NamedTemporaryFile(prefix='.signed-candidate-', dir=binary.parent, delete=False) as file:
+            signed_candidate = pathlib.Path(file.name)
+        signed = macos_code_identity.sign_copy(args.candidate, signed_candidate, base)
+        record['signing'].update(installed_sha256=signed['installed_sha256'])
+        version = subprocess.check_output([str(signed_candidate), '--version'], text=True, timeout=10).strip()
+        if version != 'remote-hosts-code ' + args.version:
+            raise RuntimeError('signed candidate version mismatch')
         config = json.loads(config_path.read_text())
         database = pathlib.Path(config['state_dir']) / 'state.sqlite'
         record['phase'] = 'gateway_preflight'
@@ -146,7 +161,7 @@ def perform_upgrade(args, base):
         record['gateway_preflight'] = remote_before.get('_transport', {})
         record['phase'] = 'candidate_validation'
         old_version = subprocess.check_output([str(binary), '--version'], text=True, timeout=10).strip().removeprefix('remote-hosts-code ')
-        subprocess.run([str(args.candidate), 'check', '--agent', '--config', str(config_path)], check=True, stdout=subprocess.DEVNULL, timeout=15)
+        subprocess.run([str(signed_candidate), 'check', '--agent', '--config', str(config_path)], check=True, stdout=subprocess.DEVNULL, timeout=15)
         record['phase'] = 'waiting_idle'
         maintenance=MaintenanceLease(config)
         maintenance.acquire(record)
@@ -172,19 +187,27 @@ def perform_upgrade(args, base):
         record['phase'] = 'installing'
         maintenance.report(record)
         cutover_started = int(time.time())
-        atomic_copy(args.candidate, binary)
+        expected_installed_sha = record['signing']['installed_sha256']
+        atomic_copy(signed_candidate, binary)
         changed = True
-        if sha(binary) != args.sha256:
-            raise RuntimeError('installed binary does not match candidate checksum')
+        if sha(binary) != expected_installed_sha:
+            raise RuntimeError('installed binary does not match signed candidate checksum')
         subprocess.run(['launchctl', 'kickstart', '-k', service], check=True, timeout=10)
         requires_lanes = tuple(int(n) for n in args.version.split('-')[0].split('+')[0].split('.')) >= (0, 3, 1)
         record['phase'] = 'verifying_readiness'
         ready = wait_ready(base, config, args.version, cutover_started,
                            remote_before.get('last_seen', 0), require_lanes=requires_lanes,
                            previous_session=remote_before.get('session'))
-        if sha(binary) != args.sha256:
+        if sha(binary) != expected_installed_sha:
             raise RuntimeError('installed binary changed during readiness verification')
-        record.update(state='upgraded', phase='completed', service_changed=True, installed_sha256=sha(binary), **ready)
+        installed_metadata = {'version': args.version, 'candidate_sha256': args.sha256,
+                              'installed_sha256': expected_installed_sha,
+                              'certificate_sha1': record['signing']['certificate_sha1'],
+                              'code_identifier': record['signing']['code_identifier'],
+                              'designated_requirement': record['signing']['designated_requirement']}
+        macos_code_identity.save_installed_metadata(base, installed_metadata)
+        record.update(state='upgraded', phase='completed', service_changed=True,
+                      installed_sha256=expected_installed_sha, **ready)
     except Exception as error:
         record.update(state='failed', service_changed=changed, error=str(error))
         if isinstance(error, GatewayObservationError):
@@ -205,6 +228,8 @@ def perform_upgrade(args, base):
                 record['rollback'] = 'failed: ' + str(rollback_error)
     if maintenance is not None:
         record["maintenance"]=maintenance.close(record)
+    if signed_candidate is not None:
+        signed_candidate.unlink(missing_ok=True)
     save_attempt(args.result, record)
     print(json.dumps(record), flush=True)
     if record['state'] != 'upgraded':
