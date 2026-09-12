@@ -114,11 +114,11 @@ Remote Hosts 明确区分：**请求已接收、执行已完成、版本已安�
 
 ## 当前版本
 
-当前最近一次不可变 packaged release 为 **0.9.0**。该 0.9.0 固定源码 pipeline 通过 **372 项测试：239 Rust + 133 Python，0 失败**，并通过格式检查、严格 Clippy、workspace check、macOS ARM64 release 构建和 Linux x86_64-musl release 构建。正式 package manifest SHA-256 为 `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`。
+当前最近一次不可变 packaged release 为 **0.9.1**。该 0.9.1 固定源码 pipeline 通过 **378 项测试：240 Rust + 138 Python，0 失败**（另有 3 项按环境跳过），并通过格式检查、严格 Clippy、workspace check，以及 macOS ARM64、Linux x86_64-musl、Windows x86_64-msvc 三个平台的 release 构建。正式 package manifest SHA-256 为 `5b34dfbd6d62a8a24e2bcedcc51e69a0d92a10df20e92c126fd1e631545d37e0`。
 
-0.9.0 进一步加入 native `russh` PTY resize/signal、pooled port forwarding、真实 SSHD/1 GiB 回归、双 MCP Agent Session 的 Workspace/PTY 隔离与 write-lease handoff、Linux systemd user service，以及 macOS 稳定 updater/code identity 基础。多进程真实 SSH 黑盒确认两个 Agent Session 共用一个 pooled transport，只有一次认证握手并发生多次安全复用。
+0.9.1 在 0.9.0 的 native `russh` PTY/port forwarding、真实 SSHD 回归和稳定升级基础上，修复 Windows Agent 将 Unix `-lc` 参数错误传给 PowerShell/cmd 的问题，并把 Windows x64 PE 正式纳入不可变 release package。PowerShell、pwsh、cmd.exe 与 Unix shell 现在分别使用原生启动参数，Windows 的代码读写和文件上传/下载也已通过真实设备验收。
 
-**当前 `main` 可以包含 0.9.0 之后尚未重新打包的源码改动；repository HEAD、已生成 release package 和现场已部署版本是不同状态。** 不要根据本 README 推断 NAS、Mac 或其他设备已经完成 0.9.0 安装；现场版本应以对应 deployment receipt、服务状态或 `devices_list` 实际结果为准。历史版本的发布证据仍保存在 `docs/releases/`。
+**repository HEAD、已生成 release package 和现场已部署版本是不同状态。** 不要根据本 README 推断 Gateway、Mac、Windows 或其他设备已经完成 0.9.1 安装；现场版本应以对应 deployment receipt、服务状态或 `devices_list` 实际结果为准。历史版本的发布证据仍保存在 `docs/releases/`。
 
 ## 开发与发布
 
