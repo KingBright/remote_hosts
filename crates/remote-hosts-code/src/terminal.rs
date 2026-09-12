@@ -194,13 +194,14 @@ impl Terminals {
             .await;
             return Err(error);
         }
+        let input = input.map(|writer| Arc::new(Mutex::new(writer)));
         self.live
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?
             .insert(
                 id.into(),
                 Live {
-                    input: input.map(|writer| Arc::new(Mutex::new(writer))),
+                    input: input.clone(),
                     #[cfg(not(unix))]
                     killer: child.clone_killer(),
                     pid,
@@ -208,12 +209,30 @@ impl Terminals {
                 },
             );
         let output = capture.clone();
+        let auto_cursor_input = if interactive && is_powershell_shell(&config.shell) {
+            input.clone()
+        } else {
+            None
+        };
         let mut reader_task = tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 8192];
+            let mut dsr = DsrResponder::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        let replies = dsr.feed(&buf[..n]);
+                        if replies > 0
+                            && let Some(input) = auto_cursor_input.as_ref()
+                            && let Ok(mut writer) = input.lock()
+                        {
+                            for _ in 0..replies {
+                                if writer.write_all(b"\x1b[1;1R").is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = writer.flush();
+                        }
                         if let Ok(mut output) = output.lock() {
                             output.push(&buf[..n]);
                         }
@@ -573,17 +592,45 @@ fn pty_eof(error: &std::io::Error, interactive: bool) -> bool {
         false
     }
 }
-fn shell_args(shell: &Path, command: &str, interactive: bool) -> Vec<String> {
-    let shell_text = shell.to_string_lossy();
-    let name = shell_text
+#[derive(Default)]
+struct DsrResponder {
+    matched: usize,
+}
+impl DsrResponder {
+    fn feed(&mut self, bytes: &[u8]) -> usize {
+        const QUERY: &[u8] = b"\x1b[6n";
+        let mut replies = 0usize;
+        for &byte in bytes {
+            if byte == QUERY[self.matched] {
+                self.matched += 1;
+                if self.matched == QUERY.len() {
+                    replies += 1;
+                    self.matched = 0;
+                }
+            } else {
+                self.matched = usize::from(byte == QUERY[0]);
+            }
+        }
+        replies
+    }
+}
+fn shell_name(shell: &Path) -> String {
+    shell
+        .to_string_lossy()
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(
-        name.as_str(),
+        .to_ascii_lowercase()
+}
+fn is_powershell_shell(shell: &Path) -> bool {
+    matches!(
+        shell_name(shell).as_str(),
         "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
-    ) {
+    )
+}
+fn shell_args(shell: &Path, command: &str, interactive: bool) -> Vec<String> {
+    let name = shell_name(shell);
+    if is_powershell_shell(shell) {
         let mut args = vec!["-NoLogo".into(), "-NoProfile".into()];
         if !interactive {
             args.push("-NonInteractive".into());
@@ -616,6 +663,15 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsr_responder_handles_split_and_repeated_queries() {
+        let mut responder = DsrResponder::default();
+        assert_eq!(responder.feed(b"prefix\x1b["), 0);
+        assert_eq!(responder.feed(b"6n"), 1);
+        assert_eq!(responder.feed(b"\x1b[6ntext\x1b[6n"), 2);
+        assert_eq!(responder.feed(b"\x1b[x\x1b[6n"), 1);
+    }
 
     #[test]
     fn shell_arguments_are_native_for_windows_and_unix_shells() {
