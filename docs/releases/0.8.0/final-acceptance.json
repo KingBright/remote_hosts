@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "version": "0.8.0",
+  "state": "accepted",
+  "all_targets_accepted": true,
+  "snapshot_id": "caf48a05f1bcf7cd136677edb55ee41d18ccf5a64e624dd5d4aa5df2882308a8",
+  "manifest_sha256": "9ddff2f112a878d38373723f9942a88f2e431b8653f2b66146d75bae750658b0",
+  "tests": {
+    "passed": 361,
+    "failed": 0,
+    "rust_passed": 239,
+    "python_passed": 122,
+    "python_failed": 0,
+    "python_skipped": 1,
+    "ignored_benchmarks": 2,
+    "test_gates_completed_successfully": true
+  },
+  "artifacts": {
+    "macos_sha256": "90aea8db952140921190bfa8483b3735a80a7b0dde591a923df893189f14a901",
+    "linux_sha256": "9dd60368165b12ff42114528ee189c46eac8a6ea00e359616727b4ff5b09b091"
+  },
+  "gateway": {
+    "version": "0.8.0",
+    "tool_count": 21,
+    "schema_diagnostics_protocol": 1,
+    "host_schema_status": "unknown_not_reported",
+    "default_file_bytes": 67108864,
+    "max_file_bytes": 268435456
+  },
+  "devices": [
+    {
+      "device_id": "ba3bf113-2390-466e-88bc-40d5b4f02884",
+      "name": "MacBook-M2-Max",
+      "online": true,
+      "version": "0.8.0",
+      "maintenance": "open",
+      "receipt_state": "upgraded",
+      "receipt_phase": "completed",
+      "installed_sha256": "90aea8db952140921190bfa8483b3735a80a7b0dde591a923df893189f14a901",
+      "gateway_verified": true,
+      "all_lanes_verified": true,
+      "stable_seconds": 22.394006625021575,
+      "transient_interruptions": 0,
+      "terminal_reconcile_v1": true
+    },
+    {
+      "device_id": "8af88e35-f316-4dd9-9810-fa5bd3a22196",
+      "name": "Mac-Studio",
+      "online": true,
+      "version": "0.8.0",
+      "maintenance": "open",
+      "receipt_state": "upgraded",
+      "receipt_phase": "completed",
+      "installed_sha256": "90aea8db952140921190bfa8483b3735a80a7b0dde591a923df893189f14a901",
+      "gateway_verified": true,
+      "all_lanes_verified": true,
+      "stable_seconds": 22.475444668903947,
+      "transient_interruptions": 0,
+      "terminal_reconcile_v1": true
+    }
+  ],
+  "standard_acceptance": {
+    "MacBook-M2-Max": {
+      "state": "passed",
+      "agent_version": "0.8.0",
+      "binary_transfer_bytes": 2097152,
+      "download": "passed",
+      "upload": "passed",
+      "http_range": "passed",
+      "upload_retry": "passed",
+      "oauth_revoked": true
+    },
+    "Mac-Studio": {
+      "state": "passed",
+      "agent_version": "0.8.0",
+      "binary_transfer_bytes": 2097152,
+      "download": "passed",
+      "upload": "passed",
+      "http_range": "passed",
+      "upload_retry": "passed",
+      "oauth_revoked": true
+    }
+  },
+  "collaboration_acceptance": {
+    "MacBook-M2-Max": {
+      "state": "passed",
+      "checks": {
+        "negotiated_transfer_limits": {
+          "passed": true,
+          "default_max_bytes": 67108864,
+          "hard_max_bytes": 268435456,
+          "checkpoint_bytes": 4194304
+        },
+        "schema_diagnostics": {
+          "passed": true,
+          "gateway_tool_count": 21,
+          "host_schema_status": "unknown_not_reported",
+          "file_default_max_bytes": 67108864,
+          "file_hard_max_bytes": 268435456,
+          "terminal_reconcile_reported": true
+        },
+        "untracked_review": {
+          "passed": true,
+          "count": 100,
+          "empty_diff": false
+        },
+        "delta_sync": {
+          "passed": true,
+          "manifest_files": 100,
+          "changed_files": 3,
+          "reused_files": 97,
+          "content_bytes_written": 153,
+          "network_bundle_bytes": 898,
+          "same_key_replay_unchanged": true
+        },
+        "large_file_roundtrip": {
+          "passed": true,
+          "bytes": 68157440,
+          "sha256": "25631f11bd18756ec0029380ec886af0c8824dc6b2706bbdb1d9451c7cf45f42",
+          "directions": [
+            "device_to_gateway",
+            "gateway_to_device"
+          ],
+          "explicit_max_bytes": 73400320
+        },
+        "unified_terminal_observation": {
+          "passed": true,
+          "status_observations": 1,
+          "output_read_calls": 1,
+          "exit_code": 9,
+          "lifecycle": {
+            "gateway_queue_ms": 271,
+            "gateway_dispatch_to_result_ms": 2228,
+            "agent_phase_ms": {
+              "completed": 0,
+              "queued": 0,
+              "running": 10,
+              "waiting_resource": 0
+            },
+            "cross_clock_subtraction_used": false
+          }
+        },
+        "change_set_recovery": {
+          "passed": true,
+          "change_set_id": "b80e3b5d-a472-4913-b7d5-5e7809924313",
+          "already_applied": 2,
+          "concurrent_user_edit_preserved": true,
+          "recovery_action": "inspect_and_merge_conflicts_then_call_change_resume_with_a_new_idempotency_key_only_when_recorded_versions_match"
+        },
+        "workspace_gc": {
+          "passed": true,
+          "preview_candidates": 0,
+          "removed_count": 0,
+          "idempotency_records_preserved": true,
+          "policy_bound_by_preview": true
+        },
+        "event_replay": {
+          "passed": true,
+          "events": 50,
+          "same_manifest_completion_present": true
+        },
+        "concurrent_edit_protection": {
+          "passed": true,
+          "error_code": "version_conflict",
+          "recovery_action": "read_current_version_and_merge"
+        },
+        "compact_response": {
+          "passed": true,
+          "text_bytes_full": 5788,
+          "text_bytes_compact": 64,
+          "scope": "opt-in text channel only; structured content preserved; not token benchmark"
+        }
+      },
+      "fixture_removed": true,
+      "oauth_revoked": true
+    },
+    "Mac-Studio": {
+      "state": "passed",
+      "checks": {
+        "negotiated_transfer_limits": {
+          "passed": true,
+          "default_max_bytes": 67108864,
+          "hard_max_bytes": 268435456,
+          "checkpoint_bytes": 4194304
+        },
+        "schema_diagnostics": {
+          "passed": true,
+          "gateway_tool_count": 21,
+          "host_schema_status": "unknown_not_reported",
+          "file_default_max_bytes": 67108864,
+          "file_hard_max_bytes": 268435456,
+          "terminal_reconcile_reported": true
+        },
+        "untracked_review": {
+          "passed": true,
+          "count": 100,
+          "empty_diff": false
+        },
+        "delta_sync": {
+          "passed": true,
+          "manifest_files": 100,
+          "changed_files": 3,
+          "reused_files": 97,
+          "content_bytes_written": 153,
+          "network_bundle_bytes": 898,
+          "same_key_replay_unchanged": true
+        },
+        "large_file_roundtrip": {
+          "passed": true,
+          "bytes": 68157440,
+          "sha256": "25631f11bd18756ec0029380ec886af0c8824dc6b2706bbdb1d9451c7cf45f42",
+          "directions": [
+            "device_to_gateway",
+            "gateway_to_device"
+          ],
+          "explicit_max_bytes": 73400320
+        },
+        "unified_terminal_observation": {
+          "passed": true,
+          "status_observations": 2,
+          "output_read_calls": 1,
+          "exit_code": 9,
+          "lifecycle": {
+            "gateway_queue_ms": 532,
+            "gateway_dispatch_to_result_ms": 2859,
+            "agent_phase_ms": {
+              "completed": 0,
+              "queued": 0,
+              "running": 51,
+              "waiting_resource": 11
+            },
+            "cross_clock_subtraction_used": false
+          }
+        },
+        "change_set_recovery": {
+          "passed": true,
+          "change_set_id": "6733d365-8279-4ca2-967c-9317ef9b21f8",
+          "already_applied": 2,
+          "concurrent_user_edit_preserved": true,
+          "recovery_action": "inspect_and_merge_conflicts_then_call_change_resume_with_a_new_idempotency_key_only_when_recorded_versions_match"
+        },
+        "workspace_gc": {
+          "passed": true,
+          "preview_candidates": 0,
+          "removed_count": 0,
+          "idempotency_records_preserved": true,
+          "policy_bound_by_preview": true
+        },
+        "event_replay": {
+          "passed": true,
+          "events": 50,
+          "same_manifest_completion_present": true
+        },
+        "concurrent_edit_protection": {
+          "passed": true,
+          "error_code": "version_conflict",
+          "recovery_action": "read_current_version_and_merge"
+        },
+        "compact_response": {
+          "passed": true,
+          "text_bytes_full": 5794,
+          "text_bytes_compact": 64,
+          "scope": "opt-in text channel only; structured content preserved; not token benchmark"
+        }
+      },
+      "fixture_removed": true,
+      "oauth_revoked": true
+    }
+  },
+  "temporary_observer_oauth_revoked": true,
+  "release_fixes": [
+    "atomic_retryable_gateway_staging",
+    "accept_only_current_validated_scripts",
+    "acceptance_attempt_isolation",
+    "workspace_open_same_key_bounded_retry",
+    "durable_receipt_comparison"
+  ]
+}
