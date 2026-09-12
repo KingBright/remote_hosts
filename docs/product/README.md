@@ -18,21 +18,17 @@ python3 scripts/product-backlog.py --render --check
 
 候选测试通过标记 candidate_verified；部分修复仍为 partial。只有满足该项验收条件才可 closed，并填写 closure_evidence。跨进程续传不能用进程内Range测试关闭，原生ChatGPT附件不能用模拟HTTP客户端验收替代，安装二进制不能代替运行构建确认。
 
-## 当前版本边界
+## 版本与状态边界
 
-0.7.1 是当前主版本：在 0.5 的独立发布、Workspace 事件、完整 diff 和 Manifest 同步基础上，0.6 加入 operation lifecycle、持久 change-set / `change_resume` 与显式 `workspace_gc`；0.7 再加入默认 64 MiB、显式协商最高 256 MiB 的传输能力和文件源授权状态。
-
-0.7.1 固定源码快照通过 348 项测试、0 失败，NAS、MacBook 与 Mac Studio 均实际运行 0.7.1。发布现场抓到并修复了旧 Agent → 新 Gateway 的暂态持久化错误被误报永久 409 的问题；修复后真实 9,089,298 字节导出发生一次 checkpoint 恢复并最终 SHA 一致。两台 Mac 的原生代码/终端验收通过；当前宿主 schema 尚未暴露 >64 MiB 文件参数，因此该项继续作为明确未验收边界。
+当前 repository/release 版本以源码中的 package version 和固定 release evidence 为准。版本历史描述产品能力演进，但不记录某个维护者实例当前有哪些设备在线、安装了哪个版本或是否已经完成现场验收。公共仓库与 private deployment/live runtime 的边界见 [Repository Content Model](../repository-content-model.md)。
 
 目标版本永远是规划，不是完成承诺。已知数据损坏、身份隔离、错误副作用重放或不可恢复发布风险属于上线阻塞项；明确的非阻塞功能缺口可以留在 backlog 中继续迭代。
 
-## 验证后直接发布
+## 验证与发布职责
 
-用户已明确授权：候选通过完整验证、输入身份与产物一致、满足既有发布门禁时，直接继续构建、发布、核对运行版本并做现场验收，不再逐版等待确认。当前授权目标为 NAS 网关、MacBook-M2-Max 和 Mac Studio；如果某台设备当时有真实业务任务，发布器按目标独立延期，不阻塞其他健康目标，也不强制取消未知业务。
+一个通用 release pipeline 按固定输入验证 → 平台构建与打包 → 生成不可变 manifest 完成 repository/release 闭环。是否自动推送、部署到哪些 Gateway/Agent、目标的 drain 策略、真实域名和设备清单属于 private deployment policy，不写死在公共产品文档中。
 
-一个迭代按固定输入验证 → 两平台构建与打包 → 先网关后 Agent → 各目标独立 drain / 安装 / 就绪 → 各目标功能验收 → 回写问题清单完成闭环。完成发布后，在当前工作会话内继续下一项高优问题，不要求用户反复发送“继续”。这不是在回复结束后自动运行的后台计划，也不会绕过宿主安全审核。
-
-平台拒绝、任务未排空、验证失败、输入变化或健康检查失败时，记录具体阶段并保留候选和原操作标识；正常可执行的独立工作继续进行。不把再次询问确认当作技术问题的替代，也不以已获常规发布授权为由绕过宿主拦截。
+具体部署系统可以在 release candidate 通过后执行 Gateway-first / Agent-second 的独立目标升级和现场验收。平台拒绝、任务未排空、验证失败、输入变化或健康检查失败时，应记录具体阶段并保留候选和原操作标识；这些现场 receipts 属于部署实例，不回写成公共仓库的“当前状态”。
 
 ## 稳定构建与发布入口
 

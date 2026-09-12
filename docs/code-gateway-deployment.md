@@ -40,6 +40,48 @@ flowchart LR
 
 如果只是在现有 Gateway 上加新机器，从第 6 节开始即可。
 
+### 1.1 推荐参考拓扑
+
+对大多数个人/小团队部署，推荐把“公网入口”和“设备执行面”彻底分开：Gateway 是唯一需要被 ChatGPT 从公网访问的核心服务；所有工作站/服务器 Agent 都只主动出站连接 Gateway。
+
+```mermaid
+flowchart TB
+  GPT[ChatGPT / OpenAI MCP client]
+  EDGE[Public HTTPS Edge\nCloudflare or equivalent]
+  RP[Reverse Proxy\nCaddy / nginx / Traefik]
+  GW[remote-hosts-code Gateway\n127.0.0.1:18787]
+  STATE[(Gateway state)]
+  A[Device Agent A]
+  B[Device Agent B]
+  C[Device Agent C]
+
+  GPT -->|HTTPS 443\nOAuth + MCP| EDGE
+  EDGE -->|HTTPS origin| RP
+  RP -->|loopback HTTP| GW
+  GW --> STATE
+  A -->|outbound HTTPS poll/result| EDGE
+  B -->|outbound HTTPS poll/result| EDGE
+  C -->|outbound HTTPS poll/result| EDGE
+```
+
+这套拓扑有几个重要性质：
+
+- ChatGPT 只需要知道一个稳定的公网 HTTPS origin。
+- Gateway 本体保持 loopback，不直接暴露公网监听。
+- Agent 不需要公网 IP，也不需要给每台工作站开放 SSH/MCP 端口。
+- Gateway state 与设备本地 state 各自持久化，设备离线不会导致 Workspace 隐式迁移到另一台机器。
+- TLS、WAF、DNS、Tunnel/Origin Rule 都留在公网入口层，不侵入 Agent 协议。
+
+根据 Gateway 所在网络，再从下面三种入口模式选择一个：
+
+| 场景 | 推荐入口 | 典型路径 |
+| --- | --- | --- |
+| 家庭/NAS/办公室，有可用公网入站或端口映射 | Cloudflare Proxy + Origin Rule | `443 -> Cloudflare -> origin 8443 -> reverse proxy -> 18787` |
+| CGNAT、无公网 IPv4、不能开放入站 | Cloudflare Tunnel | `443 -> Cloudflare -> Tunnel -> reverse proxy -> 18787` |
+| 公网 VPS/云主机，本身即可稳定对外 | 直接 443 reverse proxy，可选 Cloudflare | `443 -> Caddy/nginx -> 18787` |
+
+`8443` 不是协议要求，只是当标准 443 已被 NAS/其他服务占用时很实用的 origin 端口选择。真正的产品约束是：ChatGPT 看到稳定 HTTPS origin，Gateway 自身仍只监听受保护的本地地址。
+
 ## 2. 组件、端口与信任边界
 
 | 组件 | 放在哪里 | 典型监听/连接 | 是否需要公网入站 |
@@ -160,7 +202,16 @@ Tunnel 不需要公网 IP，也不需要开放入站端口：
   Gateway 会校验公网 authority。没有做过这一层验证时不要把“Tunnel Healthy”误认为 OAuth/MCP 已经健康。
 - Cloudflare Tunnel 只是网络入口，不替代 Remote Hosts 自己的 OAuth 和设备认证。
 
-### 4.3 中国大陆部署的现实注意事项
+### 4.3 如何选择三种网络方案
+
+优先按约束选，不要按“哪个配置看起来更高级”选：
+
+- **有稳定公网入站，且 443 已被其他站点占用：** Cloudflare Proxy + Origin Rule 最自然，公网仍是 443，源站可走 8443。
+- **没有公网入站或处于 CGNAT：** 直接选择 Tunnel，不要再叠 DDNS + 端口转发。
+- **Gateway 本来就在公网 VPS：** 最简单的是反向代理直接监听 443；是否再加 Cloudflare 取决于 DNS、WAF、隐藏源站和运维偏好。
+- **企业网络有自己的公网 LB/WAF：** 可以替代 Cloudflare，只要保留标准 HTTPS、正确 Host、OAuth metadata、长连接/streaming 行为和足够的超时。
+
+### 4.4 中国大陆部署的现实注意事项
 
 - “设备能访问 Gateway”与“ChatGPT 能访问 Gateway”是两件事，必须分别测试。
 - DDNS 只解决 IP 变化，不解决 CGNAT、运营商封端口、跨境链路质量和 TLS。
@@ -168,10 +219,51 @@ Tunnel 不需要公网 IP，也不需要开放入站端口：
 - 如果 origin 在国内，至少从境外网络独立验证 `/healthz`、OAuth metadata 和 `/mcp` 可达性。
 - 不要暴露 Gateway 的 loopback 端口，也不要把整个 NAS 管理面板一起代理到同一个公网 hostname。
 
+### 4.5 脱敏真实案例：家庭/NAS Gateway + Cloudflare
+
+下面这个案例来自真实部署经验，但已经移除了真实域名、设备身份、账号、路径和实时状态；它是**架构案例，不是当前生产状态记录**。
+
+背景约束：
+
+- Gateway 放在家庭/NAS 一侧，希望长期在线；
+- 同一入口已经承载其他 HTTPS 服务，不希望把 Code Gateway 直接暴露在标准 origin 443；
+- ChatGPT 从公网访问时仍希望只看到标准 `https://mcp.example.com`；
+- 两台以上工作站可能位于不同网络，它们都应主动出站，不开放各自的公网端口。
+
+采用的结构：
+
+```mermaid
+flowchart LR
+  GPT[ChatGPT]
+  CF[Cloudflare\npublic :443]
+  DDNS[Public/DDNS origin\n:8443]
+  CADDY[Caddy\nTLS + Host normalization]
+  GW[Gateway\n127.0.0.1:18787]
+  A[Workstation-A Agent]
+  B[Workstation-B Agent]
+
+  GPT -->|https://mcp.example.com:443| CF
+  CF -->|Origin Rule\ndestination :8443| DDNS
+  DDNS --> CADDY
+  CADDY -->|reverse_proxy| GW
+  A -->|outbound HTTPS| CF
+  B -->|outbound HTTPS| CF
+```
+
+关键经验：
+
+1. **公网资源 URL 始终保持标准 443。** `:8443` 只存在于 Cloudflare 到 origin 的网络段，不进入 OAuth issuer/resource URL。
+2. **Host 必须统一。** Caddy 转发到 loopback Gateway 时保持/归一化为公网 hostname，否则 Gateway 的 authority 校验会把请求拒绝。
+3. **Gateway 不直接接公网。** 即使 origin 8443 可达，真正对外的是 Caddy/TLS 层，Gateway 仍在 `127.0.0.1:18787`。
+4. **Agent 走与 ChatGPT 相同的公网 origin。** 不给 Agent 配置 LAN-only 地址，这样设备换网络时不需要改身份配置。
+5. **端口映射与 Cloudflare Origin Rule 是两层。** Origin Rule 决定 Cloudflare 连源站哪个端口；路由器/NAT/Caddy 必须真的让该端口可达。
+6. **如果以后失去公网入站，拓扑可以平滑换成 Tunnel。** Gateway 和 Agent 协议不需要因此改变，只替换公网入口层。
+
+这个案例适合用来理解端口关系，但不应该复制任何维护者实例的域名、DDNS、账号或设备清单。
+
 ## 5. 从零部署一台 Gateway
 
-下面以通用 Linux 为例。仓库也带有 Synology/NAS 安装脚本，但其中 `/opt/remote-hosts-code`、
-`/volume1/docker/remote-hosts-code` 和 UID/GID `18787` 是现有部署约定，不应该无脑复制到任意服务器。
+下面以通用 Linux 为例。任何 NAS/Synology/VPS 的实际安装目录、service UID/GID、存储卷和反向代理路径都属于该实例的 private deployment profile；公共仓库只提供通用模板，不应把某一套生产环境的值当作默认值。
 
 ### 5.1 获取固定版本二进制
 

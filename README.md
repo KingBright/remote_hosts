@@ -19,9 +19,9 @@ Remote Hosts 是一套面向 AI Agent 与人类运维者的远程操作与代码
 
 ### ChatGPT 代码网关
 
-`remote-hosts-code` 由 NAS 上的 OAuth/MCP Gateway 和各电脑上的出站 Agent 组成。Gateway 不直接暴露本机 operator API；每台设备都有自己的身份、授权根目录和运行能力。
+`remote-hosts-code` 由一台长期在线服务器上的 OAuth/MCP Gateway 和各设备上的出站 Agent 组成。Gateway 不直接暴露本机 operator API；每台设备都有自己的身份、授权根目录和运行能力。
 
-0.7.1 已包含这些核心能力：
+当前代码网关包含这些核心能力：
 
 - 绑定设备的持久 Workspace，支持受限代码列表、搜索、批量读取和语法树符号范围。
 - 带版本检查和本地 journal 的多文件精确编辑。
@@ -162,7 +162,9 @@ skills/                     仓库维护的 Agent Skills
 docs/                       架构、运维、发布证据和产品问题清单
 ```
 
-## 文档
+## 仓库边界与文档
+
+公共仓库只保存产品源码、通用模板/文档和可复现的 release evidence；真实域名、设备清单、Cloudflare/SSH/NAS 实例配置以及 online/offline、installed/running/accepted 等现场状态应放在独立私有 ops/runtime 系统中。详见 [Repository Content Model](docs/repository-content-model.md)。
 
 建议从 [文档索引](docs/README.md) 开始。
 

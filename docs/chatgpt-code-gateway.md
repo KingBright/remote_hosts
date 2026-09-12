@@ -2,7 +2,7 @@
 
 **2026-09-12 repository release status:** the current repository release is **0.9.0**. Its fixed-source pipeline passed **372 tests (239 Rust + 133 Python, 0 failures)**, strict format/Clippy/workspace gates, and both macOS ARM64 and Linux x86_64-musl release builds. The immutable package manifest SHA-256 is `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`.
 
-Repository release, generated package, installed version, running process and live acceptance are intentionally separate states. Do not infer that a NAS or workstation is already running 0.9.0 from this document; verify the specific target through deployment receipts, service state or `devices_list`. Historical release evidence remains under `docs/releases/`.
+Repository release, generated package, installed version, running process and live acceptance are intentionally separate states. This public document records only repository/release facts. A specific deployment's installed/running/accepted state belongs to its private ops/runtime system. See [Repository Content Model](repository-content-model.md).
 
 0.9.0 adds stable macOS updater/code identity foundations, native `russh` PTY resize/signal delivery, pooled port forwarding, Linux systemd user-service support, real-SSHD regressions including a verified 1 GiB transfer, and a two-process MCP regression proving Workspace/PTY isolation plus write-lease handoff over one pooled SSH transport.
 
@@ -22,29 +22,24 @@ not automatically an authorized code device.
 
 ```mermaid
 flowchart TD
-  ChatGPT -->|HTTPS :443, OAuth| Cloudflare
-  Cloudflare -->|Origin Rule :8443| Caddy
-  Caddy -->|loopback :18787| Gateway
-  MacBook -->|outbound HTTPS poll and result| Gateway
-  MacStudio -->|outbound HTTPS poll and result| Gateway
-  MacBook --> FilesA[Local project files and PTYs A]
-  MacStudio --> FilesB[Local project files and PTYs B]
+  ChatGPT -->|HTTPS :443, OAuth| Edge[Public HTTPS / Cloudflare]
+  Edge --> Proxy[Caddy / reverse proxy]
+  Proxy -->|loopback :18787| Gateway
+  A[Device Agent A] -->|outbound HTTPS poll/result| Gateway
+  B[Device Agent B] -->|outbound HTTPS poll/result| Gateway
+  A --> FilesA[Workspace / Files / PTY A]
+  B --> FilesB[Workspace / Files / PTY B]
 ```
 
-Public MCP URL: `https://mcp.hackerlife.fun/mcp`; OAuth issuer:
-`https://mcp.hackerlife.fun`. Cloudflare proxies the CNAME to the existing DDNS
-name `hackerlife.fun`. An Origin Rule matching only `mcp.hackerlife.fun` overrides
-the origin destination port to 8443. Caddy reuses its `cloudflare_dns` snippet
-for ACME and normalizes the upstream Host to `mcp.hackerlife.fun`, allowing
-existing device agents using port 8443 to continue connecting. Cloudflare
-terminates HTTPS and relays MCP data under the owner's explicit authorization.
-The NAS remains the central gateway; no new registered domain is needed.
+A deployment exposes an HTTPS origin such as `https://mcp.example.com`; its MCP resource is
+`https://mcp.example.com/mcp`. The public edge may be a direct reverse proxy, Cloudflare Proxy with
+an Origin Rule, or Cloudflare Tunnel. The concrete DNS names, ports and provider IDs are deployment
+profile data and are intentionally not recorded in this public document. See
+[Code Gateway 从零部署与新设备接入](code-gateway-deployment.md) for the reference topologies and a sanitized real-world deployment case study.
 
-The login response uses `Referrer-Policy: same-origin` so browser form POSTs
-retain a valid Origin, and CSP permits form redirects to `https://chatgpt.com`.
-The gateway still checks the exact registered callback before issuing a code.
-The deployed Caddy response overrides apply these fixes to the existing binary;
-the source and Caddy template contain the same behavior.
+The login response uses `Referrer-Policy: same-origin` so browser form POSTs retain a valid Origin,
+and CSP permits form redirects to `https://chatgpt.com`. The gateway checks the exact registered
+callback before issuing a code.
 
 The gateway binds loopback only. Each computer has its own randomly generated
 device credential; the gateway stores only its hash. Device identity cannot be
@@ -67,7 +62,7 @@ replay revokes the token family. Authentication endpoints are rate limited.
 
 ## Installation
 
-如果是第一次搭建 Gateway、需要配置 Cloudflare/公网入口，或者要向现有 Gateway 增加 Linux/macOS/Windows 设备，先按 [Code Gateway 从零部署与新设备接入](code-gateway-deployment.md) 操作。本节保留协议实现和现有 NAS 部署的低层细节。
+如果是第一次搭建 Gateway、需要配置 Cloudflare/公网入口，或者要向现有 Gateway 增加 Linux/macOS/Windows 设备，先按 [Code Gateway 从零部署与新设备接入](code-gateway-deployment.md) 操作。本节只保留通用协议与产品行为，不记录维护者自己的生产实例拓扑。
 
 Build using the workspace Rust toolchain:
 
@@ -83,45 +78,32 @@ Generate gateway configuration outside the repository, then enroll each device:
 ```sh
 remote-hosts-code init-gateway \
   --config /private/setup/gateway.json \
-  --public-url https://mcp.hackerlife.fun \
-  --state-dir /volume1/docker/remote-hosts-code \
+  --public-url https://mcp.example.com \
+  --state-dir /var/lib/remote-hosts-code \
   --password-file /private/setup/gateway-login-password.txt
 
 remote-hosts-code enroll \
   --gateway-config /private/setup/gateway.json \
-  --agent-config /private/setup/macbook-agent.json \
-  --name MacBook \
-  --state-dir /Users/jinliang/.local/share/remote-hosts-code/state \
-  --root /Users/jinliang/Workspace \
-  --allow-write --allow-exec
+  --agent-config /private/setup/device-a-agent.json \
+  --name Device-A \
+  --state-dir /home/YOUR_USER/.local/share/remote-hosts-code/state \
+  --root /home/YOUR_USER/Workspace \
+  --allow-write --allow-exec \
+  --shell /bin/bash
 ```
 
-Each invocation of `enroll` creates a new device UUID and credential. Repeat for
-Mac Studio with a different agent config filename and name. Do not copy an
-existing device config to another computer. All configuration and login-password
-files must be mode `0600`; agent state must be outside the exposed roots.
+Each invocation of `enroll` creates a new device UUID and credential. Repeat with a different config
+filename and device name for every machine. Do not copy an existing device config to another
+computer. All configuration and login-password files must be private; agent state must be outside
+exposed roots. Platform-specific service examples belong in generic deployment templates, while real
+UID/GID, NAS paths, DNS and device inventory belong in the private deployment profile.
 
-Transfer the NAS binary and gateway config using managed Remote Hosts uploads.
-Install the dedicated gateway system service from
-`scripts/remote-hosts-code-gateway.service`, adapting its service identity to the
-host. On Synology systemd 219, the root-owned `run-code-gateway.py` launcher drops
-supplementary groups and switches to numeric UID/GID 18787 before exec; this avoids
-the old service manager's requirement for a passwd entry. Verify the running
-process's actual UID, not just its unit settings. The account needs write permission only to its state directory. Keep the
-binary and launcher root-owned and non-writable by the gateway service; the
-configuration is private and installed read-only. The supplied Caddy
-site goes in `/etc/caddy/sites/remote-hosts-code.caddy`. Validate before reloading
-Caddy, retain previous configuration, and verify existing sites after reload.
-The installer uses separate `systemctl enable` and `start` commands for systemd
-219. `--resume` only accepts byte-identical installed service/site definitions.
-
-On each Mac, stage the native binary and that computer's private configuration,
-then run:
+On macOS, stage the native binary and that computer's private configuration, then run:
 
 ```sh
 python3 scripts/install-code-agent.py \
-  --binary /Users/jinliang/.local/share/remote-hosts-code/bin/remote-hosts-code \
-  --config /Users/jinliang/.local/share/remote-hosts-code/agent.json
+  --binary ~/.local/share/remote-hosts-code/bin/remote-hosts-code \
+  --config ~/.local/share/remote-hosts-code/agent.json
 ```
 
 The per-user LaunchAgent is `com.remote-hosts.code-agent`. It does not restart the
@@ -133,8 +115,8 @@ loaded agent. Inspect and finish/cancel its own active terminals before updates.
 
 Enable developer mode and add a remote MCP app with the public `/mcp` URL and
 OAuth authentication. Choose dynamic client registration if prompted. Verify
-that Authorization Server Base is `https://mcp.hackerlife.fun` (the issuer),
-while Resource remains `https://mcp.hackerlife.fun/mcp`. The ChatGPT form may
+that Authorization Server Base is `https://mcp.example.com` (the issuer),
+while Resource remains `https://mcp.example.com/mcp`. The ChatGPT form may
 populate the former with the resource URL; correct it before creating. The gateway
 advertises RFC 9207 issuer identification and permits the documented stable
 redirect `https://chatgpt.com/connector_platform_oauth_redirect`. If the app setup

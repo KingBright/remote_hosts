@@ -15,3 +15,11 @@ __pycache__/
 docs/**/*.tar.gz
 docs/**/*.tgz
 docs/**/*.lock
+
+# Instance-specific deployment material and live runtime notes do not belong in
+# the public product repository. Use a separate private ops repository for
+# shared deployment configuration; these paths are only local scratch space.
+/ops/private/
+/deploy/local/
+/docs/live/
+/.local-deployment/
