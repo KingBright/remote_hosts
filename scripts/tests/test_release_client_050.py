@@ -69,6 +69,12 @@ class ClientTests(unittest.TestCase):
         self.assertLessEqual(len(a[1]),64)
         with self.assertRaises(ValueError):check_collaboration.acceptance_identity('../bad','12345678-device')
 
+    def test_collaboration_workspace_open_has_bounded_same_key_retry(self):
+        source=(pathlib.Path(__file__).resolve().parents[1]/'check-collaboration.py').read_text()
+        self.assertIn("'idempotency_key':key+'-open'",source)
+        self.assertIn('for attempt in range(3):',source)
+        self.assertIn("c.tool('workspace_open',arguments)",source)
+
     def test_accept_only_requires_verified_installed_runtime(self):
         path=pathlib.Path(__file__).resolve().parents[1]/'publish-code.py';spec=importlib.util.spec_from_file_location('publish_080_accept',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
         sha='a'*64

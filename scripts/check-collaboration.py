@@ -26,6 +26,13 @@ def main():
     c=Client(config['origin'],config['password_file']);r={'version':args.version,'device_id':args.device_id,'run_id':args.run_id,'state':'running','checks':{},'operation_ids':[]};phase='login';version=tuple(map(int,args.version.split('.')))
     def record():r['phase']=phase;atomic_json(args.report,r)
     def term(ws,code,stage):return c.terminal(ws,'/opt/homebrew/bin/python3 -c '+shlex.quote(code),key+'-'+stage,60)
+    def open_workspace():
+        arguments={'device_id':args.device_id,'root':agent['root']+'/'+folder,'idempotency_key':key+'-open'}
+        for attempt in range(3):
+            try:return c.tool('workspace_open',arguments)['workspace']['id']
+            except RuntimeError:
+                if attempt==2:raise
+                time.sleep(.5*(attempt+1))
     try:
         c.login();inventory=c.tool('devices_list',{});device=next(d for d in inventory['devices'] if d['device_id']==args.device_id)
         assert device['online'] and device['capabilities']['version']==args.version
@@ -48,7 +55,7 @@ def main():
                 'file_hard_max_bytes':268435456,'terminal_reconcile_reported':True}
         phase='fixture';record()
         term(agent['workspace_id'],"import pathlib,subprocess,os;p=pathlib.Path("+repr(folder)+");p.mkdir(parents=True,exist_ok=False);subprocess.run(['git','init','-q',str(p)],env=dict(os.environ,GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1'),check=True)",'fixture')
-        workspace=c.tool('workspace_open',{'device_id':args.device_id,'root':agent['root']+'/'+folder,'idempotency_key':key+'-open'})['workspace']['id'];r['workspace_id']=workspace;record()
+        workspace=open_workspace();r['workspace_id']=workspace;record()
         files=json.loads(term(workspace,"import pathlib,json,hashlib;d=pathlib.Path('dst');d.mkdir();files=[]\nfor i in range(100):\n old=bytes([i,0,255])*17;new=bytes([i,1,254])*17 if i<3 else old;p=d/f'f{i}.bin';p.write_bytes(old);files.append({'path':str(p),'sha256':hashlib.sha256(new).hexdigest(),'size':len(new),'executable':False})\nprint(json.dumps(files))",'files'))
         before=c.tool('workspace_context',{'workspace_id':workspace,'limit':50});event_cursor=before['events']['cursor']
         phase='complete_review';record()
