@@ -127,7 +127,7 @@ fn build_catalog() -> Vec<Tool> {
     let integer = |min, max| json!({"type":"integer","minimum":min,"maximum":max});
     let mut tools: Vec<Tool> = vec![];
     let mut add = |name: &str, description: &str, mut properties: Value, required: Vec<&str>| {
-        properties["response_mode"] = json!({"type":"string","enum":["full","compact"]});
+        properties["response_mode"] = json!({"type":"string","enum":["full","compact"],"default":"compact","description":"MCP envelope view; compact is the default. full restores diagnostic metadata."});
         let read = scope(name) == Some("code:read") && name != "workspace_open";
         let value = json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"outputSchema":{"type":"object","additionalProperties":true},"annotations":{"readOnlyHint":read,"destructiveHint":!read&&name!="workspace_open","idempotentHint":true,"openWorldHint":name.starts_with("terminal_")}});
         // Catalog is composed entirely from static, server-controlled JSON.
@@ -203,8 +203,8 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "terminal_read",
-        "Read bounded combined terminal output using the returned byte cursor. New logs use stable sanitized UTF-8 cursors. has_more means buffered bytes, not a running process; check state, exit_code, output_complete and output_truncated/output_error. Poll the same terminal; never rerun to retrieve output.",
-        json!({"workspace_id":string(),"terminal_id":string(),"cursor":integer(0,100000000),"max_bytes":integer(1024,65536)}),
+        "Read bounded terminal output. Non-PTY output defaults to token-optimized compact view; PTY defaults full. compact preserves unknown/error text while collapsing known build/test noise and returns measured savings. Cursor always advances over the durable full log; use output_mode=full with raw_cursor_start to inspect source bytes. Poll the same terminal; never rerun.",
+        json!({"workspace_id":string(),"terminal_id":string(),"cursor":integer(0,100000000),"max_bytes":integer(1024,65536),"output_mode":{"type":"string","enum":["compact","full"]}}),
         vec!["workspace_id", "terminal_id"],
     );
     add(

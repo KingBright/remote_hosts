@@ -5,6 +5,7 @@ use crate::{
     now,
     store::Store,
     terminal_output::{Capture, OUTPUT_CAP, read_page},
+    token_output::{self, OutputProfile},
 };
 use anyhow::{Context, Result, ensure};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -35,6 +36,9 @@ pub struct Status {
     pub output_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_error: Option<String>,
+    /// Safe enum only; the original command is intentionally not persisted here.
+    #[serde(default, skip_serializing_if = "OutputProfile::is_generic")]
+    pub(crate) output_profile: OutputProfile,
 }
 type TerminalInput = Arc<Mutex<Box<dyn Write + Send>>>;
 struct Live {
@@ -152,6 +156,7 @@ impl Terminals {
             log_format: 1,
             output_complete: false,
             output_error: None,
+            output_profile: token_output::classify(command, interactive),
         };
         self.store.put("terminal", id, &status, i64::MAX).await?;
         // Prepare private output and all fallible I/O handles before spawning.
@@ -348,8 +353,13 @@ impl Terminals {
                         "has_more",
                         "cursor_format",
                         "output_stream",
+                        "output_view",
+                        "raw_cursor_start",
+                        "compression",
                     ] {
-                        result[key] = page[key].clone();
+                        if page.get(key).is_some() {
+                            result[key] = page[key].clone();
+                        }
                     }
                     if page["terminal"]["output_complete"] == true
                         && page["has_more"] == false
@@ -399,6 +409,14 @@ impl Terminals {
         let mut status = self.status(ws, id).await?;
         let cursor = files::number(v, "cursor", 0, 0, 100000000)?;
         let max = files::number(v, "max_bytes", 16000, 1024, 65536)?;
+        let output_mode = v
+            .get("output_mode")
+            .and_then(Value::as_str)
+            .unwrap_or(if status.pty { "full" } else { "compact" });
+        ensure!(
+            matches!(output_mode, "compact" | "full"),
+            "invalid output_mode"
+        );
         let capture = self
             .live
             .lock()
@@ -449,9 +467,18 @@ impl Terminals {
             Ok((chunk.to_owned(), cursor + chunk.len(), more))
         })
         .await??;
-        Ok(
-            json!({"terminal":status,"output":chunk,"cursor":cursor,"has_more":has_more,"retry_after_ms":500,"cursor_format":if format == 1 {"sanitized_utf8_v1"} else {"legacy_transformed"},"output_stream":"combined"}),
-        )
+        let raw_cursor_start = v.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+        let (output, compression) = if output_mode == "compact" && format == 1 {
+            let compacted = token_output::compact(status.output_profile, &chunk, status.exit_code);
+            (compacted.output, Some(compacted.metadata))
+        } else {
+            (chunk, None)
+        };
+        let mut result = json!({"terminal":status,"output":output,"cursor":cursor,"has_more":has_more,"retry_after_ms":500,"cursor_format":if format == 1 {"sanitized_utf8_v1"} else {"legacy_transformed"},"output_stream":"combined","output_view":output_mode,"raw_cursor_start":raw_cursor_start});
+        if let Some(compression) = compression {
+            result["compression"] = compression;
+        }
+        Ok(result)
     }
     pub async fn input(&self, ws: &Workspace, v: &Value) -> Result<Value> {
         let id = files::text(v, "terminal_id")?;
@@ -719,7 +746,73 @@ mod tests {
             log_format: 1,
             output_complete: false,
             output_error: None,
+            output_profile: OutputProfile::Generic,
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_read_defaults_to_compact_and_full_recovers_exact_log() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(d.path()).await.unwrap();
+        let dir = d.path().join("terminals");
+        let terminals = Terminals::new(
+            store.clone(),
+            dir.clone(),
+            "synthetic-terminal-secret-0123456789".into(),
+        )
+        .await
+        .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let raw = "   Compiling demo v0.1.0\nrunning 2 tests\ntest tests::a ... ok\ntest tests::b ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        crate::write_private(&dir.join(format!("{id}.log")), raw.as_bytes()).unwrap();
+        let mut saved = status(&id, now());
+        saved.state = "exited".into();
+        saved.exit_code = Some(0);
+        saved.output_complete = true;
+        saved.output_profile = OutputProfile::CargoTest;
+        store.put("terminal", &id, &saved, i64::MAX).await.unwrap();
+        let ws = Workspace {
+            id: "workspace".into(),
+            device_id: "device".into(),
+            root: d.path().to_path_buf(),
+        };
+
+        let compacted = terminals
+            .read(&ws, &json!({"terminal_id":id,"cursor":0,"max_bytes":65536}))
+            .await
+            .unwrap();
+        assert_eq!(compacted["output_view"], "compact");
+        assert!(
+            compacted["output"]
+                .as_str()
+                .unwrap()
+                .contains("2 passed/0 failed/0 ignored")
+        );
+        assert!(
+            !compacted["output"]
+                .as_str()
+                .unwrap()
+                .contains("tests::a ... ok")
+        );
+        assert_eq!(compacted["raw_cursor_start"], 0);
+        assert_eq!(compacted["cursor"].as_u64().unwrap(), raw.len() as u64);
+        assert!(
+            compacted["compression"]["estimated_tokens_saved"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+
+        let full = terminals
+            .read(
+                &ws,
+                &json!({"terminal_id":id,"cursor":0,"max_bytes":65536,"output_mode":"full"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full["output_view"], "full");
+        assert_eq!(full["output"], raw);
+        assert!(full.get("compression").is_none());
     }
 
     #[tokio::test]

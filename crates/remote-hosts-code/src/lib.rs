@@ -20,6 +20,7 @@ pub mod store;
 pub mod terminal;
 mod terminal_output;
 mod terminal_sync;
+mod token_output;
 pub mod tools;
 mod transfer_control;
 mod transfer_journal;

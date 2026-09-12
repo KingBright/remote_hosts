@@ -66,6 +66,7 @@ impl RuntimeFeatures {
                 "source_authorization_status_v1",
                 "terminal_reconcile_v1",
                 "transfer_recovery_guards_v1",
+                "token_compaction_v1",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -88,7 +89,7 @@ pub(crate) fn gateway_manifest(known: Option<&str>) -> Value {
         "observation_protocol":2,"capabilities_protocol":1,"schema_diagnostics_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"transfer_limits_protocol":1,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"default_file_bytes":crate::transfers::DEFAULT_MAX_BYTES,"max_file_bytes":crate::transfers::MAX_BYTES,"storage_reserve_bytes":crate::transfers::STORAGE_RESERVE_BYTES,
         "tool_constraints":{"file_upload":{"default_max_bytes":crate::transfers::DEFAULT_MAX_BYTES,"hard_max_bytes":crate::transfers::MAX_BYTES,"over_default_requires_agent_feature":"large_file_transfer_v1"},"file_download":{"default_max_bytes":crate::transfers::DEFAULT_MAX_BYTES,"hard_max_bytes":crate::transfers::MAX_BYTES,"over_default_requires_agent_feature":"large_file_transfer_v1"}},
         "optional_inputs":{"all_tools":["response_mode"],"operation_get":["operation_ids","wait_ms","cursor","max_bytes"],
-            "terminal_exec":["wait_ms"],"code_read":["allow_partial","requests[].line_byte_offset"],
+            "terminal_exec":["wait_ms"],"terminal_read":["output_mode"],"code_read":["allow_partial","requests[].line_byte_offset"],
             "devices_list":["known_tools_sha256"],
             "workspace_context":["active_only","terminal_cursor","transfer_after","cursor","after_event"],"code_diff":["include_untracked","expected_version"],"files_sync":["mode","manifest_id","bundle_path","bundle_sha256"],"change_resume":["change_set_id"],"workspace_gc":["action","older_than_seconds","max_items","preview_id"]},
         "client_schema_comparison":match known { None=>"not_provided",Some(s) if s==*CATALOG_SHA=>"match",Some(_)=>"mismatch" },
