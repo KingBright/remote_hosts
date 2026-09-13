@@ -6,11 +6,11 @@ use std::sync::LazyLock;
 
 pub fn scope(name: &str) -> Option<&'static str> {
     match name {
-        "devices_list" | "workspace_open" | "code_list" | "code_search" | "code_read"
-        | "code_symbols" | "code_diff" | "operation_get" | "terminal_read" | "file_download"
-        | "workspace_context" => Some("code:read"),
+        "devices_list" | "fleet_status" | "workspace_open" | "code_list" | "code_search"
+        | "code_read" | "code_symbols" | "code_diff" | "operation_get" | "terminal_read"
+        | "file_download" | "workspace_context" => Some("code:read"),
         "code_apply_edits" | "change_resume" | "workspace_gc" | "files_sync" | "file_upload"
-        | "transfer_cancel" | "transfer_resume" => Some("code:write"),
+        | "transfer_cancel" | "transfer_resume" | "outcome_resolve" => Some("code:write"),
         "terminal_exec" | "terminal_input" | "terminal_cancel" => Some("terminal:exec"),
         _ => None,
     }
@@ -137,8 +137,14 @@ fn build_catalog() -> Vec<Tool> {
     };
     add(
         "devices_list",
-        "List authorized devices, freshness and roots, plus gateway schema hash and separately reported agent features. Optional known_tools_sha256 detects a stale client catalog; refresh is controlled by the host, not this server. Choose a device explicitly; never fail over.",
+        "List authorized devices, freshness and roots, explicit gateway/agent wire compatibility, tool schema revision and separately reported agent/Skill features. Optional known_tools_sha256 detects a stale client catalog; refresh is controlled by the host, not this server. Choose a device explicitly; never fail over.",
         json!({"known_tools_sha256":string()}),
+        vec![],
+    );
+    add(
+        "fleet_status",
+        "Return one compact convergence view for the gateway and all authorized agents: versions, online state, wire compatibility, upgrade/maintenance state, tool schema and Skill revisions. desired_version defaults to the running gateway version. Use this instead of repeated devices_list/status polling during rollout and acceptance.",
+        json!({"desired_version":string()}),
         vec![],
     );
     add(
@@ -176,6 +182,12 @@ fn build_catalog() -> Vec<Tool> {
         "Apply version-checked precise replacements or a unified patch. All files preflight before changes; each file is atomic, and every batch returns a durable change_set_id with before/after versions. Partial or uncertain batches can be inspected and continued with change_resume. Never guess when a version or unique match conflicts. Reuse the same idempotency_key only for an uncertain identical submission. Return compact diffs.",
         json!({"workspace_id":string(),"idempotency_key":string(),"files":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"path":string(),"expected_version":string(),"action":{"type":"string","enum":["edit","create","delete"]},"edits":{"type":"array","maxItems":100,"items":{"type":"object","properties":{"old_text":string(),"new_text":string()},"required":["old_text","new_text"],"additionalProperties":false}},"patch":string(),"content":string()},"required":["path","expected_version"],"additionalProperties":false}}}),
         vec!["workspace_id", "idempotency_key", "files"],
+    );
+    add(
+        "outcome_resolve",
+        "Resolve an existing mutation whose durable agent result is outcome_unknown. This never replays work. resolution=verified_not_applied clears the semantic guard so a later deliberate new operation may run; verified_applied records completion evidence and also clears the guard. Inspect scoped evidence first; the original operation_id and owner must match.",
+        json!({"operation_id":string(),"resolution":{"type":"string","enum":["verified_not_applied","verified_applied"]},"idempotency_key":string()}),
+        vec!["operation_id", "resolution", "idempotency_key"],
     );
     add(
         "change_resume",

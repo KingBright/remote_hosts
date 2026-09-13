@@ -100,6 +100,31 @@ def _valid_identity(keychain, fingerprint):
     return result.returncode == 0 and usable and _keychain_in_search_list(keychain)
 
 
+def _signing_probe(paths, fingerprint, requirement):
+    """Prove `/usr/bin/codesign` can use the private key, not merely list it."""
+    source = pathlib.Path("/usr/bin/true")
+    if not source.is_file():
+        return False
+    with tempfile.TemporaryDirectory(prefix=".probe-", dir=paths["root"]) as tmp:
+        target = pathlib.Path(tmp) / "probe"
+        shutil.copyfile(source, target)
+        target.chmod(0o755)
+        requirement_path = pathlib.Path(tmp) / "requirement"
+        requirement_path.write_text("designated => " + requirement + "\n")
+        signed = subprocess.run(
+            ["/usr/bin/codesign", "--force", "--sign", fingerprint, "--keychain", str(paths["keychain"]),
+             "--identifier", CODE_IDENTIFIER, "--requirements", str(requirement_path), "--timestamp=none", str(target)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=30,
+        )
+        if signed.returncode != 0:
+            return False
+        verified = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(target)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=15,
+        )
+        return verified.returncode == 0
+
+
 def _atomic_json(path, value):
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,7 +246,7 @@ def status(base, create_if_missing=False):
     password = paths["password"].read_text().strip()
     _security("unlock-keychain", "-p", password, paths["keychain"])
     requirement = f'identifier "{CODE_IDENTIFIER}" and certificate leaf = H"{fingerprint}"'
-    if not _valid_identity(paths["keychain"], fingerprint):
+    if not _valid_identity(paths["keychain"], fingerprint) or not _signing_probe(paths, fingerprint, requirement):
         return {
             "state": "authorization_required",
             "certificate_name": CERT_NAME,
@@ -231,6 +256,7 @@ def status(base, create_if_missing=False):
             "code_identifier": CODE_IDENTIFIER,
             "designated_requirement": requirement,
             "next_action": "authorize_local_signing_identity_once",
+            "sign_probe": "failed_or_unavailable",
         }
     return {
         "state": "ready",

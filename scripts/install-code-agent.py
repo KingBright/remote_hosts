@@ -9,6 +9,7 @@ import os
 import pathlib
 import plistlib
 import subprocess
+import macos_code_identity
 
 
 def main():
@@ -20,8 +21,26 @@ def main():
     domain = f"gui/{os.getuid()}"
     if subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         raise SystemExit("Agent already loaded; inspect active terminals before a deliberate restart")
-    binary, config = args.binary.resolve(), args.config.resolve()
+    release_binary, config = args.binary.resolve(), args.config.resolve()
+    base = pathlib.Path.home() / ".local/share/remote-hosts-code"
+    signing = macos_code_identity.status(base, create_if_missing=True)
+    if signing.get("state") != "ready":
+        signing = macos_code_identity.authorize(base)
+    if signing.get("state") != "ready":
+        raise SystemExit("macOS code-signing trust must be approved before installing the agent")
+    binary = base / "bin/remote-hosts-code"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    signed = macos_code_identity.sign_copy(release_binary, binary, base)
+    version = subprocess.check_output([str(binary), "--version"], text=True, timeout=10).strip()
     subprocess.run([str(binary), "check", "--agent", "--config", str(config)], check=True)
+    macos_code_identity.save_installed_metadata(base, {
+        "version": version.removeprefix("remote-hosts-code "),
+        "candidate_sha256": macos_code_identity.sha(release_binary),
+        "installed_sha256": signed["installed_sha256"],
+        "certificate_sha1": signing["certificate_sha1"],
+        "code_identifier": signing["code_identifier"],
+        "designated_requirement": signing["designated_requirement"],
+    })
     config.chmod(0o600)
     logs = config.parent / "logs"
     logs.mkdir(mode=0o700, exist_ok=True)

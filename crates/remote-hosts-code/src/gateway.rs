@@ -6,15 +6,16 @@ use crate::{
     store::Store,
     tools,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::StreamExt;
 use rmcp::{
     RoleServer, ServerHandler,
     model::*,
@@ -25,8 +26,9 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::{sync::Notify, time::Instant};
+use sha2::{Digest, Sha256};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use tokio::{io::AsyncWriteExt, sync::Notify, time::Instant};
 
 // Notifications are latency hints, not the source of truth. The durable queue is
 // checked after subscribing, with a bounded fallback for recovery or missed hints.
@@ -42,6 +44,7 @@ pub struct Gateway {
     pub config: Arc<GatewayConfig>,
     pub store: Store,
     pub auth: Auth,
+    config_path: Option<PathBuf>,
     signals: Arc<HashMap<String, DeviceSignals>>,
     pub(crate) observation_changed: Arc<Notify>,
     pub(crate) transfer_limits: Arc<crate::scheduler::TransferLimits>,
@@ -58,6 +61,20 @@ pub struct Job {
 pub struct DeviceHello {
     #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub wire_protocol: Option<u32>,
+    #[serde(default)]
+    pub tool_schema_revision: Option<String>,
+    #[serde(default)]
+    pub skill_revision: Option<String>,
+    #[serde(default)]
+    pub skill_consistent: Option<bool>,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub home_dir: Option<String>,
     pub session: String,
     pub roots: Vec<String>,
     pub allow_write: bool,
@@ -91,6 +108,23 @@ impl PollRequest {
     fn valid(&self) -> bool {
         self.hello.session.len() == 64
             && self.hello.version.len() <= 64
+            && self
+                .hello
+                .wire_protocol
+                .is_none_or(|v| (1..=64).contains(&v))
+            && self
+                .hello
+                .tool_schema_revision
+                .as_ref()
+                .is_none_or(|v| v.len() == 64)
+            && self
+                .hello
+                .skill_revision
+                .as_ref()
+                .is_none_or(|v| v.len() == 64)
+            && self.hello.platform.len() <= 32
+            && self.hello.arch.len() <= 32
+            && self.hello.home_dir.as_ref().is_none_or(|v| v.len() <= 4096)
             && self.hello.roots.len() <= 50
             && self.hello.roots.iter().all(|r| r.len() <= 4096)
             && self
@@ -141,6 +175,12 @@ pub struct Receipt {
 }
 impl Gateway {
     pub async fn new(config: GatewayConfig) -> Result<Self> {
+        Self::new_inner(config, None).await
+    }
+    pub async fn new_with_config_path(config: GatewayConfig, config_path: PathBuf) -> Result<Self> {
+        Self::new_inner(config, Some(config_path)).await
+    }
+    async fn new_inner(config: GatewayConfig, config_path: Option<PathBuf>) -> Result<Self> {
         crate::validate_url(&config.public_url)?;
         ensure!(
             !config.owner.is_empty() && !config.password_hash.is_empty(),
@@ -184,6 +224,7 @@ impl Gateway {
             config,
             store,
             auth,
+            config_path,
             signals,
             observation_changed: Arc::new(Notify::new()),
             transfer_limits,
@@ -211,8 +252,16 @@ impl Gateway {
         let mcp = Router::new().nest_service("/mcp", service).route_layer(
             middleware::from_fn_with_state(self.auth.clone(), crate::auth::require_auth),
         );
+        let admin = Router::new()
+            .route("/admin/gateway-upgrade", post(gateway_upgrade))
+            .with_state(self.clone())
+            .route_layer(middleware::from_fn_with_state(
+                self.auth.clone(),
+                crate::auth::require_auth,
+            ));
         Ok(Router::new()
             .merge(mcp)
+            .merge(admin)
             .merge(self.auth.routes())
             .merge(crate::transfers::routes(self.clone()))
             .merge(crate::transfer_control::routes(self.clone()))
@@ -220,7 +269,7 @@ impl Gateway {
             .merge(crate::maintenance::routes(self.clone()))
             .route(
                 "/healthz",
-                get(|| async { Json(json!({"status":"ok","service":"remote-hosts-code","version":env!("CARGO_PKG_VERSION"),"file_transfer":true,"default_file_bytes":crate::transfers::DEFAULT_MAX_BYTES,"max_file_bytes":crate::transfers::MAX_BYTES,"storage_reserve_bytes":crate::transfers::STORAGE_RESERVE_BYTES,"transfer_limits_protocol":1,"dispatch_protocol":2,"progress_protocol":1,"readiness_protocol":1,"observation_protocol":2,"capabilities_protocol":1,"schema_diagnostics_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"execution_limits":{"read":8,"write":2,"transfer":2,"terminal":4,"control":2}})) }),
+                get(|| async { Json(json!({"status":"ok","service":"remote-hosts-code","version":env!("CARGO_PKG_VERSION"),"wire_protocol":crate::capabilities::WIRE_PROTOCOL,"min_agent_wire_protocol":crate::capabilities::MIN_AGENT_WIRE_PROTOCOL,"max_agent_wire_protocol":crate::capabilities::WIRE_PROTOCOL,"file_transfer":true,"default_file_bytes":crate::transfers::DEFAULT_MAX_BYTES,"max_file_bytes":crate::transfers::MAX_BYTES,"storage_reserve_bytes":crate::transfers::STORAGE_RESERVE_BYTES,"transfer_limits_protocol":1,"dispatch_protocol":2,"progress_protocol":1,"readiness_protocol":1,"observation_protocol":2,"capabilities_protocol":1,"schema_diagnostics_protocol":1,"resource_dispatch_protocol":1,"transfer_protocol":2,"maintenance_protocol":1,"terminal_observation_protocol":1,"change_set_protocol":1,"storage_gc_protocol":1,"checkpoint_bytes":crate::transfer_receiver::CHUNK,"execution_limits":{"read":8,"write":2,"transfer":2,"terminal":4,"control":2}})) }),
             )
             .merge(
                 Router::new()
@@ -261,6 +310,61 @@ impl Gateway {
         if matches!(name, "transfer_cancel" | "transfer_resume") {
             return crate::transfer_control::apply(self, p, name, &args).await;
         }
+        if name == "outcome_resolve" {
+            let operation_id = files::text(&args, "operation_id")?;
+            uuid::Uuid::parse_str(operation_id).context("invalid operation id")?;
+            let resolution = files::text(&args, "resolution")?;
+            if let Some(saved) = self
+                .store
+                .get::<Value>("outcome_resolution", operation_id)
+                .await?
+            {
+                ensure!(
+                    saved["resolution"] == resolution,
+                    "outcome_resolution_conflict"
+                );
+                return Ok(json!({"state":"resolved","operation_id":operation_id,
+                    "resolution":resolution,"replayed":false,"duplicate":true}));
+            }
+            let row: Option<(String, Option<String>)> =
+                sqlx::query_as("SELECT request,result FROM jobs WHERE id=?")
+                    .bind(operation_id)
+                    .fetch_optional(&self.store.pool)
+                    .await?;
+            let (request, result) = row.context("unknown operation")?;
+            let request: Job = serde_json::from_str(&request)?;
+            ensure!(request.owner == p.owner, "operation owner mismatch");
+            let result: Value = result
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .context("operation has no durable result")?;
+            ensure!(
+                result["error"] == "outcome_unknown",
+                "operation is not outcome_unknown"
+            );
+            let guard: Option<(String,)> = sqlx::query_as(
+                "SELECT semantic FROM semantic_guards WHERE operation_id=? AND state='outcome_unknown'")
+                .bind(operation_id).fetch_optional(&self.store.pool).await?;
+            let (semantic,) = guard.context("outcome guard is not active")?;
+            sqlx::query("DELETE FROM semantic_guards WHERE semantic=? AND operation_id=?")
+                .bind(&semantic)
+                .bind(operation_id)
+                .execute(&self.store.pool)
+                .await?;
+            self.store
+                .put(
+                    "outcome_resolution",
+                    operation_id,
+                    &json!({
+                        "resolution":resolution,"resolved_at":now(),"owner":p.owner
+                    }),
+                    i64::MAX,
+                )
+                .await?;
+            return Ok(json!({"state":"resolved","operation_id":operation_id,
+                "resolution":resolution,"replayed":false}));
+        }
         let source = if name == "file_upload" {
             let url = files::text(&args["file"], "download_url")?.to_owned();
             crate::transfers::source_url(&url, &self.config.public_url)?;
@@ -274,6 +378,65 @@ impl Gateway {
         } else {
             None
         };
+        if name == "fleet_status" {
+            let desired = args
+                .get("desired_version")
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .unwrap_or(env!("CARGO_PKG_VERSION"));
+            ensure!(
+                desired.len() <= 64,
+                "invalid_arguments: desired_version too long"
+            );
+            let mut devices = Vec::with_capacity(self.config.devices.len());
+            let mut online_count = 0usize;
+            let mut converged_count = 0usize;
+            for d in &self.config.devices {
+                let online = self.store.get::<Online>("online", &d.id).await?;
+                let maintenance = crate::maintenance::view(self, &d.id).await?;
+                let upgrade = self.store.get::<Value>("device_update", &d.id).await?;
+                let is_online = online
+                    .as_ref()
+                    .is_some_and(|o| (0..45).contains(&(now() - o.last_seen)));
+                let compatibility = crate::capabilities::compatibility(
+                    online.as_ref().and_then(|o| o.hello.wire_protocol),
+                );
+                let version = online
+                    .as_ref()
+                    .map(|o| o.hello.version.as_str())
+                    .unwrap_or("");
+                let wire_ok = compatibility["status"] == "compatible";
+                let tool_ok = online
+                    .as_ref()
+                    .and_then(|o| o.hello.tool_schema_revision.as_deref())
+                    == Some(crate::capabilities::tool_schema_revision());
+                let skill_ok = online
+                    .as_ref()
+                    .and_then(|o| o.hello.skill_revision.as_deref())
+                    == Some(crate::capabilities::embedded_skill_revision())
+                    && online.as_ref().and_then(|o| o.hello.skill_consistent) != Some(false);
+                let converged = is_online && version == desired && wire_ok && tool_ok && skill_ok;
+                online_count += usize::from(is_online);
+                converged_count += usize::from(converged);
+                devices.push(json!({
+                    "device_id":d.id,"name":d.name,"online":is_online,"version":version,
+                    "converged":converged,"compatibility":compatibility,"tool_schema_converged":tool_ok,"skill_converged":skill_ok,
+                    "tool_schema_revision":online.as_ref().and_then(|o|o.hello.tool_schema_revision.as_deref()),
+                    "skill_revision":online.as_ref().and_then(|o|o.hello.skill_revision.as_deref()),
+                    "skill_consistent":online.as_ref().and_then(|o|o.hello.skill_consistent),
+                    "capabilities":online.as_ref().map(|o|&o.hello),
+                    "maintenance":maintenance,"upgrade":upgrade
+                }));
+            }
+            let gateway_converged = desired == env!("CARGO_PKG_VERSION");
+            let all_converged = gateway_converged && converged_count == devices.len();
+            return Ok(json!({
+                "desired_version":desired,"all_converged":all_converged,
+                "summary":{"devices_total":devices.len(),"devices_online":online_count,
+                    "devices_converged":converged_count,"gateway_converged":gateway_converged},
+                "gateway":crate::capabilities::gateway_manifest(None),"devices":devices
+            }));
+        }
         if name == "devices_list" {
             let known = args.get("known_tools_sha256").and_then(Value::as_str);
             if let Some(s) = known {
@@ -289,7 +452,10 @@ impl Gateway {
                 let online = self.store.get::<Online>("online", &d.id).await?;
                 let maintenance = crate::maintenance::view(self, &d.id).await?;
                 let upgrade = self.store.get::<Value>("device_update", &d.id).await?;
-                devices.push(json!({"upgrade":upgrade,"maintenance":maintenance,"device_id":d.id,"name":d.name,"scopes":d.scopes,"online":online.as_ref().is_some_and(|o|(0..45).contains(&(now()-o.last_seen))),"last_seen":online.as_ref().map(|o|o.last_seen),"receipt_delivery":online.as_ref().and_then(|o|o.receipt_delivery.as_ref()),"receipt_delivery_stale":online.as_ref().and_then(|o|o.receipt_delivery.as_ref()).map(|d|!(0..=45).contains(&(now()-d.reported_at))),"runtime_features":online.as_ref().and_then(|o|o.runtime_features.as_ref()),"runtime_features_status":if online.as_ref().is_some_and(|o|o.runtime_features.is_some()) {"reported_by_agent"} else {"not_reported"},"capabilities":online.map(|o|o.hello)}));
+                let compatibility = crate::capabilities::compatibility(
+                    online.as_ref().and_then(|o| o.hello.wire_protocol),
+                );
+                devices.push(json!({"upgrade":upgrade,"maintenance":maintenance,"compatibility":compatibility,"device_id":d.id,"name":d.name,"scopes":d.scopes,"online":online.as_ref().is_some_and(|o|(0..45).contains(&(now()-o.last_seen))),"last_seen":online.as_ref().map(|o|o.last_seen),"receipt_delivery":online.as_ref().and_then(|o|o.receipt_delivery.as_ref()),"receipt_delivery_stale":online.as_ref().and_then(|o|o.receipt_delivery.as_ref()).map(|d|!(0..=45).contains(&(now()-d.reported_at))),"runtime_features":online.as_ref().and_then(|o|o.runtime_features.as_ref()),"runtime_features_status":if online.as_ref().is_some_and(|o|o.runtime_features.is_some()) {"reported_by_agent"} else {"not_reported"},"capabilities":online.map(|o|o.hello)}));
             }
             return Ok(
                 json!({"devices":devices,"gateway":crate::capabilities::gateway_manifest(known)}),
@@ -335,6 +501,20 @@ impl Gateway {
                 .unwrap_or("")
         ));
         let fingerprint = hash(serde_json::to_vec(&args)?);
+        let semantic = if scope != "code:read" {
+            let mut semantic_args = args.clone();
+            if let Some(object) = semantic_args.as_object_mut() {
+                object.remove("idempotency_key");
+                object.remove("response_mode");
+            }
+            Some(hash(format!(
+                "{}:{device}:{name}:{}",
+                p.owner,
+                serde_json::to_string(&semantic_args)?
+            )))
+        } else {
+            None
+        };
         let id = uuid::Uuid::new_v4().to_string();
         let job = Job {
             id: id.clone(),
@@ -355,6 +535,18 @@ impl Gateway {
             );
             (id, false)
         } else {
+            if let Some(semantic) = &semantic
+                && let Some((original, state)) = sqlx::query_as::<_, (String, String)>(
+                    "SELECT operation_id,state FROM semantic_guards WHERE semantic=?",
+                )
+                .bind(semantic)
+                .fetch_optional(&self.store.pool)
+                .await?
+            {
+                bail!(
+                    "semantic_operation_guarded: original_operation_id={original}; state={state}; observe original and use outcome_resolve only after scoped verification"
+                );
+            }
             let maintenance = crate::maintenance::view(self, device).await?;
             ensure!(
                 maintenance["state"] != "draining"
@@ -412,15 +604,29 @@ impl Gateway {
                 online.as_ref().is_some_and(|o| now() - o.last_seen < 45),
                 "device_offline: reconnect the selected device; do not fail over"
             );
-            if let Some(source) = &source {
-                self.store
-                    .put(
-                        "file_source",
-                        &id,
-                        source,
-                        now() + crate::transfers::SOURCE_TTL,
+            let mut transaction = self.store.pool.begin().await?;
+            if let Some(semantic) = &semantic {
+                let inserted =
+                    sqlx::query("INSERT OR IGNORE INTO semantic_guards VALUES(?,?,'active',?)")
+                        .bind(semantic)
+                        .bind(&id)
+                        .bind(now())
+                        .execute(&mut *transaction)
+                        .await?;
+                if inserted.rows_affected() == 0 {
+                    let existing: (String, String) = sqlx::query_as(
+                        "SELECT operation_id,state FROM semantic_guards WHERE semantic=?",
                     )
+                    .bind(semantic)
+                    .fetch_one(&mut *transaction)
                     .await?;
+                    transaction.rollback().await?;
+                    bail!(
+                        "semantic_operation_guarded: original_operation_id={}; state={}; observe original and use outcome_resolve only after scoped verification",
+                        existing.0,
+                        existing.1
+                    );
+                }
             }
             sqlx::query("INSERT OR IGNORE INTO jobs VALUES(?,?,?,?,?,NULL,'queued',?)")
                 .bind(&id)
@@ -429,15 +635,33 @@ impl Gateway {
                 .bind(&fingerprint)
                 .bind(serde_json::to_string(&job)?)
                 .bind(now())
-                .execute(&self.store.pool)
+                .execute(&mut *transaction)
                 .await?;
-            let (id, fp): (String, String) =
+            let (selected_id, fp): (String, String) =
                 sqlx::query_as("SELECT id,fingerprint FROM jobs WHERE idem=?")
                     .bind(&idem)
-                    .fetch_one(&self.store.pool)
+                    .fetch_one(&mut *transaction)
                     .await?;
             ensure!(fp == fingerprint, "idempotency_conflict");
-            (id, true)
+            if selected_id != id {
+                if let Some(semantic) = &semantic {
+                    sqlx::query("DELETE FROM semantic_guards WHERE semantic=? AND operation_id=?")
+                        .bind(semantic)
+                        .bind(&id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                transaction.commit().await?;
+                (selected_id, false)
+            } else {
+                transaction.commit().await?;
+                if let Some(semantic) = &semantic {
+                    self.store
+                        .put("operation_semantic", &id, semantic, i64::MAX)
+                        .await?;
+                }
+                (id, true)
+            }
         };
         if created_new {
             sqlx::query("INSERT OR IGNORE INTO operation_timing(id,queued_ms) VALUES(?,?)")
@@ -895,6 +1119,23 @@ async fn poll(
     if !request.valid() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let agent_wire = request.hello.wire_protocol.unwrap_or(1);
+    if !(crate::capabilities::MIN_AGENT_WIRE_PROTOCOL..=crate::capabilities::WIRE_PROTOCOL)
+        .contains(&agent_wire)
+    {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(json!({
+                "error":"gateway_version_incompatible",
+                "gateway_version":env!("CARGO_PKG_VERSION"),
+                "gateway_wire_protocol":crate::capabilities::WIRE_PROTOCOL,
+                "min_agent_wire_protocol":crate::capabilities::MIN_AGENT_WIRE_PROTOCOL,
+                "max_agent_wire_protocol":crate::capabilities::WIRE_PROTOCOL,
+                "agent_wire_protocol":agent_wire
+            })),
+        )
+            .into_response();
+    }
     if request
         .resource_filter
         .write_workspaces
@@ -1080,6 +1321,27 @@ async fn receipt(
         }
     };
     if !duplicate {
+        if let Ok(Some(semantic)) = g
+            .store
+            .get::<String>("operation_semantic", &receipt.operation_id)
+            .await
+        {
+            if receipt.result["error"] == "outcome_unknown" {
+                let _ = sqlx::query("UPDATE semantic_guards SET state='outcome_unknown',updated=? WHERE semantic=? AND operation_id=?")
+                    .bind(now()).bind(&semantic).bind(&receipt.operation_id).execute(&g.store.pool).await;
+            } else {
+                let _ =
+                    sqlx::query("DELETE FROM semantic_guards WHERE semantic=? AND operation_id=?")
+                        .bind(&semantic)
+                        .bind(&receipt.operation_id)
+                        .execute(&g.store.pool)
+                        .await;
+                let _ = sqlx::query("DELETE FROM kv WHERE kind='operation_semantic' AND key=?")
+                    .bind(&receipt.operation_id)
+                    .execute(&g.store.pool)
+                    .await;
+            }
+        }
         let _ =
             sqlx::query("UPDATE operation_timing SET result_ms=COALESCE(result_ms,?) WHERE id=?")
                 .bind(now_ms())
@@ -1097,6 +1359,327 @@ async fn receipt(
     g.observation_changed.notify_waiters();
     Json(json!({"accepted":true,"duplicate":duplicate})).into_response()
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayUpgradeRequest {
+    version: String,
+    bundle_sha256: String,
+}
+
+fn valid_release_version(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        && value.len() <= 32
+}
+
+async fn gateway_upgrade(
+    State(g): State<Gateway>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<GatewayUpgradeRequest>,
+) -> Response {
+    if principal.owner != g.config.owner
+        || !principal.scopes.iter().any(|scope| scope == "code:write")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"insufficient_scope"})),
+        )
+            .into_response();
+    }
+    if !valid_release_version(&request.version)
+        || request.bundle_sha256.len() != 64
+        || !request
+            .bundle_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid_upgrade_identity"})),
+        )
+            .into_response();
+    }
+    let Some(config_path) = g.config_path.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error":"gateway_self_upgrade_unavailable"})),
+        )
+            .into_response();
+    };
+    if request.version == env!("CARGO_PKG_VERSION") {
+        return Json(
+            json!({"state":"no_change","version":request.version,"service_changed":false}),
+        )
+        .into_response();
+    }
+    let Ok(binary) = std::env::current_exe() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"gateway_binary_identity_unavailable"})),
+        )
+            .into_response();
+    };
+    let Some(root) = binary.parent() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"gateway_root_unavailable"})),
+        )
+            .into_response();
+    };
+    let release = root.join("releases").join(&request.version);
+    let result_path = release.join("self-upgrade-result.json");
+    let marker_path = release.join("self-upgrade-request.json");
+    let unit = format!(
+        "remote-hosts-code-self-upgrade-{}",
+        request.version.replace('.', "-")
+    );
+    if result_path.is_file() {
+        return match std::fs::read(&result_path)
+            .ok()
+            .and_then(|v| serde_json::from_slice::<Value>(&v).ok())
+        {
+            Some(value) => Json(value).into_response(),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"gateway_upgrade_receipt_malformed"})),
+            )
+                .into_response(),
+        };
+    }
+    if marker_path.is_file() {
+        let active = tokio::process::Command::new("systemctl")
+            .args(["is-active", &unit])
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success());
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "state":if active {"started"} else {"needs_recovery"},"version":request.version,
+                "unit":unit,"result":result_path,"replayed":false
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = tokio::fs::create_dir_all(&release).await {
+        tracing::error!(?error, "gateway self-upgrade staging directory failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"gateway_upgrade_staging_failed"})),
+        )
+            .into_response();
+    }
+    let bundle = release.join(format!("remote-hosts-code-{}-bundle.tgz", request.version));
+    let staged = if bundle.is_file() {
+        std::fs::read(&bundle)
+            .ok()
+            .is_some_and(|bytes| hash(bytes) == request.bundle_sha256)
+    } else {
+        false
+    };
+    if !staged {
+        let url = format!(
+            "https://github.com/KingBright/remote_hosts/releases/download/v{0}/remote-hosts-code-{0}-bundle.tgz",
+            request.version
+        );
+        let response = match reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .and_then(|client| client.get(url).build())
+            .map_err(anyhow::Error::from)
+        {
+            Ok(request) => match reqwest::Client::new().execute(request).await {
+                Ok(response) if response.status().is_success() => response,
+                _ => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error":"release_bundle_download_failed"})),
+                    )
+                        .into_response();
+                }
+            },
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"release_request_invalid"})),
+                )
+                    .into_response();
+            }
+        };
+        if response
+            .content_length()
+            .is_some_and(|size| size > 268_435_456)
+        {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"error":"release_bundle_too_large"})),
+            )
+                .into_response();
+        }
+        let temporary = release.join(".bundle.download");
+        let mut file = match tokio::fs::File::create(&temporary).await {
+            Ok(file) => file,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"release_bundle_stage_failed"})),
+                )
+                    .into_response();
+            }
+        };
+        let mut digest = Sha256::new();
+        let mut total = 0u64;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":"release_bundle_download_interrupted"})),
+                )
+                    .into_response();
+            };
+            total = total.saturating_add(chunk.len() as u64);
+            if total > 268_435_456 || file.write_all(&chunk).await.is_err() {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(json!({"error":"release_bundle_write_failed"})),
+                )
+                    .into_response();
+            }
+            digest.update(&chunk);
+        }
+        if file.sync_all().await.is_err()
+            || format!("{:x}", digest.finalize()) != request.bundle_sha256
+        {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"release_bundle_checksum_mismatch"})),
+            )
+                .into_response();
+        }
+        if tokio::fs::rename(&temporary, &bundle).await.is_err() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"release_bundle_publish_failed"})),
+            )
+                .into_response();
+        }
+    }
+    let runner = release.join("gateway-self-upgrade-runner.py");
+    let runner_source = include_str!("../../../scripts/gateway_self_upgrade_runner.py");
+    if runner.is_file() {
+        if std::fs::read_to_string(&runner).ok().as_deref() != Some(runner_source) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error":"gateway_upgrade_runner_changed"})),
+            )
+                .into_response();
+        }
+    } else if std::fs::write(&runner, runner_source).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"gateway_upgrade_runner_stage_failed"})),
+        )
+            .into_response();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).is_err() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"gateway_upgrade_runner_permissions_failed"})),
+            )
+                .into_response();
+        }
+    }
+    let marker = json!({"version":request.version,"bundle_sha256":request.bundle_sha256,"unit":unit,"requested_at":now()});
+    let marker_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path);
+    let Ok(mut marker_file) = marker_file else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"gateway_upgrade_request_already_exists"})),
+        )
+            .into_response();
+    };
+    use std::io::Write as _;
+    if marker_file
+        .write_all(
+            serde_json::to_string_pretty(&marker)
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+        .is_err()
+        || marker_file.sync_all().is_err()
+    {
+        let _ = std::fs::remove_file(&marker_path);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"gateway_upgrade_marker_failed"})),
+        )
+            .into_response();
+    }
+    let python = if std::path::Path::new("/bin/python3").is_file() {
+        "/bin/python3"
+    } else {
+        "/usr/bin/python3"
+    };
+    let output = tokio::process::Command::new("systemd-run")
+        .arg("--unit")
+        .arg(&unit)
+        .arg("--collect")
+        .arg("--property=Type=exec")
+        .arg(python)
+        .arg(&runner)
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--bundle-sha256")
+        .arg(&request.bundle_sha256)
+        .arg("--version")
+        .arg(&request.version)
+        .arg("--result")
+        .arg(&result_path)
+        .arg("--binary-path")
+        .arg(&binary)
+        .arg("--config-path")
+        .arg(config_path)
+        .arg("--backup-root")
+        .arg(root.join("releases"))
+        .arg("--service-name")
+        .arg("remote-hosts-code-gateway.service")
+        .arg("--gateway-bind")
+        .arg(&g.config.bind)
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "state":"started","version":request.version,"bundle_sha256":request.bundle_sha256,
+                "unit":unit,"result":result_path,"replayed":false
+            })),
+        )
+            .into_response(),
+        _ => {
+            let _ = std::fs::remove_file(&marker_path);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"gateway_upgrade_runner_start_failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn security_headers(
     State(config): State<Arc<GatewayConfig>>,
     request: Request,

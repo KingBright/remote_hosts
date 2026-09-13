@@ -39,7 +39,8 @@ def validate_report_scope(report, origin, version, run_id, selected):
         raise ValueError('receipt has duplicate, unselected or wrong-version devices')
 
 
-def expected_tool_names(version):
+def required_tool_names(version):
+    """Minimum capability contract. New additive tools never invalidate an older client."""
     tools = {'devices_list','workspace_open','code_list','code_search','code_read','code_symbols',
              'code_apply_edits','code_diff','terminal_exec','terminal_read','terminal_input',
              'terminal_cancel','operation_get','file_upload','file_download'}
@@ -50,6 +51,8 @@ def expected_tool_names(version):
         tools |= {'files_sync'}
     if parsed >= (0, 6, 0):
         tools |= {'change_resume','workspace_gc'}
+    if parsed >= (0, 10, 2):
+        tools |= {'fleet_status','outcome_resolve'}
     return tools
 
 
@@ -142,15 +145,21 @@ def main():
     rpc("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "remote-hosts-live-acceptance", "version": "1"}})
     catalog = rpc("tools/list", {})
     names = [tool['name'] for tool in catalog['tools']]
-    expected_tools = expected_tool_names(args.expected_version)
-    assert len(names) == len(set(names)) and set(names) == expected_tools, 'Unexpected tool catalog'
+    required_tools = required_tool_names(args.expected_version)
+    assert len(names) == len(set(names)), 'Duplicate tool catalog entries'
+    missing_tools = sorted(required_tools - set(names))
+    assert not missing_tools, 'Missing required tools: ' + ','.join(missing_tools)
     upload_descriptor = next(t for t in catalog["tools"] if t["name"] == "file_upload")
     assert upload_descriptor["_meta"]["openai/fileParams"] == ["file"]
     health = parsed("/healthz")
     assert health["version"] == args.expected_version
+    parsed_version = tuple(map(int, args.expected_version.split('.')))
+    if parsed_version >= (0, 10, 2):
+        assert health.get("wire_protocol", 0) >= 2
+        assert health.get("min_agent_wire_protocol", 0) <= 1
     if args.dispatch_protocol is not None:
         assert health.get("dispatch_protocol") == args.dispatch_protocol
-    if tuple(map(int, args.expected_version.split('.'))) >= (0, 7, 0):
+    if parsed_version >= (0, 7, 0):
         assert health.get("transfer_limits_protocol") == 1
         assert health.get("default_file_bytes") == 67108864
         assert health.get("max_file_bytes") == 268435456

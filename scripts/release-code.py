@@ -210,8 +210,12 @@ def run_pipeline(snapshot, report, slot, verify_only=False):
                 for filename, info in packaged['artifacts'].items():
                     if pathlib.Path(filename).name != filename or build_slot.digest(release/filename) != info['sha256']:
                         raise ValueError('packaged artifact checksum mismatch')
+                bundle = release.parent/(release.name+'-bundle.tgz')
+                if not bundle.is_file():
+                    raise ValueError('release bundle missing after package stage')
                 state['package'] = {'path': str(release), 'manifest_sha256': build_slot.digest(release/'manifest.json'),
-                                    'artifacts': packaged['artifacts']}
+                                    'bundle': str(bundle), 'bundle_sha256': build_slot.digest(bundle),
+                                    'bundle_size': bundle.stat().st_size, 'artifacts': packaged['artifacts']}
             source_snapshot.check(snapshot)
             source_snapshot.check(checkout)
             state.update(state='passed', phase='finished', source_inputs_unchanged=True)

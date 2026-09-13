@@ -21,7 +21,8 @@ import release_receipts as rr
 import source_snapshot
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-DOC_PREFIXES = ('docs/', 'skills/')
+DOC_PREFIXES = ('docs/',)
+SKILL_PREFIX = 'skills/'
 DOC_FILES = {'README.md', 'README_EN.md', '.gitignore'}
 
 
@@ -49,9 +50,15 @@ def classify(paths):
         return 'clean'
     def doc(path):
         return path in DOC_FILES or path.startswith(DOC_PREFIXES)
+    def skill(path):
+        return path.startswith(SKILL_PREFIX)
+    if all(skill(path) for path in paths):
+        return 'skill'
     if all(doc(path) for path in paths):
         return 'docs'
-    if all(doc(path) or (path.startswith('scripts/') and path.endswith('.py')) for path in paths):
+    if all(doc(path) or skill(path) for path in paths):
+        return 'skill'
+    if all(doc(path) or skill(path) or (path.startswith('scripts/') and path.endswith(('.py','.ps1'))) for path in paths):
         return 'release_python'
     return 'runtime'
 
@@ -93,13 +100,30 @@ def audit_commit_scope(paths):
             raise ValueError('temporary bearer file URL must not be committed: '+name)
 
 
+def verify_skill():
+    skill = ROOT/'skills/remote-hosts-agent/SKILL.md'
+    if not skill.is_file():
+        raise ValueError('Remote Hosts core Skill is missing')
+    if skill.stat().st_size > 16*1024:
+        raise ValueError('Remote Hosts core Skill exceeds 16 KiB hot-context budget')
+    text = skill.read_text()
+    references = re.findall(r'\]\((references/[^)]+)\)', text)
+    missing = sorted(name for name in set(references) if not (skill.parent/name).is_file())
+    if missing:
+        raise ValueError('Skill references missing: '+', '.join(missing))
+
+
 def verify_light(profile, paths):
     audit_commit_scope(paths)
     run(['git', 'diff', '--check'])
     check_json(paths)
     if (ROOT/'docs/product/backlog.json').is_file():
         run([sys.executable, 'scripts/product-backlog.py', '--check'])
+    if profile == 'skill':
+        verify_skill()
     if profile == 'release_python':
+        if any(name.startswith(SKILL_PREFIX) for name in paths):
+            verify_skill()
         changed_python = [name for name in paths if name.endswith('.py') and (ROOT/name).is_file()]
         if changed_python:
             run([sys.executable, '-m', 'py_compile', *changed_python])
@@ -128,9 +152,19 @@ def git_push(paths, message):
 
 
 def compact_publish_status(directory):
-    path = pathlib.Path(directory)/'deployment.json'
+    directory = pathlib.Path(directory)
+    fleet_path = directory/'fleet.json'
+    if fleet_path.is_file():
+        value=json.loads(fleet_path.read_text());fleet=value.get('fleet') or {};summary=fleet.get('summary') or {}
+        agents={ident:{'name':row.get('name'),'state':row.get('state'),'platform':row.get('platform')}
+                for ident,row in value.get('agents',{}).items()}
+        return {'state':value.get('state'),'phase':value.get('phase'),'version':value.get('version'),
+                'all_targets_accepted':value.get('all_converged',False),'all_converged':value.get('all_converged',False),
+                'summary':summary,'gateway':{'state':(value.get('gateway') or {}).get('state'),'version':value.get('version')},
+                'agents':agents,'report':str(fleet_path)}
+    path = directory/'deployment.json'
     if not path.is_file():
-        return {'state': 'not_started', 'report': str(path)}
+        return {'state': 'not_started', 'report': str(fleet_path)}
     value = json.loads(path.read_text())
     agents = {ident: {'name': row.get('name'), 'state': row.get('state'), 'phase': row.get('phase')}
               for ident, row in value.get('agents', {}).items()}
@@ -209,6 +243,9 @@ def main():
                 state['pipeline'] = str(pipeline)
                 state['version'] = built['version']
                 state['manifest_sha256'] = built['package']['manifest_sha256']
+                state['release_dir'] = built['package']['path']
+                state['bundle'] = built['package']['bundle']
+                state['bundle_sha256'] = built['package']['bundle_sha256']
             else:
                 verify_light(profile, paths)
             if fingerprint(paths) != initial:
@@ -232,9 +269,13 @@ def main():
                 raise ValueError('--publish-report-dir is required with --publish-config')
             if state['stages'].get('publication', {}).get('state') != 'passed':
                 state['phase'] = 'publication'; save(report, state)
-                run([sys.executable, 'scripts/publish-code.py', '--config', str(args.publish_config),
-                     '--pipeline', state['pipeline'], '--report-dir', str(args.publish_report_dir),
-                     '--version', state['version'], '--apply'])
+                if state['stages'].get('github_release', {}).get('state') != 'passed':
+                    run([sys.executable,'scripts/publish-github-code-release.py','--version',state['version'],
+                         '--package',state['release_dir'],'--bundle',state['bundle']])
+                    state['stages']['github_release']={'state':'passed','version':state['version'],'bundle_sha256':state['bundle_sha256']};save(report,state)
+                run([sys.executable, 'scripts/fleet-upgrade.py', '--config', str(args.publish_config),
+                     '--package', state['release_dir'], '--report-dir', str(args.publish_report_dir),
+                     '--version', state['version']])
                 summary = compact_publish_status(args.publish_report_dir)
                 if not summary.get('all_targets_accepted'):
                     state['publish_status'] = summary; save(report, state)

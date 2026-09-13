@@ -337,8 +337,24 @@ impl Agent {
             .connect_timeout(Duration::from_secs(10))
             .build()?;
         let delivery = Delivery::new(self.store.clone(), self.config.clone()).await?;
+        if let Err(error) = crate::capabilities::sync_embedded_skill() {
+            tracing::error!(
+                ?error,
+                "failed to synchronize embedded Agent Skill; fleet convergence will remain false"
+            );
+        }
+        let (skill_revision, skill_consistent) = crate::capabilities::installed_skill_revision();
         let hello = DeviceHello {
             version: env!("CARGO_PKG_VERSION").into(),
+            wire_protocol: Some(crate::capabilities::WIRE_PROTOCOL),
+            tool_schema_revision: Some(crate::capabilities::tool_schema_revision().to_owned()),
+            skill_revision,
+            skill_consistent,
+            platform: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            home_dir: std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|v| std::path::PathBuf::from(v).to_string_lossy().into_owned()),
             session: crate::random(),
             roots: self
                 .config
@@ -374,12 +390,44 @@ impl Agent {
                     .await
             }
             .await;
-            if health.is_ok_and(|v| {
-                v["dispatch_protocol"] == 2
+            if let Ok(v) = &health {
+                let gateway_wire = v["wire_protocol"].as_u64().unwrap_or(0) as u32;
+                if gateway_wire < crate::capabilities::MIN_GATEWAY_WIRE_PROTOCOL {
+                    self.store.put("runtime", "gateway_compatibility", &json!({
+                        "state":"gateway_version_incompatible",
+                        "agent_version":env!("CARGO_PKG_VERSION"),
+                        "agent_wire_protocol":crate::capabilities::WIRE_PROTOCOL,
+                        "gateway_version":v["version"],
+                        "gateway_wire_protocol":gateway_wire,
+                        "required_gateway_wire_protocol":crate::capabilities::MIN_GATEWAY_WIRE_PROTOCOL,
+                        "observed_at":crate::now()
+                    }), i64::MAX).await?;
+                    attempt = attempt.saturating_add(1);
+                    tracing::error!(
+                        gateway_wire,
+                        required = crate::capabilities::MIN_GATEWAY_WIRE_PROTOCOL,
+                        "gateway_version_incompatible; upgrade gateway before this agent"
+                    );
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+                if v["dispatch_protocol"] == 2
                     && v["resource_dispatch_protocol"] == 1
                     && v["transfer_protocol"] == 2
-            }) {
-                break;
+                {
+                    self.store
+                        .put(
+                            "runtime",
+                            "gateway_compatibility",
+                            &json!({
+                                "state":"compatible","gateway_version":v["version"],
+                                "gateway_wire_protocol":gateway_wire,"observed_at":crate::now()
+                            }),
+                            i64::MAX,
+                        )
+                        .await?;
+                    break;
+                }
             }
             attempt = attempt.saturating_add(1);
             // No URL, body or credentials in diagnostics. Stay in this process on

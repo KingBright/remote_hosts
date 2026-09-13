@@ -20,7 +20,10 @@ class IterationPolicyTests(unittest.TestCase):
         self.assertEqual(iteration.classify([
             'skills/remote-hosts-agent/SKILL.md',
             'skills/remote-hosts-agent/references/setup-and-runtime.md',
-        ]), 'docs')
+        ]), 'skill')
+
+    def test_docs_plus_skill_uses_skill_gate(self):
+        self.assertEqual(iteration.classify(['docs/product/NEXT.md','skills/remote-hosts-agent/SKILL.md']), 'skill')
 
     def test_release_python_does_not_force_rust_rebuild(self):
         self.assertEqual(iteration.classify(['scripts/check-code-gateway.py',

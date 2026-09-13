@@ -98,7 +98,9 @@ async fn main() -> Result<()> {
                 "gateway must bind loopback behind Caddy"
             );
             let _lock = lock(&c.state_dir)?;
-            let gateway = remote_hosts_code::gateway::Gateway::new(c).await?;
+            let gateway =
+                remote_hosts_code::gateway::Gateway::new_with_config_path(c, config.clone())
+                    .await?;
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(%bind,"gateway listening");
             axum::serve(listener, gateway.router()?)

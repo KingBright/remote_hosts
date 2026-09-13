@@ -39,6 +39,9 @@ impl Store {
         sqlx::query("CREATE INDEX IF NOT EXISTS jobs_device_state ON jobs(device,state,updated)")
             .execute(&pool)
             .await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS semantic_guards (semantic TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, updated INTEGER NOT NULL)")
+            .execute(&pool)
+            .await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS operation_timing (id TEXT PRIMARY KEY,queued_ms INTEGER NOT NULL,dispatched_ms INTEGER,result_ms INTEGER)")
             .execute(&pool)
             .await?;

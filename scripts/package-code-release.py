@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -65,6 +66,12 @@ def main():
         'release_client.py': ROOT/'scripts/release_client.py',
         'publish-code.py': ROOT/'scripts/publish-code.py',
         'check-collaboration.py': ROOT/'scripts/check-collaboration.py',
+        'install-code-agent.py': ROOT/'scripts/install-code-agent.py',
+        'upgrade-code-agent-linux.py': ROOT/'scripts/upgrade-code-agent-linux.py',
+        'upgrade-code-agent-windows.ps1': ROOT/'scripts/upgrade-code-agent-windows.ps1',
+        'launch-code-upgrade-windows.ps1': ROOT/'scripts/launch-code-upgrade-windows.ps1',
+        'fleet-upgrade.py': ROOT/'scripts/fleet-upgrade.py',
+        'gateway_self_upgrade_runner.py': ROOT/'scripts/gateway_self_upgrade_runner.py',
     }
     for path in files.values():
         if not path.is_file():
@@ -93,8 +100,10 @@ def main():
         manifest = {
             'schema_version':1, 'version':args.version,
             'packaged_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'wire_protocol':2, 'min_agent_wire_protocol':1, 'max_agent_wire_protocol':2,
             'dispatch_protocol':2, 'progress_protocol':1, 'readiness_protocol':1,
-            'resource_dispatch_protocol':1, 'transfer_protocol':2, 'transfer_limits_protocol':1, 'tool_count':21, 'maintenance_protocol':1, 'terminal_observation_protocol':1, 'observation_protocol':2, 'change_set_protocol':1, 'storage_gc_protocol':1,
+            'resource_dispatch_protocol':1, 'transfer_protocol':2, 'transfer_limits_protocol':1, 'tool_count':23, 'maintenance_protocol':1, 'terminal_observation_protocol':1, 'observation_protocol':2, 'change_set_protocol':1, 'storage_gc_protocol':1,
+            'fleet_protocol':1, 'skill_revision_protocol':1, 'outcome_guard_protocol':1,
             'checkpoint_bytes':4194304, 'default_file_bytes':67108864, 'max_file_bytes':268435456, 'storage_reserve_bytes':268435456, 'snapshot_id':proof.get('snapshot_id'),
             'build_execution_root':str(ROOT),
             'source_verification_sha256':digest(proof_path),
@@ -110,9 +119,16 @@ def main():
         }
         (stage/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
         (stage/'SHA256SUMS').write_text(''.join(digest(stage/name)+'  '+name+'\n' for name in sorted([*files,'manifest.json','source-verification.json'])))
-        (stage/'README.md').write_text('# Remote Hosts '+args.version+'\n\nGateway must be upgraded before agents. Keep existing device identities.\nRun the bundled upgrade scripts from a deployment session independent of the agent being replaced.\nRecord actual runtime versions and check binary SHA-256 against manifest.json.\nRun check-code-gateway.py with --expected-version '+args.version+' --dispatch-protocol 2 and explicit --device-id for each authorized device.\nSource verification is not a deployment or native browser-file acceptance receipt.\n')
+        (stage/'README.md').write_text('# Remote Hosts '+args.version+'\n\nThe bundle is the release identity. Upgrade the Gateway before Agents, or use fleet-upgrade.py to converge the whole fleet. Keep existing device identities.\nAll platform binaries and updater helpers are bound by manifest.json.\nRecord actual runtime versions and check binary SHA-256 against manifest.json.\nAcceptance is capability-based: required capabilities must be present; additive tools are allowed.\nSource verification is not a deployment acceptance receipt.\n')
         stage.rename(dest)
-    print(json.dumps({'release_dir':str(dest), 'manifest_sha256':digest(dest/'manifest.json'), 'artifacts':artifacts, 'deployed':False}))
+    bundle=dest.parent/(dest.name+'-bundle.tgz')
+    if bundle.exists(): raise SystemExit('release bundle already exists; do not overwrite')
+    with tarfile.open(bundle,'x:gz') as archive:
+        for path in sorted(dest.iterdir(), key=lambda p:p.name):
+            if path.is_file(): archive.add(path,arcname=path.name)
+    print(json.dumps({'release_dir':str(dest), 'manifest_sha256':digest(dest/'manifest.json'),
+                      'bundle':str(bundle),'bundle_sha256':digest(bundle),'bundle_size':bundle.stat().st_size,
+                      'artifacts':artifacts, 'deployed':False}))
 
 if __name__ == '__main__':
     main()

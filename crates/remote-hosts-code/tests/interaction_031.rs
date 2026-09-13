@@ -222,7 +222,7 @@ async fn startup_failure_retries_in_same_process_then_records_all_lane_acknowled
                     } else {
                         (
                             StatusCode::OK,
-                            Json(json!({"dispatch_protocol":2,"resource_dispatch_protocol":1,"transfer_protocol":2})),
+                            Json(json!({"wire_protocol":2,"version":"0.10.2","dispatch_protocol":2,"resource_dispatch_protocol":1,"transfer_protocol":2})),
                         )
                     }
                 }

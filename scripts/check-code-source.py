@@ -38,7 +38,7 @@ def inputs(root):
                              'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') if (root/n).is_file()}
     # sqlx::migrate!("../../migrations") and root fixtures are compiled/tested
     # inputs too. Include their membership, not only .rs files inside crates.
-    for subtree in ('crates', '.cargo', 'migrations', 'fixtures', 'tests', 'assets', '.sqlx'):
+    for subtree in ('crates', 'skills', '.cargo', 'migrations', 'fixtures', 'tests', 'assets', '.sqlx'):
         if (root/subtree).is_symlink():
             raise ValueError('unsupported linked verification subtree: '+subtree)
         for directory, children, files in os.walk(root/subtree, followlinks=False):
@@ -47,6 +47,7 @@ def inputs(root):
                 raise ValueError('linked directory cannot be omitted from verification: '+str(directory))
             paths.update(pathlib.Path(directory)/n for n in files)
     paths.update((root/'scripts').glob('*.py'))
+    paths.update((root/'scripts').glob('*.ps1'))
     for name in (
         'remote-hosts-service',
         'remote-hosts-systemd-service',

@@ -113,7 +113,17 @@ fn compact_devices(value: &mut Value) {
             capabilities.retain(|key, _| {
                 matches!(
                     key.as_str(),
-                    "version" | "roots" | "allow_write" | "allow_exec"
+                    "version"
+                        | "wire_protocol"
+                        | "tool_schema_revision"
+                        | "skill_revision"
+                        | "skill_consistent"
+                        | "platform"
+                        | "arch"
+                        | "home_dir"
+                        | "roots"
+                        | "allow_write"
+                        | "allow_exec"
                 )
             });
         }
@@ -149,6 +159,10 @@ fn compact_devices(value: &mut Value) {
             matches!(
                 key.as_str(),
                 "version"
+                    | "wire_protocol"
+                    | "min_agent_wire_protocol"
+                    | "max_agent_wire_protocol"
+                    | "tool_schema_revision"
                     | "tools_sha256"
                     | "tool_count"
                     | "refresh_required"
@@ -189,7 +203,7 @@ pub(crate) fn compact_response(tool: &str, mut value: Value) -> Value {
         compact_completed_shape(&mut value);
     }
     match tool {
-        "devices_list" => compact_devices(&mut value),
+        "devices_list" | "fleet_status" => compact_devices(&mut value),
         "code_search" => compact_search(&mut value),
         "terminal_read" => {
             let complete = value
@@ -253,6 +267,29 @@ pub(crate) fn compact_text(tool: &str, value: &Value) -> String {
             value
                 .pointer("/terminal/exit_code")
                 .map_or_else(|| "?".into(), Value::to_string)
+        ),
+        "fleet_status" => format!(
+            "fleet_status: {}/{} converged; online={}; gateway={}; all_converged={}",
+            value
+                .pointer("/summary/devices_converged")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            value
+                .pointer("/summary/devices_total")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            value
+                .pointer("/summary/devices_online")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            value
+                .pointer("/gateway/version")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            value
+                .get("all_converged")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         ),
         "devices_list" => {
             let devices = value

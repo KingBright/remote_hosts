@@ -128,6 +128,7 @@ python3 scripts/macos_code_identity.py status
 ```
 
 `ready` means more than “the certificate is listed”: the code-signing identity must be trusted **and** its private keychain must be present in the current user's keychain search list. A `security find-identity` row containing `CSSMERR_*` is not ready even if the footer says that a valid identity was found. `codesign: no identity found` is likewise a signing-environment failure, not permission to skip signing.
+Current runtimes also require a real sign probe: the helper copies a tiny system Mach-O, signs it with the same identity and designated requirement used for the Agent, and verifies it with `codesign --verify`. Only that full probe may report `ready`. First installation performs identity preparation/trust/probe before loading the Agent so routine upgrades remain noninteractive.
 
 When authorization is required, use the repository helper once:
 
@@ -138,6 +139,14 @@ python3 scripts/macos_code_identity.py authorize
 The host-local certificate is self-signed, so its user trust is scoped with `trustRoot` plus the `codeSign` policy. Do not use `trustAsRoot` for this identity. The certificate/private key remain in the dedicated Remote Hosts keychain; that keychain must also be in the user's search list so `/usr/bin/codesign` can resolve the identity. The helper must not expose the generated keychain password.
 
 If `launch-code-upgrade.py --start` returned `authorization_required` before the one-shot job was started, authorize the identity and resume the same prepared request. If an updater job already started and wrote a failed result, do not replay that immutable job: repair the signing environment and create a new updater job identity, then observe that new job. In all cases require the candidate SHA-256, signed installed SHA-256, service readiness, and Gateway-reported version before declaring the upgrade complete.
+
+## Code Fleet Upgrade Contract
+
+For 0.10.2+ Code releases, the release bundle is the immutable rollout identity. The bundle binds macOS/Linux/Windows binaries, platform updaters, Gateway updater, Fleet orchestrator, manifest, and source verification. Prefer `fleet_status` over repeated per-device status calls. Its convergence result requires the Gateway version plus every online Agent's version, wire protocol, tool-schema revision, and embedded Skill revision to match the requested release.
+
+Gateway and Agent compatibility is explicit. Upgrade the Gateway first. A legacy Agent may remain temporarily `legacy_compatible`; a newer Agent facing an older incompatible Gateway reports `gateway_version_incompatible` instead of silently turning an incompatibility into an ordinary offline diagnosis. From 0.10.2 onward prefer the narrow authenticated Gateway self-upgrade endpoint; SSH is only a bootstrap/recovery path when the running Gateway predates that endpoint.
+
+Fleet rollout exports one verified bundle and uses independent one-shot platform updaters so replacing an Agent cannot kill its own updater. Do not manually replay an uncertain updater. Observe the original receipt/Fleet report and resume only through the documented recovery state.
 
 ## Codex MCP Config
 

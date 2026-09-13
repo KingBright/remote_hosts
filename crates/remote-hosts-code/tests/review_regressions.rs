@@ -275,7 +275,7 @@ async fn simultaneous_device_sessions_have_only_one_winner() {
 #[test]
 fn catalog_schema_rejects_nested_unknown_fields_types_and_bounds() {
     use remote_hosts_code::tools::{catalog, validate};
-    assert_eq!(catalog().len(), 21); // Includes durable change-set recovery and explicit workspace GC.
+    assert_eq!(catalog().len(), 23); // Includes durable change-set recovery and explicit workspace GC.
     let valid = json!({"workspace_id":"w","idempotency_key":"edit","files":[{
         "path":"a.txt","expected_version":"absent","action":"create","content":"hello"
     }]});
