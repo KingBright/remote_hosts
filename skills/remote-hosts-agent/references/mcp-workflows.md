@@ -4,7 +4,7 @@ Use these workflows when `remote_hosts_*` MCP tools are available.
 
 ## Default Agent Tools
 
-The `agent` profile intentionally exposes only 18 task-level tools:
+The `agent` profile intentionally exposes 22 task-level tools. Legacy workspace-state polling is not part of this surface; normal waiting is centralized in Agent Work Context:
 
 - `remote_hosts_list_hosts`
 - `remote_hosts_ensure_host`
@@ -16,26 +16,30 @@ The `agent` profile intentionally exposes only 18 task-level tools:
 - `remote_hosts_run_in_workspace`
 - `remote_hosts_upload_file`
 - `remote_hosts_download_file`
-- `remote_hosts_wait_workspace_state`
 - `remote_hosts_get_workspace_result`
 - `remote_hosts_read_output_artifact_content`
 - `remote_hosts_open_workspace_pty_session`
+- `remote_hosts_heartbeat_pty_session`
 - `remote_hosts_queue_pty_input`
+- `remote_hosts_control_pty`
 - `remote_hosts_read_pty_output`
 - `remote_hosts_close_pty_session`
+- `remote_hosts_get_agent_work_context`
 - `remote_hosts_wait_runtime_events`
+- `remote_hosts_configure_instance_sync_peer`
+- `remote_hosts_sync_instance_peer`
 
 The `admin` profile adds host deduplication/upsert, environments, credential references, access paths, facts, and operational maintenance. The `full` profile is reserved for development and debugging.
 
-Agent-profile responses are compact by default. High-frequency calls preserve stable nested paths
-such as `workspace.id` and `operation.id`, while omitting repeated runtime snapshots, command
-catalogs, protection decisions, full Workspace records, and unrelated recent operations. Follow
-`next_action` and `retry_after_ms`; call the explicit runtime snapshot or admin/full profile only
-for diagnostics and maintenance.
-
-Shell and PTY audit records contain bounded, secret-redacted command previews. Incremental output
-chunks contain sequence, stream, text, and truncation state without repeating Workspace and
-operation ids in every chunk. Password-like PTY interactions remain type-only.
+Agent-profile responses are compact by default. High-frequency calls preserve stable ids and raw
+sequence/offset cursors while omitting repeated runtime snapshots, command catalogs, protection
+decisions, timing envelopes, and unrelated operation detail. Workspace and artifact output use a
+semantic compact view by default; `output_mode=full` restores exact durable redacted text without
+re-running the command. Recognized high-noise artifact reads may consume a larger raw window while
+advancing `next_offset` over the source bytes. PTY compaction is deliberately conservative and
+preserves prompts/interactions. Follow `next_action`, `retry_after_ms`, `next_sequence`, and
+`next_offset`; call the explicit runtime snapshot or admin/full profile only for diagnostics and
+maintenance.
 
 ## Standard Remote Check
 

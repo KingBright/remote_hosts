@@ -408,7 +408,6 @@ impl Terminals {
         let id = files::text(v, "terminal_id")?;
         let mut status = self.status(ws, id).await?;
         let cursor = files::number(v, "cursor", 0, 0, 100000000)?;
-        let max = files::number(v, "max_bytes", 16000, 1024, 65536)?;
         let output_mode = v
             .get("output_mode")
             .and_then(Value::as_str)
@@ -417,6 +416,19 @@ impl Terminals {
             matches!(output_mode, "compact" | "full"),
             "invalid output_mode"
         );
+        // For recognized high-noise commands, consume a much larger raw page before
+        // semantic compaction. This reduces MCP round trips and repeated cursor/status
+        // envelopes without exposing larger unknown-command output. Generic/full views
+        // retain the conservative 16 KB default.
+        let default_max = if output_mode == "compact"
+            && status.output_profile != OutputProfile::Generic
+            && status.log_format == 1
+        {
+            65_536
+        } else {
+            16_000
+        };
+        let max = files::number(v, "max_bytes", default_max, 1024, 65536)?;
         let capture = self
             .live
             .lock()
@@ -786,7 +798,7 @@ mod tests {
             compacted["output"]
                 .as_str()
                 .unwrap()
-                .contains("2 passed/0 failed/0 ignored")
+                .contains("2 passed, 0 failed, 0 ignored")
         );
         assert!(
             !compacted["output"]
@@ -796,12 +808,7 @@ mod tests {
         );
         assert_eq!(compacted["raw_cursor_start"], 0);
         assert_eq!(compacted["cursor"].as_u64().unwrap(), raw.len() as u64);
-        assert!(
-            compacted["compression"]["estimated_tokens_saved"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
+        assert!(compacted["compression"]["saved_tokens"].as_u64().unwrap() > 0);
 
         let full = terminals
             .read(
@@ -813,6 +820,67 @@ mod tests {
         assert_eq!(full["output_view"], "full");
         assert_eq!(full["output"], raw);
         assert!(full.get("compression").is_none());
+    }
+
+    #[tokio::test]
+    async fn recognized_compact_read_consumes_large_raw_page_by_default() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(d.path()).await.unwrap();
+        let dir = d.path().join("terminals");
+        let terminals = Terminals::new(
+            store.clone(),
+            dir.clone(),
+            "synthetic-terminal-secret-0123456789".into(),
+        )
+        .await
+        .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut raw = String::from("running 700 tests\n");
+        for n in 0..700 {
+            raw.push_str(&format!(
+                "test integration::long_case_{n:04}_that_is_routine ... ok\n"
+            ));
+        }
+        raw.push_str(
+            "test result: ok. 700 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+        assert!(raw.len() > 16_000 && raw.len() < 65_536);
+        crate::write_private(&dir.join(format!("{id}.log")), raw.as_bytes()).unwrap();
+        let mut saved = status(&id, now());
+        saved.state = "exited".into();
+        saved.exit_code = Some(0);
+        saved.output_complete = true;
+        saved.output_profile = OutputProfile::CargoTest;
+        store.put("terminal", &id, &saved, i64::MAX).await.unwrap();
+        let ws = Workspace {
+            id: "workspace".into(),
+            device_id: "device".into(),
+            root: d.path().to_path_buf(),
+        };
+
+        let compacted = terminals
+            .read(&ws, &json!({"terminal_id":id,"cursor":0}))
+            .await
+            .unwrap();
+        assert_eq!(compacted["cursor"].as_u64().unwrap(), raw.len() as u64);
+        assert_eq!(compacted["has_more"], false);
+        assert!(compacted["output"].as_str().unwrap().len() < 800);
+        assert!(
+            compacted["output"]
+                .as_str()
+                .unwrap()
+                .contains("700 passed, 0 failed, 0 ignored")
+        );
+
+        let full = terminals
+            .read(
+                &ws,
+                &json!({"terminal_id":id,"cursor":0,"output_mode":"full"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full["cursor"], 16_000);
+        assert_eq!(full["has_more"], true);
     }
 
     #[tokio::test]

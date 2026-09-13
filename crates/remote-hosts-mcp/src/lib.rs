@@ -1,5 +1,7 @@
 //! MCP tool contracts and server handlers for remote hosts.
 
+mod token_output;
+
 use std::{
     collections::BTreeSet,
     io::SeekFrom,
@@ -54,6 +56,7 @@ pub const SERVER_NAME: &str = "remote-hosts";
 const DEFAULT_ARTIFACT_ROOT: &str = "remote-hosts-artifacts";
 const DEFAULT_ARTIFACT_READ_BYTES: usize = 64 * 1024;
 const MAX_ARTIFACT_READ_BYTES: usize = 256 * 1024;
+const MAX_SEMANTIC_COMPACT_ARTIFACT_READ_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_CHANNELS: u16 = 8;
 const WRITE_LEASE_SECONDS: i64 = 300;
 
@@ -173,7 +176,6 @@ const AGENT_TOOL_NAMES: &[&str] = &[
     tools::RUN_IN_WORKSPACE,
     tools::UPLOAD_FILE,
     tools::DOWNLOAD_FILE,
-    tools::WAIT_WORKSPACE_STATE,
     tools::GET_WORKSPACE_RESULT,
     tools::READ_OUTPUT_ARTIFACT_CONTENT,
     tools::OPEN_WORKSPACE_PTY_SESSION,
@@ -189,6 +191,7 @@ const AGENT_TOOL_NAMES: &[&str] = &[
 ];
 
 const ADMIN_TOOL_NAMES: &[&str] = &[
+    tools::WAIT_WORKSPACE_STATE,
     tools::FIND_HOST_DUPLICATES,
     tools::UPSERT_HOST,
     tools::GET_HOST,
@@ -868,6 +871,17 @@ pub struct HeartbeatPtySessionRequest {
     pub input_allowed: bool,
 }
 
+/// Agent-facing output view. Durable redacted output is never changed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputMode {
+    /// Token-optimized semantic view.
+    #[default]
+    Compact,
+    /// Exact durable redacted chunks.
+    Full,
+}
+
 /// Read PTY output request.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ReadPtyOutputRequest {
@@ -875,8 +889,10 @@ pub struct ReadPtyOutputRequest {
     pub pty_session_id: String,
     /// Only return chunks after this sequence number.
     pub after_sequence: Option<u64>,
-    /// Maximum number of chunks. Defaults to 50 and is capped at 200.
+    /// Maximum number of source chunks. Compact Agent reads default to 200; full reads default to 50.
     pub limit: Option<u32>,
+    /// `compact` or `full`. Agent profile defaults to compact; admin/full profiles default to full.
+    pub output_mode: Option<OutputMode>,
 }
 
 /// Queue PTY input request.
@@ -1067,8 +1083,10 @@ pub struct ReadWorkspaceOutputRequest {
     pub operation_id: Option<String>,
     /// Only return chunks after this sequence number.
     pub after_sequence: Option<u64>,
-    /// Maximum number of chunks. Defaults to 50 and is capped at 200.
+    /// Maximum number of source chunks. Exact compact operation reads default to 200; full reads default to 50.
     pub limit: Option<u32>,
+    /// `compact` or `full`. Agent profile defaults to compact; admin/full profiles default to full.
+    pub output_mode: Option<OutputMode>,
 }
 
 /// Combined workspace result request.
@@ -1081,8 +1099,10 @@ pub struct GetWorkspaceResultRequest {
     pub operation_id: Option<String>,
     /// Only return chunks after this sequence number. Requires `operation_id`.
     pub after_sequence: Option<u64>,
-    /// Maximum chunks and artifacts per collection. Defaults to 50 and is capped at 200.
+    /// Maximum source chunks and artifacts per collection. Compact reads may consume up to 200 chunks before returning one semantic view.
     pub limit: Option<u32>,
+    /// `compact` or `full`. Agent profile defaults to compact; admin/full profiles default to full.
+    pub output_mode: Option<OutputMode>,
 }
 
 /// List workspace output artifacts request.
@@ -1111,8 +1131,10 @@ pub struct ReadOutputArtifactContentRequest {
     pub artifact_id: String,
     /// Byte offset. Start at zero and then reuse `next_offset`.
     pub offset: Option<u64>,
-    /// Maximum UTF-8 bytes. Defaults to 64 KiB and is capped at 256 KiB.
+    /// Maximum durable UTF-8 source bytes consumed. Recognized semantic compact reads default to 1 MiB; generic/full reads default to 64 KiB.
     pub max_bytes: Option<usize>,
+    /// `compact` or `full`. Agent profile defaults to compact; admin/full profiles default to full.
+    pub output_mode: Option<OutputMode>,
 }
 
 /// Wait workspace state request.
@@ -1213,6 +1235,14 @@ impl RemoteHostsMcpServer {
 
     fn compact_responses(&self) -> bool {
         self.tool_profile == ToolProfile::Agent
+    }
+
+    fn compact_output(&self, requested: Option<OutputMode>) -> bool {
+        match requested {
+            Some(OutputMode::Compact) => true,
+            Some(OutputMode::Full) => false,
+            None => self.compact_responses(),
+        }
     }
 
     fn instance_sync_service(&self) -> Result<InstanceSyncService, String> {
@@ -2067,7 +2097,7 @@ impl RemoteHostsMcpServer {
                 public_operation_value(&operation)?
             },
             workspace: if self.compact_responses() {
-                compact_workspace_value(&workspace)
+                compact_workspace_status_value(&workspace)
             } else {
                 to_json_value(&workspace)?
             },
@@ -2259,7 +2289,7 @@ impl RemoteHostsMcpServer {
                 public_operation_value(&plan.operation)?
             },
             workspace: if self.compact_responses() {
-                compact_workspace_value(&workspace)
+                compact_workspace_status_value(&workspace)
             } else {
                 to_json_value(&workspace)?
             },
@@ -2426,7 +2456,7 @@ impl RemoteHostsMcpServer {
                 public_operation_value(&plan.operation)?
             },
             workspace: if self.compact_responses() {
-                compact_workspace_value(&workspace)
+                compact_workspace_status_value(&workspace)
             } else {
                 to_json_value(&workspace)?
             },
@@ -5271,7 +5301,7 @@ impl RemoteHostsMcpServer {
     /// Read redacted output chunks from a PTY session.
     #[tool(
         name = "remote_hosts_read_pty_output",
-        description = "Read redacted output chunks from a persistent PTY session without exposing shell input or credentials.",
+        description = "Read persistent PTY output. Agent mode defaults to conservative token compaction (terminal redraw/repetition only); output_mode=full returns exact durable redacted chunks.",
         annotations(
             title = "Read PTY Output",
             read_only_hint = true,
@@ -5284,25 +5314,36 @@ impl RemoteHostsMcpServer {
     ) -> Result<Json<PtyOutputChunksOutput>, String> {
         let pty_session_id = parse_pty_session_id(&request.pty_session_id)?;
         let pty_session = self.pty_session_for_tool(pty_session_id).await?;
-        let limit = request.limit.unwrap_or(50).clamp(1, 200);
+        let compact_output = self.compact_output(request.output_mode);
+        let limit = request
+            .limit
+            .unwrap_or(if compact_output { 200 } else { 50 })
+            .clamp(1, 200);
         let chunks = self
             .repositories
             .pty_output_chunks
             .list_for_session(pty_session_id, request.after_sequence, limit)
             .await
             .map_err(|error| tool_error(&error))?;
+        let source_count = chunks.len();
+        let next_sequence = chunks.last().map(|chunk| chunk.sequence);
+        let (visible_chunks, compression) = if compact_output {
+            token_output::compact_pty_chunks(&chunks)
+        } else {
+            (values(&chunks)?, None)
+        };
         Ok(Json(PtyOutputChunksOutput {
             pty_session: if self.compact_responses() {
-                compact_pty_session_value(&pty_session)
+                compact_pty_output_status_value(&pty_session)
             } else {
                 to_json_value(&pty_session)?
             },
-            count: chunks.len(),
-            chunks: if self.compact_responses() {
-                chunks.iter().map(compact_pty_chunk_value).collect()
-            } else {
-                values(&chunks)?
-            },
+            output_view: if compact_output { "compact" } else { "full" }.to_owned(),
+            source_count,
+            count: visible_chunks.len(),
+            next_sequence,
+            compression,
+            chunks: visible_chunks,
         }))
     }
 
@@ -6012,7 +6053,7 @@ impl RemoteHostsMcpServer {
     /// Read redacted output chunks from a workspace.
     #[tool(
         name = "remote_hosts_read_workspace_output",
-        description = "Read redacted output chunks for a workspace or one queued operation.",
+        description = "Read workspace output. Agent mode defaults to semantic token compaction for exact operations and returns next_sequence over the durable raw chunks; output_mode=full restores exact redacted chunks.",
         annotations(
             title = "Read Workspace Output",
             read_only_hint = true,
@@ -6048,13 +6089,23 @@ impl RemoteHostsMcpServer {
         } else {
             None
         };
-        let limit = request.limit.unwrap_or(50).clamp(1, 200);
+        let compact_output = self.compact_output(request.output_mode);
+        let limit = request
+            .limit
+            .unwrap_or(if compact_output && operation_id.is_some() {
+                200
+            } else {
+                50
+            })
+            .clamp(1, 200);
         let chunks = self
             .repositories
             .operation_output_chunks
             .list_for_workspace(workspace_id, operation_id, request.after_sequence, limit)
             .await
             .map_err(|error| tool_error(&error))?;
+        let source_count = chunks.len();
+        let next_sequence = chunks.last().map(|chunk| chunk.sequence);
         let operations = if let Some(operation) = requested_operation {
             vec![operation]
         } else {
@@ -6064,20 +6115,32 @@ impl RemoteHostsMcpServer {
                 .await
                 .map_err(|error| tool_error(&error))?
         };
+        let (visible_chunks, compression) = if compact_output {
+            if let Some(operation) = operations.first().filter(|_| operation_id.is_some()) {
+                token_output::compact_operation_chunks(operation, &chunks)
+            } else {
+                token_output::compact_unscoped_operation_chunks(&chunks)
+            }
+        } else {
+            (values(&chunks)?, None)
+        };
         Ok(Json(WorkspaceOutputChunksOutput {
             workspace: if self.compact_responses() {
                 compact_workspace_status_value(&workspace)
             } else {
                 to_json_value(&workspace)?
             },
-            count: chunks.len(),
-            chunks: if self.compact_responses() {
-                chunks.iter().map(compact_operation_chunk_value).collect()
-            } else {
-                values(&chunks)?
-            },
+            output_view: if compact_output { "compact" } else { "full" }.to_owned(),
+            source_count,
+            count: visible_chunks.len(),
+            next_sequence,
+            compression,
+            chunks: visible_chunks,
             recent_operations: if self.compact_responses() {
-                operations.iter().map(compact_operation_value).collect()
+                operations
+                    .iter()
+                    .map(compact_operation_result_value)
+                    .collect()
             } else {
                 public_operation_values(&operations)?
             },
@@ -6087,7 +6150,7 @@ impl RemoteHostsMcpServer {
     /// Read output, operations, and artifact metadata in one bounded result.
     #[tool(
         name = "remote_hosts_get_workspace_result",
-        description = "Get one bounded workspace result containing redacted output chunks, recent operations, and large-output artifact metadata.",
+        description = "Get one bounded workspace result. Agent mode defaults to semantic token-compacted output plus raw next_sequence and savings metadata; output_mode=full restores exact redacted chunks.",
         annotations(
             title = "Get Workspace Result",
             read_only_hint = true,
@@ -6104,6 +6167,7 @@ impl RemoteHostsMcpServer {
                 operation_id: request.operation_id.clone(),
                 after_sequence: request.after_sequence,
                 limit: request.limit,
+                output_mode: request.output_mode,
             }))
             .await?;
         let Json(artifact_output) = self
@@ -6116,7 +6180,11 @@ impl RemoteHostsMcpServer {
 
         Ok(Json(WorkspaceResultOutput {
             workspace: output.workspace,
+            output_view: output.output_view,
+            source_chunk_count: output.source_count,
             chunk_count: output.count,
+            next_sequence: output.next_sequence,
+            compression: output.compression,
             chunks: output.chunks,
             recent_operations: output.recent_operations,
             artifact_count: artifact_output.count,
@@ -6210,7 +6278,7 @@ impl RemoteHostsMcpServer {
     /// Read a bounded chunk from one redacted output artifact.
     #[tool(
         name = "remote_hosts_read_output_artifact_content",
-        description = "Read one bounded UTF-8 chunk from a redacted large-output artifact; continue with next_offset.",
+        description = "Read a bounded large-output artifact view. Agent mode uses command-aware compaction and may consume up to 1 MiB per call for recognized high-noise output; generic/full reads stay conservative. Continue with raw next_offset; output_mode=full restores exact redacted text.",
         annotations(
             title = "Read Output Artifact Content",
             read_only_hint = true,
@@ -6237,10 +6305,36 @@ impl RemoteHostsMcpServer {
                 artifact.byte_len
             ));
         }
+        let compact_output = self.compact_output(request.output_mode);
+        let compact_operation = if compact_output {
+            Some(
+                self.repositories
+                    .operations
+                    .get(artifact.operation_id)
+                    .await
+                    .map_err(|error| tool_error(&error))?
+                    .ok_or_else(|| format!("operation not found: {}", artifact.operation_id))?,
+            )
+        } else {
+            None
+        };
+        let semantic_compaction = compact_operation
+            .as_ref()
+            .is_some_and(|operation| !token_output::classify_operation(operation).is_generic());
+        let max_source_bytes = if semantic_compaction {
+            MAX_SEMANTIC_COMPACT_ARTIFACT_READ_BYTES
+        } else {
+            MAX_ARTIFACT_READ_BYTES
+        };
+        let default_source_bytes = if semantic_compaction {
+            MAX_SEMANTIC_COMPACT_ARTIFACT_READ_BYTES
+        } else {
+            DEFAULT_ARTIFACT_READ_BYTES
+        };
         let max_bytes = request
             .max_bytes
-            .unwrap_or(DEFAULT_ARTIFACT_READ_BYTES)
-            .clamp(1_024, MAX_ARTIFACT_READ_BYTES);
+            .unwrap_or(default_source_bytes)
+            .clamp(1_024, max_source_bytes);
         let chunk = read_artifact_utf8_chunk(
             self.artifact_root.as_ref(),
             &artifact.relative_path,
@@ -6256,14 +6350,24 @@ impl RemoteHostsMcpServer {
                     .map_err(|error| format!("artifact chunk length conversion: {error}"))?,
             )
             .ok_or_else(|| "artifact offset overflow".to_owned())?;
+        let (content, compression) = if let Some(operation) = compact_operation.as_ref() {
+            let (content, metadata) = token_output::compact_operation_text(operation, &chunk);
+            (content, Some(metadata))
+        } else {
+            (chunk, None)
+        };
+        let content_bytes = content.len();
         Ok(Json(OutputArtifactContentOutput {
             artifact_id: artifact_id.to_string(),
+            output_view: if compact_output { "compact" } else { "full" }.to_owned(),
             offset,
             next_offset,
             bytes_read,
+            content_bytes,
             eof: next_offset >= artifact.byte_len,
             sha256: artifact.sha256,
-            content: chunk,
+            compression,
+            content,
         }))
     }
 
@@ -6293,7 +6397,11 @@ impl RemoteHostsMcpServer {
             if desired_states.contains(&workspace.state) {
                 return Ok(Json(WaitWorkspaceStateOutput {
                     matched: true,
-                    workspace: to_json_value(&workspace)?,
+                    workspace: if self.compact_responses() {
+                        compact_workspace_status_value(&workspace)
+                    } else {
+                        to_json_value(&workspace)?
+                    },
                     desired_states: workspace_states_to_values(&desired_states)?,
                     elapsed_ms: elapsed_ms(started_at),
                     retry_after_ms: None,
@@ -6302,7 +6410,11 @@ impl RemoteHostsMcpServer {
             if std::time::Instant::now() >= deadline {
                 return Ok(Json(WaitWorkspaceStateOutput {
                     matched: false,
-                    workspace: to_json_value(&workspace)?,
+                    workspace: if self.compact_responses() {
+                        compact_workspace_status_value(&workspace)
+                    } else {
+                        to_json_value(&workspace)?
+                    },
                     desired_states: workspace_states_to_values(&desired_states)?,
                     elapsed_ms: elapsed_ms(started_at),
                     retry_after_ms: Some(poll_interval_ms),
@@ -6317,7 +6429,7 @@ impl RemoteHostsMcpServer {
     router = self.tool_router,
     name = "remote-hosts",
     version = "0.1.0",
-    instructions = "Manage remote SSH hosts, access paths, connector state, and agent workspaces without exposing secrets."
+    instructions = "Manage remote SSH hosts, access paths, connector state, and agent workspaces without exposing secrets. Agent output reads are token-compact by default; use output_mode=full only when exact durable redacted chunks are required. Continue compact reads with next_sequence instead of replaying commands."
 )]
 impl ServerHandler for RemoteHostsMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -6881,9 +6993,18 @@ fn pty_session_output(pty_session: &PtySession) -> Result<PtySessionOutput, Stri
 pub struct PtyOutputChunksOutput {
     /// PTY session record as JSON.
     pub pty_session: Value,
-    /// Number of returned chunks.
+    /// `compact` or `full`.
+    pub output_view: String,
+    /// Number of durable source chunks consumed to build this view.
+    pub source_count: usize,
+    /// Number of visible chunks returned after optional compaction.
     pub count: usize,
-    /// Redacted PTY output chunks as JSON.
+    /// Last durable source sequence represented by this response.
+    pub next_sequence: Option<u64>,
+    /// Optional measured token-compaction metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Value>,
+    /// Redacted PTY output chunks or a compact semantic view.
     pub chunks: Vec<Value>,
 }
 
@@ -6960,9 +7081,18 @@ pub struct OperationCompletionOutput {
 pub struct WorkspaceOutputChunksOutput {
     /// Workspace record as JSON.
     pub workspace: Value,
-    /// Number of returned chunks.
+    /// `compact` or `full`.
+    pub output_view: String,
+    /// Number of durable source chunks consumed to build this view.
+    pub source_count: usize,
+    /// Number of visible chunks returned after optional compaction.
     pub count: usize,
-    /// Output chunks as JSON.
+    /// Last durable source sequence represented by this response.
+    pub next_sequence: Option<u64>,
+    /// Optional measured token-compaction metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Value>,
+    /// Output chunks or compact semantic views as JSON.
     pub chunks: Vec<Value>,
     /// Recent workspace operations as JSON.
     pub recent_operations: Vec<Value>,
@@ -6973,9 +7103,18 @@ pub struct WorkspaceOutputChunksOutput {
 pub struct WorkspaceResultOutput {
     /// Workspace record as JSON.
     pub workspace: Value,
-    /// Number of returned redacted output chunks.
+    /// `compact` or `full`.
+    pub output_view: String,
+    /// Number of durable source chunks consumed to build the visible result.
+    pub source_chunk_count: usize,
+    /// Number of visible redacted output chunks after optional compaction.
     pub chunk_count: usize,
-    /// Redacted output chunks as JSON.
+    /// Last durable source sequence represented by this response.
+    pub next_sequence: Option<u64>,
+    /// Optional measured token-compaction metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Value>,
+    /// Redacted output chunks or compact semantic views as JSON.
     pub chunks: Vec<Value>,
     /// Recent workspace operations as JSON.
     pub recent_operations: Vec<Value>,
@@ -7008,17 +7147,24 @@ pub struct OutputArtifactOutput {
 pub struct OutputArtifactContentOutput {
     /// Output artifact id.
     pub artifact_id: String,
-    /// Byte offset used for this chunk.
+    /// `compact` or `full`.
+    pub output_view: String,
+    /// Byte offset used for this durable source chunk.
     pub offset: u64,
-    /// Next byte offset to request.
+    /// Next durable byte offset to request.
     pub next_offset: u64,
-    /// Bytes returned in this chunk.
+    /// Durable source bytes consumed to produce this view.
     pub bytes_read: usize,
-    /// Whether the complete artifact has been read.
+    /// Model-facing UTF-8 bytes returned after optional compaction.
+    pub content_bytes: usize,
+    /// Whether the complete artifact has been consumed.
     pub eof: bool,
     /// SHA-256 digest of the complete redacted artifact.
     pub sha256: String,
-    /// Redacted UTF-8 content chunk.
+    /// Optional measured token-compaction metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Value>,
+    /// Redacted UTF-8 content or compact semantic view.
     pub content: String,
 }
 
@@ -7765,46 +7911,44 @@ fn compact_workspace_status_value(workspace: &AgentWorkspace) -> Value {
     })
 }
 
-fn compact_pty_session_value(session: &PtySession) -> Value {
+fn compact_pty_output_status_value(session: &PtySession) -> Value {
     json!({
         "pty_session_id": session.pty_session_id,
-        "workspace_id": session.workspace_id,
         "state": session.state,
         "backend_state": session.backend_state,
-        "coordination_scopes": session.coordination_scopes,
-        "foreground_process": session.foreground_process,
         "input_allowed": session.input_allowed,
         "interaction": session.interaction,
         "last_exit_code": session.last_exit_code
     })
 }
 
-fn compact_pty_chunk_value(chunk: &remote_hosts_domain::PtyOutputChunk) -> Value {
+fn compact_operation_result_value(operation: &OperationRun) -> Value {
     json!({
-        "sequence": chunk.sequence,
-        "stream": chunk.stream,
-        "text": chunk.redacted_text,
-        "truncated": chunk.truncated
-    })
-}
-
-fn compact_operation_chunk_value(chunk: &remote_hosts_domain::OperationOutputChunk) -> Value {
-    json!({
-        "sequence": chunk.sequence,
-        "stream": chunk.stream,
-        "text": chunk.redacted_text,
-        "truncated": chunk.truncated
+        "id": operation.id,
+        "state": operation.state,
+        "exit_code": operation.exit_code,
+        "summary": operation_result_summary(operation),
+        "last_error": operation.last_error,
+        "next_action": operation_next_action(&operation.state)
     })
 }
 
 fn compact_artifact_value(artifact: &remote_hosts_domain::OperationOutputArtifact) -> Value {
+    let mut preview = artifact
+        .redacted_preview
+        .chars()
+        .take(320)
+        .collect::<String>();
+    if artifact.redacted_preview.chars().count() > 320 {
+        preview.push('…');
+    }
     json!({
         "id": artifact.id,
         "operation_id": artifact.operation_id,
         "stream": artifact.stream,
         "byte_len": artifact.byte_len,
         "sha256": artifact.sha256,
-        "preview": artifact.redacted_preview,
+        "preview": preview,
         "truncated": artifact.truncated
     })
 }
@@ -7815,15 +7959,12 @@ fn compact_operation_value(operation: &OperationRun) -> Value {
         "workspace_id": operation.workspace_id,
         "state": operation.state,
         "exit_code": operation.exit_code,
-        "intent": operation.intent,
         "requires_write_lease": operation.requires_write_lease,
         "coordination_scope": operation.coordination_scope,
         "coordination_scopes": operation_coordination_scopes(operation),
         "command_preview": operation.redacted_command_summary,
         "summary": operation_result_summary(operation),
-        "last_error": operation.last_error,
-        "started_at": operation.started_at,
-        "finished_at": operation.finished_at
+        "last_error": operation.last_error
     })
 }
 
@@ -8147,7 +8288,7 @@ fn resolution_error(error: &AccessResolutionError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, time::Duration};
+    use std::{collections::BTreeSet, fmt::Write as _, time::Duration};
 
     use remote_hosts_db::{Repositories, connect_sqlite, migrate};
     use remote_hosts_domain::{
@@ -9150,9 +9291,11 @@ mod tests {
             RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Admin);
         let full =
             RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Full);
-        let agent_names = agent
-            .tool_router
-            .list_all()
+        let agent_tools = agent.tool_router.list_all();
+        let agent_schema_bytes = serde_json::to_vec(&agent_tools)?.len();
+        eprintln!("agent_tool_schema_bytes={agent_schema_bytes}");
+        assert!(agent_schema_bytes < 128 * 1024);
+        let agent_names = agent_tools
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect::<BTreeSet<_>>();
@@ -9163,8 +9306,9 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(agent_names.len(), 23);
+        assert_eq!(agent_names.len(), 22);
         assert!(agent_names.contains(tools::GET_AGENT_WORK_CONTEXT));
+        assert!(!agent_names.contains(tools::WAIT_WORKSPACE_STATE));
         assert!(agent_names.contains(tools::CONTROL_PTY));
         assert!(agent_names.contains("remote_hosts_ensure_host"));
         assert!(agent_names.contains(tools::STORE_HOST_CREDENTIAL));
@@ -9178,6 +9322,7 @@ mod tests {
         assert!(agent_names.contains(tools::SYNC_INSTANCE_PEER));
         assert!(!agent_names.contains(tools::UPSERT_HOST));
         assert!(admin_names.is_superset(&agent_names));
+        assert!(admin_names.contains(tools::WAIT_WORKSPACE_STATE));
         assert!(admin_names.contains(tools::UPSERT_HOST));
         assert!(admin_names.contains(tools::FIND_HOST_DUPLICATES));
         assert!(admin_names.len() < full.tool_router.list_all().len());
@@ -11230,6 +11375,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_workspace_output_compacts_large_test_log_and_full_recovers_raw_chunks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = TestFixture::new().await?;
+        let agent =
+            RemoteHostsMcpServer::with_profile(fixture.repositories.clone(), ToolProfile::Agent);
+        let prepared = call_tool(
+            agent.clone(),
+            tools::PREPARE_WORKSPACE,
+            Some(json!({"host_id": fixture.host_id.to_string()})),
+        )
+        .await?;
+        let workspace_id = prepared["workspace"]["id"]
+            .as_str()
+            .ok_or("workspace id should be a string")?;
+        let queued = call_tool(
+            agent.clone(),
+            tools::RUN_IN_WORKSPACE,
+            Some(json!({
+                "workspace_id": workspace_id,
+                "command_profile": "shell.posix",
+                "args": ["cargo test --workspace"],
+                "intent": "exercise compact output",
+                "coordination_mode": "read_only",
+                "idempotency_key": "token-output-e2e"
+            })),
+        )
+        .await?;
+        let operation_id = queued["operation"]["id"]
+            .as_str()
+            .ok_or("operation id should be a string")?;
+        let operation_id_value = super::parse_operation_id(operation_id)?;
+        let workspace_id_value = super::parse_workspace_id(workspace_id)?;
+
+        let mut raw = String::from("running 2500 tests\n");
+        for index in 0..2500 {
+            let _ = writeln!(
+                raw,
+                "test integration::very_long_regression_case_{index:04}_with_context ... ok"
+            );
+        }
+        raw.push_str(
+            "test result: ok. 2500 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+        assert!(raw.len() >= 100_000);
+        let raw_len = u64::try_from(raw.len())?;
+        fixture
+            .repositories
+            .operation_output_chunks
+            .insert(&OperationOutputChunk {
+                id: remote_hosts_domain::OperationOutputChunkId::new(),
+                operation_id: operation_id_value,
+                workspace_id: workspace_id_value,
+                stream: OutputStream::Stdout,
+                sequence: 1,
+                redacted_text: raw,
+                byte_len: raw_len,
+                truncated: false,
+                created_at: now_utc(),
+            })
+            .await?;
+
+        let compact = call_tool(
+            agent.clone(),
+            tools::GET_WORKSPACE_RESULT,
+            Some(json!({
+                "workspace_id": workspace_id,
+                "operation_id": operation_id
+            })),
+        )
+        .await?;
+        assert_eq!(compact["output_view"], json!("compact"));
+        assert_eq!(compact["source_chunk_count"], json!(2));
+        assert_eq!(compact["chunk_count"], json!(1));
+        assert_eq!(compact["next_sequence"], json!(1));
+        let compact_text = compact["chunks"][0]["text"]
+            .as_str()
+            .ok_or("compact text should be a string")?;
+        assert!(compact_text.contains("2500 passed, 0 failed, 0 ignored"));
+        assert!(!compact_text.contains("very_long_regression_case_2499"));
+        assert!(
+            compact["compression"]["saved_tokens"]
+                .as_u64()
+                .is_some_and(|saved| saved >= 24_000)
+        );
+
+        let full = call_tool(
+            agent,
+            tools::GET_WORKSPACE_RESULT,
+            Some(json!({
+                "workspace_id": workspace_id,
+                "operation_id": operation_id,
+                "output_mode": "full"
+            })),
+        )
+        .await?;
+        assert_eq!(full["output_view"], json!("full"));
+        assert_eq!(full["source_chunk_count"], json!(2));
+        assert_eq!(full["chunk_count"], json!(2));
+        assert!(
+            full["chunks"][1]["redacted_text"]
+                .as_str()
+                .is_some_and(|text| text.contains("very_long_regression_case_2499"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn mcp_queue_operation_rolls_back_when_atomic_publish_fails()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -12588,7 +12840,7 @@ mod tests {
                 .ok_or("artifact test path should have parent")?,
         )
         .await?;
-        let content = "redacted log line: 部署完成\n".repeat(200);
+        let content = "redacted log line: 部署完成\n".repeat(12_000);
         tokio::fs::write(&artifact_path, content.as_bytes()).await?;
         let now = now_utc();
         let operation = OperationRun {
@@ -12610,8 +12862,8 @@ mod tests {
             finished_at: Some(now),
             exit_code: Some(0),
             timeout_seconds: 30,
-            redacted_command_summary: "du -sh /var/log".to_owned(),
-            command_profile_json: Some(json!({"name": "disk.usage"})),
+            redacted_command_summary: "cargo test --workspace".to_owned(),
+            command_profile_json: Some(json!({"name": "shell.posix"})),
             transport_evidence: None,
             redacted_output_summary: Some("stored as artifact".to_owned()),
             log_ref: None,
@@ -12696,7 +12948,7 @@ mod tests {
             .as_u64()
             .ok_or("next offset should be an integer")?;
         let second = call_tool(
-            agent,
+            agent.clone(),
             tools::READ_OUTPUT_ARTIFACT_CONTENT,
             Some(json!({
                 "artifact_id": artifact.id.to_string(),
@@ -12712,6 +12964,51 @@ mod tests {
                 .is_some_and(|offset| offset > next_offset)
         );
         assert_eq!(second["sha256"], json!("d2".repeat(32)));
+
+        let semantic = call_tool(
+            agent.clone(),
+            tools::READ_OUTPUT_ARTIFACT_CONTENT,
+            Some(json!({
+                "artifact_id": artifact.id.to_string(),
+                "offset": 0
+            })),
+        )
+        .await?;
+        assert_eq!(semantic["output_view"], json!("compact"));
+        assert_eq!(semantic["eof"], json!(true));
+        assert_eq!(semantic["bytes_read"], json!(content.len()));
+        assert_eq!(
+            semantic["next_offset"],
+            json!(u64::try_from(content.len())?)
+        );
+        assert!(
+            semantic["content_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes < 1024)
+        );
+        assert!(
+            semantic["compression"]["saved_tokens"]
+                .as_u64()
+                .is_some_and(|saved| saved > 50_000)
+        );
+
+        let exact = call_tool(
+            agent,
+            tools::READ_OUTPUT_ARTIFACT_CONTENT,
+            Some(json!({
+                "artifact_id": artifact.id.to_string(),
+                "offset": 0,
+                "max_bytes": 1024,
+                "output_mode": "full"
+            })),
+        )
+        .await?;
+        assert_eq!(exact["output_view"], json!("full"));
+        assert!(exact.get("compression").is_none());
+        let exact_content = exact["content"]
+            .as_str()
+            .ok_or("exact artifact content should be a string")?;
+        assert!(content.starts_with(exact_content));
         Ok(())
     }
 

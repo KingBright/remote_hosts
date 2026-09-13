@@ -9,6 +9,7 @@ members = [
     "crates/remote-hosts-launcher",
     "crates/remote-hosts-mcp",
     "crates/remote-hosts-sync",
+    "crates/remote-hosts-token-output",
     "crates/remote-hosts-vault",
     "crates/remote-hosts-code",
 ]

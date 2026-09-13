@@ -474,6 +474,143 @@ impl Gateway {
             }
         }
     }
+    async fn legacy_job(&self, p: &Principal, id: &str) -> Option<Job> {
+        let request: Option<String> = sqlx::query_scalar("SELECT request FROM jobs WHERE id=?")
+            .bind(id)
+            .fetch_optional(&self.store.pool)
+            .await
+            .ok()?;
+        let job = serde_json::from_str::<Job>(&request?).ok()?;
+        (job.owner == p.owner).then_some(job)
+    }
+    async fn legacy_terminal_origin(
+        &self,
+        p: &Principal,
+        tool: &str,
+        args: &Value,
+    ) -> Option<(String, bool, Value, bool)> {
+        let (tool, args) = if tool == "operation_get" {
+            let id = args.get("operation_id").and_then(Value::as_str)?;
+            let job = self.legacy_job(p, id).await?;
+            (job.tool, job.arguments)
+        } else {
+            (tool.to_owned(), args.clone())
+        };
+        if tool == "terminal_exec" {
+            return Some((
+                args.get("command").and_then(Value::as_str)?.to_owned(),
+                args.get("pty").and_then(Value::as_bool).unwrap_or(false),
+                json!(0),
+                false,
+            ));
+        }
+        if tool != "terminal_read" {
+            return None;
+        }
+        let terminal_id = args.get("terminal_id").and_then(Value::as_str)?;
+        let job = self.legacy_job(p, terminal_id).await?;
+        if job.tool != "terminal_exec" {
+            return None;
+        }
+        Some((
+            job.arguments
+                .get("command")
+                .and_then(Value::as_str)?
+                .to_owned(),
+            job.arguments
+                .get("pty")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            args.get("cursor").cloned().unwrap_or(json!(0)),
+            args.get("output_mode").and_then(Value::as_str) == Some("full"),
+        ))
+    }
+    fn apply_legacy_terminal_compaction(
+        command: &str,
+        raw_cursor_start: Value,
+        mut value: Value,
+    ) -> Value {
+        if value.get("compression").is_some()
+            || value.get("output").and_then(Value::as_str).is_none()
+        {
+            return value;
+        }
+        let raw = value
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let exit_code = value
+            .pointer("/terminal/exit_code")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                value
+                    .pointer("/terminal_observation/terminal/exit_code")
+                    .and_then(Value::as_i64)
+            });
+        let compacted = crate::token_output::compact(
+            crate::token_output::classify(command, false),
+            &raw,
+            exit_code,
+        );
+        let mut metadata = compacted.metadata;
+        metadata["origin"] = json!("gateway_fallback");
+        value["output"] = json!(compacted.output);
+        value["compression"] = metadata;
+        value["output_view"] = json!("compact");
+        value["raw_cursor_start"] = raw_cursor_start;
+        value
+    }
+    async fn compact_legacy_terminal_result(
+        &self,
+        p: &Principal,
+        tool: &str,
+        args: &Value,
+        mut value: Value,
+    ) -> Value {
+        // Batch operation_get is also a possible return path for old-agent terminal
+        // reads. Compact every terminal-shaped child independently without changing
+        // nonterminal siblings.
+        if tool == "operation_get"
+            && let Some(operations) = value.get("operations").and_then(Value::as_array).cloned()
+        {
+            let mut compacted = Vec::with_capacity(operations.len());
+            for operation in operations {
+                let Some(id) = operation.get("operation_id").and_then(Value::as_str) else {
+                    compacted.push(operation);
+                    continue;
+                };
+                let op_args = json!({"operation_id":id});
+                let Some((command, pty, cursor, requested_full)) = self
+                    .legacy_terminal_origin(p, "operation_get", &op_args)
+                    .await
+                else {
+                    compacted.push(operation);
+                    continue;
+                };
+                if pty || requested_full {
+                    compacted.push(operation);
+                } else {
+                    compacted.push(Self::apply_legacy_terminal_compaction(
+                        &command, cursor, operation,
+                    ));
+                }
+            }
+            value["operations"] = json!(compacted);
+            return value;
+        }
+        let Some((command, pty, cursor, requested_full)) =
+            self.legacy_terminal_origin(p, tool, args).await
+        else {
+            return value;
+        };
+        // Interactive terminals are stateful streams and explicit full reads are
+        // recovery/diagnostic requests. Preserve both verbatim.
+        if pty || requested_full {
+            return value;
+        }
+        Self::apply_legacy_terminal_compaction(&command, cursor, value)
+    }
     async fn lifecycle(&self, id: &str, device: &str) -> Result<Value> {
         let timing: Option<(i64, Option<i64>, Option<i64>)> = sqlx::query_as(
             "SELECT queued_ms,dispatched_ms,result_ms FROM operation_timing WHERE id=?",
@@ -603,8 +740,15 @@ impl ServerHandler for Gateway {
         // duplicate large successful results in the model context. full is an
         // explicit diagnostic/recovery view.
         let compact = mode != Some(json!("full"));
+        let compact_args = args.clone();
         match self.dispatch(&p, &request.name, args).await {
             Ok(value) => {
+                let value = if compact {
+                    self.compact_legacy_terminal_result(&p, &request.name, &compact_args, value)
+                        .await
+                } else {
+                    value
+                };
                 let structured = if compact {
                     crate::token_output::compact_response(&request.name, value.clone())
                 } else {

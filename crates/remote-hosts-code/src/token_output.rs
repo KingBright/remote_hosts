@@ -1,286 +1,31 @@
-//! Token-efficient views over durable terminal output.
-//! Raw sanitized logs remain the source of truth; this module only changes what
-//! the model sees by default. Filters are conservative: known routine lines are
-//! removed while unknown and failure text is preserved verbatim.
-use serde::{Deserialize, Serialize};
+//! Token-efficient protocol views over durable terminal output.
+//! Shared command classification and text compaction live in `remote-hosts-token-output`;
+//! this module only compacts Remote Hosts Code MCP envelopes.
+
+pub(crate) use remote_hosts_token_output::{OutputProfile, classify, compact};
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum OutputProfile {
-    #[default]
-    Generic,
-    CargoTest,
-    CargoBuild,
-    CargoClippy,
-    Pytest,
-}
-impl OutputProfile {
-    pub(crate) fn is_generic(&self) -> bool {
-        *self == Self::Generic
-    }
-}
-
-pub(crate) fn classify(command: &str, interactive: bool) -> OutputProfile {
-    if interactive {
-        return OutputProfile::Generic;
-    }
-    let normalized = command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-        .replace("cargo.exe ", "cargo ");
-    if normalized.contains("cargo nextest") || normalized.contains("cargo test") {
-        OutputProfile::CargoTest
-    } else if normalized.contains("cargo clippy") {
-        OutputProfile::CargoClippy
-    } else if normalized.contains("cargo build") || normalized.contains("cargo check") {
-        OutputProfile::CargoBuild
-    } else if normalized.contains("pytest") || normalized.contains("python -m pytest") {
-        OutputProfile::Pytest
-    } else {
-        OutputProfile::Generic
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct CompactOutput {
-    pub output: String,
-    pub metadata: Value,
-}
-
-fn strip_terminal_controls(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != 0x1b {
-            out.push(bytes[i]);
-            i += 1;
-            continue;
-        }
-        i += 1;
-        if i >= bytes.len() {
-            break;
-        }
-        match bytes[i] {
-            b'[' => {
-                i += 1;
-                while i < bytes.len() {
-                    let b = bytes[i];
-                    i += 1;
-                    if (0x40..=0x7e).contains(&b) {
-                        break;
-                    }
-                }
-            }
-            b']' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == 0x07 {
-                        i += 1;
-                        break;
-                    }
-                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn normalized_lines(input: &str) -> Vec<String> {
-    strip_terminal_controls(input)
-        .split('\n')
-        .map(|line| {
-            line.rsplit('\r')
-                .find(|part| !part.is_empty())
-                .unwrap_or("")
-                .trim_end()
-                .to_owned()
-        })
-        .collect()
-}
-
-fn result_counts(line: &str) -> (u64, u64, u64) {
-    let words: Vec<_> = line.split_whitespace().collect();
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut ignored = 0;
-    for (index, word) in words.iter().enumerate() {
-        let value = index
-            .checked_sub(1)
-            .and_then(|i| words[i].trim_end_matches(';').parse().ok())
-            .unwrap_or(0);
-        match word.trim_end_matches(';') {
-            "passed" => passed += value,
-            "failed" => failed += value,
-            "ignored" => ignored += value,
-            _ => {}
-        }
-    }
-    (passed, failed, ignored)
-}
-
-fn cargo_progress(line: &str) -> bool {
-    let t = line.trim_start();
-    [
-        "Compiling ",
-        "Checking ",
-        "Fresh ",
-        "Downloading ",
-        "Downloaded ",
-        "Blocking waiting for file lock",
-    ]
-    .iter()
-    .any(|prefix| t.starts_with(prefix))
-        || t.starts_with("Finished `")
-        || t.starts_with("Running unittests ")
-        || t.starts_with("Running tests/")
-        || t.starts_with("Running benches/")
-        || t.starts_with("Doc-tests ")
-        || t.starts_with("running ") && (t.ends_with(" test") || t.ends_with(" tests"))
-}
-
-fn passing_test_line(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with("test ") && (t.ends_with(" ... ok") || t.ends_with(" ... ignored"))
-}
-
-fn pytest_progress(line: &str) -> bool {
-    let t = line.trim();
-    if t.is_empty()
-        || t.starts_with("============================= test session starts")
-        || t.starts_with("platform ")
-        || t.starts_with("collected ")
-    {
-        return true;
-    }
-    let progress = t.strip_suffix("[100%]").unwrap_or(t).trim();
-    !progress.is_empty()
-        && progress
-            .chars()
-            .all(|c| matches!(c, '.' | 's' | 'x' | 'X' | '%' | '[' | ']' | '0'..='9'))
-}
-
-pub(crate) fn compact(
-    profile: OutputProfile,
-    input: &str,
-    exit_code: Option<i64>,
-) -> CompactOutput {
-    let raw_bytes = input.len();
-    let lines = normalized_lines(input);
-    let mut kept = Vec::new();
-    let mut omitted = 0usize;
-    let mut passed = 0u64;
-    let mut failed = 0u64;
-    let mut ignored = 0u64;
-    let mut previous_blank = true;
-
-    for line in lines {
-        let trimmed = line.trim();
-        let drop = match profile {
-            OutputProfile::CargoTest => {
-                if trimmed.starts_with("test result: ok.") {
-                    let counts = result_counts(trimmed);
-                    passed += counts.0;
-                    failed += counts.1;
-                    ignored += counts.2;
-                    true
-                } else {
-                    cargo_progress(&line) || passing_test_line(&line) || trimmed.is_empty()
-                }
-            }
-            OutputProfile::CargoBuild | OutputProfile::CargoClippy => {
-                cargo_progress(&line) || trimmed.is_empty()
-            }
-            OutputProfile::Pytest => pytest_progress(&line),
-            OutputProfile::Generic => false,
-        };
-        if drop {
-            omitted += 1;
-            continue;
-        }
-        if profile == OutputProfile::CargoTest && trimmed.starts_with("test result: FAILED.") {
-            let counts = result_counts(trimmed);
-            passed += counts.0;
-            failed += counts.1;
-            ignored += counts.2;
-        }
-        if profile == OutputProfile::Generic && trimmed.is_empty() {
-            if previous_blank {
-                omitted += 1;
-                continue;
-            }
-            previous_blank = true;
-        } else {
-            previous_blank = false;
-        }
-        kept.push(line);
-    }
-
-    let profile_name = serde_json::to_value(profile)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "generic".into());
-    if profile != OutputProfile::Generic && omitted > 0 {
-        let state = exit_code.map_or("running".into(), |code| format!("exit={code}"));
-        let counts = if profile == OutputProfile::CargoTest && passed + failed + ignored > 0 {
-            format!("; tests={passed} passed/{failed} failed/{ignored} ignored")
-        } else {
-            String::new()
-        };
-        kept.push(format!(
-            "[compact {profile_name}: {state}{counts}; omitted {omitted} routine lines]"
-        ));
-    }
-    let mut output = kept.join("\n");
-    if input.ends_with('\n') && !output.is_empty() {
-        output.push('\n');
-    }
-    if output.len() > raw_bytes && profile == OutputProfile::Generic {
-        output = strip_terminal_controls(input);
-    }
-    let output_bytes = output.len();
-    let saved_bytes = raw_bytes.saturating_sub(output_bytes);
-    let metadata = json!({
-        "view":"compact",
-        "profile":profile,
-        "raw_bytes":raw_bytes,
-        "output_bytes":output_bytes,
-        "omitted_lines":omitted,
-        "estimated_input_tokens":raw_bytes.div_ceil(4),
-        "estimated_output_tokens":output_bytes.div_ceil(4),
-        "estimated_tokens_saved":saved_bytes/4,
-        "savings_pct": if raw_bytes == 0 { 0.0 } else { (saved_bytes as f64 * 1000.0 / raw_bytes as f64).round() / 10.0 },
-        "full_output_available":true
-    });
-    CompactOutput { output, metadata }
-}
-
-fn compact_lifecycle(value: &Value) -> Value {
+/// Lifecycle timing is useful for diagnostics, but normal queue/receipt bookkeeping
+/// is not useful model context. Keep only states that change the Agent's decision.
+fn compact_lifecycle(value: &Value) -> Option<Value> {
     let gateway = &value["gateway"];
     if gateway["available"] == false {
-        return json!({"available":false});
+        return Some(json!({"available":false}));
     }
     let delivery = &value["device_receipt_delivery"];
-    let pending = delivery["pending"].as_u64().unwrap_or(0);
-    let sending = delivery["sending"].as_u64().unwrap_or(0);
     let blocked = delivery["blocked"].as_u64().unwrap_or(0);
-    let mut result = json!({
-        "queue_ms":gateway["queue_ms"],
-        "dispatch_to_result_ms":gateway["dispatch_to_result_ms"]
-    });
-    if pending + sending + blocked > 0 {
-        result["receipt_delivery"] = json!({"pending":pending,"sending":sending,"blocked":blocked});
+    let queue_ms = gateway["queue_ms"].as_u64().unwrap_or(0);
+    if blocked > 0 || queue_ms > 5_000 {
+        let mut result = json!({});
+        if queue_ms > 5_000 {
+            result["queue_ms"] = json!(queue_ms);
+        }
+        if blocked > 0 {
+            result["receipt_blocked"] = json!(blocked);
+        }
+        return Some(result);
     }
-    result
+    None
 }
 
 fn compact_terminal_status(value: &mut Value) {
@@ -296,9 +41,61 @@ fn compact_terminal_status(value: &mut Value) {
                 | "output_complete"
                 | "output_truncated"
                 | "output_error"
-                | "output_profile"
         )
     });
+}
+
+fn compact_search(value: &mut Value) {
+    let Some(matches) = value.get_mut("matches").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let flat = std::mem::take(matches);
+    let count = flat.len();
+    let mut files: Vec<Value> = Vec::new();
+    for mut hit in flat {
+        let path = hit
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let version = hit
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if let Some(object) = hit.as_object_mut() {
+            object.remove("path");
+            object.remove("version");
+        }
+        if let Some(group) = files.iter_mut().find(|group| {
+            group["path"].as_str() == Some(path.as_str())
+                && group["version"].as_str() == Some(version.as_str())
+        }) {
+            group["hits"].as_array_mut().expect("hits array").push(hit);
+        } else {
+            files.push(json!({"path":path,"version":version,"hits":[hit]}));
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.remove("matches");
+        object.insert("match_count".into(), json!(count));
+        object.insert("files".into(), json!(files));
+    }
+}
+
+fn compact_completed_shape(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.remove("operation_lifecycle");
+    object.remove("timing");
+    object.remove("read_stats");
+    if value.get("matches").is_some() {
+        compact_search(value);
+    }
+    if let Some(terminal) = value.pointer_mut("/terminal_observation/terminal") {
+        compact_terminal_status(terminal);
+    }
 }
 
 fn compact_devices(value: &mut Value) {
@@ -375,25 +172,58 @@ pub(crate) fn compact_response(tool: &str, mut value: Value) -> Value {
         .get("pending")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if let Some(object) = value.as_object_mut() {
-        if pending {
-            if let Some(lifecycle) = object.get_mut("operation_lifecycle") {
-                *lifecycle = compact_lifecycle(lifecycle);
+    if pending {
+        let compacted = value.get("operation_lifecycle").and_then(compact_lifecycle);
+        if let Some(object) = value.as_object_mut() {
+            match compacted {
+                Some(lifecycle) => {
+                    object.insert("operation_lifecycle".into(), lifecycle);
+                }
+                None => {
+                    object.remove("operation_lifecycle");
+                }
             }
-        } else {
-            object.remove("operation_lifecycle");
             object.remove("timing");
         }
-        if tool == "code_read" {
-            object.remove("read_stats");
-        }
+    } else {
+        compact_completed_shape(&mut value);
     }
     match tool {
         "devices_list" => compact_devices(&mut value),
+        "code_search" => compact_search(&mut value),
         "terminal_read" => {
+            let complete = value
+                .pointer("/terminal/output_complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if let Some(terminal) = value.get_mut("terminal") {
                 compact_terminal_status(terminal);
             }
+            if let Some(object) = value.as_object_mut() {
+                // These are fixed protocol facts in the compact path. Full mode still
+                // exposes them for diagnostics, while compact keeps only information
+                // that changes the Agent's next decision.
+                object.remove("cursor_format");
+                object.remove("output_stream");
+                object.remove("output_view");
+                if complete {
+                    object.remove("retry_after_ms");
+                }
+                if object.get("output").and_then(Value::as_str) == Some("") {
+                    object.remove("output");
+                }
+            }
+        }
+        "operation_get" => {
+            if let Some(operations) = value.get_mut("operations").and_then(Value::as_array_mut) {
+                for operation in operations {
+                    compact_completed_shape(operation);
+                }
+            }
+            // The common single-operation path returns the original tool's shape
+            // directly, so shape-based compaction keeps async results as lean as
+            // direct results without adding another repeated `operation_tool` field.
+            compact_completed_shape(&mut value);
         }
         "terminal_exec" => {
             if let Some(terminal) = value.pointer_mut("/terminal_observation/terminal") {
@@ -415,23 +245,14 @@ pub(crate) fn compact_text(tool: &str, value: &Value) -> String {
     }
     match tool {
         "terminal_read" => format!(
-            "terminal_read: {} exit={} output={}B saved~{}t",
+            "terminal_read: {}/{}",
             value
                 .pointer("/terminal/state")
                 .and_then(Value::as_str)
                 .unwrap_or("result"),
             value
                 .pointer("/terminal/exit_code")
-                .map_or_else(|| "?".into(), Value::to_string),
-            value
-                .get("output")
-                .and_then(Value::as_str)
-                .map(str::len)
-                .unwrap_or(0),
-            value
-                .pointer("/compression/estimated_tokens_saved")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
+                .map_or_else(|| "?".into(), Value::to_string)
         ),
         "devices_list" => {
             let devices = value
@@ -460,9 +281,12 @@ pub(crate) fn compact_text(tool: &str, value: &Value) -> String {
         "code_search" => format!(
             "code_search: {} match(es)",
             value
-                .get("matches")
-                .and_then(Value::as_array)
-                .map(Vec::len)
+                .get("match_count")
+                .and_then(Value::as_u64)
+                .or_else(|| value
+                    .get("matches")
+                    .and_then(Value::as_array)
+                    .map(|v| v.len() as u64))
                 .unwrap_or(0)
         ),
         _ => format!(
@@ -509,9 +333,37 @@ mod tests {
             "\ntest result: ok. 100 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.00s\n",
         );
         let compacted = compact(OutputProfile::CargoTest, &raw, Some(0));
-        assert!(compacted.output.contains("100 passed/0 failed/2 ignored"));
+        assert!(compacted.output.contains("100 passed, 0 failed, 2 ignored"));
         assert!(!compacted.output.contains("case_99"));
-        assert!(compacted.output.len() * 10 < raw.len());
+        assert!(compacted.output.len() * 20 < raw.len());
+    }
+
+    #[test]
+    fn twenty_five_k_token_cargo_test_regression_stays_below_two_hundred_tokens() {
+        let mut raw = String::from("running 2500 tests\n");
+        for n in 0..2500 {
+            raw.push_str(&format!(
+                "test integration::very_long_regression_case_{n:04}_with_context ... ok\n"
+            ));
+        }
+        raw.push_str(
+            "test result: ok. 2500 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+        assert!(
+            raw.len() >= 100_000,
+            "fixture should model at least ~25k tokens"
+        );
+        let compacted = compact(OutputProfile::CargoTest, &raw, Some(0));
+        assert!(
+            compacted.output.len() <= 800,
+            "compact view must stay below ~200 tokens"
+        );
+        assert!(compacted.metadata["saved_tokens"].as_u64().unwrap() >= 24_000);
+        assert!(
+            compacted
+                .output
+                .contains("2500 passed, 0 failed, 0 ignored")
+        );
     }
 
     #[test]
@@ -529,12 +381,29 @@ mod tests {
     }
 
     #[test]
+    fn cargo_test_compile_failure_keeps_primary_rustc_diagnostic() {
+        let raw = "   Compiling demo v0.1.0\nerror[E0425]: cannot find value `missing_symbol` in this scope\n --> tests/repro.rs:3:13\n  |\n3 |     let _ = missing_symbol;\n  |             ^^^^^^^^^^^^^^ not found in this scope\nerror: could not compile `demo` (test \"repro\") due to 1 previous error\n";
+        let compacted = compact(OutputProfile::CargoTest, raw, Some(101));
+        assert!(compacted.output.contains("error[E0425]"));
+        assert!(compacted.output.contains("tests/repro.rs:3:13"));
+        assert!(compacted.output.contains("missing_symbol"));
+    }
+
+    #[test]
     fn generic_view_only_removes_terminal_decoration_and_duplicate_blanks() {
         let raw = "\x1b[31merror\x1b[0m\n\n\nkeep me\n";
         let compacted = compact(OutputProfile::Generic, raw, Some(1));
         assert!(compacted.output.contains("error"));
         assert!(compacted.output.contains("keep me"));
         assert!(!compacted.output.contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn generic_view_losslessly_folds_consecutive_repetition() {
+        let raw = "heartbeat\nheartbeat\nheartbeat\nunique\n";
+        let compacted = compact(OutputProfile::Generic, raw, Some(0));
+        assert_eq!(compacted.output, "heartbeat\n[repeated 2x]\nunique\n");
+        assert_eq!(compacted.metadata["folded_lines"], 2);
     }
 
     #[test]
@@ -548,6 +417,60 @@ mod tests {
         assert_eq!(compacted["result"], "kept");
         assert!(compacted.get("operation_lifecycle").is_none());
         assert!(compacted.get("timing").is_none());
+    }
+
+    #[test]
+    fn ordinary_pending_result_drops_non_actionable_lifecycle_noise() {
+        let value = json!({
+            "operation_id":"op","state":"dispatched","pending":true,"retry_after_ms":1000,
+            "operation_lifecycle":{"gateway":{"available":true,"queue_ms":22,"dispatch_to_result_ms":null},"device_receipt_delivery":{"pending":1,"sending":0,"blocked":0}}
+        });
+        let compacted = compact_response("terminal_exec", value);
+        assert!(compacted.get("operation_lifecycle").is_none());
+        assert_eq!(compacted["retry_after_ms"], 1000);
+    }
+
+    #[test]
+    fn blocked_pending_result_keeps_actionable_lifecycle_signal() {
+        let value = json!({
+            "operation_id":"op","state":"dispatched","pending":true,
+            "operation_lifecycle":{"gateway":{"available":true,"queue_ms":22,"dispatch_to_result_ms":null},"device_receipt_delivery":{"pending":1,"sending":0,"blocked":2}}
+        });
+        let compacted = compact_response("terminal_exec", value);
+        assert_eq!(compacted["operation_lifecycle"]["receipt_blocked"], 2);
+    }
+
+    #[test]
+    fn compact_search_groups_repeated_path_and_version_fields() {
+        let value = json!({"matches":[
+            {"path":"src/lib.rs","version":"abc","line":1,"text":"alpha"},
+            {"path":"src/lib.rs","version":"abc","line":9,"text":"beta"},
+            {"path":"src/main.rs","version":"def","line":2,"text":"gamma"}
+        ],"next_cursor":null,"skipped_files":0});
+        let compacted = compact_response("code_search", value);
+        assert_eq!(compacted["match_count"], 3);
+        assert_eq!(compacted["files"].as_array().unwrap().len(), 2);
+        assert_eq!(compacted["files"][0]["hits"].as_array().unwrap().len(), 2);
+        assert!(compacted.get("matches").is_none());
+    }
+
+    #[test]
+    fn compact_terminal_read_drops_constant_protocol_envelope() {
+        let value = json!({
+            "terminal":{"id":"t","state":"exited","exit_code":0,"pty":false,"output_complete":true,"output_truncated":false,"output_error":null,"output_profile":"cargo_test"},
+            "output":"","cursor":65536,"has_more":false,"retry_after_ms":500,
+            "cursor_format":"sanitized_utf8_v1","output_stream":"combined","output_view":"compact",
+            "raw_cursor_start":0,"compression":{"profile":"cargo_test","raw_bytes":65536,"output_bytes":0,"saved_tokens":16384,"full":true}
+        });
+        let compacted = compact_response("terminal_read", value);
+        assert!(compacted.get("cursor_format").is_none());
+        assert!(compacted.get("output_stream").is_none());
+        assert!(compacted.get("output_view").is_none());
+        assert!(compacted.get("retry_after_ms").is_none());
+        assert!(compacted.get("output").is_none());
+        assert!(compacted["terminal"].get("output_profile").is_none());
+        assert_eq!(compacted["cursor"], 65536);
+        assert_eq!(compacted["compression"]["saved_tokens"], 16384);
     }
 
     #[test]

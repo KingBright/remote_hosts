@@ -279,3 +279,17 @@ fn build_catalog() -> Vec<Tool> {
     }
     tools
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_tool_catalog_has_a_fixed_context_budget() -> Result<(), serde_json::Error> {
+        let tools = catalog();
+        let bytes = serde_json::to_vec(&tools)?.len();
+        eprintln!("code_tool_schema_bytes={bytes}");
+        assert!(bytes < 96 * 1024);
+        Ok(())
+    }
+}

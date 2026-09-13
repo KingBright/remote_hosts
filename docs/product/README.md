@@ -40,7 +40,7 @@ python3 scripts/iteration-code.py --report target/iteration-runs/<id>/iteration.
 
 获取进度使用同一个 report 的 `--status`，需要时附 `--publish-status-dir`；不要重新启动原 build/publish。底层 `source_snapshot.py`、`release-code.py` 和 `publish-code.py` 仍保留为可独立诊断的分层组件。同一报告不覆盖，同槽忙时返回原持有者，缓存复用不等于跳过测试。
 
-完整复盘和新纪律见 [`ITERATION-EFFICIENCY.md`](ITERATION-EFFICIENCY.md)。
+完整复盘和新纪律见 [`ITERATION-EFFICIENCY.md`](ITERATION-EFFICIENCY.md)。Agent/MCP 上下文与终端输出的固定优化契约见 [`TOKEN-EFFICIENCY.md`](TOKEN-EFFICIENCY.md)。
 
 源码必须有可追溯 Git 基线；固定源码归档不是长期替代 Git 的理由。发布配置、密码、运行数据库、缓存和大型临时二进制不应进入提交。功能范围先锁定、最终候选再改版本号，避免每个小补丁都触发无意义的全量重链接。下一轮功能优先级见 `NEXT.md`；实际状态以 `backlog.json` 为准。
 

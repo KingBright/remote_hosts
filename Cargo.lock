@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "remote-hosts-code"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -3000,6 +3000,7 @@ dependencies = [
  "nix 0.30.1",
  "portable-pty",
  "regex",
+ "remote-hosts-token-output",
  "reqwest",
  "rmcp",
  "serde",
@@ -3109,6 +3110,7 @@ dependencies = [
  "remote-hosts-db",
  "remote-hosts-domain",
  "remote-hosts-sync",
+ "remote-hosts-token-output",
  "remote-hosts-vault",
  "rmcp",
  "schemars",
@@ -3144,6 +3146,14 @@ dependencies = [
  "tokio",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "remote-hosts-token-output"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
