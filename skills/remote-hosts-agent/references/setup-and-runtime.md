@@ -117,6 +117,28 @@ restarting the API, connector, MCP children, PTYs, or active operations.
 - Do not kill the MCP child mid-task and expect the same task transport to reconnect automatically.
 - For deployment smoke tests, a separate freshly launched MCP stdio client may verify the installed binary without disturbing an active task.
 
+## macOS Code Agent Signing Gate
+
+The `remote-hosts-code` macOS updater keeps the release artifact immutable and signs only a local install copy with the host-local `Remote Hosts Local Code Signing` identity. Do not bypass this gate with an ad-hoc or unsigned replacement.
+
+Before or during an upgrade, inspect the identity with:
+
+```bash
+python3 scripts/macos_code_identity.py status
+```
+
+`ready` means more than “the certificate is listed”: the code-signing identity must be trusted **and** its private keychain must be present in the current user's keychain search list. A `security find-identity` row containing `CSSMERR_*` is not ready even if the footer says that a valid identity was found. `codesign: no identity found` is likewise a signing-environment failure, not permission to skip signing.
+
+When authorization is required, use the repository helper once:
+
+```bash
+python3 scripts/macos_code_identity.py authorize
+```
+
+The host-local certificate is self-signed, so its user trust is scoped with `trustRoot` plus the `codeSign` policy. Do not use `trustAsRoot` for this identity. The certificate/private key remain in the dedicated Remote Hosts keychain; that keychain must also be in the user's search list so `/usr/bin/codesign` can resolve the identity. The helper must not expose the generated keychain password.
+
+If `launch-code-upgrade.py --start` returned `authorization_required` before the one-shot job was started, authorize the identity and resume the same prepared request. If an updater job already started and wrote a failed result, do not replay that immutable job: repair the signing environment and create a new updater job identity, then observe that new job. In all cases require the candidate SHA-256, signed installed SHA-256, service readiness, and Gateway-reported version before declaring the upgrade complete.
+
 ## Codex MCP Config
 
 Expected `~/.codex/config.toml` entry:

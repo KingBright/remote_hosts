@@ -71,10 +71,33 @@ def _certificate_sha1(keychain):
     raise RuntimeError("local signing certificate fingerprint unavailable")
 
 
+def _user_keychains():
+    result = _security("list-keychains", "-d", "user", capture=True)
+    return [pathlib.Path(line.strip().strip('"')) for line in result.stdout.splitlines() if line.strip()]
+
+
+def _keychain_in_search_list(keychain):
+    target = pathlib.Path(keychain).expanduser().resolve()
+    return any(path.expanduser().resolve() == target for path in _user_keychains())
+
+
+def _ensure_keychain_search_list(keychain):
+    target = pathlib.Path(keychain).expanduser().resolve()
+    existing = _user_keychains()
+    if any(path.expanduser().resolve() == target for path in existing):
+        return False
+    _security("list-keychains", "-d", "user", "-s", target, *existing)
+    return True
+
+
 def _valid_identity(keychain, fingerprint):
     result = _security("find-identity", "-v", "-p", "codesigning", keychain, check=False, capture=True)
     expected = fingerprint.upper()
-    return result.returncode == 0 and any(expected in line and CERT_NAME in line for line in result.stdout.splitlines())
+    usable = any(
+        expected in line and CERT_NAME in line and "CSSMERR_" not in line
+        for line in result.stdout.splitlines()
+    )
+    return result.returncode == 0 and usable and _keychain_in_search_list(keychain)
 
 
 def _atomic_json(path, value):
@@ -227,10 +250,10 @@ def authorize(base):
     if value["state"] != "authorization_required":
         raise RuntimeError("local signing identity cannot be authorized")
     paths = _paths(base)
+    _ensure_keychain_search_list(paths["keychain"])
     try:
         result = _security(
-            "add-trusted-cert", "-r", "trustAsRoot", "-p", "codeSign",
-            "-k", paths["keychain"], paths["certificate"],
+            "add-trusted-cert", "-r", "trustRoot", "-p", "codeSign", paths["certificate"],
             check=False, capture=True, timeout=120,
         )
     except subprocess.TimeoutExpired:
@@ -265,6 +288,7 @@ def sign_copy(source, destination, base):
     os.chmod(destination, 0o755)
     password = paths["password"].read_text().strip()
     _security("unlock-keychain", "-p", password, paths["keychain"])
+    _ensure_keychain_search_list(paths["keychain"])
     with tempfile.NamedTemporaryFile(prefix=".remote-hosts-requirement-", dir=destination.parent) as requirement_file:
         requirement_file.write(("designated => " + value["designated_requirement"] + "\n").encode())
         requirement_file.flush()

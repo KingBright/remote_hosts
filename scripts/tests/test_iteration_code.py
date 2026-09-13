@@ -16,10 +16,17 @@ class IterationPolicyTests(unittest.TestCase):
     def test_docs_only_uses_lightest_gate(self):
         self.assertEqual(iteration.classify(['README.md','docs/product/NEXT.md']), 'docs')
 
+    def test_skill_only_uses_lightest_gate(self):
+        self.assertEqual(iteration.classify([
+            'skills/remote-hosts-agent/SKILL.md',
+            'skills/remote-hosts-agent/references/setup-and-runtime.md',
+        ]), 'docs')
+
     def test_release_python_does_not_force_rust_rebuild(self):
         self.assertEqual(iteration.classify(['scripts/check-code-gateway.py',
                                              'scripts/tests/test_acceptance_scope_032.py',
-                                             'docs/releases/0.7.1/RELEASE.md']), 'release_python')
+                                             'docs/releases/0.7.1/RELEASE.md',
+                                             'skills/remote-hosts-agent/SKILL.md']), 'release_python')
 
     def test_runtime_change_requires_full_release_pipeline(self):
         for paths in (['crates/remote-hosts-code/src/agent.rs'], ['Cargo.lock'],

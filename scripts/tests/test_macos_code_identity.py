@@ -36,14 +36,41 @@ class MacOsCodeIdentityTests(unittest.TestCase):
                 result = IDENTITY.authorize(base)
             self.assertEqual(result["state"], "ready")
             args = security.call_args.args
-            self.assertEqual(args[:5], ("add-trusted-cert", "-r", "trustAsRoot", "-p", "codeSign"))
+            self.assertEqual(args[:5], ("add-trusted-cert", "-r", "trustRoot", "-p", "codeSign"))
+            self.assertNotIn("-k", args)
             self.assertEqual(security.call_args.kwargs["timeout"], 120)
+
+    def test_valid_identity_rejects_untrusted_or_unsearchable_identity(self):
+        fingerprint = "a" * 40
+        keychain = pathlib.Path("/tmp/remote-hosts-signing.keychain-db")
+        trusted = subprocess.CompletedProcess([], 0,
+            f'1) {fingerprint.upper()} "{IDENTITY.CERT_NAME}"\n', "")
+        untrusted = subprocess.CompletedProcess([], 0,
+            f'1) {fingerprint.upper()} "{IDENTITY.CERT_NAME}" (CSSMERR_TP_NOT_TRUSTED)\n', "")
+        searchable = subprocess.CompletedProcess([], 0, f'"{keychain}"\n', "")
+        missing = subprocess.CompletedProcess([], 0, '"/Users/test/Library/Keychains/login.keychain-db"\n', "")
+        with mock.patch.object(IDENTITY, "_security", return_value=untrusted):
+            self.assertFalse(IDENTITY._valid_identity(keychain, fingerprint))
+        with mock.patch.object(IDENTITY, "_security", side_effect=[trusted, missing]):
+            self.assertFalse(IDENTITY._valid_identity(keychain, fingerprint))
+        with mock.patch.object(IDENTITY, "_security", side_effect=[trusted, searchable]):
+            self.assertTrue(IDENTITY._valid_identity(keychain, fingerprint))
+
+    def test_ensure_keychain_search_list_prepends_private_keychain_once(self):
+        keychain = pathlib.Path("/tmp/remote-hosts-signing.keychain-db")
+        listed = subprocess.CompletedProcess([], 0, '"/Users/test/Library/Keychains/login.keychain-db"\n', "")
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(IDENTITY, "_security", side_effect=[listed, completed]) as security:
+            self.assertTrue(IDENTITY._ensure_keychain_search_list(keychain))
+        self.assertEqual(security.call_args_list[1].args[:5],
+                         ("list-keychains", "-d", "user", "-s", keychain.resolve()))
 
     def test_authorize_timeout_remains_recoverable_and_does_not_claim_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp)
             waiting = self.authorization_required(base)
             with mock.patch.object(IDENTITY, "status", return_value=waiting), \
+                 mock.patch.object(IDENTITY, "_ensure_keychain_search_list", return_value=False), \
                  mock.patch.object(IDENTITY, "_security", side_effect=subprocess.TimeoutExpired("security", 120)):
                 result = IDENTITY.authorize(base)
             self.assertEqual(result["state"], "authorization_required")

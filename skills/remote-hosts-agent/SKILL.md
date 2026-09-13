@@ -43,6 +43,7 @@ Use this skill to interact with the user's Remote Hosts service instead of openi
 ## Service Assumptions
 
 Platform install paths, service managers, local API checks, upgrade/version gates, and MCP client setup are cold-path context. Read [setup-and-runtime.md](references/setup-and-runtime.md) only when tools are unavailable or the task is explicitly about installation, upgrade, runtime version, or service diagnosis. Do not infer a live deployment path or version from an example.
+For a macOS Code Agent upgrade, never bypass the repository signing gate or replace the running binary with an unsigned candidate. `authorization_required`, `no identity found`, or a `CSSMERR_*` identity is a signing-recovery state: load [setup-and-runtime.md](references/setup-and-runtime.md), repair the host-local trust/search-list state, and only then resume the original upgrade workflow.
 
 ## Workflow Router
 

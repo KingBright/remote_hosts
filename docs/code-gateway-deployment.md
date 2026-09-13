@@ -614,6 +614,8 @@ python3 scripts/install-code-agent.py \
 0.9.0 开始对 macOS updater/code identity 做稳定化迁移；首次从旧 ad-hoc 身份迁移时，系统可能需要一次
 登录用户确认。不要因为弹窗没有出现就反复生成新身份。
 
+后续升级必须保持 release artifact 不变，只对本机安装副本做 host-local code signing。`scripts/macos_code_identity.py status` 只有在证书信任有效、专用 signing keychain 已进入当前用户 search list、且 identity 没有 `CSSMERR_*` 时才可视为 `ready`。需要授权时只使用 `scripts/macos_code_identity.py authorize`：这张 self-signed 证书使用 user-domain `trustRoot + codeSign`，不要用 `trustAsRoot`，也不要为了绕过 `codesign: no identity found` 而安装 unsigned/ad-hoc 候选。
+
 ## 9. Windows 新设备
 
 Windows 仍遵守同一原则：

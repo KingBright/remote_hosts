@@ -21,7 +21,7 @@ import release_receipts as rr
 import source_snapshot
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-DOC_PREFIXES = ('docs/',)
+DOC_PREFIXES = ('docs/', 'skills/')
 DOC_FILES = {'README.md', 'README_EN.md', '.gitignore'}
 
 
