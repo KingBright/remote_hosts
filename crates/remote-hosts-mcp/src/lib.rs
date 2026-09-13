@@ -12863,7 +12863,10 @@ mod tests {
             exit_code: Some(0),
             timeout_seconds: 30,
             redacted_command_summary: "cargo test --workspace".to_owned(),
-            command_profile_json: Some(json!({"name": "shell.posix"})),
+            command_profile_json: Some(json!({
+                "name": "shell.posix",
+                "args": ["-lc", "cargo test --workspace"]
+            })),
             transport_evidence: None,
             redacted_output_summary: Some("stored as artifact".to_owned()),
             log_ref: None,

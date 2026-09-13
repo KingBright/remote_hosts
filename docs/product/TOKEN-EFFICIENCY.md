@@ -42,7 +42,11 @@ The shared crate recognizes:
 - `rg` / `grep`
 - generic or interactive output
 
-Cargo/Pytest routine progress and passing-test lines collapse to summaries. Large remaining diagnostic sets are bounded with head/tail evidence and a full-output recovery hint. Git/search enumeration is sampled. Generic output is never semantically truncated by this layer; it receives only visual-equivalent cleanup and exact repetition folding.
+Cargo/Pytest routine progress and passing-test lines collapse to summaries. Remaining diagnostic text and source locations are never head/tail sampled; the enclosing source cursor/page limits bound each response instead. Only positively identified Git/search enumeration records from an explicitly successful command may be sampled. Unknown formats, instructions and diagnostics survive in their original order, including text between omitted records. Running and failed enumerations are not sampled.
+
+Classification recognizes the executable and exact subcommand, not keywords in arguments. Direct executable paths, simple environment assignments and Cargo toolchain selectors are supported. Compound scripts, pipelines, shell expansions, unknown wrappers and interactive commands deliberately use the generic profile; do not split dependency-sensitive scripts merely to force compression. The original MCP frontend classifies the complete stored shell script rather than a potentially truncated activity preview, and removes only its own anchored legacy summary header when full command metadata is unavailable.
+
+Generic output is never semantically truncated by this layer; it receives only visual-equivalent cleanup and exact repetition folding. These rules are shared by the Code gateway and original MCP frontend.
 
 PTY uses the generic profile deliberately. Prompts, menus and unique interactive text must survive.
 
@@ -71,10 +75,11 @@ When adding a new tool or rule, prefer a short invariant in the hot surface and 
 1. A synthetic Cargo success log representing at least ~25k tokens compacts below ~200 tokens and reports at least ~24k estimated tokens saved.
 2. Compiler/test failures preserve diagnostic text and source locations.
 3. PTY compaction preserves unique prompts while folding redraw/repetition noise.
-4. Git/search enumeration remains bounded and advertises full-output recovery.
+4. Successful, recognized Git/search enumeration remains bounded and advertises full-output recovery; unknown text, middle diagnostics, and all running/failed enumeration records survive.
 5. Agent MCP operation output defaults to compact, advances the raw sequence, and `output_mode=full` recovers durable chunks.
 6. Code and original MCP frontends consume the same shared classification/compaction implementation.
 7. Strict Clippy, formatting and affected crate tests pass before release.
+8. Keyword-bearing arguments and compound commands remain generic; complete MCP command metadata takes precedence over activity previews. Long diagnostic-only fixtures retain every unique error and source location.
 
 ## Boundary
 

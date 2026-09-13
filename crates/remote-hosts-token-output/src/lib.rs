@@ -61,36 +61,76 @@ pub struct CompactOutput {
 /// Classifies a command without executing or rewriting it.
 #[must_use]
 pub fn classify(command: &str, interactive: bool) -> OutputProfile {
-    if interactive {
+    let command = command.trim();
+    // A shell script, pipeline or expansion can emit unrelated text. Do not
+    // infer its output type from keywords anywhere in the command string.
+    // Deliberately prefer a false negative over interpreting shell syntax.
+    if interactive
+        || command.chars().any(|c| {
+            matches!(
+                c,
+                '\n' | '\r' | ';' | '|' | '&' | '`' | '$' | '(' | ')' | '{' | '}' | '<' | '>'
+            )
+        })
+    {
         return OutputProfile::Generic;
     }
-    let normalized = command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-        .replace("cargo.exe ", "cargo ");
-    if normalized.contains("cargo nextest") || normalized.contains("cargo test") {
-        OutputProfile::CargoTest
-    } else if normalized.contains("cargo clippy") {
-        OutputProfile::CargoClippy
-    } else if normalized.contains("cargo build") || normalized.contains("cargo check") {
-        OutputProfile::CargoBuild
-    } else if normalized.contains("python -m pytest") || normalized.contains("pytest") {
-        OutputProfile::Pytest
-    } else if normalized.contains("git log") {
-        OutputProfile::GitLog
-    } else if normalized.contains("git status") {
-        OutputProfile::GitStatus
-    } else if normalized.starts_with("rg ")
-        || normalized.contains(" rg ")
-        || normalized.starts_with("grep ")
-        || normalized.contains(" grep ")
-    {
-        OutputProfile::Search
-    } else {
-        OutputProfile::Generic
+    let mut words = command.split_whitespace().peekable();
+    if words.peek().copied() == Some("env") {
+        words.next();
     }
+    while words
+        .peek()
+        .is_some_and(|word| environment_assignment(word))
+    {
+        words.next();
+    }
+    let Some(program) = words.next() else {
+        return OutputProfile::Generic;
+    };
+    let executable = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let mut subcommand = words.next().unwrap_or_default();
+    match executable.as_str() {
+        "cargo" | "cargo.exe" => {
+            if subcommand.starts_with('+') {
+                subcommand = words.next().unwrap_or_default();
+            }
+            match subcommand {
+                "test" | "nextest" => OutputProfile::CargoTest,
+                "build" | "check" => OutputProfile::CargoBuild,
+                "clippy" => OutputProfile::CargoClippy,
+                _ => OutputProfile::Generic,
+            }
+        }
+        "git" | "git.exe" => match subcommand {
+            "log" => OutputProfile::GitLog,
+            "status" => OutputProfile::GitStatus,
+            _ => OutputProfile::Generic,
+        },
+        "pytest" | "pytest.exe" => OutputProfile::Pytest,
+        "python" | "python3" | "python.exe" | "python3.exe"
+            if subcommand == "-m" && words.next() == Some("pytest") =>
+        {
+            OutputProfile::Pytest
+        }
+        "rg" | "rg.exe" | "grep" | "grep.exe" => OutputProfile::Search,
+        _ => OutputProfile::Generic,
+    }
+}
+
+fn environment_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn strip_terminal_controls(input: &str) -> String {
@@ -234,17 +274,81 @@ fn fold_repeated_lines(lines: &[String]) -> (Vec<String>, usize) {
     (output, folded)
 }
 
-fn sample_lines(lines: Vec<String>, head: usize, tail: usize) -> (Vec<String>, usize) {
-    if lines.len() <= head + tail {
+fn enumeration_line(profile: OutputProfile, line: &str) -> bool {
+    match profile {
+        OutputProfile::GitLog => line.split_once(' ').is_some_and(|(hash, _)| {
+            (7..=64).contains(&hash.len()) && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }),
+        OutputProfile::GitStatus => {
+            let bytes = line.as_bytes();
+            bytes.len() > 3
+                && bytes[2] == b' '
+                && (matches!((bytes[0], bytes[1]), (b'?', b'?') | (b'!', b'!'))
+                    || (bytes[..2].iter().all(|byte| b" MADRCUT".contains(byte))
+                        && bytes[..2] != [b' ', b' ']))
+        }
+        OutputProfile::Search => {
+            let Some((path, mut rest)) = line.split_once(':') else {
+                return false;
+            };
+            if path.is_empty() {
+                return false;
+            }
+            // A Windows drive letter is part of the path, not a line number.
+            if path.len() == 1 && rest.starts_with(['/', '\\']) {
+                let Some((_, after_path)) = rest.split_once(':') else {
+                    return false;
+                };
+                rest = after_path;
+            }
+            rest.split_once(':').is_some_and(|(number, _)| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        }
+        _ => false,
+    }
+}
+
+fn sample_enumeration(
+    profile: OutputProfile,
+    lines: Vec<String>,
+    head: usize,
+    tail: usize,
+) -> (Vec<String>, usize) {
+    let count = lines
+        .iter()
+        .filter(|line| enumeration_line(profile, line))
+        .count();
+    if count <= head + tail {
         return (lines, 0);
     }
-    let omitted = lines.len() - head - tail;
     let mut sampled = Vec::with_capacity(head + tail + 1);
-    sampled.extend(lines.iter().take(head).cloned());
-    sampled.push(format!(
-        "[... {omitted} lines omitted; request output_mode=full for exact output ...]"
-    ));
-    sampled.extend(lines.iter().skip(lines.len() - tail).cloned());
+    let mut seen = 0;
+    let mut pending = 0;
+    let mut omitted = 0;
+    let omission = |count| {
+        format!("[... {count} lines omitted; request output_mode=full for exact output ...]")
+    };
+    for line in lines {
+        let known = enumeration_line(profile, &line);
+        let skip = known && seen >= head && seen < count - tail;
+        if known {
+            seen += 1;
+        }
+        if skip {
+            pending += 1;
+            omitted += 1;
+        } else {
+            if pending > 0 {
+                sampled.push(omission(pending));
+                pending = 0;
+            }
+            sampled.push(line);
+        }
+    }
+    if pending > 0 {
+        sampled.push(omission(pending));
+    }
     (sampled, omitted)
 }
 
@@ -316,16 +420,15 @@ pub fn compact(profile: OutputProfile, input: &str, exit_code: Option<i64>) -> C
         ));
     }
 
-    // Commands whose value is dominated by large enumerations are sampled in compact
-    // mode. Exact output is still durable and available with output_mode=full.
-    let (kept, sampled_lines) = match profile {
-        OutputProfile::GitLog => sample_lines(kept, 30, 0),
-        OutputProfile::GitStatus | OutputProfile::Search => sample_lines(kept, 80, 20),
-        OutputProfile::CargoTest
-        | OutputProfile::CargoBuild
-        | OutputProfile::CargoClippy
-        | OutputProfile::Pytest => sample_lines(kept, 120, 120),
-        OutputProfile::Generic => (kept, 0),
+    // Only successful, positively identified enumeration records may be sampled.
+    // Unknown text and diagnostics must survive even between omitted records;
+    // source pagination, not semantic head/tail truncation, bounds large errors.
+    let (kept, sampled_lines) = match (profile, exit_code) {
+        (OutputProfile::GitLog, Some(0)) => sample_enumeration(profile, kept, 30, 0),
+        (OutputProfile::GitStatus | OutputProfile::Search, Some(0)) => {
+            sample_enumeration(profile, kept, 80, 20)
+        }
+        _ => (kept, 0),
     };
     omitted += sampled_lines;
 
@@ -427,5 +530,142 @@ mod tests {
         );
         assert_eq!(classify("rg -n error .", false), OutputProfile::Search);
         assert_eq!(classify("cargo test", true), OutputProfile::Generic);
+    }
+
+    #[test]
+    fn classifier_does_not_treat_arguments_or_compound_scripts_as_commands() {
+        for command in [
+            "printf 'cargo test'",
+            "echo pytest",
+            "git log --oneline; cat AGENTS.md",
+            "cargo test && cat verification.json",
+            "cargo test | cat",
+            "cargo test\nprintf 'important instructions'",
+            "cargo testhelper",
+            "python3 -c 'print(\"pytest\")'",
+            "my-pytest-runner",
+            "env NOTE=pytest ls",
+        ] {
+            assert_eq!(
+                classify(command, false),
+                OutputProfile::Generic,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_accepts_direct_executables_and_simple_environment_prefixes() {
+        for command in [
+            "cargo.exe test --workspace",
+            "/opt/rust/bin/cargo test",
+            "C:\\Rust\\bin\\cargo.exe test",
+            "CARGO_TERM_COLOR=never cargo test",
+            "env CARGO_TERM_COLOR=never cargo +stable test",
+        ] {
+            assert_eq!(
+                classify(command, false),
+                OutputProfile::CargoTest,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            classify("python3 -m pytest -q", false),
+            OutputProfile::Pytest
+        );
+    }
+
+    #[test]
+    fn long_diagnostics_are_not_head_tail_sampled() {
+        let mut raw = String::new();
+        for index in 0..400 {
+            let _ = writeln!(raw, "error[E{index:04}]: unique diagnostic {index}");
+            let _ = writeln!(raw, " --> src/case_{index}.rs:17:4");
+        }
+        for profile in [
+            OutputProfile::CargoTest,
+            OutputProfile::CargoBuild,
+            OutputProfile::CargoClippy,
+            OutputProfile::Pytest,
+        ] {
+            let result = compact(profile, &raw, Some(101));
+            assert_eq!(result.output, raw, "{} lost diagnostics", profile.label());
+        }
+    }
+
+    fn enumeration_fixture(profile: OutputProfile, count: usize) -> String {
+        (0..count)
+            .map(|index| match profile {
+                OutputProfile::GitLog => format!("{index:040x} commit {index}"),
+                OutputProfile::GitStatus => format!(" M src/file_{index}.rs"),
+                OutputProfile::Search => format!("src/file.rs:{index}:match"),
+                _ => unreachable!("enumeration profile required"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn enumeration_compaction_preserves_unknown_text_and_middle_diagnostics() {
+        for profile in [
+            OutputProfile::GitLog,
+            OutputProfile::GitStatus,
+            OutputProfile::Search,
+        ] {
+            let raw = enumeration_fixture(profile, 300);
+            let mut lines: Vec<_> = raw.lines().map(str::to_owned).collect();
+            lines.insert(150, "IMPORTANT: keep this instruction verbatim".to_owned());
+            lines.insert(
+                151,
+                "error: recoverable failure at src/critical.rs:42:7".to_owned(),
+            );
+            let result = compact(profile, &lines.join("\n"), Some(0));
+            assert!(
+                result
+                    .output
+                    .contains("IMPORTANT: keep this instruction verbatim")
+            );
+            assert!(
+                result
+                    .output
+                    .contains("error: recoverable failure at src/critical.rs:42:7")
+            );
+            assert!(
+                result.metadata["omitted_lines"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    > 0
+            );
+        }
+    }
+
+    #[test]
+    fn pending_and_failed_enumerations_are_not_sampled() {
+        for profile in [
+            OutputProfile::GitLog,
+            OutputProfile::GitStatus,
+            OutputProfile::Search,
+        ] {
+            let raw = enumeration_fixture(profile, 300);
+            for exit_code in [None, Some(1), Some(128)] {
+                let result = compact(profile, &raw, exit_code);
+                assert_eq!(result.output, raw, "{} {exit_code:?}", profile.label());
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_enumeration_formats_are_not_sampled() {
+        let raw = (0..300)
+            .map(|index| format!("unrecognized format with important detail {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for profile in [
+            OutputProfile::GitLog,
+            OutputProfile::GitStatus,
+            OutputProfile::Search,
+        ] {
+            assert_eq!(compact(profile, &raw, Some(0)).output, raw);
+        }
     }
 }

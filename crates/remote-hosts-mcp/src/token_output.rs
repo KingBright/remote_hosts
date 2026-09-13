@@ -7,7 +7,26 @@ use remote_hosts_token_output::{OutputProfile, classify, compact};
 use serde_json::{Value, json};
 
 pub(crate) fn classify_operation(operation: &OperationRun) -> OutputProfile {
-    classify(&operation.redacted_command_summary, false)
+    // The activity preview can be truncated. Classify the complete stored shell
+    // script when available, without exposing its unredacted contents in output.
+    if let Some(profile) = &operation.command_profile_json
+        && matches!(
+            profile["name"].as_str(),
+            Some("shell.posix" | "shell.powershell")
+        )
+    {
+        return profile["args"]
+            .as_array()
+            .and_then(|args| args.last())
+            .and_then(Value::as_str)
+            .map_or(OutputProfile::Generic, |script| classify(script, false));
+    }
+    let summary = &operation.redacted_command_summary;
+    let command = summary
+        .strip_prefix("shell.posix via pooled workspace:")
+        .or_else(|| summary.strip_prefix("shell.powershell via pooled workspace:"))
+        .unwrap_or(summary);
+    classify(command, false)
 }
 
 pub(crate) fn compact_operation_text(operation: &OperationRun, input: &str) -> (String, Value) {
@@ -236,6 +255,46 @@ mod tests {
                 .is_some_and(|saved| saved >= 24_000)
         );
         assert_eq!(view[0]["sequence"], 7);
+    }
+
+    #[test]
+    fn complete_stored_script_takes_precedence_over_activity_preview() {
+        let mut operation = operation("cargo test --workspace", Some(0));
+        operation.command_profile_json = Some(json!({
+            "name": "shell.posix",
+            "args": ["-lc", "cargo test --workspace && cat verification.json"]
+        }));
+        assert_eq!(classify_operation(&operation), OutputProfile::Generic);
+
+        operation.command_profile_json = Some(json!({
+            "name": "shell.posix",
+            "args": ["-lc", "cargo test --workspace"]
+        }));
+        assert_eq!(classify_operation(&operation), OutputProfile::CargoTest);
+
+        operation.command_profile_json = Some(json!({"name": "shell.posix"}));
+        assert_eq!(classify_operation(&operation), OutputProfile::Generic);
+    }
+
+    #[test]
+    fn known_summary_headers_are_removed_without_interpreting_script_keywords() {
+        for header in ["shell.posix", "shell.powershell"] {
+            let direct = operation(
+                &format!("{header} via pooled workspace:\ncargo test"),
+                Some(0),
+            );
+            assert_eq!(classify_operation(&direct), OutputProfile::CargoTest);
+            let mixed = operation(
+                &format!("{header} via pooled workspace:\ncargo test; cat result.json"),
+                Some(0),
+            );
+            assert_eq!(classify_operation(&mixed), OutputProfile::Generic);
+            let truncated = operation(
+                &format!("{header} via pooled workspace:\ncargo test\n... <truncated>"),
+                Some(0),
+            );
+            assert_eq!(classify_operation(&truncated), OutputProfile::Generic);
+        }
     }
 
     #[test]
