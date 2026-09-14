@@ -57,7 +57,14 @@ class Client:
         self.rpc('initialize',{'protocolVersion':'2025-11-25','capabilities':{},'clientInfo':{'name':'remote-hosts-release','version':'0.5.0'}});return self
     def rpc(self,method,params):
         self.sequence+=1
-        value=self.parsed('/mcp',{'jsonrpc':'2.0','id':self.sequence,'method':method,'params':params},auth=True)
+        payload={'jsonrpc':'2.0','id':self.sequence,'method':method,'params':params}
+        for attempt in range(5):
+            try:
+                value=self.parsed('/mcp',payload,auth=True)
+                break
+            except (TimeoutError, urllib.error.URLError, OSError):
+                if attempt==4: raise
+                time.sleep(min(2**attempt,8))
         if 'error' in value:raise RuntimeError('MCP protocol error '+str(value['error'].get('code')))
         return value['result']
     def raw(self,name,args):

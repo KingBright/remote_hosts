@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "remote-hosts-code"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",

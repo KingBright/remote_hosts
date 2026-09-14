@@ -137,7 +137,15 @@ def main():
     def rpc(method, params):
         nonlocal sequence
         sequence += 1
-        result = parsed("/mcp", {"jsonrpc": "2.0", "id": sequence, "method": method, "params": params}, bearer=bearer)
+        payload = {"jsonrpc": "2.0", "id": sequence, "method": method, "params": params}
+        for attempt in range(5):
+            try:
+                result = parsed("/mcp", payload, bearer=bearer)
+                break
+            except (TimeoutError, urllib.error.URLError, OSError):
+                if attempt == 4:
+                    raise
+                time.sleep(min(2 ** attempt, 8))
         if "error" in result:
             raise RuntimeError("MCP protocol error: " + str(result["error"].get("code")))
         return result["result"]

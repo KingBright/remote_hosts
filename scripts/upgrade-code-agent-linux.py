@@ -22,7 +22,7 @@ import tempfile
 import time
 import uuid
 
-from agent_upgrade_support import gateway_observation
+from agent_upgrade_support import GatewayObservationError, gateway_observation
 from maintenance_client import MaintenanceLease
 
 
@@ -73,8 +73,15 @@ def wait_gateway(config, version, baseline, timeout=240):
     session = None
     fresh = 0
     last_seen = baseline
+    last_transport_error = None
     while time.monotonic() < deadline:
-        value = gateway_observation(config, attempts=1)
+        try:
+            value = gateway_observation(config, attempts=1)
+            last_transport_error = None
+        except GatewayObservationError as error:
+            last_transport_error = error
+            time.sleep(2)
+            continue
         if value.get("agent_version") == version and value.get("ready") is True and value.get("last_seen", 0) > last_seen:
             current = value.get("session")
             if session != current:
@@ -85,6 +92,8 @@ def wait_gateway(config, version, baseline, timeout=240):
             if fresh >= 3:
                 return {"gateway_verified": True, "session": session, "samples": fresh, "last_seen": last_seen}
         time.sleep(2)
+    if last_transport_error is not None:
+        raise last_transport_error
     raise RuntimeError("gateway readiness did not converge")
 
 

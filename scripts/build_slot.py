@@ -41,6 +41,30 @@ class SlotBusy(RuntimeError):
         super().__init__('build_slot_busy: observe the original report; do not start another build')
 
 
+def process_alive(pid, *, group=False):
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        (os.killpg if group else os.kill)(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stale_owner_recoverable(previous):
+    """Recover only after the lease is ours and the recorded process group is gone."""
+    if process_alive(previous.get('pid')):
+        return False
+    try:
+        report = json.loads(pathlib.Path(previous['report']).read_text())
+    except (KeyError, OSError, ValueError, TypeError):
+        return False
+    child = report.get('child_pid')
+    return child is None or not process_alive(child, group=True)
+
+
 @contextlib.contextmanager
 def lease(directory, report, snapshot_id):
     if os.name != 'posix':
@@ -72,7 +96,12 @@ def lease(directory, report, snapshot_id):
         if prior_owner.exists():
             previous = json.loads(prior_owner.read_text())
             if previous.get('state') != 'released':
-                raise ValueError('build_slot_recovery_required: previous owner did not confirm cleanup; retain its report and inspect owned child processes before reuse')
+                if stale_owner_recoverable(previous):
+                    previous.update(state='released', released_at=int(time.time()),
+                                    recovery='stale_owner_no_live_process_or_process_group')
+                    atomic_json(prior_owner, previous)
+                else:
+                    raise ValueError('build_slot_recovery_required: previous owner did not confirm cleanup; retain its report and inspect owned child processes before reuse')
         owner = {'pid': os.getpid(), 'report': str(pathlib.Path(report).absolute()),
                  'snapshot_id': snapshot_id, 'started_at': int(time.time()), 'state': 'running'}
         atomic_json(directory/'owner.json', owner)

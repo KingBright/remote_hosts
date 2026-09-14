@@ -83,6 +83,32 @@ def ps_quote(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def controller_device_id(config):
+    explicit=config.get('controller_device_id')
+    if explicit:return explicit
+    workspace=str(config.get('controller_workspace') or '')
+    return workspace.split(':',1)[0] if ':' in workspace else None
+
+
+def verified_import(client, imported, exported, bundle, bundle_sha, version, ident):
+    if imported.get('state')=='completed' and imported.get('sha256')==bundle_sha:return imported
+    if imported.get('state') in ('paused','awaiting_source') and imported.get('next_action')=='transfer_resume':
+        resumed=client.tool('transfer_resume',{'operation_id':imported['operation_id'],
+            'idempotency_key':'fleet-'+version+'-bundle-resume-'+ident,
+            'file':{'file_id':exported['artifact_id'],'download_url':exported['download_url'],'file_name':bundle.name}})
+        if resumed.get('state')=='completed' and resumed.get('sha256')==bundle_sha:return resumed
+    raise RuntimeError('bundle import not verified: '+ident)
+
+
+def accept_fleet(config,package,directory,version,fleet):
+    ids=[d['device_id'] for d in fleet['devices']]
+    acceptance=directory/'acceptance.json';run_id='fleet-'+version.replace('.','-')+'-'+rr.identity(ids)[:8]
+    command(['python3',str(package/'check-code-gateway.py'),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(acceptance),'--run-id',run_id,'--expected-version',version,'--dispatch-protocol','2',*[x for ident in ids for x in ('--device-id',ident)]],1200)
+    result=json.loads(acceptance.read_text())
+    if result.get('state')!='passed':raise RuntimeError('fleet capability acceptance failed')
+    return acceptance
+
+
 def gateway_upgrade_api(client,version,bundle_sha,timeout=600):
     """Prefer the narrow authenticated self-upgrade endpoint; None means legacy gateway."""
     deadline=time.monotonic()+timeout
@@ -171,8 +197,12 @@ def main():
             if 'gateway' not in config: raise RuntimeError('legacy gateway requires one-time SSH bootstrap configuration')
             gateway=gateway_upgrade_ssh(config,package,manifest,args.version,directory)
         state['gateway']=gateway;save()
-        fleet=client.tool('fleet_status',{'desired_version':args.version});devices=fleet['devices']
-        controller_id=config.get('controller_device_id')
+        fleet=client.tool('fleet_status',{'desired_version':args.version});devices=fleet['devices'];state['fleet']=fleet;save()
+        if fleet.get('all_converged'):
+            acceptance=accept_fleet(config,package,directory,args.version,fleet)
+            state.update(state='passed',phase='finished',all_converged=True,acceptance=str(acceptance));save()
+            print(json.dumps({'state':state['state'],'version':args.version,'all_converged':True,'report':str(directory/'fleet.json')}));return
+        controller_id=controller_device_id(config)
         local_candidates=[d for d in devices if d['online'] and platform(d) in ('macos','linux')
                           and any(str(bundle).startswith(root.rstrip('/')+'/') for root in (d.get('capabilities') or {}).get('roots',[]))]
         controller=next((d for d in local_candidates if d['device_id']==controller_id),None) if controller_id else None
@@ -183,28 +213,29 @@ def main():
         cws=open_workspace(client,controller['device_id'],controller_root,'fleet-'+args.version+'-controller')
         exported=client.tool('file_download',{'workspace_id':cws,'path':relative,'expected_version':bundle_sha,'max_bytes':268435456,'idempotency_key':'fleet-'+args.version+'-bundle-export'})
         state['source_artifact']={'operation_id':exported['operation_id'],'sha256':bundle_sha,'size':exported['size']};save()
-        for device in devices:
+        ordered=[d for d in devices if d['device_id']!=controller_id]+[d for d in devices if d['device_id']==controller_id]
+        for device in ordered:
             ident=device['device_id'];state['agents'][ident]={'name':device['name'],'platform':platform(device),'state':'already_converged' if device['converged'] else 'staging'};save()
             if device['converged']: continue
             ws=open_workspace(client,ident,root_path(device),'fleet-'+args.version+'-'+ident)
             remote_bundle='.remote-hosts-release-staging-'+args.version+'/'+bundle.name
             imported=client.tool('file_upload',{'workspace_id':ws,'path':remote_bundle,'expected_version':'absent','sha256':bundle_sha,'max_bytes':268435456,'idempotency_key':'fleet-'+args.version+'-bundle-import-'+ident,'file':{'file_id':exported['artifact_id'],'download_url':exported['download_url'],'file_name':bundle.name}})
-            if imported.get('state')!='completed' or imported.get('sha256')!=bundle_sha: raise RuntimeError('bundle import not verified: '+ident)
+            imported=verified_import(client,imported,exported,bundle,bundle_sha,args.version,ident)
             h=home(device);destination=(h+'/.local/share/remote-hosts-code/releases/'+args.version) if platform(device)!='windows' else (h+'\\.local\\share\\remote-hosts-code\\releases\\'+args.version)
             client.terminal(ws,extract_command(device,remote_bundle,destination,bundle_sha),'fleet-'+args.version+'-extract-'+ident,120)
             output=client.terminal(ws,launch_command(device,destination,manifest,args.version),'fleet-'+args.version+'-launch-'+ident,60)
             state['agents'][ident].update(state='upgrading',launch_output=output[-2048:]);save()
+            if ident==controller_id:
+                state.update(state='handoff_pending',phase='controller_handoff',
+                    next_action='controller updater is independent; let this invoking terminal exit, then rerun the same fleet command after the controller reconnects')
+                save();print(json.dumps({'state':state['state'],'version':args.version,'all_converged':False,'report':str(directory/'fleet.json')}));return
         deadline=time.monotonic()+900
         while time.monotonic()<deadline:
             fleet=client.tool('fleet_status',{'desired_version':args.version});state['fleet']=fleet;save()
             if fleet.get('all_converged'):break
             time.sleep(3)
         else: raise RuntimeError('fleet did not converge; inspect fleet.json without replaying upgrades')
-        ids=[d['device_id'] for d in fleet['devices']]
-        acceptance=directory/'acceptance.json';run_id='fleet-'+args.version.replace('.','-')+'-'+rr.identity(ids)[:8]
-        command(['python3',str(package/'check-code-gateway.py'),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(acceptance),'--run-id',run_id,'--expected-version',args.version,'--dispatch-protocol','2',*[x for ident in ids for x in ('--device-id',ident)]],1200)
-        result=json.loads(acceptance.read_text());
-        if result.get('state')!='passed': raise RuntimeError('fleet capability acceptance failed')
+        acceptance=accept_fleet(config,package,directory,args.version,fleet)
         state.update(state='passed',phase='finished',all_converged=True,acceptance=str(acceptance));save()
     except Exception as error:
         state.update(state='needs_recovery',phase='finished',error_type=type(error).__name__,next_action='inspect fleet.json and original operation/updater receipts; do not replay blindly');save();raise

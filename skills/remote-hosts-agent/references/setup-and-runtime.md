@@ -148,6 +148,8 @@ Gateway and Agent compatibility is explicit. Upgrade the Gateway first. A legacy
 
 Fleet rollout exports one verified bundle and uses independent one-shot platform updaters so replacing an Agent cannot kill its own updater. Do not manually replay an uncertain updater. Observe the original receipt/Fleet report and resume only through the documented recovery state.
 
+From 0.10.3, rollout hardening also treats a paused transfer with `publication_recovery_required` as a resumable publication instead of retransmitting bytes, retries transient authenticated readiness/RPC transport failures with the same operation identity, discovers the Windows Agent binary/config from the installed scheduled task, and ignores console-host helper processes when deciding whether Windows is idle. If the selected controller itself still needs an upgrade, it is staged last and Fleet records `controller_handoff`; let the invoking Remote Hosts terminal exit so the independent updater can cut over the controller, then rerun the same Fleet command. An already-converged rerun skips bundle export and goes straight to capability acceptance.
+
 ## Codex MCP Config
 
 Expected `~/.codex/config.toml` entry:
