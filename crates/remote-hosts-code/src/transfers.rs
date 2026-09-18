@@ -280,7 +280,10 @@ impl Staged {
             self.dir.rename(&self.temporary, &self.dir, &self.name)?;
         }
         #[cfg(unix)]
-        self.dir.try_clone()?.into_std_file().sync_all()?;
+        // Linux capability directories may be O_PATH handles, which cannot be
+        // fsynced. Open the pinned directory itself for I/O without returning to
+        // an ambient path or dropping the durability requirement.
+        self.dir.open(".")?.sync_all()?;
         Ok(())
     }
 }

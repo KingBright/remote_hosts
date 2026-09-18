@@ -405,10 +405,12 @@ impl Terminals {
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?;
         if let Some(t) = live.get_mut(id) {
-            t.input.take();
+            // Stop the owned process group before releasing its input. A PTY
+            // writer must never try to enqueue EOF into a full input queue here.
             kill_group(t.pid)?;
             #[cfg(not(unix))]
             t.killer.kill()?;
+            t.input.take();
         }
         Ok(())
     }
@@ -577,6 +579,21 @@ fn spawn(
             pixel_height: 0,
         })?;
         let reader = pair.master.try_clone_reader()?;
+        #[cfg(unix)]
+        let input: Box<dyn Write + Send> = {
+            use std::os::fd::BorrowedFd;
+            let fd = pair
+                .master
+                .as_raw_fd()
+                .context("native PTY master descriptor unavailable")?;
+            // SAFETY: the master owns fd throughout this borrow; try_clone_to_owned
+            // duplicates it with independent ownership. File::drop only closes it.
+            // portable-pty's writer Drop sends newline+EOF, which can block forever
+            // when a raw-mode child does not read and its input queue is full.
+            let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+            Box::new(std::fs::File::from(owned))
+        };
+        #[cfg(not(unix))]
         let input = pair.master.take_writer()?;
         let mut cmd = CommandBuilder::new(&config.shell);
         for arg in shell_args(&config.shell, command, true) {
