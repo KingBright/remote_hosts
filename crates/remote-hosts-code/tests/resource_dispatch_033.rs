@@ -16,6 +16,7 @@ async fn fixture() -> (tempfile::TempDir, Gateway, String, Value) {
     let token = random();
     let device = uuid::Uuid::new_v4().to_string();
     let g = Gateway::new(GatewayConfig {
+        allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: "https://fixture.example".into(),
         bind: "127.0.0.1:0".into(),
         state_dir: d.path().join("state"),

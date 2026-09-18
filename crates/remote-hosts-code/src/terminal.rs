@@ -27,6 +27,14 @@ pub struct Status {
     pub output_truncated: bool,
     pub created_at: i64,
     #[serde(default)]
+    pub updated_at: i64,
+    /// Spawn-time process identity. Historical PIDs never authorize signalling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u32>,
+    /// Initial working directory; a command may change directory after spawning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(default)]
     pub pty: bool,
     /// 0 is the old raw log, 1 is an append-only sanitized UTF-8 log.
     #[serde(default)]
@@ -61,8 +69,8 @@ impl Terminals {
         std::fs::create_dir_all(&dir)?;
         // Recover every interrupted terminal atomically, regardless of history
         // size or key order. Do not load a truncated history page and miss live work.
-        sqlx::query("UPDATE kv SET value=json_set(value,'$.state','runtime_lost') WHERE kind='terminal' AND json_extract(value,'$.state') IN ('running','starting')")
-            .execute(&store.pool).await?;
+        sqlx::query("UPDATE kv SET value=json_set(value,'$.state','runtime_lost','$.updated_at',?) WHERE kind='terminal' AND json_extract(value,'$.state') IN ('running','starting')")
+            .bind(now()).execute(&store.pool).await?;
         Ok(Self {
             store,
             dir,
@@ -101,6 +109,7 @@ impl Terminals {
             }
             let mut status: Status = serde_json::from_str(&text)?;
             status.state = "runtime_lost".into();
+            status.updated_at = now();
             status.output_complete = true;
             status.output_error = Some("terminal_runtime_ownership_lost".into());
             let saved = sqlx::query(
@@ -135,7 +144,10 @@ impl Terminals {
         let command = files::text(v, "command")?;
         ensure!(command.len() <= 65536, "command too large");
         let timeout = files::number(v, "timeout_seconds", 600, 1, 7200)?;
-        let wait_ms = files::number(v, "wait_ms", 0, 0, 2000)?;
+        // Default to a short bounded wait so fast commands usually finish in the
+        // initiating tool call even when an older host schema cannot send wait_ms.
+        // Long commands still return the same durable terminal handle.
+        let wait_ms = files::number(v, "wait_ms", 1000, 0, 2000)?;
         let interactive = v.get("pty").and_then(Value::as_bool).unwrap_or(false);
         let rows = files::number(v, "rows", 40, 5, 200)? as u16;
         let cols = files::number(v, "cols", 120, 20, 500)? as u16;
@@ -145,13 +157,17 @@ impl Terminals {
             .clone()
             .try_acquire_owned()
             .context("device terminal capacity reached")?;
+        let created_at = now();
         let status = Status {
             id: id.into(),
             workspace_id: ws.id.clone(),
             state: "starting".into(),
             exit_code: None,
             output_truncated: false,
-            created_at: now(),
+            created_at,
+            updated_at: created_at,
+            process_id: None,
+            working_directory: Some(ws.root.to_string_lossy().into_owned()),
             pty: interactive,
             log_format: 1,
             output_complete: false,
@@ -181,13 +197,16 @@ impl Terminals {
             Ok(setup) => setup,
             Err(error) => {
                 status.state = "failed".into();
+                status.updated_at = now();
                 status.output_complete = true;
                 self.store.put("terminal", id, &status, i64::MAX).await?;
                 return Err(error);
             }
         };
         let pid = child.process_id();
+        status.process_id = pid;
         status.state = "running".into();
+        status.updated_at = now();
         if let Err(error) = self.store.put("terminal", id, &status, i64::MAX).await {
             let _ = kill_group(pid);
             let _ = child.kill();
@@ -305,6 +324,7 @@ impl Terminals {
             if status.state == "running" {
                 status.state = if result.is_some() { "exited" } else { "failed" }.into();
             }
+            status.updated_at = now();
             status.exit_code = result.map(|s| i64::from(s.exit_code()));
             // Cancellation and finalization race through one conditional SQL update,
             // not a read/modify/write that could overwrite an accepted cancellation.
@@ -524,8 +544,8 @@ impl Terminals {
     pub async fn cancel(&self, ws: &Workspace, v: &Value) -> Result<Value> {
         let id = files::text(v, "terminal_id")?;
         self.status(ws, id).await?;
-        let changed: Option<(String,)> = sqlx::query_as("UPDATE kv SET value=json_set(value,'$.state','cancelled') WHERE kind='terminal' AND key=? AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.state')='running' RETURNING value")
-            .bind(id).bind(&ws.id).fetch_optional(&self.store.pool).await?;
+        let changed: Option<(String,)> = sqlx::query_as("UPDATE kv SET value=json_set(value,'$.state','cancelled','$.updated_at',?) WHERE kind='terminal' AND key=? AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.state')='running' RETURNING value")
+            .bind(now()).bind(id).bind(&ws.id).fetch_optional(&self.store.pool).await?;
         let status = if let Some((value,)) = changed {
             self.kill(id)?;
             serde_json::from_str::<Status>(&value)?
@@ -754,12 +774,54 @@ mod tests {
             exit_code: None,
             output_truncated: false,
             created_at,
+            updated_at: created_at,
+            process_id: None,
+            working_directory: None,
             pty: false,
             log_format: 1,
             output_complete: false,
             output_error: None,
             output_profile: OutputProfile::Generic,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn short_noninteractive_command_returns_exit_and_output_without_explicit_wait() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(d.path()).await.unwrap();
+        let terminals = Terminals::new(
+            store,
+            d.path().join("terminals"),
+            "synthetic-terminal-secret-0123456789".into(),
+        )
+        .await
+        .unwrap();
+        let ws = Workspace {
+            id: "workspace".into(),
+            device_id: "device".into(),
+            root: d.path().to_path_buf(),
+        };
+        let config = AgentConfig {
+            gateway_url: "https://unused.example".into(),
+            device_id: "device".into(),
+            device_token: "unused".into(),
+            state_dir: d.path().join("state"),
+            roots: vec![d.path().to_path_buf()],
+            allow_write: true,
+            allow_exec: true,
+            shell: PathBuf::from("/bin/sh"),
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let out = terminals
+            .start(&config, &ws, &json!({"command":"printf one-call"}), &id)
+            .await
+            .unwrap();
+        assert_eq!(out["terminal"]["exit_code"], 0, "{out}");
+        assert_eq!(out["terminal"]["output_complete"], true, "{out}");
+        assert_eq!(out["has_more"], false, "{out}");
+        assert_eq!(out["output"], "one-call", "{out}");
+        assert!(out["next_action"].is_null(), "{out}");
     }
 
     #[tokio::test]

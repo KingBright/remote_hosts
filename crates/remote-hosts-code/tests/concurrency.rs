@@ -176,6 +176,7 @@ async fn concurrent_duplicate_mutation_returns_one_durable_result() {
 async fn gateway(agent: &Agent, dir: &std::path::Path, origin: String) -> (Gateway, String) {
     let other = random();
     let g = Gateway::new(GatewayConfig {
+        allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: origin,
         bind: "127.0.0.1:0".into(),
         state_dir: dir.join("gateway"),
@@ -375,7 +376,7 @@ async fn actual_agent_poll_loop_keeps_serving_during_stalled_transfer() {
         axum::serve(listener, router).await.unwrap();
     });
     let a = agent.clone();
-    let worker = tokio::spawn(async move { a.run().await });
+    let worker = tokio::spawn(async move { a.run_isolated().await });
     tokio::time::timeout(Duration::from_secs(3), async {
         while g
             .store

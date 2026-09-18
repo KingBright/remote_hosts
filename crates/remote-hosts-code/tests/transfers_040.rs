@@ -48,6 +48,7 @@ impl Fixture {
         let root = dir.path().join("project");
         std::fs::create_dir(&root).unwrap();
         let g = Gateway::new(GatewayConfig {
+            allowed_origins: remote_hosts_code::default_mcp_client_origins(),
             public_url: format!("https://{address}"),
             bind: address.to_string(),
             state_dir: dir.path().join("gateway"),
@@ -183,7 +184,11 @@ async fn value(response: Response) -> Value {
 }
 #[test]
 fn catalog_exposes_three_scoped_workflow_tools_and_refresh_file_parameter() {
-    assert_eq!(tools::catalog().len(), 23);
+    assert_eq!(
+        remote_hosts_code::release_manifest()["tool_count"],
+        tools::catalog().len()
+    );
+    assert!(tools::catalog().iter().any(|t| t.name == "task_context"));
     let catalog = tools::catalog();
     let refresh = catalog
         .iter()
@@ -455,10 +460,13 @@ async fn interrupted_export_resumes_saved_snapshot_not_the_changed_source() {
     let bytes: Vec<u8> = (0..CHUNK + 111).map(|i| (i % 251) as u8).collect();
     std::fs::write(f.ws.root.join("data.bin"), &bytes).unwrap();
     let blocking = Arc::new(AtomicBool::new(true));
+    let checkpoint_reached = Arc::new(tokio::sync::Notify::new());
     let flag = blocking.clone();
     let router = f.g.router().unwrap().layer(middleware::from_fn_with_state(
-        flag,
-        |State(flag): State<Arc<AtomicBool>>, r: AxumRequest, next: Next| async move {
+        (flag, checkpoint_reached.clone()),
+        |State((flag, reached)): State<(Arc<AtomicBool>, Arc<tokio::sync::Notify>)>,
+         r: AxumRequest,
+         next: Next| async move {
             if r.uri().path().ends_with("/chunk")
                 && r.headers()
                     .get("x-transfer-offset")
@@ -466,6 +474,8 @@ async fn interrupted_export_resumes_saved_snapshot_not_the_changed_source() {
                     == Some("4194304")
                 && flag.load(Ordering::SeqCst)
             {
+                // The next request proves the first durable chunk was acknowledged.
+                reached.notify_one();
                 std::future::pending::<()>().await;
             }
             next.run(r).await
@@ -478,22 +488,25 @@ async fn interrupted_export_resumes_saved_snapshot_not_the_changed_source() {
     let a = f.agent.clone();
     let work = j.clone();
     let task = tokio::spawn(async move { a.execute(&work).await });
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if f.g
-                .store
-                .get::<Value>("transfer_receiver", &j.id)
-                .await
-                .unwrap()
-                .is_some_and(|v| v["offset"] == CHUNK)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    // Synchronize fault injection with the protocol boundary instead of polling
+    // SQLite at 100 Hz while the first 4 MiB snapshot is being fsynced.
+    let reached =
+        tokio::time::timeout(Duration::from_secs(30), checkpoint_reached.notified()).await;
+    if reached.is_err() {
+        task.abort();
+        server.abort();
+    }
+    reached.expect("sender did not reach the second-chunk fault-injection barrier");
+    let receiver =
+        f.g.store
+            .get::<Value>("transfer_receiver", &j.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        receiver["offset"], CHUNK,
+        "interrupt only after a durable acknowledged checkpoint"
+    );
     task.abort();
     let _ = task.await;
     std::fs::write(
@@ -568,6 +581,16 @@ async fn workspace_context_is_scoped_and_has_a_stable_cursor() {
         .unwrap();
     assert_eq!(first["terminals"].as_array().unwrap().len(), 1);
     assert_eq!(first["terminals"][0]["id"], "one");
+    assert_eq!(first["next_action"], "no_active_work");
+    assert_eq!(
+        first["freshness"]["heartbeat_is_not_business_progress"],
+        true
+    );
+    assert!(
+        first["freshness"]["workspace_observed_at"]
+            .as_i64()
+            .is_some()
+    );
     let again = f
         .agent
         .execute(&make(

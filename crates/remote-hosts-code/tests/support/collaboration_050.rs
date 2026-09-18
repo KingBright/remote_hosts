@@ -47,10 +47,34 @@ async fn r050_workspace_events_are_bounded_and_do_not_record_observers() {
     let next=f.agent.execute(&q).await.unwrap();assert_eq!(next["events"]["items"].as_array().unwrap().len(),n);assert_eq!(next["events"]["has_more"],false);
     q.id=uuid::Uuid::new_v4().to_string();q.arguments["after_event"]=next["events"]["cursor"].clone();
     assert!(f.agent.execute(&q).await.unwrap()["events"]["items"].as_array().unwrap().is_empty());
-    // Inject old retention floor, not 4096 real tasks, to check expired cursors fail explicitly.
-    sqlx::query("UPDATE work_event_floor SET seq=20 WHERE workspace=?").bind(&f.ws.id).execute(&f.agent.store.pool).await.unwrap();
+    // Exercise the real retention triggers on one terminal instead of mutating
+    // the removed floor table or retaining thousands of synthetic terminal rows.
+    const RETENTION: i64 = 4096;
+    for i in 0..RETENTION {
+        f.agent.store.put(
+            "terminal",
+            "retention-probe",
+            &json!({"workspace_id":f.ws.id,"id":"retention-probe","state":if i % 2 == 0 {"running"} else {"exited"},"created_at":now(),"exit_code":0}),
+            i64::MAX,
+        ).await.unwrap();
+    }
+    let (retained,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM work_events WHERE workspace=?")
+        .bind(&f.ws.id).fetch_one(&f.agent.store.pool).await.unwrap();
+    assert_eq!(retained, RETENTION);
+    let (floor_tables,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='work_event_floor'")
+        .fetch_one(&f.agent.store.pool).await.unwrap();
+    assert_eq!(floor_tables, 0, "retention must not recreate the obsolete floor table");
     q.id=uuid::Uuid::new_v4().to_string();q.arguments["after_event"]=json!(cursor);
     assert_eq!(f.agent.execute(&q).await.unwrap()["error_code"],"invalid_or_expired_cursor");
+    // A fresh snapshot recovers from expiration, and observing it adds no events.
+    q.id = uuid::Uuid::new_v4().to_string();
+    q.arguments.as_object_mut().unwrap().remove("after_event");
+    let fresh = f.agent.execute(&q).await.unwrap();
+    assert!(fresh.get("error").is_none(), "{fresh}");
+    assert_eq!(fresh["events"]["items"].as_array().unwrap().len(), 50);
+    q.id = uuid::Uuid::new_v4().to_string();
+    q.arguments["after_event"] = fresh["events"]["cursor"].clone();
+    assert!(f.agent.execute(&q).await.unwrap()["events"]["items"].as_array().unwrap().is_empty());
 }
 #[tokio::test]
 async fn r050_multi_file_partial_edit_has_committed_and_pending_evidence() {

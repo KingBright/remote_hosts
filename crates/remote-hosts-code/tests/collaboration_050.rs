@@ -32,6 +32,7 @@ impl Fixture {
         let root = d.path().join("root");
         std::fs::create_dir(&root).unwrap();
         let g = Gateway::new(GatewayConfig {
+            allowed_origins: remote_hosts_code::default_mcp_client_origins(),
             public_url: format!("https://{addr}"),
             bind: addr.to_string(),
             state_dir: d.path().join("gateway"),
@@ -220,7 +221,7 @@ async fn operation_get_observes_terminal_exit_without_new_read_jobs() {
         axum::serve(listener, router).await.unwrap();
     });
     let a = f.a.clone();
-    let agent = tokio::spawn(async move { a.run().await });
+    let agent = tokio::spawn(async move { a.run_isolated().await });
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let v =

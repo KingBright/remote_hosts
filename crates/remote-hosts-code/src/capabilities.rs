@@ -56,7 +56,8 @@ const EMBEDDED_SKILL: &[(&str, &str)] = &[
         include_str!("../../../skills/remote-hosts-agent/references/topology-and-inventory.md"),
     ),
 ];
-static SKILL_SHA: LazyLock<String> = LazyLock::new(|| hash(EMBEDDED_SKILL[0].1));
+static SKILL_SHA: LazyLock<String> =
+    LazyLock::new(|| hash(serde_json::to_vec(EMBEDDED_SKILL).expect("embedded Skill bundle")));
 
 pub(crate) fn embedded_skill_revision() -> &'static str {
     SKILL_SHA.as_str()
@@ -69,6 +70,10 @@ pub(crate) fn sync_embedded_skill() -> std::io::Result<()> {
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
         })?;
+    sync_embedded_skill_at(&home)
+}
+
+pub(crate) fn sync_embedded_skill_at(home: &std::path::Path) -> std::io::Result<()> {
     for target in [
         home.join(".codex/skills/remote-hosts-agent"),
         home.join(".gemini/config/skills/remote-hosts-agent"),
@@ -106,13 +111,25 @@ pub(crate) fn installed_skill_revision() -> (Option<String>, Option<bool>) {
     let Some(home) = home else {
         return (None, None);
     };
-    let home = std::path::PathBuf::from(home);
-    let codex = std::fs::read(home.join(".codex/skills/remote-hosts-agent/SKILL.md"))
-        .ok()
-        .map(hash);
-    let antigravity = std::fs::read(home.join(".gemini/config/skills/remote-hosts-agent/SKILL.md"))
-        .ok()
-        .map(hash);
+    installed_skill_revision_at(&std::path::PathBuf::from(home))
+}
+
+pub(crate) fn installed_skill_revision_at(
+    home: &std::path::Path,
+) -> (Option<String>, Option<bool>) {
+    let bundle_hash = |root: std::path::PathBuf| -> Option<String> {
+        let files: Option<Vec<_>> = EMBEDDED_SKILL
+            .iter()
+            .map(|(path, _)| {
+                std::fs::read_to_string(root.join(path))
+                    .ok()
+                    .map(|text| (*path, text))
+            })
+            .collect();
+        Some(hash(serde_json::to_vec(&files?).ok()?))
+    };
+    let codex = bundle_hash(home.join(".codex/skills/remote-hosts-agent"));
+    let antigravity = bundle_hash(home.join(".gemini/config/skills/remote-hosts-agent"));
     let revision = codex.clone().or_else(|| antigravity.clone());
     let consistent = match (&codex, &antigravity) {
         (Some(left), Some(right)) => Some(left == right),
@@ -206,6 +223,9 @@ impl RuntimeFeatures {
                 "fleet_status_v1",
                 "skill_revision_v1",
                 "semantic_outcome_guard_v1",
+                "diagnostics_v2",
+                "bounded_observe_defaults_v1",
+                "terminal_preview_v1",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -228,11 +248,9 @@ pub(crate) fn gateway_manifest(known: Option<&str>) -> Value {
         Some(value) if value == tool_schema_revision() => "match",
         Some(_) => "mismatch",
     };
-    let host_status = match known {
-        None => "unknown_not_reported",
-        Some(value) if value == tool_schema_revision() => "current",
-        Some(_) => "stale",
-    };
+    // A model-supplied known server hash is only a comparison hint. Actual
+    // adapter/host exposure is reported by the authenticated transport separately.
+    let host_status = "unknown_not_reported";
     let mut manifest = serde_json::Map::new();
     for (key, value) in [
         ("version", json!(env!("CARGO_PKG_VERSION"))),
@@ -248,18 +266,21 @@ pub(crate) fn gateway_manifest(known: Option<&str>) -> Value {
         ("tool_schema_revision", json!(tool_schema_revision())),
         ("tool_count", json!(tools::catalog().len())),
         ("dispatch_protocol", json!(2)),
+        ("progress_protocol", json!(1)),
         ("readiness_protocol", json!(1)),
         ("fleet_protocol", json!(1)),
         ("skill_revision_protocol", json!(1)),
         ("outcome_guard_protocol", json!(1)),
         ("observation_protocol", json!(2)),
-        ("capabilities_protocol", json!(1)),
-        ("schema_diagnostics_protocol", json!(1)),
+        ("capabilities_protocol", json!(2)),
+        ("schema_diagnostics_protocol", json!(2)),
+        ("admin_status_protocol", json!(1)),
+        ("request_receipt_protocol", json!(1)),
         ("resource_dispatch_protocol", json!(1)),
         ("transfer_protocol", json!(2)),
         ("transfer_limits_protocol", json!(1)),
         ("maintenance_protocol", json!(1)),
-        ("terminal_observation_protocol", json!(1)),
+        ("terminal_observation_protocol", json!(2)),
         ("change_set_protocol", json!(1)),
         ("storage_gc_protocol", json!(1)),
         ("checkpoint_bytes", json!(crate::transfer_receiver::CHUNK)),
@@ -300,7 +321,7 @@ pub(crate) fn gateway_manifest(known: Option<&str>) -> Value {
         "optional_inputs".into(),
         json!({
             "all_tools": ["response_mode"],
-            "operation_get": ["operation_ids", "wait_ms", "cursor", "max_bytes"],
+            "operation_get": ["request_id", "operation_ids", "wait_ms", "cursor", "terminal_cursor", "max_bytes"],
             "terminal_exec": ["wait_ms"],
             "terminal_read": ["output_mode"],
             "code_read": ["allow_partial", "requests[].line_byte_offset"],
@@ -317,4 +338,43 @@ pub(crate) fn gateway_manifest(known: Option<&str>) -> Value {
         json!("Compare the supplied client catalog hash. A mismatch needs host-side tool refresh; this server cannot refresh the conversation schema. Agent feature reports are separate."),
     );
     Value::Object(manifest)
+}
+
+/// Static machine-readable contract used by health, release packaging and host adapters.
+/// Runtime/session comparison fields are deliberately excluded so every consumer hashes
+/// and validates the same server-owned capability truth instead of copying constants.
+pub fn release_manifest() -> Value {
+    let mut manifest = gateway_manifest(None);
+    if let Some(object) = manifest.as_object_mut() {
+        for key in [
+            "client_schema_comparison",
+            "host_schema_status",
+            "refresh_required",
+            "refresh_guidance",
+        ] {
+            object.remove(key);
+        }
+        object.insert("machine_contract_protocol".into(), json!(1));
+    }
+    manifest
+}
+
+#[cfg(test)]
+mod release_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn release_manifest_is_static_and_derived_from_live_catalog() {
+        let manifest = release_manifest();
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest["tool_count"], tools::catalog().len());
+        assert_eq!(manifest["tool_schema_revision"], tool_schema_revision());
+        assert_eq!(manifest["tools_sha256"], tool_schema_revision());
+        assert_eq!(manifest["terminal_observation_protocol"], 2);
+        assert_eq!(manifest["request_receipt_protocol"], 1);
+        assert_eq!(manifest["machine_contract_protocol"], 1);
+        assert!(manifest.get("host_schema_status").is_none());
+        assert!(manifest.get("client_schema_comparison").is_none());
+        assert!(manifest.get("refresh_required").is_none());
+    }
 }

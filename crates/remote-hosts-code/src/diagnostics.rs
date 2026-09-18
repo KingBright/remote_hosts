@@ -1,4 +1,5 @@
 //! Stable recovery guidance. Never serialize raw commands, URLs, or OS error chains.
+use crate::now;
 use serde_json::{Value, json};
 pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &str) -> Value {
     let (code, recovery, outcome) = if message.contains("device_draining") {
@@ -113,9 +114,55 @@ pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &
             "unknown",
         )
     };
+    let (failure_boundary, last_confirmed_stage) = match stage {
+        "gateway_dispatch" => ("gateway", "gateway_received_request"),
+        "agent_execute" => ("device", "device_received_operation"),
+        "host" => ("host", "host_observed_request"),
+        _ => ("connector", "connector_observed_request"),
+    };
+    let execution_state = match outcome {
+        "not_executed" => "not_started",
+        "not_executed_or_paused" => "not_started_or_paused",
+        "not_executed_or_partial" => "not_started_or_partial",
+        _ => "unknown",
+    };
+    let retry_policy = match code {
+        "invalid_arguments" => "retry_only_after_correcting_arguments",
+        "device_offline" | "device_feature_unavailable" | "storage_capacity_insufficient" => {
+            "retry_only_after_reported_condition_changes"
+        }
+        "idempotency_conflict" | "operation_unavailable" => "do_not_replay_observe_original",
+        "version_conflict" | "change_set_unavailable" | "gc_preview_changed" => {
+            "do_not_replay_reconcile_state_first"
+        }
+        _ if outcome == "not_executed" => "safe_only_after_confirming_precondition",
+        _ => "do_not_replay_until_original_outcome_is_observed",
+    };
+    let user_action = match code {
+        "device_offline" => "reconnect_selected_device",
+        "source_authorization_required" => "refresh_original_file_authorization",
+        "storage_capacity_insufficient" => "free_storage_or_reduce_request",
+        "invalid_arguments" => "correct_arguments",
+        "access_denied" => "check_account_and_device_permissions",
+        _ => "none_until_observation_or_recovery_guidance_requires_it",
+    };
     json!({"error":"tool_failed","error_code":code,"message":code,
-        "stage":stage,"outcome":outcome,"recovery_action":recovery,
-        "automatic_replay_safe":false,"operation_id":operation,"tool":tool,"diagnostic_protocol":1})
+        "stage":stage,"failure_boundary":failure_boundary,"last_confirmed_stage":last_confirmed_stage,
+        "execution_state":execution_state,"outcome":outcome,"recovery_action":recovery,
+        "retry_policy":retry_policy,"user_action":user_action,"observed_at":now(),
+        "evidence":{"error_code":code,"sanitized":true},
+        "automatic_replay_safe":false,"operation_id":operation,"tool":tool,"diagnostic_protocol":2})
+}
+pub(crate) fn error_with_request(
+    tool: &str,
+    message: &str,
+    request_id: &str,
+    operation: Option<&str>,
+    stage: &str,
+) -> Value {
+    let mut value = error(tool, message, operation, stage);
+    value["request_id"] = json!(request_id);
+    value
 }
 #[cfg(test)]
 mod tests {
@@ -131,7 +178,31 @@ mod tests {
         assert!(!s.contains("secret"));
         assert!(!s.contains("command-password"));
         assert_eq!(v["outcome"], "unknown");
+        assert_eq!(v["diagnostic_protocol"], 2);
+        assert_eq!(v["failure_boundary"], "connector");
+        assert_eq!(v["last_confirmed_stage"], "connector_observed_request");
+        assert_eq!(v["execution_state"], "unknown");
+        assert_eq!(
+            v["retry_policy"],
+            "do_not_replay_until_original_outcome_is_observed"
+        );
+        assert_eq!(v["evidence"]["sanitized"], true);
+        assert!(v["observed_at"].as_i64().is_some());
         assert_eq!(v["automatic_replay_safe"], false);
+    }
+    #[test]
+    fn request_receipt_is_distinct_from_remote_operation() {
+        let value = super::error_with_request(
+            "code_read",
+            "device_offline",
+            "req_fixture",
+            None,
+            "gateway_dispatch",
+        );
+        assert_eq!(value["request_id"], "req_fixture");
+        assert!(value["operation_id"].is_null());
+        assert_eq!(value["last_confirmed_stage"], "gateway_received_request");
+        assert_eq!(value["execution_state"], "not_started");
     }
     #[test]
     fn workflow_recovery_codes_are_specific() {
@@ -177,6 +248,13 @@ mod tests {
             "gateway_dispatch",
         );
         assert_eq!(feature["outcome"], "not_executed");
+        assert_eq!(feature["failure_boundary"], "gateway");
+        assert_eq!(feature["last_confirmed_stage"], "gateway_received_request");
+        assert_eq!(feature["execution_state"], "not_started");
+        assert_eq!(
+            feature["retry_policy"],
+            "retry_only_after_reported_condition_changes"
+        );
     }
     #[test]
     fn conflicts_are_actionable_not_retry_promises() {

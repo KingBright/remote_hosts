@@ -187,9 +187,12 @@ def run_pipeline(snapshot, report, slot, verify_only=False):
             # final binary filenames in the user's globally configured target-dir.
             env['CARGO_TARGET_DIR'] = str(slot/'cargo-target')
             state['cargo_target_dir'] = env['CARGO_TARGET_DIR']
-            state['toolchain'] = subprocess.check_output(['rustc', '-vV'], cwd=checkout, env=env, text=True, timeout=10).strip()
+            # Cold toolchain startup on a busy workstation is not a lease failure.
+            state.update(phase='toolchain_probe', state='running')
+            build_slot.atomic_json(report, state)
+            state['toolchain'] = subprocess.check_output(['rustc', '-vV'], cwd=checkout, env=env, text=True, timeout=60).strip()
             run_stage('verification', [sys.executable, 'scripts/check-code-source.py', '--report', str(directory/'verification.json')],
-                      checkout, directory, report, state, env)
+                      checkout, directory, report, state, env, timeout=5400)
             proof = load(directory/'verification.json')
             verifier = source_snapshot.verifier(checkout)
             if not verifier.receipt_current(proof, checkout):
@@ -225,7 +228,7 @@ def run_pipeline(snapshot, report, slot, verify_only=False):
     except (Exception, KeyboardInterrupt) as error:
         state.update(state='interrupted' if isinstance(error, KeyboardInterrupt) else 'failed',
                      failure_type=type(error).__name__, next_action='inspect the saved stage log; do not rerun an unknown operation')
-        if isinstance(error, (ValueError, FileExistsError, RuntimeError)):
+        if isinstance(error, (ValueError, FileExistsError, RuntimeError, subprocess.TimeoutExpired)):
             state['failure_detail'] = str(error)[:400]
     finally:
         state.update(updated_at=stamp(), updated_epoch=time.time())

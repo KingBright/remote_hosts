@@ -173,6 +173,22 @@ pub(crate) async fn read(store: &Store, ws: &Workspace, args: &Value) -> Result<
     result["changed"] = json!(true);
     result["cursor"] = json!(fingerprint);
     result["observed_at"] = json!(now());
+    result["next_action"] = json!(if active_terminals > 0 {
+        "observe_existing_terminal"
+    } else if paused > 0 {
+        "resume_or_cancel_existing_transfer"
+    } else if retained > 0 {
+        "observe_existing_transfer"
+    } else if change_set_count > 0 {
+        "review_recent_change_set_before_new_mutation"
+    } else {
+        "no_active_work"
+    });
+    result["freshness"] = json!({
+        "workspace_observed_at":result["observed_at"],
+        "receipt_delivery_stale":delivery_stale,
+        "heartbeat_is_not_business_progress":true
+    });
     ensure!(
         serde_json::to_vec(&result)?.len() <= 128 * 1024,
         "workspace_context_budget: reduce limit"

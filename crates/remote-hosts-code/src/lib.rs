@@ -1,8 +1,13 @@
 //! Authenticated personal MCP gateway and outbound local code agent.
+mod activity;
 pub mod agent;
 pub mod auth;
 mod capabilities;
+mod status_view;
+pub use capabilities::release_manifest;
+pub mod adapter;
 mod change_review;
+pub mod contract;
 mod delivery;
 mod diagnostics;
 mod durable_transfer;
@@ -13,6 +18,7 @@ mod maintenance;
 mod observations;
 mod progress;
 mod reads;
+pub mod receipts;
 mod resumable;
 mod scheduler;
 mod storage_gc;
@@ -85,6 +91,75 @@ pub struct GatewayConfig {
     pub password_hash: String,
     pub devices: Vec<DeviceRegistration>,
     pub redirect_uris: Vec<String>,
+    /// Exact browser origins. OAuth callback URIs are a separate allowlist.
+    #[serde(default = "default_mcp_client_origins")]
+    pub allowed_origins: Vec<String>,
+}
+/// Preserve the browser policy of existing configurations on upgrade.
+pub fn default_mcp_client_origins() -> Vec<String> {
+    vec![
+        "https://chatgpt.com".into(),
+        "https://gemini.google.com".into(),
+    ]
+}
+impl GatewayConfig {
+    /// Check client-facing policy without starting a service or opening its database.
+    pub fn validate_oauth_policy(&self) -> Result<()> {
+        validate_url(&self.public_url)?;
+        ensure!(self.allowed_origins.len() <= 32, "too many browser origins");
+        ensure!(self.redirect_uris.len() <= 64, "too many OAuth callbacks");
+        for origin in &self.allowed_origins {
+            validate_url(origin).context("browser origin must be an exact HTTPS origin")?;
+            ensure!(!origin.contains('*'), "wildcard origins are not allowed");
+        }
+        for uri in &self.redirect_uris {
+            let u = reqwest::Url::parse(uri)?;
+            ensure!(
+                uri.len() <= 4096
+                    && !uri.contains('*')
+                    && !uri
+                        .bytes()
+                        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                    && u.scheme() == "https"
+                    && u.host_str().is_some()
+                    && u.username().is_empty()
+                    && u.password().is_none()
+                    && u.fragment().is_none(),
+                "OAuth callback must be an exact HTTPS URL without userinfo or fragment"
+            );
+        }
+        Ok(())
+    }
+    pub(crate) fn browser_origins(&self) -> Vec<String> {
+        let mut origins = self.allowed_origins.clone();
+        origins.push(self.public_url.clone());
+        origins.sort();
+        origins.dedup();
+        origins
+    }
+    pub(crate) fn authorization_csp(&self) -> String {
+        // Only configured callbacks contribute redirect destinations. Browser
+        // request origins must never implicitly authorize an OAuth callback.
+        let mut origins: Vec<_> = self
+            .redirect_uris
+            .iter()
+            .filter_map(|uri| reqwest::Url::parse(uri).ok())
+            .map(|uri| uri.origin().ascii_serialization())
+            .collect();
+        if self
+            .allowed_origins
+            .iter()
+            .any(|origin| origin == "https://gemini.google.com")
+        {
+            origins.push("https://oauth-redirect.googleusercontent.com".into());
+        }
+        origins.sort();
+        origins.dedup();
+        format!(
+            "default-src 'none'; form-action 'self' {}; frame-ancestors 'none'; base-uri 'none'",
+            origins.join(" ")
+        )
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

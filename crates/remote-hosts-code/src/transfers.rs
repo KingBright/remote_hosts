@@ -800,6 +800,22 @@ async fn record_received_progress(g: &Gateway, progress: &crate::progress::Progr
             .await;
     }
 }
+fn unavailable_download(result: &mut Value) -> Result<()> {
+    let receipt = result.as_object_mut().context("invalid download receipt")?;
+    receipt.remove("download_url");
+    receipt.remove("expires_at");
+    receipt.insert("download_available".into(), json!(false));
+    receipt.insert(
+        "download_unavailable_reason".into(),
+        json!("artifact_expired_or_removed"),
+    );
+    receipt.insert(
+        "recovery_action".into(),
+        json!("export_again_with_expected_source_version"),
+    );
+    Ok(())
+}
+
 /// Called only after the original operation and principal have been authorized.
 pub async fn decorate(g: &Gateway, job: &Job, result: &mut Value) -> Result<()> {
     if job.tool != "file_download"
@@ -808,19 +824,23 @@ pub async fn decorate(g: &Gateway, job: &Job, result: &mut Value) -> Result<()> 
     {
         return Ok(());
     }
-    let blob: Blob = g
-        .store
-        .get("file_blob", &job.id)
-        .await?
-        .context("download artifact unavailable")?;
+    // The durable operation receipt outlives its temporary downloadable blob.
+    // Expiration affects availability, never whether the operation completed.
+    // Database, scope and receipt-integrity failures must still propagate.
+    let Some(blob): Option<Blob> = g.store.get("file_blob", &job.id).await? else {
+        return unavailable_download(result);
+    };
     ensure!(
-        blob.device == job.device_id && blob.owner == job.owner && blob.expires > now(),
-        "download artifact expired; source unchanged"
+        blob.device == job.device_id && blob.owner == job.owner,
+        "download artifact scope mismatch"
     );
     ensure!(
         result["sha256"] == blob.sha256 && result["size"] == blob.size,
         "download artifact receipt mismatch"
     );
+    if blob.expires <= now() {
+        return unavailable_download(result);
+    }
     let key = random();
     let expires = (now() + LINK_TTL).min(blob.expires);
     g.store
@@ -836,6 +856,7 @@ pub async fn decorate(g: &Gateway, job: &Job, result: &mut Value) -> Result<()> 
         )
         .await?;
     let name: String = url::form_urlencoded::byte_serialize(blob.name.as_bytes()).collect();
+    result["download_available"] = json!(true);
     result["download_url"] = json!(format!("{}/files/{key}/{name}", g.config.public_url));
     result["expires_at"] = json!(expires);
     result["artifact_expires_at"] = json!(blob.expires);

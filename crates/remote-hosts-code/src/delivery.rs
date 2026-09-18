@@ -55,6 +55,12 @@ impl Delivery {
             .execute(&store.pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS receipt_outbox_due ON receipt_outbox(device,origin,state,next_attempt,id)")
             .execute(&store.pool).await?;
+        // Startup discards receipts owned by the Gateway: no poll response from
+        // the previous process can still arrive. During this process, keep a
+        // compact fingerprint receipt for late responses, never a duplicate body.
+        // code_apply_edits remains the original change_resume recovery anchor.
+        sqlx::query("DELETE FROM kv WHERE kind='local_operation' AND json_extract(value,'$.state')='done' AND json_extract(value,'$.tool') IS NOT NULL AND (json_extract(value,'$.tool')<>'code_apply_edits' OR json_extract(value,'$.gateway_accepted')=1) AND NOT EXISTS (SELECT 1 FROM receipt_outbox r WHERE r.id=kv.key)")
+            .execute(&store.pool).await?;
         // Do not recover another device's receipts or redirect private results.
         // Expired in-flight leases are reclaimed by claim(); a restart need not
         // guess whether a previous sender is still finishing its bounded request.
@@ -178,15 +184,26 @@ impl Delivery {
         let outcome = self.send(client, &claim).await;
         match outcome {
             Outcome::Accepted => {
-                sqlx::query(
+                let mut tx = self.store.pool.begin().await?;
+                let accepted = sqlx::query(
                     "DELETE FROM receipt_outbox WHERE id=? AND device=? AND origin=? AND lease=?",
                 )
                 .bind(&claim.id)
                 .bind(&self.config.device_id)
                 .bind(&self.config.gateway_url)
                 .bind(&claim.lease)
-                .execute(&self.store.pool)
-                .await?;
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                // A late acknowledgement must not remove a newer sender's recovery anchor.
+                if accepted == 1 {
+                    // Keep only the current-runtime deduplication receipt. A
+                    // delayed poll can outlive result delivery; deleting the
+                    // fingerprint here would permit repeating a mutation.
+                    sqlx::query("UPDATE kv SET value=json_set(json_remove(value,'$.result'),'$.gateway_accepted',json('true')) WHERE kind='local_operation' AND key=? AND json_extract(value,'$.state')='done' AND json_extract(value,'$.tool') IS NOT NULL AND json_extract(value,'$.tool')<>'code_apply_edits'")
+                        .bind(&claim.id).execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
             }
             Outcome::Retry(status) => {
                 let backoff = 1i64 << claim.attempt.saturating_sub(1).clamp(0, 6);

@@ -76,6 +76,7 @@ async fn gateway(dir: &std::path::Path) -> (Gateway, String, String) {
         .to_string();
     let token = random();
     let config = GatewayConfig {
+        allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: "https://mcp.example.com:8443".into(),
         bind: "127.0.0.1:0".into(),
         state_dir: dir.into(),

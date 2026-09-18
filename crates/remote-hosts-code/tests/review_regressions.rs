@@ -18,6 +18,7 @@ async fn gateway() -> (tempfile::TempDir, Gateway, String) {
     let dir = tempfile::tempdir().unwrap();
     let credential = random();
     let gateway = Gateway::new(GatewayConfig {
+        allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: "https://review.example".into(),
         bind: "127.0.0.1:0".into(),
         state_dir: dir.path().into(),
@@ -275,7 +276,11 @@ async fn simultaneous_device_sessions_have_only_one_winner() {
 #[test]
 fn catalog_schema_rejects_nested_unknown_fields_types_and_bounds() {
     use remote_hosts_code::tools::{catalog, validate};
-    assert_eq!(catalog().len(), 23); // Includes durable change-set recovery and explicit workspace GC.
+    assert_eq!(
+        remote_hosts_code::release_manifest()["tool_count"],
+        catalog().len()
+    );
+    assert!(catalog().iter().any(|t| t.name == "task_context"));
     let valid = json!({"workspace_id":"w","idempotency_key":"edit","files":[{
         "path":"a.txt","expected_version":"absent","action":"create","content":"hello"
     }]});

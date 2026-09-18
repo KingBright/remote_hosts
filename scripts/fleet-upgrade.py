@@ -90,6 +90,29 @@ def controller_device_id(config):
     return workspace.split(':',1)[0] if ':' in workspace else None
 
 
+def exported_size(exported, bundle):
+    value=exported.get('size')
+    return value if isinstance(value,int) and value>=0 else bundle.stat().st_size
+
+
+def verified_export(client, exported, bundle, bundle_sha, version):
+    value=exported
+    for attempt in range(1,6):
+        if value.get('state')=='completed':
+            if value.get('sha256')!=bundle_sha or not value.get('artifact_id') or not value.get('download_url'):
+                raise RuntimeError('bundle export completed without verified artifact identity')
+            return value
+        ident=value.get('operation_id')
+        if not ident: raise RuntimeError('bundle export missing operation identity')
+        if value.get('state')=='already_finished' and value.get('next_action')=='operation_get':
+            value=client.tool('operation_get',{'operation_id':ident});continue
+        if value.get('state') in ('paused','awaiting_source') and value.get('next_action')=='transfer_resume':
+            client.tool('transfer_resume',{'operation_id':ident,'idempotency_key':'fleet-'+version+'-bundle-export-resume-'+str(attempt)})
+            value=client.tool('operation_get',{'operation_id':ident});continue
+        raise RuntimeError('bundle export not recoverable: '+str(value.get('state')))
+    raise RuntimeError('bundle export did not complete after bounded resume attempts')
+
+
 def verified_import(client, imported, exported, bundle, bundle_sha, version, ident):
     if imported.get('state')=='completed' and imported.get('sha256')==bundle_sha:return imported
     if imported.get('state') in ('paused','awaiting_source') and imported.get('next_action')=='transfer_resume':
@@ -107,6 +130,40 @@ def accept_fleet(config,package,directory,version,fleet):
     result=json.loads(acceptance.read_text())
     if result.get('state')!='passed':raise RuntimeError('fleet capability acceptance failed')
     return acceptance
+
+
+def rollout_targets(devices, controller_id):
+    online=[d for d in devices if d.get('online')]
+    deferred=[d for d in devices if not d.get('online')]
+    ordered=[d for d in online if d['device_id']!=controller_id]+[d for d in online if d['device_id']==controller_id]
+    return ordered,deferred
+
+
+def finish_observed_fleet(config,package,directory,version,state,fleet):
+    """Accept the actual reachable scope; never label offline devices as upgraded."""
+    if fleet.get('all_converged'):
+        acceptance=accept_fleet(config,package,directory,version,fleet)
+        state.update(state='passed',phase='finished',all_converged=True,online_converged=True,
+                     pending_device_ids=[],acceptance_scope='all_devices',acceptance=str(acceptance))
+    else:
+        pending=[d for d in fleet['devices'] if not d['converged']]
+        if not fleet.get('summary',{}).get('gateway_converged') or not pending or any(d.get('online') for d in pending):
+            return False
+        online=[d for d in fleet['devices'] if d.get('online')]
+        acceptance=None
+        if online:
+            scope=directory/'online-only';scope.mkdir(parents=True,exist_ok=True)
+            acceptance=accept_fleet(config,package,scope,version,dict(fleet,devices=online))
+        for d in pending:
+            state['agents'][d['device_id']]={'name':d['name'],'platform':platform(d),'state':'waiting_online'}
+        state.update(state='waiting_online',phase='offline_devices',all_converged=False,
+                     online_converged=bool(online),pending_device_ids=[d['device_id'] for d in pending],
+                     acceptance_scope='online_devices',acceptance=str(acceptance) if acceptance else None,
+                     next_action='rerun this fleet command after the deferred devices reconnect; no offline upgrade was queued')
+    state['fleet']=fleet
+    rr.atomic_json(directory/'fleet.json',state)
+    print(json.dumps({k:state.get(k) for k in ('state','version','all_converged','online_converged','pending_device_ids','acceptance_scope')}))
+    return True
 
 
 def gateway_upgrade_api(client,version,bundle_sha,timeout=600):
@@ -198,10 +255,7 @@ def main():
             gateway=gateway_upgrade_ssh(config,package,manifest,args.version,directory)
         state['gateway']=gateway;save()
         fleet=client.tool('fleet_status',{'desired_version':args.version});devices=fleet['devices'];state['fleet']=fleet;save()
-        if fleet.get('all_converged'):
-            acceptance=accept_fleet(config,package,directory,args.version,fleet)
-            state.update(state='passed',phase='finished',all_converged=True,acceptance=str(acceptance));save()
-            print(json.dumps({'state':state['state'],'version':args.version,'all_converged':True,'report':str(directory/'fleet.json')}));return
+        if finish_observed_fleet(config,package,directory,args.version,state,fleet):return
         controller_id=controller_device_id(config)
         local_candidates=[d for d in devices if d['online'] and platform(d) in ('macos','linux')
                           and any(str(bundle).startswith(root.rstrip('/')+'/') for root in (d.get('capabilities') or {}).get('roots',[]))]
@@ -211,9 +265,14 @@ def main():
         controller_root=next(root for root in (controller.get('capabilities') or {}).get('roots',[]) if str(bundle).startswith(root.rstrip('/')+'/'))
         relative=str(bundle.relative_to(pathlib.Path(controller_root)))
         cws=open_workspace(client,controller['device_id'],controller_root,'fleet-'+args.version+'-controller')
-        exported=client.tool('file_download',{'workspace_id':cws,'path':relative,'expected_version':bundle_sha,'max_bytes':268435456,'idempotency_key':'fleet-'+args.version+'-bundle-export'})
-        state['source_artifact']={'operation_id':exported['operation_id'],'sha256':bundle_sha,'size':exported['size']};save()
-        ordered=[d for d in devices if d['device_id']!=controller_id]+[d for d in devices if d['device_id']==controller_id]
+        export_attempt=rr.identity([args.version,str(directory)])[:12]
+        exported=client.tool('file_download',{'workspace_id':cws,'path':relative,'expected_version':bundle_sha,'max_bytes':268435456,'idempotency_key':'fleet-'+args.version+'-bundle-export-'+export_attempt})
+        exported=verified_export(client,exported,bundle,bundle_sha,args.version)
+        state['source_artifact']={'operation_id':exported['operation_id'],'sha256':bundle_sha,'size':exported_size(exported,bundle)};save()
+        ordered,deferred=rollout_targets(devices,controller_id)
+        for device in deferred:
+            state['agents'][device['device_id']]={'name':device['name'],'platform':platform(device),'state':'waiting_online'}
+        save()
         for device in ordered:
             ident=device['device_id'];state['agents'][ident]={'name':device['name'],'platform':platform(device),'state':'already_converged' if device['converged'] else 'staging'};save()
             if device['converged']: continue
@@ -232,11 +291,9 @@ def main():
         deadline=time.monotonic()+900
         while time.monotonic()<deadline:
             fleet=client.tool('fleet_status',{'desired_version':args.version});state['fleet']=fleet;save()
-            if fleet.get('all_converged'):break
+            if finish_observed_fleet(config,package,directory,args.version,state,fleet):return
             time.sleep(3)
         else: raise RuntimeError('fleet did not converge; inspect fleet.json without replaying upgrades')
-        acceptance=accept_fleet(config,package,directory,args.version,fleet)
-        state.update(state='passed',phase='finished',all_converged=True,acceptance=str(acceptance));save()
     except Exception as error:
         state.update(state='needs_recovery',phase='finished',error_type=type(error).__name__,next_action='inspect fleet.json and original operation/updater receipts; do not replay blindly');save();raise
     finally: client.close()

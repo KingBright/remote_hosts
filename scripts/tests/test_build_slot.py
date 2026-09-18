@@ -137,6 +137,21 @@ class BuildSlotTests(unittest.TestCase):
             result = runner.run_pipeline(self.snapshot, report, self.slot)
         self.assertEqual(result['state'], 'failed')
         self.assertFalse(self.slot.exists())
+    def test_toolchain_probe_timeout_is_bounded_and_distinct_from_a_lease_failure(self):
+        report = self.base/'toolchain-timeout.json'
+        error = runner.subprocess.TimeoutExpired(['rustc', '-vV'], 60)
+        with mock.patch.object(runner.subprocess, 'check_output', side_effect=error) as probe, \
+             mock.patch.object(runner, 'run_stage') as stage:
+            result = runner.run_pipeline(self.snapshot, report, self.slot)
+        self.assertEqual(probe.call_args.args[0], ['rustc', '-vV'])
+        self.assertEqual(probe.call_args.kwargs['timeout'], 60)
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(result['phase'], 'toolchain_probe')
+        self.assertEqual(result['failure_type'], 'TimeoutExpired')
+        self.assertIn('rustc', result['failure_detail'])
+        self.assertEqual(json.loads(report.read_text())['phase'], 'toolchain_probe')
+        self.assertEqual(json.loads((self.slot/'owner.json').read_text())['state'], 'released')
+        stage.assert_not_called()
     def test_status_query_does_not_run_a_command(self):
         report = self.base/'status.json'
         report.write_text(json.dumps({'state': 'running', 'phase': 'verification'}))

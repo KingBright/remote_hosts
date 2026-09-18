@@ -1,0 +1,1476 @@
+{
+  "adapter_tools_sha256": "3178659ff6cab98fec845ab3d0b34f8890798f8a3d5c76d2595e1683091798ba",
+  "boundary": "Adapter-sent catalog is not proof of final host exposure. No final host report means unknown.",
+  "protocol": 1,
+  "server_tools_sha256": "3178659ff6cab98fec845ab3d0b34f8890798f8a3d5c76d2595e1683091798ba",
+  "skill_revision": "37932a1aa6461584486a930eb23e1a860be10b4b8322a376e3766202b590bb44",
+  "tools": [
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Restore one authorized cross-device task: linked operations, workspaces, execution states, evidence boundaries and the next existing handle. Read-only; never resumes or replays work. Follow next_page when has_more=true. No evidence of a task is not proof of a host rejection.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_operation": {
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "limit": {
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "task_context",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "List authorized devices, freshness and roots, explicit gateway/agent wire compatibility, tool schema revision and separately reported agent/Skill features. Optional known_tools_sha256 detects a stale client catalog; refresh is controlled by the host, not this server. Choose a device explicitly; never fail over.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "known_tools_sha256": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "devices_list",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Return one compact convergence view for the gateway and all authorized agents: versions, online state, wire compatibility, upgrade/maintenance state, tool schema and Skill revisions. desired_version defaults to the running gateway version. Use this instead of repeated devices_list/status polling during rollout and acceptance.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "desired_version": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "fleet_status",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Open a persistent workspace on one device and project root. Returns workspace_id bound to that device. Reuse it for all subsequent reads, edits and terminals.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "root": {
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "root",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
+      "name": "workspace_open",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Find unknown file paths using a relative glob; respects gitignore unless include_ignored=true. Returns a bounded page without file contents. Skip this call when the exact path and read range are already known.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "glob": {
+            "type": "string"
+          },
+          "include_ignored": {
+            "type": "boolean"
+          },
+          "limit": {
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "name": "code_list",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Search literal text (default) or regex across project files. Returns bounded line matches with context and file versions. Narrow with glob and continue using cursor.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "context_lines": {
+            "maximum": 5,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "glob": {
+            "type": "string"
+          },
+          "include_ignored": {
+            "type": "boolean"
+          },
+          "limit": {
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_bytes": {
+            "maximum": 65536,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "query": {
+            "type": "string"
+          },
+          "regex": {
+            "type": "boolean"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "code_search",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Batch-read needed ranges from request-local file snapshots. Long lines return UTF-8 fragments: continue with next_line/next_line_byte_offset and expected_version. allow_partial=true keeps successful ranges alongside per-range errors. Read known ranges directly.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "allow_partial": {
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "maximum": 65536,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "requests": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "end_line": {
+                  "maximum": 10000000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "expected_version": {
+                  "type": "string"
+                },
+                "line_byte_offset": {
+                  "maximum": 8388608,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "start_line": {
+                  "maximum": 10000000,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path",
+                "start_line",
+                "end_line"
+              ],
+              "type": "object"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "requests"
+        ],
+        "type": "object"
+      },
+      "name": "code_read",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Get syntax-tree declarations and start/end lines for Rust, Python, JavaScript and TypeScript/TSX. Other languages return a labeled lexical outline. This is not compiler-resolved references. Read only chosen symbol ranges next.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "maximum": 300,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "start_line": {
+            "maximum": 10000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "code_symbols",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Apply version-checked precise replacements or a unified patch. All files preflight before changes; each file is atomic, and every batch returns a durable change_set_id with before/after versions. Partial or uncertain batches can be inspected and continued with change_resume. Never guess when a version or unique match conflicts. Reuse the same idempotency_key only for an uncertain identical submission. Return compact diffs.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "enum": [
+                    "edit",
+                    "create",
+                    "delete"
+                  ],
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                },
+                "edits": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "new_text": {
+                        "type": "string"
+                      },
+                      "old_text": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "old_text",
+                      "new_text"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 100,
+                  "type": "array"
+                },
+                "expected_version": {
+                  "type": "string"
+                },
+                "patch": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "expected_version"
+              ],
+              "type": "object"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "idempotency_key",
+          "files"
+        ],
+        "type": "object"
+      },
+      "name": "code_apply_edits",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Resolve an existing mutation whose durable agent result is outcome_unknown. This never replays work. resolution=verified_not_applied clears the semantic guard so a later deliberate new operation may run; verified_applied records completion evidence and also clears the guard. Inspect scoped evidence first; the original operation_id and owner must match.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "resolution": {
+            "enum": [
+              "verified_not_applied",
+              "verified_applied"
+            ],
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "resolution",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
+      "name": "outcome_resolve",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Resume the SAME durable multi-file edit change-set after a partial or uncertain apply. The original change_set_id must belong to this workspace and code_apply_edits. Files already at their recorded after-version are accepted; files still at their recorded before-version may be applied; any third version is preserved as a conflict. Reuse one idempotency_key only for an uncertain identical recovery attempt; after resolving a conflict, start the next recovery attempt with a new key. Never replays shell work or overwrites concurrent edits.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "change_set_id": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "idempotency_key",
+          "change_set_id"
+        ],
+        "type": "object"
+      },
+      "name": "change_resume",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Preview or apply bounded cleanup of old terminal logs, terminal status rows, finished transfer checkpoints and completed edit journals for this workspace. Active/running work, resumable transfers, partial change-sets, receipt outbox entries and local idempotency results are never deleted. Apply requires preview_id from an unchanged preview plus the same age/max_items policy. Preview and apply are distinct operations, so use distinct idempotency keys.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "preview",
+              "apply"
+            ],
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "max_items": {
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "older_than_seconds": {
+            "maximum": 2592000,
+            "minimum": 3600,
+            "type": "integer"
+          },
+          "preview_id": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "idempotency_key",
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "workspace_gc",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Review tracked and nonignored untracked files, including binary/special omissions. staged=true selects index only. Continue with cursor plus expected_version to reject changed reviews. Does not stage, commit or reset; external diff, text conversion and pathspec magic disabled.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "maximum": 100000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expected_version": {
+            "type": "string"
+          },
+          "include_untracked": {
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "maximum": 65536,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "type": "array"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "staged": {
+            "type": "boolean"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "name": "code_diff",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Start a command in the bound workspace. Default pty=false uses real pipes with stdin EOF and combined stdout/stderr; use pty=true only for interactive input. Shell has local-user authority outside code roots. Write-capable action. By default waits up to 1000 ms so short commands can return exit/output in one call; long commands return the same durable terminal_id. wait_ms may be 0..2000 and never stops the command. Follow the returned cursor; never replay uncertain execution.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cols": {
+            "maximum": 500,
+            "minimum": 20,
+            "type": "integer"
+          },
+          "command": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "pty": {
+            "type": "boolean"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "rows": {
+            "maximum": 200,
+            "minimum": 5,
+            "type": "integer"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "maximum": 7200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "wait_ms": {
+            "default": 1000,
+            "maximum": 2000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "idempotency_key",
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "terminal_exec",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "description": "Read bounded terminal output. Non-PTY output defaults to token-optimized compact view; PTY defaults full. compact preserves unknown/error text while collapsing known build/test noise and returns measured savings. Cursor always advances over the durable full log; use output_mode=full with raw_cursor_start to inspect source bytes. Poll the same terminal; never rerun.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "maximum": 100000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_bytes": {
+            "maximum": 65536,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "output_mode": {
+            "enum": [
+              "compact",
+              "full"
+            ],
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "terminal_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "terminal_id"
+        ],
+        "type": "object"
+      },
+      "name": "terminal_read",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Write to the existing interactive terminal. Input is an execution action. Reuse idempotency_key to avoid duplicate keystrokes. Never send credentials through this tool.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "terminal_id": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "terminal_id",
+          "text",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
+      "name": "terminal_input",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Cancel this terminal process group and preserve output/status. Only affects the specified terminal in the specified workspace.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "terminal_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "terminal_id",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
+      "name": "terminal_cancel",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Observe one request_id, one operation_id, or 1..20 operation_ids without creating another task. request_id exposes the Gateway receipt even when no remote operation was created, and resolves to its operation when one exists. A bounded wait defaults to 1200 ms. Terminal operations include a bounded sanitized live-output preview; terminal_cursor continues that preview when retained. Use terminal_read only for full history/recovery. It never queues, retries, cancels or replays work.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "maximum": 131072,
+            "minimum": 4096,
+            "type": "integer"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "operation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "terminal_cursor": {
+            "maximum": 100000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait_ms": {
+            "default": 1200,
+            "maximum": 5000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "operation_get",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "openai/fileParams": [
+          "file"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Transfer a conversation file to a relative path on the selected device. Binary-safe streaming; default limit is 64 MiB and 0.7+ agents may explicitly negotiate up to 256 MiB with max_bytes. Large transfers are rejected before queueing unless the selected agent reports support. Default refuses overwrite; replacing requires expected_version equal to the existing SHA-256. Optional sha256 verifies incoming bytes. 4 MiB checkpoints survive restarts. operation_get reports source authorization state; use transfer_resume with refreshed file authorization when required. Never put bytes/Base64 or a sandbox path in JSON.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "type": "string"
+          },
+          "file": {
+            "additionalProperties": false,
+            "properties": {
+              "download_url": {
+                "type": "string"
+              },
+              "file_id": {
+                "type": "string"
+              },
+              "file_name": {
+                "type": "string"
+              },
+              "mime_type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "download_url",
+              "file_id"
+            ],
+            "type": "object"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "maximum": 268435456,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "idempotency_key",
+          "path",
+          "file"
+        ],
+        "type": "object"
+      },
+      "name": "file_upload",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Snapshot a selected device file and send verified chunks to the gateway; checkpoints resume from the durable receiver offset across restarts. Default limit is 64 MiB and 0.7+ agents may explicitly negotiate up to 256 MiB with max_bytes. Large transfers are rejected before queueing unless the selected agent reports support and both sides enforce storage reserve. Return a temporary HTTPS link plus SHA-256 and size; does not modify the source.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "maximum": 268435456,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "idempotency_key",
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "file_download",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Read bounded workspace transfer/terminal facts, recent durable change-set summaries, state counts and runtime identity. active_only narrows terminal/transfer facts; terminal_cursor and transfer_after continue independent live pages. Cursors bind the workspace and filters; restart pages for a fresh view after state changes. after_event replays durable workspace transitions from the returned scoped event cursor; expired cursors require a fresh snapshot. Reports whether explicit workspace_gc is available. No command text or credentials. Device-wide counts are labelled. Not chat-memory or build-verification evidence.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "active_only": {
+            "type": "boolean"
+          },
+          "after_event": {
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "limit": {
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "terminal_cursor": {
+            "type": "string"
+          },
+          "transfer_after": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "name": "workspace_context",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Request cancellation of an original file transfer. Permission checks include the original operation. Cancellation intent is durable and independent of the transfer lane. Query operation_get until cleanup_complete is true; request acceptance alone is not stopped/cleaned. Published results are not undone.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
+      "name": "transfer_cancel",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "openai/fileParams": [
+          "file"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Resume a paused/awaiting_source file transfer with the SAME operation ID. Does not replay arbitrary commands or overwrite target-version preconditions. operation_get reports whether source authorization is available, expired or needs refresh. Optional file refreshes expired authorization; a changed file_id requires an original expected SHA-256. Retained checkpoints expire after 24 hours. Completed/cancelled operations are not rerun.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "additionalProperties": false,
+            "properties": {
+              "download_url": {
+                "type": "string"
+              },
+              "file_id": {
+                "type": "string"
+              },
+              "file_name": {
+                "type": "string"
+              },
+              "mime_type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "download_url",
+              "file_id"
+            ],
+            "type": "object"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
+      "name": "transfer_resume",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Plan or apply a version-bound one-way file set (up to 256 regular files). Plan returns bound files and manifest_id. Upload a RHSYNC1 bundle with file_upload, then apply with bundle_path and bundle_sha256. Only changed content is bundled; exact matches are reused. No deletion, symlinks or archive extraction. Partial results preserve applied/pending items and journal; reapply the same manifest only after checking conflicts. This is a write-capable tool even in plan mode.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "bundle_path": {
+            "type": "string"
+          },
+          "bundle_sha256": {
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "executable": {
+                  "type": "boolean"
+                },
+                "expected_version": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "size": {
+                  "maximum": 67108864,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path",
+                "sha256",
+                "size"
+              ],
+              "type": "object"
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "type": "array"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "manifest_id": {
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "plan",
+              "apply"
+            ],
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "idempotency_key",
+          "mode",
+          "files"
+        ],
+        "type": "object"
+      },
+      "name": "files_sync",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    }
+  ],
+  "transport_contract": {
+    "adapter_catalog": "x-rh-adapter-catalog-sha256",
+    "adapter_skill": "x-rh-adapter-skill-revision",
+    "file_parameter": "Resolve the host file reference into the catalog's file object. Never inline file bytes.",
+    "host_catalog": "x-rh-host-catalog-sha256",
+    "host_report_optional": true,
+    "host_tools": "x-rh-host-tools",
+    "request_id": "x-rh-request-id"
+  },
+  "version": "0.10.4"
+}

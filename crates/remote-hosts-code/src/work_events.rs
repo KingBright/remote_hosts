@@ -8,10 +8,8 @@ pub(crate) async fn install(store: &Store) -> Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS work_events_scoped ON work_events(workspace,seq)")
         .execute(&store.pool)
         .await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS work_event_floor(workspace TEXT PRIMARY KEY,seq INTEGER NOT NULL)").execute(&store.pool).await?;
     // Trigger definitions are versioned behavior. Recreate them under one
-    // immediate transaction so concurrent process startup cannot interleave
-    // drop/create and publish duplicate or stale definitions.
+    // immediate transaction so startup cannot expose half-migrated event state.
     let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DROP TRIGGER IF EXISTS work_event_insert")
         .execute(&mut *tx)
@@ -19,10 +17,19 @@ pub(crate) async fn install(store: &Store) -> Result<()> {
     sqlx::query("DROP TRIGGER IF EXISTS work_event_update")
         .execute(&mut *tx)
         .await?;
-    // Only state transitions, never polling requests, command text, output, or credentials.
+    // Old revisions maintained a second floor table and an expensive MAX/NOT IN
+    // query on every state transition. The retained event tail itself is the floor.
+    sqlx::query("DROP TABLE IF EXISTS work_event_floor")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DROP INDEX IF EXISTS work_events_kind_entity_seq")
+        .execute(&mut *tx)
+        .await?;
+    // Only state transitions are retained. One indexed cutoff keeps the newest
+    // 4096 events per workspace without making the audit log a live-state index.
     for statement in [
-        r#"CREATE TRIGGER IF NOT EXISTS work_event_insert AFTER INSERT ON kv WHEN NEW.kind IN ('terminal','transfer_local','local_operation') AND json_valid(NEW.value) AND json_extract(NEW.value,'$.workspace_id') IS NOT NULL AND (NEW.kind<>'local_operation' OR json_extract(NEW.value,'$.tool') IN ('code_apply_edits','change_resume','workspace_gc','files_sync','terminal_exec','file_upload','file_download'))  BEGIN INSERT INTO work_events(workspace,kind,entity,state,at,detail) VALUES(json_extract(NEW.value,'$.workspace_id'),NEW.kind,NEW.key,COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase')),unixepoch(),json_object('tool',json_extract(NEW.value,'$.tool'),'exit_code',json_extract(NEW.value,'$.exit_code'),'output_complete',json_extract(NEW.value,'$.output_complete'),'error',json_extract(NEW.value,'$.result.error'),'journal_id',json_extract(NEW.value,'$.result.journal_id'))); INSERT INTO work_event_floor(workspace,seq) SELECT json_extract(NEW.value,'$.workspace_id'),COALESCE(MAX(seq),0) FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq NOT IN (SELECT seq FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') ORDER BY seq DESC LIMIT 4096) ON CONFLICT(workspace) DO UPDATE SET seq=MAX(work_event_floor.seq,excluded.seq); DELETE FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq<=(SELECT seq FROM work_event_floor WHERE workspace=json_extract(NEW.value,'$.workspace_id')); END"#,
-        r#"CREATE TRIGGER IF NOT EXISTS work_event_update AFTER UPDATE ON kv WHEN NEW.kind IN ('terminal','transfer_local','local_operation') AND json_valid(NEW.value) AND json_extract(NEW.value,'$.workspace_id') IS NOT NULL AND (NEW.kind<>'local_operation' OR json_extract(NEW.value,'$.tool') IN ('code_apply_edits','change_resume','workspace_gc','files_sync','terminal_exec','file_upload','file_download')) AND (COALESCE(json_extract(OLD.value,'$.state'),json_extract(OLD.value,'$.phase'),'')<>COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase'),'') OR COALESCE(json_extract(OLD.value,'$.output_complete'),0)<>COALESCE(json_extract(NEW.value,'$.output_complete'),0)) BEGIN INSERT INTO work_events(workspace,kind,entity,state,at,detail) VALUES(json_extract(NEW.value,'$.workspace_id'),NEW.kind,NEW.key,COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase')),unixepoch(),json_object('tool',json_extract(NEW.value,'$.tool'),'exit_code',json_extract(NEW.value,'$.exit_code'),'output_complete',json_extract(NEW.value,'$.output_complete'),'error',json_extract(NEW.value,'$.result.error'),'journal_id',json_extract(NEW.value,'$.result.journal_id'))); INSERT INTO work_event_floor(workspace,seq) SELECT json_extract(NEW.value,'$.workspace_id'),COALESCE(MAX(seq),0) FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq NOT IN (SELECT seq FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') ORDER BY seq DESC LIMIT 4096) ON CONFLICT(workspace) DO UPDATE SET seq=MAX(work_event_floor.seq,excluded.seq); DELETE FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq<=(SELECT seq FROM work_event_floor WHERE workspace=json_extract(NEW.value,'$.workspace_id')); END"#,
+        r#"CREATE TRIGGER work_event_insert AFTER INSERT ON kv WHEN NEW.kind IN ('terminal','transfer_local','local_operation') AND json_valid(NEW.value) AND json_extract(NEW.value,'$.workspace_id') IS NOT NULL AND (NEW.kind<>'local_operation' OR json_extract(NEW.value,'$.tool') IN ('code_apply_edits','change_resume','workspace_gc','files_sync','terminal_exec','file_upload','file_download')) BEGIN INSERT INTO work_events(workspace,kind,entity,state,at,detail) VALUES(json_extract(NEW.value,'$.workspace_id'),NEW.kind,NEW.key,COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase')),unixepoch(),json_object('tool',json_extract(NEW.value,'$.tool'),'exit_code',json_extract(NEW.value,'$.exit_code'),'output_complete',json_extract(NEW.value,'$.output_complete'),'error',json_extract(NEW.value,'$.result.error'),'journal_id',json_extract(NEW.value,'$.result.journal_id'))); DELETE FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq<=COALESCE((SELECT seq FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') ORDER BY seq DESC LIMIT 1 OFFSET 4096),-1); END"#,
+        r#"CREATE TRIGGER work_event_update AFTER UPDATE ON kv WHEN NEW.kind IN ('terminal','transfer_local','local_operation') AND json_valid(NEW.value) AND json_extract(NEW.value,'$.workspace_id') IS NOT NULL AND (NEW.kind<>'local_operation' OR json_extract(NEW.value,'$.tool') IN ('code_apply_edits','change_resume','workspace_gc','files_sync','terminal_exec','file_upload','file_download')) AND (COALESCE(json_extract(OLD.value,'$.state'),json_extract(OLD.value,'$.phase'),'')<>COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase'),'') OR COALESCE(json_extract(OLD.value,'$.output_complete'),0)<>COALESCE(json_extract(NEW.value,'$.output_complete'),0)) BEGIN INSERT INTO work_events(workspace,kind,entity,state,at,detail) VALUES(json_extract(NEW.value,'$.workspace_id'),NEW.kind,NEW.key,COALESCE(json_extract(NEW.value,'$.state'),json_extract(NEW.value,'$.phase')),unixepoch(),json_object('tool',json_extract(NEW.value,'$.tool'),'exit_code',json_extract(NEW.value,'$.exit_code'),'output_complete',json_extract(NEW.value,'$.output_complete'),'error',json_extract(NEW.value,'$.result.error'),'journal_id',json_extract(NEW.value,'$.result.journal_id'))); DELETE FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') AND seq<=COALESCE((SELECT seq FROM work_events WHERE workspace=json_extract(NEW.value,'$.workspace_id') ORDER BY seq DESC LIMIT 1 OFFSET 4096),-1); END"#,
     ] {
         sqlx::query(statement).execute(&mut *tx).await?;
     }
@@ -50,19 +57,18 @@ pub(crate) async fn read(
         })
         .transpose()?;
     let mut tx = store.pool.begin().await?;
-    let (floor,): (i64,) =
-        sqlx::query_as("SELECT COALESCE((SELECT seq FROM work_event_floor WHERE workspace=?),0)")
-            .bind(&ws.id)
-            .fetch_one(&mut *tx)
-            .await?;
+    // Sequence numbers are global, not contiguous within a workspace. Below
+    // capacity no history was trimmed, so another workspace cannot expire this cursor.
+    // At capacity, require a fresh snapshot for cursors older than the retained tail.
+    let (floor, latest): (i64, i64) = sqlx::query_as(
+        "SELECT CASE WHEN COUNT(*)>=4096 THEN COALESCE(MIN(seq)-1,0) ELSE 0 END,COALESCE(MAX(seq),0) FROM work_events WHERE workspace=?",
+    )
+    .bind(&ws.id)
+    .fetch_one(&mut *tx)
+    .await?;
     if let Some(n) = after {
         ensure!(n >= floor, "cursor_expired: refresh workspace snapshot");
     }
-    let (latest,): (i64,) =
-        sqlx::query_as("SELECT COALESCE(MAX(seq),0) FROM work_events WHERE workspace=?")
-            .bind(&ws.id)
-            .fetch_one(&mut *tx)
-            .await?;
     if let Some(n) = after {
         ensure!(n <= latest.max(floor), "invalid future event cursor");
     }
@@ -92,6 +98,7 @@ mod tests {
     async fn events_are_atomic_scoped_and_survive_reopen() {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(d.path()).await.unwrap();
+        s.install_agent_schema().await.unwrap();
         let ws = Workspace {
             id: "one".into(),
             device_id: "d".into(),
@@ -121,6 +128,7 @@ mod tests {
         // Reopening re-applies the versioned trigger definition idempotently.
         // Inspect the stored SQL rather than relying on in-memory assumptions.
         let reopened = Store::open(d.path()).await.unwrap();
+        reopened.install_agent_schema().await.unwrap();
         let (definition,): (String,) = sqlx::query_as(
             "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_event_insert'",
         )
@@ -141,5 +149,91 @@ mod tests {
         tx.rollback().await.unwrap();
         let v = read(&s, &wrong, None, 10).await.unwrap();
         assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn another_workspace_cannot_expire_an_empty_workspace_cursor() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(d.path()).await.unwrap();
+        s.install_agent_schema().await.unwrap();
+        let ws = Workspace {
+            id: "waiting".into(),
+            device_id: "d".into(),
+            root: d.path().to_path_buf(),
+        };
+        let first = read(&s, &ws, None, 10).await.unwrap();
+        for n in 0..4 {
+            s.put(
+                "terminal",
+                &format!("other-{n}"),
+                &json!({"workspace_id":"other","state":"exited"}),
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        }
+        s.put(
+            "terminal",
+            "mine",
+            &json!({"workspace_id":"waiting","state":"exited"}),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+        let replay = read(&s, &ws, first["cursor"].as_str(), 10).await.unwrap();
+        assert_eq!(replay["history_floor"], 0);
+        assert_eq!(replay["items"].as_array().unwrap().len(), 1);
+        assert_eq!(replay["items"][0]["entity_id"], "mine");
+    }
+
+    #[tokio::test]
+    async fn event_tail_is_bounded_without_a_second_floor_table() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(d.path()).await.unwrap();
+        s.install_agent_schema().await.unwrap();
+        for n in 0..4105 {
+            let key = format!("terminal-{n}");
+            s.put(
+                "terminal",
+                &key,
+                &json!({"workspace_id":"bounded","state":"exited","created_at":n}),
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        }
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM work_events WHERE workspace='bounded'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 4096);
+        let ws = Workspace {
+            id: "bounded".into(),
+            device_id: "d".into(),
+            root: d.path().to_path_buf(),
+        };
+        let expired = format!("{}.0", hash(format!("{}:{}", ws.device_id, ws.id)));
+        assert!(
+            read(&s, &ws, Some(&expired), 10)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cursor_expired")
+        );
+        let tail = read(&s, &ws, None, 10).await.unwrap();
+        assert!(
+            read(&s, &ws, tail["cursor"].as_str(), 10).await.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let (floor_tables,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='work_event_floor'",
+        )
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(floor_tables, 0);
     }
 }

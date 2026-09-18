@@ -43,6 +43,7 @@ async fn check_delivery_loss(commit_before_error: bool) {
     .unwrap();
     Arc::make_mut(&mut a.config).gateway_url = format!("http://{address}");
     let g = Gateway::new(GatewayConfig {
+        allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: format!("https://{address}"),
         bind: "127.0.0.1:0".into(),
         state_dir: d.path().join("gateway"),
@@ -102,7 +103,7 @@ async fn check_delivery_loss(commit_before_error: bool) {
         .await
         .unwrap();
     let running = a.clone();
-    let worker = tokio::spawn(async move { running.run().await });
+    let worker = tokio::spawn(async move { running.run_isolated().await });
     // Six seconds is well below the gateway's 30-second redispatch window.
     let completed = tokio::time::timeout(Duration::from_secs(6), async {
         loop {

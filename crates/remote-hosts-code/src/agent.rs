@@ -32,6 +32,8 @@ struct LocalOperation {
     state: String,
     result: Option<Value>,
     #[serde(default)]
+    gateway_accepted: bool,
+    #[serde(default)]
     resumable: bool,
     #[serde(default)]
     workspace_id: Option<String>,
@@ -59,6 +61,7 @@ impl Agent {
             "agent state must be outside exposed code roots"
         );
         let store = Store::open(&config.state_dir).await?;
+        store.install_agent_schema().await?;
         // An interrupted mutation has an unknown outcome; never blindly re-execute it.
         sqlx::query("UPDATE kv SET value=json_set(value,'$.state','unknown') WHERE kind='local_operation' AND json_extract(value,'$.state')='running' AND COALESCE(json_extract(value,'$.resumable'),0)=0").execute(&store.pool).await?;
         let terminals = Terminals::new(
@@ -94,6 +97,13 @@ impl Agent {
                 op.fingerprint == fingerprint,
                 "operation fingerprint conflict"
             );
+            // A poll response dispatched before receipt acceptance can arrive
+            // afterwards. Its compact receipt prevents re-execution, but must
+            // not replace the authoritative Gateway result with a new payload.
+            if op.gateway_accepted {
+                return Ok(json!({"state":"already_completed","operation_id":job.id,
+                    "result_owner":"gateway","next_action":"operation_get"}));
+            }
             if !(op.resumable && op.result.is_none() && crate::durable_transfer::is_file(&job.tool))
             {
                 let result = op.result.unwrap_or_else(||json!({"error":"outcome_unknown","operation_id":job.id,"recovery":"Inspect files, terminal status and local journal. This operation is never automatically repeated after runtime loss."}));
@@ -113,6 +123,7 @@ impl Agent {
                     fingerprint: fingerprint.clone(),
                     state: "running".into(),
                     result: None,
+                    gateway_accepted: false,
                     resumable: crate::durable_transfer::is_file(&job.tool),
                     workspace_id: job.arguments["workspace_id"].as_str().map(str::to_owned),
                     tool: Some(job.tool.clone()),
@@ -137,6 +148,7 @@ impl Agent {
                         fingerprint,
                         state: "paused".into(),
                         result: None,
+                        gateway_accepted: false,
                         resumable: true,
                         workspace_id: job.arguments["workspace_id"].as_str().map(str::to_owned),
                         tool: Some(job.tool.clone()),
@@ -166,6 +178,7 @@ impl Agent {
             fingerprint,
             state: "done".into(),
             result: Some(result.clone()),
+            gateway_accepted: false,
             resumable: false,
             workspace_id: job.arguments["workspace_id"].as_str().map(str::to_owned),
             tool: Some(job.tool.clone()),
@@ -331,19 +344,36 @@ impl Agent {
         }
     }
     pub async fn run(&self) -> Result<()> {
+        self.run_loop(None).await
+    }
+    /// Run the real device lifecycle with Skill files isolated below this
+    /// instance's state directory. Test/embedded callers must not overwrite
+    /// the operator's installed Codex or Gemini Skill files.
+    pub async fn run_isolated(&self) -> Result<()> {
+        let home = self.config.state_dir.join("isolated-skill-home");
+        self.run_loop(Some(&home)).await
+    }
+    async fn run_loop(&self, skill_home: Option<&std::path::Path>) -> Result<()> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()?;
         let delivery = Delivery::new(self.store.clone(), self.config.clone()).await?;
-        if let Err(error) = crate::capabilities::sync_embedded_skill() {
+        let skill_sync = match skill_home {
+            Some(home) => crate::capabilities::sync_embedded_skill_at(home),
+            None => crate::capabilities::sync_embedded_skill(),
+        };
+        if let Err(error) = skill_sync {
             tracing::error!(
                 ?error,
                 "failed to synchronize embedded Agent Skill; fleet convergence will remain false"
             );
         }
-        let (skill_revision, skill_consistent) = crate::capabilities::installed_skill_revision();
+        let (skill_revision, skill_consistent) = match skill_home {
+            Some(home) => crate::capabilities::installed_skill_revision_at(home),
+            None => crate::capabilities::installed_skill_revision(),
+        };
         let hello = DeviceHello {
             version: env!("CARGO_PKG_VERSION").into(),
             wire_protocol: Some(crate::capabilities::WIRE_PROTOCOL),
@@ -520,7 +550,14 @@ impl Agent {
             let terminals = crate::terminal_sync::collect(&self.store)
                 .await
                 .unwrap_or_default();
-            let fingerprint = crate::hash(serde_json::to_vec(&terminals)?);
+            let terminal_previews =
+                crate::terminal_sync::previews(&terminals, self.config.state_dir.join("terminals"))
+                    .await
+                    .unwrap_or_default();
+            let fingerprint = crate::hash(serde_json::to_vec(&json!({
+                "terminals":terminals,
+                "previews":terminal_previews,
+            }))?);
             let running_terminal = terminals
                 .iter()
                 .any(|s| matches!(s.state.as_str(), "starting" | "running"));
@@ -534,6 +571,7 @@ impl Agent {
             request["active_operations"] = json!(active);
             request["progress"] = json!(self.progress.snapshots());
             request["terminal_updates"] = json!(terminals);
+            request["terminal_previews"] = json!(terminal_previews);
             let response = client
                 .post(format!("{}/device/heartbeat", self.config.gateway_url))
                 .bearer_auth(&self.config.device_token)
@@ -614,11 +652,8 @@ impl Agent {
         request["poll_wait_ms"] = json!(if filter.is_empty() { 20000 } else { 250 });
         request["resource_filter"] = serde_json::to_value(filter)?;
         request["runtime_features"] = json!(crate::capabilities::RuntimeFeatures::current());
-        request["terminal_updates"] = json!(
-            crate::terminal_sync::collect(&self.store)
-                .await
-                .unwrap_or_default()
-        );
+        // Heartbeat owns terminal-state replication. Independent poll lanes must
+        // not repeat the same SQLite snapshot on every long poll.
         request["receipt_delivery"] = json!(
             self.store
                 .get::<crate::delivery::Status>("runtime", "receipt_delivery")
@@ -743,6 +778,110 @@ mod tests {
             "hello"
         );
     }
+    #[tokio::test]
+    async fn late_poll_after_receipt_acceptance_cannot_repeat_a_mutation() {
+        use axum::{Json, Router, routing::post};
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/device/result",
+                    post(|| async { Json(json!({"accepted":true})) }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let mut a = Agent::new(AgentConfig {
+            gateway_url: "https://fixture.invalid".into(),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            device_token: crate::random(),
+            state_dir: state.path().into(),
+            roots: vec![root.path().into()],
+            allow_write: true,
+            allow_exec: false,
+            shell: "/bin/sh".into(),
+        })
+        .await
+        .unwrap();
+        // The production constructor must continue to reject HTTP origins.
+        // Only this in-module fixture redirects delivery to its loopback server.
+        Arc::make_mut(&mut a.config).gateway_url = gateway_url;
+        let delivery = Delivery::new(a.store.clone(), a.config.clone())
+            .await
+            .unwrap();
+        let sending = delivery.clone();
+        let sender = tokio::spawn(async move { sending.run(&reqwest::Client::new()).await });
+        let job = Job {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: a.config.device_id.clone(),
+            owner: "owner".into(),
+            tool: "workspace_open".into(),
+            arguments: json!({"device_id":a.config.device_id,"root":root.path(),"idempotency_key":"late-poll"}),
+        };
+        a.execute_with_delivery(&job, Some(&delivery))
+            .await
+            .unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if a.store
+                    .get::<LocalOperation>("local_operation", &job.id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|op| op.gateway_accepted)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        sender.abort();
+        let _ = sender.await;
+        server.abort();
+        assert!(accepted.is_ok(), "receipt acceptance never completed");
+        let late = a
+            .execute_with_delivery(&job, Some(&delivery))
+            .await
+            .unwrap();
+        assert_eq!(late["state"], "already_completed");
+        let (workspaces,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM kv WHERE kind='workspace'")
+                .fetch_one(&a.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            workspaces, 1,
+            "the late request must not create another workspace"
+        );
+        let (outbox,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM receipt_outbox")
+            .fetch_one(&a.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            outbox, 0,
+            "a local tombstone must not replace the Gateway's original result"
+        );
+        let saved: Value = a
+            .store
+            .get("local_operation", &job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(saved.get("result").is_none());
+        let mut conflict = job;
+        conflict.arguments["idempotency_key"] = json!("different");
+        assert!(
+            a.execute_with_delivery(&conflict, Some(&delivery))
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn deduplicates_mutations_and_rejects_other_devices() {
         let root = tempfile::tempdir().unwrap();

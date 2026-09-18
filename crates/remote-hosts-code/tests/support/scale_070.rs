@@ -17,13 +17,12 @@ async fn r070_large_file_limit_requires_explicit_agent_negotiation() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("device_feature_unavailable"));
-    let mut online: Value = f
-        .g
-        .store
-        .get("online", &f.ws.device_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let mut online: Value =
+        f.g.store
+            .get("online", &f.ws.device_id)
+            .await
+            .unwrap()
+            .unwrap();
     online["runtime_features"]["names"]
         .as_array_mut()
         .unwrap()
@@ -76,22 +75,32 @@ async fn r070_source_authorization_state_is_observable_and_structured() {
         )
         .await
         .unwrap();
-    let available = f
-        .g
-        .dispatch(&f.principal(), "operation_get", json!({"operation_id":j.id}))
+    let available =
+        f.g.dispatch(
+            &f.principal(),
+            "operation_get",
+            json!({"operation_id":j.id}),
+        )
         .await
         .unwrap();
     assert_eq!(available["source_authorization"]["state"], "available");
-    assert!(available["source_authorization"]["expires_at"].as_i64().is_some());
+    assert!(
+        available["source_authorization"]["expires_at"]
+            .as_i64()
+            .is_some()
+    );
     sqlx::query("UPDATE kv SET expires=? WHERE kind='file_source' AND key=?")
         .bind(now() - 1)
         .bind(&j.id)
         .execute(&f.g.store.pool)
         .await
         .unwrap();
-    let expired = f
-        .g
-        .dispatch(&f.principal(), "operation_get", json!({"operation_id":j.id}))
+    let expired =
+        f.g.dispatch(
+            &f.principal(),
+            "operation_get",
+            json!({"operation_id":j.id}),
+        )
         .await
         .unwrap();
     assert_eq!(expired["source_authorization"]["state"], "expired");
@@ -127,38 +136,71 @@ async fn r071_transient_receiver_5xx_retries_the_same_durable_chunk() {
     let j = f
         .job("file_download", json!({"expected_version":hash(&bytes)}))
         .await;
-    let injected = Arc::new(AtomicBool::new(false));
+    #[derive(Default)]
+    struct RetryProbe {
+        first_requests: std::sync::atomic::AtomicUsize,
+        final_requests: std::sync::atomic::AtomicUsize,
+        injected: tokio::sync::Notify,
+    }
+    let probe = Arc::new(RetryProbe::default());
     async fn fail_final_chunk_once(
-        State(injected): State<Arc<AtomicBool>>,
+        State(probe): State<Arc<RetryProbe>>,
         request: AxumRequest,
         next: Next,
     ) -> Response {
-        let final_chunk = request.uri().path().ends_with("/chunk")
-            && request
+        if request.uri().path().ends_with("/chunk") {
+            let offset = request
                 .headers()
                 .get("x-transfer-offset")
-                .and_then(|v| v.to_str().ok())
-                == Some("4194304");
-        if final_chunk && !injected.swap(true, Ordering::SeqCst) {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                .and_then(|v| v.to_str().ok());
+            if offset == Some("0") {
+                probe.first_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            if offset == Some("4194304") && probe.final_requests.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                probe.injected.notify_one();
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
         }
         next.run(request).await
     }
-    let router = f
-        .g
-        .router()
-        .unwrap()
-        .layer(middleware::from_fn_with_state(
-            injected.clone(),
-            fail_final_chunk_once,
-        ));
+    let router = f.g.router().unwrap().layer(middleware::from_fn_with_state(
+        probe.clone(),
+        fail_final_chunk_once,
+    ));
     let server = f.serve(Some(router));
-    let result = tokio::time::timeout(Duration::from_secs(30), f.agent.execute(&j))
-        .await
-        .expect("sender retry timed out")
+    let agent = f.agent.clone();
+    let work = j.clone();
+    let mut sender = tokio::spawn(async move { agent.execute(&work).await });
+    // Snapshotting and its first durable write are fixture preparation. Start
+    // the existing retry watchdog only when the server actually injects 5xx.
+    let injected = tokio::time::timeout(Duration::from_secs(30), probe.injected.notified()).await;
+    if injected.is_err() {
+        sender.abort();
+        server.abort();
+    }
+    injected.expect("export did not reach the receiver fault-injection boundary");
+    let retried = tokio::time::timeout(Duration::from_secs(30), &mut sender).await;
+    if retried.is_err() {
+        sender.abort();
+    }
+    server.abort();
+    let result = retried
+        .expect("sender retry timed out after injected 5xx")
+        .expect("sender task failed")
         .expect("sender treated transient 5xx as permanent");
     assert_eq!(result["state"], "completed");
-    assert!(injected.load(Ordering::SeqCst));
+    assert_eq!(result["sha256"], hash(&bytes));
+    assert_eq!(result["size"], bytes.len());
+    assert_eq!(
+        probe.first_requests.load(Ordering::SeqCst),
+        1,
+        "retry must not resend the acknowledged first chunk"
+    );
+    assert!(
+        probe.final_requests.load(Ordering::SeqCst) >= 2,
+        "the failed final chunk must really be retried"
+    );
     assert_eq!(
         std::fs::read(
             f.g.config
@@ -169,5 +211,4 @@ async fn r071_transient_receiver_5xx_retries_the_same_durable_chunk() {
         .unwrap(),
         bytes
     );
-    server.abort();
 }

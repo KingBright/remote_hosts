@@ -14,11 +14,51 @@ struct View {
     cursor: String,
     pending: usize,
 }
-fn omitted(id: &str) -> Value {
-    json!({"operation_id":id,"result_omitted":true,"reason":"response_budget",
-        "next_action":"query_this_operation_individually"})
+fn omitted(id: &str, original: &Value) -> Value {
+    let mut value = json!({"operation_id":id,"result_omitted":true,"reason":"response_budget",
+        "next_action":"query_this_operation_individually","evidence_complete":false});
+    for key in [
+        "receipt",
+        "error",
+        "error_code",
+        "outcome",
+        "stale",
+        "retry_policy",
+        "user_action",
+        "execution_state",
+        "request_id",
+    ] {
+        if let Some(field) = original.get(key) {
+            value[key] = field.clone();
+        }
+    }
+    if value["receipt"].is_object() {
+        value["receipt"]["evidence_complete"] = json!(false);
+    }
+    value
+}
+fn completed_receipt_defaults() -> Value {
+    json!({"protocol":1,"failure_boundary":null,"last_confirmed_stage":"gateway_completed_request",
+        "execution_state":"completed","business_state":"not_evaluated","evidence_complete":true,
+        "retry_policy":"do_not_replay_completed_operation","next_action":null,"user_action":"none","stale":false})
 }
 fn compact_batch_result(mut result: Value) -> Value {
+    if result["receipt"]["execution_state"] == "completed"
+        && result["receipt"]["evidence_complete"] == true
+        && result["receipt"]["stale"] == false
+        && result["receipt"]["error_code"].is_null()
+        && result["receipt"]["user_action"] == "none"
+        && result["receipt"]["next_action"].is_null()
+    {
+        // Losslessly factor repeated no-action decisions into the batch defaults.
+        // Uncertainty, errors and required actions always retain their own receipt.
+        if let Some(object) = result.as_object_mut() {
+            object.remove("receipt");
+        }
+    }
+    if let Some(object) = result.as_object_mut() {
+        object.remove("device_id");
+    }
     if let Some(lifecycle) = result.get_mut("operation_lifecycle") {
         let gateway = &lifecycle["gateway"];
         *lifecycle = if gateway["available"] == false {
@@ -28,6 +68,45 @@ fn compact_batch_result(mut result: Value) -> Value {
         };
     }
     result
+}
+fn apply_terminal_cursor(result: &mut Value, args: &Value) -> Result<()> {
+    let Some(requested) = args.get("terminal_cursor") else {
+        return Ok(());
+    };
+    let requested = requested
+        .as_u64()
+        .context("invalid_arguments: terminal_cursor must be a non-negative integer")?;
+    let Some(observation) = result.get_mut("terminal_observation") else {
+        return Ok(());
+    };
+    let Some(start) = observation["output_cursor_start"].as_u64() else {
+        return Ok(());
+    };
+    let Some(end) = observation["output_cursor_end"].as_u64() else {
+        return Ok(());
+    };
+    ensure!(
+        requested <= end,
+        "invalid_arguments: terminal_cursor is ahead of observed output"
+    );
+    if requested < start {
+        observation["output_gap"] = json!(true);
+        observation["requested_output_cursor"] = json!(requested);
+        return Ok(());
+    }
+    let output = observation["output"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let offset = usize::try_from(requested - start)?;
+    ensure!(
+        offset <= output.len() && output.is_char_boundary(offset),
+        "invalid_arguments: terminal_cursor is not a UTF-8 output boundary"
+    );
+    observation["output"] = json!(&output[offset..]);
+    observation["output_cursor_start"] = json!(requested);
+    observation["output_gap"] = json!(false);
+    Ok(())
 }
 async fn view(g: &Gateway, p: &Principal, ids: &[String]) -> Result<View> {
     let rows = sqlx::query("SELECT j.id,j.device,j.state,json_extract(j.request,'$.owner') AS owner,json_extract(j.request,'$.tool') AS tool,COALESCE(r.value,a.value) AS progress FROM jobs j LEFT JOIN kv a ON a.kind='operation_progress' AND a.key=j.id AND a.expires>? LEFT JOIN kv r ON r.kind='receive_progress' AND r.key=j.id AND r.expires>? AND json_extract(j.request,'$.tool')='file_download' WHERE j.id IN (SELECT value FROM json_each(?))")
@@ -62,7 +141,9 @@ async fn view(g: &Gateway, p: &Principal, ids: &[String]) -> Result<View> {
             && let Some(observed) = crate::terminal_sync::observed(g, id).await?
         {
             let t = &observed["terminal"];
-            stamp["terminal"] = json!({"state":t["state"],"exit_code":t["exit_code"],"output_complete":t["output_complete"],"stale":observed["stale"]});
+            stamp["terminal"] = json!({"state":t["state"],"exit_code":t["exit_code"],"output_complete":t["output_complete"],
+                "output_truncated":t["output_truncated"],"output_error":t["output_error"],
+                "output_cursor_end":observed["output_cursor_end"],"output_gap":observed["output_gap"],"stale":observed["stale"]});
             if state == "done"
                 && observed["stale"] == false
                 && matches!(t["state"].as_str(), Some("running" | "starting"))
@@ -107,16 +188,84 @@ async fn view(g: &Gateway, p: &Principal, ids: &[String]) -> Result<View> {
     })
 }
 pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<Value> {
-    let single = args.get("operation_id").and_then(Value::as_str);
+    let request_id = args.get("request_id").and_then(Value::as_str);
+    let direct_single = args.get("operation_id").and_then(Value::as_str);
+    let has_batch = args.get("operation_ids").is_some();
     ensure!(
-        single.is_some() != args.get("operation_ids").is_some(),
-        "invalid_arguments: supply exactly one of operation_id or operation_ids"
+        usize::from(request_id.is_some())
+            + usize::from(direct_single.is_some())
+            + usize::from(has_batch)
+            == 1,
+        "invalid_arguments: supply exactly one of request_id, operation_id or operation_ids"
     );
+    let mut request_receipt = None;
+    let resolved_request_operation = if let Some(request_id) = request_id {
+        ensure!(
+            request_id.len() == 36
+                && request_id.starts_with("req_")
+                && request_id[4..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "invalid_arguments: invalid request_id"
+        );
+        let Some(mut receipt) = g.store.get::<Value>("request_receipt", request_id).await? else {
+            return Ok(
+                json!({"request_id":request_id,"state":"not_observed_or_expired","operation_id":null,
+                "execution_state":"unknown","business_state":"not_evaluated","evidence_complete":false,
+                "failure_boundary":"unknown","last_confirmed_stage":"receipt_lookup_only","stale":true,
+                "retry_policy":"do_not_replay_until_reconciled","next_action":"check_original_transport_receipt",
+                "user_action":"none","observed_at":now()}),
+            );
+        };
+        ensure!(
+            receipt["owner"].as_str() == Some(&p.owner) && p.owner == g.config.owner,
+            "request_unavailable: request belongs to another owner"
+        );
+        let original_scope = receipt["tool"].as_str().and_then(tools::scope);
+        ensure!(
+            original_scope.map_or(receipt["state"] == "gateway_rejected", |scope| p
+                .scopes
+                .iter()
+                .any(|s| s == scope)),
+            "request_unavailable: original request scope is required"
+        );
+        let operation = receipt["operation_id"].as_str().map(str::to_owned);
+        if let Some(object) = receipt.as_object_mut() {
+            object.remove("owner");
+            object.remove("fingerprint");
+        }
+        if operation.is_none() {
+            receipt["pending"] = json!(receipt["state"] == "gateway_received");
+            receipt["stale"] = json!(
+                receipt["state"] == "gateway_received"
+                    && now() - receipt["updated_at"].as_i64().unwrap_or(0) > 45
+            );
+            if receipt["state"] == "completed_at_gateway" {
+                receipt["next_action"] = Value::Null;
+                return Ok(receipt);
+            }
+            receipt["next_action"] = json!(if receipt["state"] == "gateway_rejected" {
+                "follow_retry_policy; no remote operation exists"
+            } else {
+                "observe this request_id; no remote operation has been confirmed"
+            });
+            return Ok(receipt);
+        }
+        request_receipt = Some(receipt);
+        operation
+    } else {
+        None
+    };
+    let single = resolved_request_operation.as_deref().or(direct_single);
     let ids: Vec<String> = if let Some(id) = single {
         vec![id.to_owned()]
     } else {
         serde_json::from_value(args["operation_ids"].clone())?
     };
+    ensure!(
+        args.get("terminal_cursor").is_none() || single.is_some(),
+        "invalid_arguments: terminal_cursor is only valid for one operation_id"
+    );
     ensure!(
         !ids.is_empty() && ids.len() <= 20 && ids.iter().collect::<HashSet<_>>().len() == ids.len(),
         "invalid_arguments: use 1..20 unique operation IDs"
@@ -127,7 +276,23 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
     if let Some(id) = single
         && args.as_object().is_some_and(|o| o.len() == 1)
     {
-        return g.result(p, id).await;
+        // Backward-compatible shape with a short bounded wait. This reduces the
+        // submit -> get -> get chain for older hosts that cannot send wait_ms.
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        loop {
+            let changed = g.observation_changed.notified();
+            let mut result = g.result(p, id).await?;
+            if let Some(receipt) = &request_receipt {
+                result["request_receipt"] = receipt.clone();
+            }
+            if result.get("pending") != Some(&json!(true)) || Instant::now() >= deadline {
+                return Ok(result);
+            }
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep_until(deadline.min(Instant::now()+Duration::from_millis(250))) => {}
+            }
+        }
     }
     let supplied = args.get("cursor").and_then(Value::as_str);
     if let Some(c) = supplied {
@@ -138,7 +303,7 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
             "invalid observation cursor"
         );
     }
-    let wait = files::number(args, "wait_ms", 0, 0, 5000)?;
+    let wait = files::number(args, "wait_ms", 1200, 0, 5000)?;
     let budget = files::number(args, "max_bytes", 65536, 4096, 131072)?;
     let started = Instant::now();
     let deadline = started + Duration::from_millis(wait as u64);
@@ -163,11 +328,28 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
     // budget. Explicit observation options honor their requested byte ceiling.
     if let Some(id) = single {
         let mut result = g.result(p, id).await?;
+        apply_terminal_cursor(&mut result, args)?;
+        if let Some(receipt) = &request_receipt {
+            result["request_receipt"] = receipt.clone();
+        }
         result["observation"] = metadata.clone();
+        if metadata["changed"] == false
+            && args.get("terminal_cursor").is_none()
+            && result.get("error").is_none()
+        {
+            // Preserve decisions and uncertainty while omitting unchanged payload.
+            result = json!({"operation_id":id,"pending":result["pending"],"receipt":result["receipt"],
+                "observation":metadata,"request_receipt":result["request_receipt"],
+                "next_action":result["receipt"]["next_action"],"unchanged_payload_omitted":true});
+        }
         if serde_json::to_vec(&result)?.len() > budget {
-            result = omitted(id);
+            result = omitted(id, &result);
             result["observation"] = metadata;
         }
+        ensure!(
+            serde_json::to_vec(&result)?.len() <= budget,
+            "observation_response_budget: critical evidence exceeds requested budget; increase max_bytes"
+        );
         return Ok(result);
     }
     // First preserve exact legacy per-operation shapes when the whole batch fits.
@@ -197,14 +379,26 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
         .cloned()
         .map(compact_batch_result)
         .collect();
-    let compact_output = json!({"operations":compact,"pending_count":final_view.pending,"observation":output["observation"]});
+    let compact_output = json!({"operations":compact,"receipt_defaults":completed_receipt_defaults(),
+        "receipt_semantics":"A row without receipt inherits receipt_defaults; operation_id remains its immutable lookup handle.",
+        "pending_count":final_view.pending,"observation":output["observation"]});
     if serde_json::to_vec(&compact_output)?.len() <= budget {
         return Ok(compact_output);
     }
     // Finally reserve actual serialized placeholders and admit compact results
     // individually. This keeps large siblings from hiding independent small ones.
-    let placeholders: Vec<Value> = ids.iter().map(|id| omitted(id)).collect();
-    let mut bounded = json!({"operations":placeholders,"pending_count":final_view.pending,"observation":compact_output["observation"]});
+    let placeholders: Vec<Value> = ids
+        .iter()
+        .zip(
+            compact_output["operations"]
+                .as_array()
+                .expect("batch results"),
+        )
+        .map(|(id, result)| omitted(id, result))
+        .collect();
+    let mut bounded = json!({"operations":placeholders,"receipt_defaults":completed_receipt_defaults(),
+        "receipt_semantics":"Only complete rows without a receipt inherit defaults. result_omitted always means incomplete evidence.",
+        "pending_count":final_view.pending,"observation":compact_output["observation"]});
     ensure!(
         serde_json::to_vec(&bounded)?.len() <= budget,
         "observation_response_budget: query fewer operations"

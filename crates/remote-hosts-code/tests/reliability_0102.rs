@@ -16,6 +16,7 @@ async fn fixture() -> (tempfile::TempDir, Gateway, String, Principal, String) {
     let root = dir.path().join("root");
     std::fs::create_dir(&root).unwrap();
     let gateway = Gateway::new(GatewayConfig {
+        allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: "https://fixture.example".into(),
         bind: "127.0.0.1:0".into(),
         state_dir: dir.path().join("state"),

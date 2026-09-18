@@ -1,4 +1,4 @@
-//! Explicit, workspace-scoped lifecycle cleanup. Never deletes idempotency results or active work.
+//! Explicit workspace-scoped cleanup of finished state; active recovery and undelivered receipts are protected.
 use crate::{
     AgentConfig,
     files::{self, Workspace},
@@ -39,15 +39,15 @@ fn regular_size(path: &std::path::Path) -> Result<Option<u64>> {
 
 async fn collect(
     config: &AgentConfig,
-    store: &Store,
+    connection: &mut sqlx::SqliteConnection,
     ws: &Workspace,
     cutoff: i64,
     max: usize,
 ) -> Result<Vec<Candidate>> {
     let mut out = Vec::new();
     let terminal_rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT t.key FROM kv t JOIN kv o ON o.kind='local_operation' AND o.key=t.key WHERE t.kind='terminal' AND json_extract(t.value,'$.workspace_id')=? AND json_extract(t.value,'$.state') NOT IN ('running','starting') AND json_extract(o.value,'$.state')='done' AND json_extract(o.value,'$.updated_at') IS NOT NULL AND json_extract(o.value,'$.updated_at')<=? ORDER BY json_extract(o.value,'$.updated_at'),t.key LIMIT ?")
-        .bind(&ws.id).bind(cutoff).bind(max as i64).fetch_all(&store.pool).await?;
+        "SELECT key FROM kv WHERE kind='terminal' AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.state') NOT IN ('running','starting') AND json_extract(value,'$.output_complete')=1 AND COALESCE(NULLIF(json_extract(value,'$.updated_at'),0),json_extract(value,'$.created_at'),0)>0 AND COALESCE(NULLIF(json_extract(value,'$.updated_at'),0),json_extract(value,'$.created_at'),0)<=? AND NOT EXISTS(SELECT 1 FROM receipt_outbox r WHERE r.id=kv.key) AND NOT EXISTS(SELECT 1 FROM kv o WHERE o.kind='local_operation' AND o.key=kv.key AND COALESCE(json_extract(o.value,'$.state'),'unknown')<>'done') ORDER BY COALESCE(NULLIF(json_extract(value,'$.updated_at'),0),json_extract(value,'$.created_at'),0),key LIMIT ?")
+        .bind(&ws.id).bind(cutoff).bind(max as i64).fetch_all(&mut *connection).await?;
     for (id,) in terminal_rows {
         if out.len() >= max {
             break;
@@ -72,8 +72,8 @@ async fn collect(
     }
     if out.len() < max {
         let rows: Vec<(String,String)> = sqlx::query_as(
-            "SELECT t.key,t.value FROM kv t JOIN kv o ON o.kind='local_operation' AND o.key=t.key WHERE t.kind='transfer_local' AND json_extract(t.value,'$.workspace_id')=? AND json_extract(t.value,'$.phase') IN ('completed','cancelled','failed','expired') AND json_extract(o.value,'$.state')='done' AND json_extract(o.value,'$.updated_at') IS NOT NULL AND json_extract(o.value,'$.updated_at')<=? ORDER BY json_extract(o.value,'$.updated_at'),t.key LIMIT ?")
-            .bind(&ws.id).bind(cutoff).bind((max-out.len()) as i64).fetch_all(&store.pool).await?;
+            "SELECT key,value FROM kv WHERE kind='transfer_local' AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.phase') IN ('completed','cancelled','failed','expired') AND json_extract(value,'$.updated_at')>0 AND json_extract(value,'$.updated_at')<=? AND NOT EXISTS(SELECT 1 FROM receipt_outbox r WHERE r.id=kv.key) AND NOT EXISTS(SELECT 1 FROM kv o WHERE o.kind='local_operation' AND o.key=kv.key AND COALESCE(json_extract(o.value,'$.state'),'unknown')<>'done') ORDER BY json_extract(value,'$.updated_at'),key LIMIT ?")
+            .bind(&ws.id).bind(cutoff).bind((max-out.len()) as i64).fetch_all(&mut *connection).await?;
         for (id, text) in rows {
             let journal: Journal = serde_json::from_str(&text)?;
             ensure!(
@@ -94,8 +94,8 @@ async fn collect(
     }
     if out.len() < max {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT key FROM kv WHERE kind='local_operation' AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.tool')='code_apply_edits' AND json_extract(value,'$.state')='done' AND json_extract(value,'$.updated_at') IS NOT NULL AND json_extract(value,'$.updated_at')<=? AND json_extract(value,'$.result.change_set.state')='completed' ORDER BY json_extract(value,'$.updated_at'),key LIMIT ?")
-            .bind(&ws.id).bind(cutoff).bind((max-out.len()) as i64).fetch_all(&store.pool).await?;
+            "SELECT key FROM kv WHERE kind='local_operation' AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.tool')='code_apply_edits' AND json_extract(value,'$.state')='done' AND json_extract(value,'$.updated_at')>0 AND json_extract(value,'$.updated_at')<=? AND json_extract(value,'$.result.change_set.state')='completed' AND NOT EXISTS(SELECT 1 FROM receipt_outbox r WHERE r.id=kv.key) ORDER BY json_extract(value,'$.updated_at'),key LIMIT ?")
+            .bind(&ws.id).bind(cutoff).bind((max-out.len()) as i64).fetch_all(&mut *connection).await?;
         for (id,) in rows {
             let path = config.state_dir.join("edits").join(format!("{id}.json"));
             if let Some(bytes) = regular_size(&path)? {
@@ -132,7 +132,17 @@ pub(crate) async fn run(
     let older = files::number(args, "older_than_seconds", 7 * 86400, 3600, 30 * 86400)?;
     let max = files::number(args, "max_items", 100, 1, 1000)?;
     let cutoff = now().saturating_sub(older as i64);
-    let candidates = collect(config, store, ws, cutoff, max).await?;
+    // Freeze lifecycle/receipt state from selection through deletion, not just
+    // during the final DELETE. A recovery transition cannot race file removal.
+    let mut tx = store
+        .pool
+        .begin_with(if action == "apply" {
+            "BEGIN IMMEDIATE"
+        } else {
+            "BEGIN"
+        })
+        .await?;
+    let candidates = collect(config, &mut tx, ws, cutoff, max).await?;
     let preview_id = preview_identity(ws, older, max, &candidates);
     let bytes = candidates
         .iter()
@@ -146,11 +156,12 @@ pub(crate) async fn run(
         Value::Object(map)
     };
     if action == "preview" {
+        tx.commit().await?;
         return Ok(
             json!({"state":"preview","preview_id":preview_id,"workspace_id":ws.id,
             "policy":{"older_than_seconds":older,"max_items":max},"candidate_count":candidates.len(),
             "candidate_bytes":bytes,"counts":counts,"items":candidates.iter().map(Candidate::view).collect::<Vec<_>>(),
-            "protected":["running_or_starting_terminals","active_or_resumable_transfers","partial_change_sets","receipt_outbox","local_idempotency_results","legacy_records_without_lifecycle_timestamp"],
+            "protected":["running_or_starting_terminals","unfinished_terminal_output","active_or_resumable_transfers","partial_change_sets","undelivered_receipts","legacy_records_without_lifecycle_timestamp"],
             "gc_protocol":1}),
         );
     }
@@ -173,21 +184,27 @@ pub(crate) async fn run(
         match candidate.kind {
             "terminal" => {
                 sqlx::query("DELETE FROM kv WHERE kind='terminal' AND key=? AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.state') NOT IN ('running','starting')")
-                    .bind(&candidate.id).bind(&ws.id).execute(&store.pool).await?;
+                    .bind(&candidate.id).bind(&ws.id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE kv SET value=json_set(json_remove(value,'$.result'),'$.gateway_accepted',json('true')) WHERE kind='local_operation' AND key=? AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.tool')='terminal_exec' AND json_extract(value,'$.state')='done'")
+                    .bind(&candidate.id).bind(&ws.id).execute(&mut *tx).await?;
             }
             "transfer_checkpoint" => {
                 sqlx::query("DELETE FROM kv WHERE kind='transfer_local' AND key=? AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.phase') IN ('completed','cancelled','failed','expired')")
-                    .bind(&candidate.id).bind(&ws.id).execute(&store.pool).await?;
+                    .bind(&candidate.id).bind(&ws.id).execute(&mut *tx).await?;
             }
-            "completed_change_journal" => {}
+            "completed_change_journal" => {
+                sqlx::query("UPDATE kv SET value=json_set(json_remove(value,'$.result'),'$.gateway_accepted',json('true')) WHERE kind='local_operation' AND key=? AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.tool')='code_apply_edits' AND json_extract(value,'$.state')='done' AND json_extract(value,'$.result.change_set.state')='completed'")
+                    .bind(&candidate.id).bind(&ws.id).execute(&mut *tx).await?;
+            }
             _ => unreachable!(),
         }
         freed = freed.saturating_add(candidate.bytes);
         removed.push(candidate.view());
     }
+    tx.commit().await?;
     Ok(
         json!({"state":"completed","preview_id":preview_id,"workspace_id":ws.id,"removed_count":removed.len(),
-        "freed_bytes":freed,"removed":removed,"idempotency_records_preserved":true,"gc_protocol":1}),
+        "freed_bytes":freed,"removed":removed,"active_recovery_records_preserved":true,"gc_protocol":1}),
     )
 }
 
@@ -215,6 +232,10 @@ mod tests {
             shell: "/bin/sh".into(),
         };
         let store = Store::open(state.path()).await.unwrap();
+        sqlx::query("CREATE TABLE receipt_outbox (id TEXT PRIMARY KEY)")
+            .execute(&store.pool)
+            .await
+            .unwrap();
         std::fs::create_dir_all(state.path().join("terminals")).unwrap();
         let old = now() - 90000;
         for (id, status) in [("done", "exited"), ("live", "running")] {
@@ -235,6 +256,75 @@ mod tests {
             "legacy",
         )
         .unwrap();
+        let mut protected = Vec::new();
+        for (name, status, complete, created, updated, op_state, pending) in [
+            (
+                "pending",
+                "exited",
+                true,
+                Some(old),
+                Some(old),
+                "done",
+                true,
+            ),
+            (
+                "streaming",
+                "cancelled",
+                false,
+                Some(old),
+                Some(old),
+                "done",
+                false,
+            ),
+            ("timeless", "exited", true, None, None, "done", false),
+            (
+                "recent",
+                "exited",
+                true,
+                Some(old),
+                Some(now()),
+                "done",
+                false,
+            ),
+            (
+                "recovery",
+                "exited",
+                true,
+                Some(old),
+                Some(old),
+                "unknown",
+                false,
+            ),
+        ] {
+            let key = uuid::Uuid::new_v4().to_string();
+            store.put("terminal", &key, &json!({"id":key,"workspace_id":ws.id,"state":status,"created_at":created,"updated_at":updated,"output_complete":complete}), i64::MAX).await.unwrap();
+            store.put("local_operation", &key, &json!({"workspace_id":ws.id,"tool":"terminal_exec","state":op_state,"updated_at":old}), i64::MAX).await.unwrap();
+            let path = state.path().join("terminals").join(format!("{key}.log"));
+            std::fs::write(&path, name).unwrap();
+            if pending {
+                sqlx::query("INSERT INTO receipt_outbox(id) VALUES(?)")
+                    .bind(&key)
+                    .execute(&store.pool)
+                    .await
+                    .unwrap();
+            }
+            protected.push((key, path));
+        }
+        std::fs::create_dir_all(state.path().join("edits")).unwrap();
+        for (change_state, pending) in [("completed", true), ("partial", false)] {
+            let key = uuid::Uuid::new_v4().to_string();
+            store.put("local_operation", &key, &json!({"workspace_id":ws.id,"tool":"code_apply_edits","state":"done","updated_at":old,"result":{"change_set":{"state":change_state}}}), i64::MAX).await.unwrap();
+            let path = state.path().join("edits").join(format!("{key}.json"));
+            std::fs::write(&path, "{}").unwrap();
+            if pending {
+                sqlx::query("INSERT INTO receipt_outbox(id) VALUES(?)")
+                    .bind(&key)
+                    .execute(&store.pool)
+                    .await
+                    .unwrap();
+            }
+            protected.push((key, path));
+        }
         let preview = run(
             &config,
             &store,
@@ -243,24 +333,48 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(preview["candidate_count"], 1);
-        assert_eq!(preview["counts"]["terminal"], 1);
+        assert_eq!(preview["candidate_count"], 2);
+        assert_eq!(preview["counts"]["terminal"], 2);
         assert!(run(&config,&store,&ws,&json!({"action":"apply","older_than_seconds":3600,"max_items":100,"preview_id":"bad"})).await.is_err());
         let applied=run(&config,&store,&ws,&json!({"action":"apply","older_than_seconds":3600,"max_items":100,"preview_id":preview["preview_id"]})).await.unwrap();
-        assert_eq!(applied["removed_count"], 1);
+        assert_eq!(applied["removed_count"], 2);
         let (terminal_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM kv WHERE kind='terminal'")
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();
         assert_eq!(
-            terminal_count, 2,
-            "running and legacy records remain protected"
+            terminal_count, 6,
+            "running, unfinished, unacknowledged, recent and unknown-age terminals remain protected"
         );
         let (ops,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kv WHERE kind='local_operation'")
             .fetch_one(&store.pool)
             .await
             .unwrap();
-        assert_eq!(ops, 3, "idempotency results are deliberately retained");
+        assert_eq!(
+            ops,
+            3 + protected.len() as i64,
+            "active recovery and current-runtime deduplication receipts are retained"
+        );
+        let (compact,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kv WHERE kind='local_operation' AND json_extract(value,'$.gateway_accepted')=1 AND json_extract(value,'$.result') IS NULL").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(
+            compact, 2,
+            "collected terminals retain only compact deduplication receipts"
+        );
+        for (key, path) in protected {
+            assert!(path.exists());
+            assert!(
+                store
+                    .get::<Value>("local_operation", &key)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let (receipts,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM receipt_outbox")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 2);
     }
 }

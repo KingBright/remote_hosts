@@ -24,6 +24,24 @@ def digest(path):
             h.update(data)
     return h.hexdigest()
 
+def machine_contract(binary, version):
+    try:
+        contract = json.loads(subprocess.check_output(
+            [str(binary), 'release-manifest'], text=True, timeout=30))
+    except (subprocess.SubprocessError, json.JSONDecodeError) as error:
+        raise ValueError('native machine contract unavailable') from error
+    if contract.get('version') != version:
+        raise ValueError('machine contract version mismatch')
+    if (contract.get('machine_contract_protocol') != 1
+            or not isinstance(contract.get('tool_count'), int) or contract['tool_count'] <= 0
+            or contract.get('tool_schema_revision') != contract.get('tools_sha256')
+            or len(contract.get('tool_schema_revision', '')) != 64):
+        raise ValueError('native machine contract identity invalid')
+    forbidden = {'client_schema_comparison', 'host_schema_status', 'refresh_required', 'refresh_guidance'}
+    if forbidden.intersection(contract):
+        raise ValueError('release machine contract contains session-specific fields')
+    return contract
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--version', required=True)
@@ -76,9 +94,14 @@ def main():
     for path in files.values():
         if not path.is_file():
             raise SystemExit('missing artifact: ' + str(path))
-    actual = subprocess.check_output([str(files['remote-hosts-code-macos-arm64']), '--version'], text=True).strip()
+    native = files['remote-hosts-code-macos-arm64']
+    actual = subprocess.check_output([str(native), '--version'], text=True).strip()
     if actual != 'remote-hosts-code ' + args.version:
         raise SystemExit('native artifact version mismatch')
+    try:
+        contract = machine_contract(native, args.version)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if files['remote-hosts-code-windows-amd64.exe'].read_bytes()[:2] != b'MZ':
         raise SystemExit('Windows artifact is not a PE executable')
     # Compile helper source without importing it or running any deployment action.
@@ -98,13 +121,9 @@ def main():
             artifacts[name] = {'sha256':digest(stage/name), 'size':(stage/name).stat().st_size}
         shutil.copyfile(proof_path, stage/'source-verification.json')
         manifest = {
-            'schema_version':1, 'version':args.version,
+            'schema_version':1, **contract,
             'packaged_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            'wire_protocol':2, 'min_agent_wire_protocol':1, 'max_agent_wire_protocol':2,
-            'dispatch_protocol':2, 'progress_protocol':1, 'readiness_protocol':1,
-            'resource_dispatch_protocol':1, 'transfer_protocol':2, 'transfer_limits_protocol':1, 'tool_count':23, 'maintenance_protocol':1, 'terminal_observation_protocol':1, 'observation_protocol':2, 'change_set_protocol':1, 'storage_gc_protocol':1,
-            'fleet_protocol':1, 'skill_revision_protocol':1, 'outcome_guard_protocol':1,
-            'checkpoint_bytes':4194304, 'default_file_bytes':67108864, 'max_file_bytes':268435456, 'storage_reserve_bytes':268435456, 'snapshot_id':proof.get('snapshot_id'),
+            'snapshot_id':proof.get('snapshot_id'),
             'build_execution_root':str(ROOT),
             'source_verification_sha256':digest(proof_path),
             'source_inputs':proof['source_inputs'], 'artifacts':artifacts,

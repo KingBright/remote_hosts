@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/remote-hosts-admin",
+    "crates/remote-hosts-release",
     "crates/remote-hosts-api",
     "crates/remote-hosts-cli",
     "crates/remote-hosts-connector",

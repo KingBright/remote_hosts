@@ -117,6 +117,26 @@ def main():
     assert metadata["resource"] == args.origin + "/mcp"
     assert call("/mcp", {})[0] == 401
     redirect = "https://chatgpt.com/connector_platform_oauth_redirect"
+    parsed_version = tuple(map(int, args.expected_version.split('.')))
+    if parsed_version >= (0, 10, 4):
+        status, _, body = call("/status")
+        assert status == 200 and b"Gateway password" in body
+        status, headers, _ = call(
+            "/status/login",
+            {"password": args.password_file.read_text().strip()},
+            form=True,
+        )
+        assert status == 303 and headers["Location"] == "/status"
+        status, headers, body = call("/status")
+        assert status == 200 and b"Authoritative Gateway state" in body
+        assert b"Heartbeat is not counted as business progress" in body
+        assert "no-store" in headers.get("Cache-Control", "")
+    if parsed_version >= (0, 10, 4):
+        spark_redirect = "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-remote-hosts-acceptance-" + args.run_id
+        spark = parsed("/oauth/register", {"redirect_uris": [spark_redirect], "client_name": "Gemini Spark acceptance"})
+        assert spark["redirect_uris"] == [spark_redirect]
+        assert spark["token_endpoint_auth_method"] == "client_secret_basic"
+        assert spark.get("client_secret")
     client = parsed("/oauth/register", {"redirect_uris": [redirect], "token_endpoint_auth_method": "none"})
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
@@ -161,10 +181,19 @@ def main():
     assert upload_descriptor["_meta"]["openai/fileParams"] == ["file"]
     health = parsed("/healthz")
     assert health["version"] == args.expected_version
-    parsed_version = tuple(map(int, args.expected_version.split('.')))
     if parsed_version >= (0, 10, 2):
         assert health.get("wire_protocol", 0) >= 2
         assert health.get("min_agent_wire_protocol", 0) <= 1
+    if parsed_version >= (0, 10, 4):
+        assert health.get("machine_contract_protocol") == 1
+        assert health.get("capabilities_protocol") == 2
+        assert health.get("schema_diagnostics_protocol") == 2
+        assert health.get("request_receipt_protocol") == 1
+        assert health.get("terminal_observation_protocol") == 2
+        assert health.get("tool_schema_revision") == health.get("tools_sha256")
+        operation_get = next(t for t in catalog["tools"] if t["name"] == "operation_get")
+        op_props = operation_get["inputSchema"]["properties"]
+        assert "request_id" in op_props and "terminal_cursor" in op_props
     if args.dispatch_protocol is not None:
         assert health.get("dispatch_protocol") == args.dispatch_protocol
     if parsed_version >= (0, 7, 0):

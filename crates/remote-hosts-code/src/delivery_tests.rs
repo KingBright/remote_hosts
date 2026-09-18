@@ -77,7 +77,8 @@ async fn old_ack_cannot_delete_a_new_attempt_lease() {
         .unwrap();
     });
     let id = uuid::Uuid::new_v4().to_string();
-    d.enqueue(&id, &json!({"answer":1})).await.unwrap();
+    let saved = json!({"state":"done","tool":"terminal_exec","result":{"answer":1}});
+    d.complete(&id, &saved, &json!({"answer":1})).await.unwrap();
     let old = d.claim().await.unwrap().unwrap();
     sqlx::query("UPDATE receipt_outbox SET next_attempt=? WHERE id=?")
         .bind(now() - 1)
@@ -88,8 +89,15 @@ async fn old_ack_cannot_delete_a_new_attempt_lease() {
     let new = d.claim().await.unwrap().unwrap();
     d.deliver(&reqwest::Client::new(), old).await.unwrap();
     assert_eq!(rows(&d).await.len(), 1);
+    assert_eq!(
+        d.store.get::<Value>("local_operation", &id).await.unwrap(),
+        Some(saved)
+    );
     d.deliver(&reqwest::Client::new(), new).await.unwrap();
     assert!(rows(&d).await.is_empty());
+    let compact: Value = d.store.get("local_operation", &id).await.unwrap().unwrap();
+    assert_eq!(compact["gateway_accepted"], true);
+    assert!(compact.get("result").is_none());
     server.abort();
 }
 use axum::{Json, Router, routing::post};
@@ -115,6 +123,87 @@ async fn rows(d: &Delivery) -> Vec<(String, String, i64)> {
         .fetch_all(&d.store.pool)
         .await
         .unwrap()
+}
+#[tokio::test]
+async fn reopening_prunes_only_gateway_owned_local_results() {
+    let (_tmp, d) = fixture().await;
+    let delivered = uuid::Uuid::new_v4().to_string();
+    let pending = uuid::Uuid::new_v4().to_string();
+    let edit = uuid::Uuid::new_v4().to_string();
+    let retired_edit = uuid::Uuid::new_v4().to_string();
+    d.store
+        .put(
+            "local_operation",
+            &retired_edit,
+            &json!({"state":"done","tool":"code_apply_edits","gateway_accepted":true}),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+    d.store
+        .put(
+            "local_operation",
+            &delivered,
+            &json!({"state":"done","tool":"terminal_exec"}),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+    d.store
+        .put(
+            "local_operation",
+            &pending,
+            &json!({"state":"done","tool":"terminal_exec"}),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+    d.enqueue(&pending, &json!({"answer":1})).await.unwrap();
+    d.store
+        .put(
+            "local_operation",
+            &edit,
+            &json!({"state":"done","tool":"code_apply_edits"}),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+    let config = d.config.clone();
+    let store = d.store.clone();
+    drop(d);
+    let reopened = Delivery::new(store, config).await.unwrap();
+    assert!(
+        reopened
+            .store
+            .get::<Value>("local_operation", &retired_edit)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .store
+            .get::<Value>("local_operation", &delivered)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reopened
+            .store
+            .get::<Value>("local_operation", &pending)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reopened
+            .store
+            .get::<Value>("local_operation", &edit)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 #[tokio::test]
 async fn final_result_and_receipt_intent_commit_together_and_conflicts_rollback() {
@@ -269,7 +358,7 @@ async fn permanent_conflict_is_retained_without_automatic_retry_or_reexecution()
     server.abort();
 }
 #[tokio::test]
-async fn accepted_receipt_drops_only_delivery_intent_not_local_idempotency_record() {
+async fn accepted_receipt_drops_result_body_but_keeps_runtime_deduplication() {
     let (_tmp, mut d) = fixture().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     Arc::make_mut(&mut d.config).gateway_url = format!("http://{}", listener.local_addr().unwrap());
@@ -285,8 +374,40 @@ async fn accepted_receipt_drops_only_delivery_intent_not_local_idempotency_recor
         .unwrap();
     });
     let id = uuid::Uuid::new_v4().to_string();
-    let saved = json!({"state":"done","result":{"answer":1}});
+    let saved = json!({"state":"done","fingerprint":"fixture-fingerprint","tool":"terminal_exec","result":{"large":"x".repeat(32000)}});
     d.complete(&id, &saved, &json!({"answer":1})).await.unwrap();
+    let claim = d.claim().await.unwrap().unwrap();
+    d.deliver(&reqwest::Client::new(), claim).await.unwrap();
+    assert!(rows(&d).await.is_empty());
+    let compact: Value = d.store.get("local_operation", &id).await.unwrap().unwrap();
+    assert_eq!(compact["gateway_accepted"], true);
+    assert_eq!(compact["fingerprint"], "fixture-fingerprint");
+    assert!(compact.get("result").is_none());
+    assert!(serde_json::to_vec(&compact).unwrap().len() < 300);
+    server.abort();
+}
+
+#[tokio::test]
+async fn accepted_edit_receipt_keeps_change_resume_anchor() {
+    let (_tmp, mut d) = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    Arc::make_mut(&mut d.config).gateway_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/device/result",
+                post(|| async { Json(json!({"accepted":true})) }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let id = uuid::Uuid::new_v4().to_string();
+    let saved = json!({"state":"done","tool":"code_apply_edits","workspace_id":"ws","result":{"change_set":{"state":"partial"}}});
+    d.complete(&id, &saved, &json!({"change_set":{"state":"partial"}}))
+        .await
+        .unwrap();
     let claim = d.claim().await.unwrap().unwrap();
     d.deliver(&reqwest::Client::new(), claim).await.unwrap();
     assert!(rows(&d).await.is_empty());

@@ -104,6 +104,7 @@ async fn actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it() {
     let address = listener.local_addr().unwrap();
     Arc::make_mut(&mut a.config).gateway_url = format!("http://{address}");
     let g = Gateway::new(GatewayConfig {
+        allowed_origins: crate::default_mcp_client_origins(),
         public_url: format!("https://{address}"),
         bind: "127.0.0.1:0".into(),
         state_dir: d.path().join("gateway"),
@@ -160,19 +161,46 @@ async fn actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it() {
     });
     let aa = a.clone();
     let worker = tokio::spawn(async move { aa.run().await });
-    let result = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let (value,): (Option<String>,) = sqlx::query_as("SELECT result FROM jobs WHERE id=?")
-                .bind(&independent.id)
-                .fetch_one(&g.store.pool)
-                .await
-                .unwrap();
-            if let Some(value) = value {
-                break serde_json::from_str::<Value>(&value).unwrap();
+    let result: Result<Value> = async {
+        // Startup is not scheduling latency. Wait for an authenticated write-lane
+        // round trip, without requiring B to finish or releasing the held A root.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let ready = a.store.get::<Value>("runtime", "readiness").await.unwrap();
+                if ready.is_some_and(|r| r["lanes"]["write"].as_i64().is_some_and(|n| n > 0)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        })
+        .await
+        .context("fixture write lane did not become ready")?;
+        let value = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (value,): (Option<String>,) =
+                    sqlx::query_as("SELECT result FROM jobs WHERE id=?")
+                        .bind(&independent.id)
+                        .fetch_one(&g.store.pool)
+                        .await
+                        .unwrap();
+                if let Some(value) = value {
+                    break serde_json::from_str::<Value>(&value).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("blocked A aliases hid runnable B after startup")?;
+        let (completed,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE result IS NOT NULL")
+                .fetch_one(&g.store.pool)
+                .await?;
+        ensure!(
+            completed == 1,
+            "blocked A work completed before its root was released"
+        );
+        Ok(value)
+    }
     .await;
     // Release even on failure: no background task leaks from an assertion.
     drop(held);
@@ -182,28 +210,52 @@ async fn actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it() {
     }
     let result = result.expect("queued writes for aliases of blocked A hid runnable project B");
     assert!(result.get("error").is_none(), "{result}");
-    tokio::time::timeout(Duration::from_secs(8), async {
-        loop {
-            let (remaining,): (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE result IS NULL")
-                    .fetch_one(&g.store.pool)
-                    .await
-                    .unwrap();
-            if remaining == 0 {
-                break;
+    let drained: Result<()> = async {
+        // Prove A becomes schedulable within the original watchdog. Finishing
+        // all 24 durable edits is a separate completeness check, not a latency
+        // benchmark for the host's fsync throughput.
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let (resumed,): (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE id<>? AND result IS NOT NULL")
+                        .bind(&independent.id)
+                        .fetch_one(&g.store.pool)
+                        .await
+                        .unwrap();
+                if resumed > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("released resource did not become schedulable again");
+        })
+        .await
+        .context("released resource did not become schedulable again")?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let (remaining,): (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE result IS NULL")
+                        .fetch_one(&g.store.pool)
+                        .await
+                        .unwrap();
+                if remaining == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("resumed backlog did not finish every durable edit")?;
+        Ok(())
+    }
+    .await;
+    worker.abort();
+    let _ = worker.await;
+    server.abort();
+    drained.expect("released-root scheduling or completeness failed");
     for n in 0..24 {
         assert_eq!(
             std::fs::read(a.config.roots[0].join(format!("a/pending-{n}"))).unwrap(),
             b"ok"
         );
     }
-    worker.abort();
-    let _ = worker.await;
-    server.abort();
 }

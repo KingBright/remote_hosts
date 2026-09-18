@@ -99,7 +99,12 @@ class SnapshotTests(unittest.TestCase):
         gates=[('fmt',[sys.executable,'-c',code])]
         with contextlib.redirect_stdout(io.StringIO()):
             proof=checker.run_verification(self.dest,self.dest/'proof.json',gates,5)
-        self.assertEqual(proof['state'],'passed')
+        # The isolated step succeeds and the snapshot stays intact. This fixture
+        # does not execute a test suite, so it must not claim release verification.
+        self.assertEqual(proof['checks']['fmt']['exit_code'], 0)
+        self.assertEqual(proof['state'], 'failed')
+        self.assertEqual(proof['failure_type'], 'IncompleteTestEvidence')
+        self.assertFalse(proof['functional_tests']['evidence_complete'])
         self.assertTrue(proof['source_inputs_unchanged'])
         self.assertNotEqual(proof['source_inputs'],checker.inputs(self.root))
         snapshot.check(self.dest,checker.inputs)

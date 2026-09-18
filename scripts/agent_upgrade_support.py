@@ -58,7 +58,8 @@ def gateway_error(error):
         code = getattr(reason, 'verify_code', None)
         if isinstance(code, int): result['verify_code'] = code
     elif isinstance(reason, ssl.SSLError):
-        result.update(category='tls_handshake', next_action='inspect_tls_handshake')
+        result.update(category='tls_handshake', retryable=True,
+                      next_action='retry_same_readonly_probe_with_backoff')
     elif isinstance(reason, (TimeoutError, socket.timeout)):
         result.update(category='network_timeout', retryable=True, next_action='retry_same_readonly_probe_with_backoff')
     elif isinstance(reason, socket.gaierror):

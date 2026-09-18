@@ -58,17 +58,24 @@ class Client:
     def rpc(self,method,params):
         self.sequence+=1
         payload={'jsonrpc':'2.0','id':self.sequence,'method':method,'params':params}
-        for attempt in range(5):
+        # Only observations may be retried automatically. A lost mutation response
+        # is not proof that execution did not start; retain the original key/handle.
+        readonly = method in ('initialize', 'tools/list') or (method == 'tools/call' and params.get('name') in ('devices_list', 'fleet_status', 'operation_get', 'task_context'))
+        attempts = 5 if readonly else 1
+        for attempt in range(attempts):
             try:
                 value=self.parsed('/mcp',payload,auth=True)
                 break
             except (TimeoutError, urllib.error.URLError, OSError):
-                if attempt==4: raise
+                if attempt + 1 == attempts: raise
                 time.sleep(min(2**attempt,8))
         if 'error' in value:raise RuntimeError('MCP protocol error '+str(value['error'].get('code')))
         return value['result']
     def raw(self,name,args):
-        response=self.rpc('tools/call',{'name':name,'arguments':args});value=response.get('structuredContent')
+        # Machine clients consume the stable full contract, never the model's
+        # presentation view. Copy inputs so the caller's request identity is intact.
+        arguments=dict(args);arguments.setdefault('response_mode','full')
+        response=self.rpc('tools/call',{'name':name,'arguments':arguments});value=response.get('structuredContent')
         if value is None:
             if response.get('isError'):raise RuntimeError('tool_error:'+name+'; inspect original bounded response')
             value=json.loads(response['content'][0]['text'])
@@ -85,7 +92,9 @@ class Client:
         ident=value['terminal_id'];text=value.get('output','');cursor=value.get('cursor',0);status=value.get('terminal',{});more=value.get('has_more',False);end=time.monotonic()+timeout+60
         while more or not(status.get('exit_code') is not None and status.get('output_complete')):
             if time.monotonic()>end:raise RuntimeError('terminal_observation_timeout:'+ident)
-            page=self.tool('terminal_read',{'workspace_id':ws,'terminal_id':ident,'cursor':cursor,'max_bytes':65536});text+=page['output'];cursor=page['cursor'];status=page['terminal'];more=page['has_more'];time.sleep(.2)
+            page=self.tool('terminal_read',{'workspace_id':ws,'terminal_id':ident,'cursor':cursor,'max_bytes':65536,'output_mode':'full'});text+=page.get('output','');cursor=page['cursor'];status=page['terminal'];more=page['has_more'];time.sleep(.2)
+        if status.get('output_truncated') or status.get('output_error'):
+            raise RuntimeError('terminal_evidence_incomplete:'+ident)
         if status['exit_code']!=0:raise RuntimeError('terminal_failed:'+ident)
         return text
     def close(self):

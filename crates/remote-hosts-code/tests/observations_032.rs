@@ -17,6 +17,7 @@ async fn fixture() -> (tempfile::TempDir, Gateway, Principal, String) {
     let d = tempfile::tempdir().unwrap();
     let token = random();
     let g = Gateway::new(GatewayConfig {
+        allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: "https://fixture.example".into(),
         bind: "127.0.0.1:0".into(),
         state_dir: d.path().join("gateway"),
@@ -118,6 +119,143 @@ async fn legacy_single_shape_and_batch_order_are_preserved_without_dispatch() {
     assert_eq!(batch["pending_count"], 1);
     assert_eq!(count(&g).await, 2);
 }
+#[tokio::test]
+async fn legacy_single_observation_waits_for_result_without_recursive_query() {
+    let (_d, g, p, token) = fixture().await;
+    let id = insert(&g, "code_read", None).await;
+    let gg = g.clone();
+    let pp = p.clone();
+    let operation = id.clone();
+    let waiter =
+        tokio::spawn(async move { call(&gg, &pp, json!({"operation_id":operation})).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        post(
+            &g,
+            &token,
+            "/device/result",
+            json!({"operation_id":id,"result":{"answer":"one-observation"}})
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let out = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out["answer"], "one-observation");
+    assert_eq!(out["operation_id"], id);
+    assert_ne!(out.get("pending"), Some(&json!(true)));
+    assert_eq!(
+        count(&g).await,
+        1,
+        "observation must never create a second job"
+    );
+}
+
+#[tokio::test]
+async fn terminal_preview_is_returned_and_continued_without_terminal_read_job() {
+    let (_d, g, p, _) = fixture().await;
+    let id = insert(&g, "terminal_exec", None).await;
+    g.store
+        .put(
+            "terminal_observation",
+            &id,
+            &json!({
+                "terminal":{"id":id,"workspace_id":"fixture-workspace","state":"running","exit_code":null,
+                    "output_truncated":false,"created_at":now(),"updated_at":now(),"pty":false,
+                    "log_format":1,"output_complete":false},
+                "reported_at":now(),"session":"fixture-session",
+                "output_preview":"abcdef","output_cursor_start":10,"output_cursor_end":16,
+                "output_truncated_before":true
+            }),
+            now() + 100,
+        )
+        .await
+        .unwrap();
+    let full = call(&g, &p, json!({"operation_id":id,"wait_ms":0})).await;
+    assert_eq!(full["terminal_observation"]["output"], "abcdef");
+    assert_eq!(full["terminal_observation"]["output_cursor_start"], 10);
+    assert_eq!(full["terminal_observation"]["output_cursor_end"], 16);
+    assert_eq!(full["terminal_observation"]["output_gap"], true);
+
+    let continued = call(
+        &g,
+        &p,
+        json!({"operation_id":id,"wait_ms":0,"terminal_cursor":13}),
+    )
+    .await;
+    assert_eq!(continued["terminal_observation"]["output"], "def");
+    assert_eq!(continued["terminal_observation"]["output_cursor_start"], 13);
+    assert_eq!(continued["terminal_observation"]["output_cursor_end"], 16);
+    assert_eq!(continued["terminal_observation"]["output_gap"], false);
+    assert_eq!(
+        count(&g).await,
+        1,
+        "observe must not create a terminal_read job"
+    );
+}
+
+#[tokio::test]
+async fn request_receipt_is_observable_before_or_after_remote_operation_creation() {
+    let (_d, g, p, _) = fixture().await;
+    let rejected = format!("req_{}", "a".repeat(32));
+    g.store
+        .put(
+            "request_receipt",
+            &rejected,
+            &json!({
+                "protocol":1,"request_id":rejected,"owner":"owner","tool":"terminal_exec",
+                "state":"gateway_rejected","received_at":now(),"updated_at":now(),
+                "operation_id":null,"last_confirmed_stage":"gateway_received_request",
+                "execution_state":"not_started","error_code":"invalid_arguments",
+                "retry_policy":"retry_only_after_correcting_arguments","user_action":"correct_arguments"
+            }),
+            now() + 100,
+        )
+        .await
+        .unwrap();
+    let rejected_view = call(&g, &p, json!({"request_id":rejected})).await;
+    assert_eq!(rejected_view["state"], "gateway_rejected");
+    assert!(rejected_view["operation_id"].is_null());
+    assert!(rejected_view.get("owner").is_none());
+    assert!(
+        rejected_view["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("no remote operation exists")
+    );
+    assert_eq!(count(&g).await, 0);
+
+    let operation = insert(&g, "code_read", Some(json!({"answer":42}))).await;
+    let accepted = format!("req_{}", "b".repeat(32));
+    g.store
+        .put(
+            "request_receipt",
+            &accepted,
+            &json!({
+                "protocol":1,"request_id":accepted,"owner":"owner","tool":"code_read",
+                "state":"operation_created","received_at":now(),"updated_at":now(),
+                "operation_id":operation,"last_confirmed_stage":"operation_created",
+                "execution_state":"remote_operation_observable"
+            }),
+            now() + 100,
+        )
+        .await
+        .unwrap();
+    let accepted_view = call(&g, &p, json!({"request_id":accepted})).await;
+    assert_eq!(accepted_view["answer"], 42);
+    assert_eq!(accepted_view["operation_id"], operation);
+    assert_eq!(accepted_view["request_receipt"]["request_id"], accepted);
+    assert!(accepted_view["request_receipt"].get("owner").is_none());
+    assert_eq!(
+        count(&g).await,
+        1,
+        "request observation must not create a new job"
+    );
+}
+
 #[tokio::test]
 async fn receipt_wakes_existing_batch_wait_and_does_not_reexecute() {
     let (_d, g, p, token) = fixture().await;
@@ -239,13 +377,17 @@ async fn small_results_that_fit_the_budget_are_not_all_omitted() {
 #[tokio::test]
 async fn expired_artifact_does_not_hide_other_authorized_results() {
     let (_d, g, p, _) = fixture().await;
-    let gone = insert(&g, "file_download", Some(json!({"artifact_id":"expired"}))).await;
+    let saved =
+        json!({"state":"completed","artifact_id":"expired","sha256":"a".repeat(64),"size":3});
+    let gone = insert(&g, "file_download", Some(saved.clone())).await;
     let good = insert(&g, "code_read", Some(json!({"answer":42}))).await;
     let out = call(&g, &p, json!({"operation_ids":[gone,good]})).await;
-    assert_eq!(
-        out["operations"][0]["observation_error"]["code"],
-        "result_unavailable"
-    );
+    assert_eq!(out["operations"][0]["state"], "completed");
+    assert_eq!(out["operations"][0]["sha256"], saved["sha256"]);
+    assert_eq!(out["operations"][0]["size"], saved["size"]);
+    assert_eq!(out["operations"][0]["download_available"], false);
+    assert!(out["operations"][0].get("observation_error").is_none());
+    assert!(out["operations"][0].get("download_url").is_none());
     assert_eq!(out["operations"][1]["answer"], 42);
     assert_eq!(count(&g).await, 2);
 }
@@ -304,6 +446,7 @@ async fn malformed_mixed_or_duplicate_requests_never_create_jobs() {
     for args in [
         json!({}),
         json!({"operation_id":id,"operation_ids":[id]}),
+        json!({"request_id":format!("req_{}", "c".repeat(32)),"operation_id":id}),
         json!({"operation_ids":[id,id]}),
         json!({"operation_ids":[]}),
         json!({"operation_id":id,"wait_ms":5001}),
@@ -319,11 +462,31 @@ async fn device_manifest_detects_schema_mismatch_without_guessing_old_agent_feat
     let expected = hash(serde_json::to_vec(&tools::catalog()).unwrap());
     assert_eq!(a["gateway"]["tools_sha256"], expected);
     assert_eq!(a["devices"][0]["runtime_features_status"], "not_reported");
+    assert_eq!(
+        a["capability_layers"]["current_session_exposure"]["status"],
+        "unknown_not_reported"
+    );
+    assert_eq!(
+        a["capability_layers"]["current_session_exposure"]["host_catalog_hash_supplied"],
+        false
+    );
+    assert_eq!(
+        a["capability_layers"]["account_authorization"]["status"],
+        "known"
+    );
+    assert_eq!(
+        a["capability_layers"]["server_catalog"]["tool_schema_revision"],
+        expected
+    );
     let good = g
         .dispatch(&p, "devices_list", json!({"known_tools_sha256":expected}))
         .await
         .unwrap();
     assert_eq!(good["gateway"]["refresh_required"], false);
+    assert_eq!(
+        good["capability_layers"]["current_session_exposure"]["status"],
+        "unknown_not_reported"
+    );
     let bad = g
         .dispatch(
             &p,
@@ -333,6 +496,10 @@ async fn device_manifest_detects_schema_mismatch_without_guessing_old_agent_feat
         .await
         .unwrap();
     assert_eq!(bad["gateway"]["refresh_required"], true);
+    assert_eq!(
+        bad["capability_layers"]["current_session_exposure"]["status"],
+        "unknown_not_reported"
+    );
     assert!(
         g.dispatch(
             &p,

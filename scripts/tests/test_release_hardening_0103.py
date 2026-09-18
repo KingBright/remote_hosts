@@ -2,8 +2,10 @@
 import importlib.util
 import json
 import pathlib
+import ssl
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 import sys
 
@@ -23,6 +25,7 @@ def load(name, path):
 
 fleet = load('fleet_upgrade_0103', SCRIPTS/'fleet-upgrade.py')
 linux_upgrade = load('linux_upgrade_0103', SCRIPTS/'upgrade-code-agent-linux.py')
+agent_support = load('agent_upgrade_support_0103', SCRIPTS/'agent_upgrade_support.py')
 
 
 class FakeClient:
@@ -40,6 +43,40 @@ class ReleaseHardening0103Tests(unittest.TestCase):
         self.assertEqual(fleet.controller_device_id({'controller_workspace':'device-1:workspace-2'}), 'device-1')
         self.assertEqual(fleet.controller_device_id({'controller_device_id':'explicit','controller_workspace':'other:ws'}), 'explicit')
         self.assertIsNone(fleet.controller_device_id({}))
+
+    def test_exported_size_accepts_legacy_receipt_without_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = pathlib.Path(directory)/'bundle.tgz'
+            bundle.write_bytes(b'legacy-export')
+            self.assertEqual(fleet.exported_size({'operation_id':'op'}, bundle), len(b'legacy-export'))
+            self.assertEqual(fleet.exported_size({'size':123}, bundle), 123)
+
+    def test_export_attempt_identity_changes_with_report_directory(self):
+        first=fleet.rr.identity(['0.10.3','/tmp/report-a'])[:12]
+        second=fleet.rr.identity(['0.10.3','/tmp/report-b'])[:12]
+        self.assertNotEqual(first,second)
+        self.assertEqual(first,fleet.rr.identity(['0.10.3','/tmp/report-a'])[:12])
+
+    def test_verified_export_resumes_same_operation_until_completed(self):
+        sha = 'a'*64
+        paused = {'state':'paused','next_action':'transfer_resume','operation_id':'op-export'}
+        queued = {'state':'resume_queued','operation_id':'op-export','next_action':'operation_get'}
+        completed = {'state':'completed','operation_id':'op-export','sha256':sha,
+                     'artifact_id':'artifact-1','download_url':'https://example.invalid/export','size':7}
+        class SequenceClient:
+            def __init__(self): self.calls=[];self.results=[queued,completed]
+            def tool(self,name,args): self.calls.append((name,args));return self.results.pop(0)
+        client=SequenceClient()
+        result=fleet.verified_export(client,paused,pathlib.Path('bundle.tgz'),sha,'0.10.3')
+        self.assertEqual(result,completed)
+        self.assertEqual([c[0] for c in client.calls],['transfer_resume','operation_get'])
+        self.assertEqual(client.calls[0][1]['operation_id'],'op-export')
+
+    def test_verified_export_rejects_completed_without_artifact_identity(self):
+        client=FakeClient({})
+        with self.assertRaisesRegex(RuntimeError,'verified artifact identity'):
+            fleet.verified_export(client,{'state':'completed','operation_id':'op','sha256':'a'*64},
+                                  pathlib.Path('bundle.tgz'),'a'*64,'0.10.3')
 
     def test_verified_import_resumes_publication_recovery(self):
         sha = 'a'*64
@@ -61,6 +98,15 @@ class ReleaseHardening0103Tests(unittest.TestCase):
                 {'artifact_id':'source','download_url':'https://example.invalid/file'},
                 pathlib.Path('bundle.tgz'), 'a'*64, '0.10.3', 'device-1')
         self.assertEqual(client.calls, [])
+
+    def test_tls_handshake_is_retryable_but_certificate_failure_is_not(self):
+        transient = agent_support.gateway_error(urllib.error.URLError(ssl.SSLError('transient handshake')))
+        self.assertEqual(transient['category'], 'tls_handshake')
+        self.assertTrue(transient['retryable'])
+        self.assertEqual(transient['next_action'], 'retry_same_readonly_probe_with_backoff')
+        permanent = agent_support.gateway_error(urllib.error.URLError(ssl.SSLCertVerificationError(1, 'certificate verify failed')))
+        self.assertEqual(permanent['category'], 'tls_certificate')
+        self.assertFalse(permanent['retryable'])
 
     def test_linux_readiness_retries_transient_gateway_error(self):
         error = linux_upgrade.GatewayObservationError({

@@ -18,6 +18,7 @@ async fn fixture() -> (tempfile::TempDir, Gateway, String, tokio::net::TcpListen
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let credential = random();
     let g = Gateway::new(GatewayConfig {
+        allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: format!("https://{}", listener.local_addr().unwrap()),
         bind: listener.local_addr().unwrap().to_string(),
         state_dir: dir.path().join("gateway"),
@@ -79,7 +80,11 @@ async fn get(g: &Gateway, path: &str, range: Option<&str>) -> axum::response::Re
 
 #[test]
 fn host_file_parameter_metadata_and_safety_annotations_survive_catalog() {
-    assert_eq!(tools::catalog().len(), 23);
+    assert_eq!(
+        remote_hosts_code::release_manifest()["tool_count"],
+        tools::catalog().len()
+    );
+    assert!(tools::catalog().iter().any(|t| t.name == "task_context"));
     let t = tools::catalog()
         .into_iter()
         .find(|t| t.name == "file_upload")
@@ -205,11 +210,120 @@ async fn real_streaming_export_checksum_range_expiry_and_duplicate() {
         .await
         .unwrap();
     assert_ne!(refreshed["download_url"], result["download_url"]);
+    assert_eq!(refreshed["download_available"], true);
+    let (durable_before,): (String,) = sqlx::query_as("SELECT result FROM jobs WHERE id=?")
+        .bind(&job.id)
+        .fetch_one(&g.store.pool)
+        .await
+        .unwrap();
+    let (links_before,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kv WHERE kind='file_link'")
+        .fetch_one(&g.store.pool)
+        .await
+        .unwrap();
+    // Both an expired cache entry and a collected artifact preserve the receipt.
+    for statement in [
+        "UPDATE kv SET expires=0 WHERE kind='file_blob' AND key=?",
+        "DELETE FROM kv WHERE kind='file_blob' AND key=?",
+    ] {
+        sqlx::query(statement)
+            .bind(&job.id)
+            .execute(&g.store.pool)
+            .await
+            .unwrap();
+        let unavailable = g
+            .dispatch(
+                &principal(&g),
+                "operation_get",
+                json!({"operation_id":job.id}),
+            )
+            .await
+            .unwrap();
+        assert!(unavailable.get("error").is_none(), "{unavailable}");
+        assert_eq!(unavailable["sha256"], result["sha256"]);
+        assert_eq!(unavailable["size"], result["size"]);
+        assert_eq!(unavailable["operation_id"], job.id);
+        assert_eq!(unavailable["download_available"], false);
+        assert_eq!(
+            unavailable["download_unavailable_reason"],
+            "artifact_expired_or_removed"
+        );
+        assert!(unavailable.get("download_url").is_none());
+        let (durable_after,): (String,) = sqlx::query_as("SELECT result FROM jobs WHERE id=?")
+            .bind(&job.id)
+            .fetch_one(&g.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(durable_after, durable_before);
+    }
+    let (links_after,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kv WHERE kind='file_link'")
+        .fetch_one(&g.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        links_after, links_before,
+        "unavailable artifacts must not mint links"
+    );
     assert_eq!(
         std::fs::read(ws.root.join("binary-test.bin")).unwrap(),
         bytes
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn completed_export_remains_observable_without_blob_and_keeps_authorization() {
+    let (_dir, g, _credential, _listener) = fixture().await;
+    let export = job(&g, "file_download", json!({"path":"receipt.bin"})).await;
+    let saved =
+        json!({"state":"completed","artifact_id":export.id,"sha256":hash(b"receipt"),"size":7});
+    sqlx::query("UPDATE jobs SET state='done',result=? WHERE id=?")
+        .bind(saved.to_string())
+        .bind(&export.id)
+        .execute(&g.store.pool)
+        .await
+        .unwrap();
+    let result = g
+        .dispatch(
+            &principal(&g),
+            "operation_get",
+            json!({"operation_id":export.id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["state"], "completed");
+    assert_eq!(result["sha256"], saved["sha256"]);
+    assert_eq!(result["download_available"], false);
+    assert_eq!(
+        result["recovery_action"],
+        "export_again_with_expected_source_version"
+    );
+    assert!(result.get("download_url").is_none());
+    let mut foreign = principal(&g);
+    foreign.owner = "another-owner".into();
+    assert!(
+        g.dispatch(&foreign, "operation_get", json!({"operation_id":export.id}))
+            .await
+            .is_err()
+    );
+    let mut unprivileged = principal(&g);
+    unprivileged.scopes.clear();
+    assert!(
+        g.dispatch(
+            &unprivileged,
+            "operation_get",
+            json!({"operation_id":export.id})
+        )
+        .await
+        .is_err()
+    );
+    let (jobs,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM jobs")
+        .fetch_one(&g.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs, 1,
+        "observing a receipt must never re-export the source"
+    );
 }
 
 #[tokio::test]

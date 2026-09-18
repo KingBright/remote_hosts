@@ -8,7 +8,7 @@ pub fn scope(name: &str) -> Option<&'static str> {
     match name {
         "devices_list" | "fleet_status" | "workspace_open" | "code_list" | "code_search"
         | "code_read" | "code_symbols" | "code_diff" | "operation_get" | "terminal_read"
-        | "file_download" | "workspace_context" => Some("code:read"),
+        | "file_download" | "workspace_context" | "task_context" => Some("code:read"),
         "code_apply_edits" | "change_resume" | "workspace_gc" | "files_sync" | "file_upload"
         | "transfer_cancel" | "transfer_resume" | "outcome_resolve" => Some("code:write"),
         "terminal_exec" | "terminal_input" | "terminal_cancel" => Some("terminal:exec"),
@@ -128,13 +128,23 @@ fn build_catalog() -> Vec<Tool> {
     let mut tools: Vec<Tool> = vec![];
     let mut add = |name: &str, description: &str, mut properties: Value, required: Vec<&str>| {
         properties["response_mode"] = json!({"type":"string","enum":["full","compact"],"default":"compact","description":"MCP envelope view; compact is the default. full restores diagnostic metadata."});
-        let read = scope(name) == Some("code:read") && name != "workspace_open";
+        if name != "task_context" {
+            properties["task_id"] = json!({"type":"string","description":"Optional correlation label for one authorized cross-device task; it never authorizes or replays work."});
+        }
+        let read =
+            scope(name) == Some("code:read") && !matches!(name, "workspace_open" | "file_download");
         let value = json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"outputSchema":{"type":"object","additionalProperties":true},"annotations":{"readOnlyHint":read,"destructiveHint":!read&&name!="workspace_open","idempotentHint":true,"openWorldHint":name.starts_with("terminal_")}});
         // Catalog is composed entirely from static, server-controlled JSON.
         if let Ok(tool) = serde_json::from_value(value) {
             tools.push(tool);
         }
     };
+    add(
+        "task_context",
+        "Restore one authorized cross-device task: linked operations, workspaces, execution states, evidence boundaries and the next existing handle. Read-only; never resumes or replays work. Follow next_page when has_more=true. No evidence of a task is not proof of a host rejection.",
+        json!({"task_id":string(),"limit":integer(1,100),"after_operation":string(),"cursor":string()}),
+        vec!["task_id"],
+    );
     add(
         "devices_list",
         "List authorized devices, freshness and roots, explicit gateway/agent wire compatibility, tool schema revision and separately reported agent/Skill features. Optional known_tools_sha256 detects a stale client catalog; refresh is controlled by the host, not this server. Choose a device explicitly; never fail over.",
@@ -209,8 +219,8 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "terminal_exec",
-        "Start a command in the bound workspace. Default pty=false uses real pipes with stdin EOF and combined stdout/stderr; use pty=true only for interactive input. Shell has local-user authority outside code roots. Write-capable action. Default returns terminal_id immediately. Optional wait_ms up to 2000 returns initial output/status without rerunning; a wait timeout does not stop the command. Follow the returned cursor. Never retry uncertain execution with a new key.",
-        json!({"workspace_id":string(),"idempotency_key":string(),"command":string(),"pty":{"type":"boolean"},"timeout_seconds":integer(1,7200),"cols":integer(20,500),"rows":integer(5,200),"wait_ms":integer(0,2000)}),
+        "Start a command in the bound workspace. Default pty=false uses real pipes with stdin EOF and combined stdout/stderr; use pty=true only for interactive input. Shell has local-user authority outside code roots. Write-capable action. By default waits up to 1000 ms so short commands can return exit/output in one call; long commands return the same durable terminal_id. wait_ms may be 0..2000 and never stops the command. Follow the returned cursor; never replay uncertain execution.",
+        json!({"workspace_id":string(),"idempotency_key":string(),"command":string(),"pty":{"type":"boolean"},"timeout_seconds":integer(1,7200),"cols":integer(20,500),"rows":integer(5,200),"wait_ms":{"type":"integer","minimum":0,"maximum":2000,"default":1000}}),
         vec!["workspace_id", "idempotency_key", "command"],
     );
     add(
@@ -233,8 +243,8 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "operation_get",
-        "Observe one operation_id OR 1..20 operation_ids. Optional wait_ms up to 5000 waits for meaningful state/progress changes; cursor is a latest-state fingerprint, not an event replay cursor. Results include gateway queue/dispatch/result lifecycle timing, agent monotonic execution phases when available, linked terminal status/exit_code, and transfer progress. Never subtract gateway wall timestamps from agent clocks. It does not read terminal output, queue, retry or cancel work. Query omitted results individually.",
-        json!({"operation_id":string(),"operation_ids":{"type":"array","minItems":1,"maxItems":20,"items":string()},"wait_ms":integer(0,5000),"cursor":string(),"max_bytes":integer(4096,131072)}),
+        "Observe one request_id, one operation_id, or 1..20 operation_ids without creating another task. request_id exposes the Gateway receipt even when no remote operation was created, and resolves to its operation when one exists. A bounded wait defaults to 1200 ms. Terminal operations include a bounded sanitized live-output preview; terminal_cursor continues that preview when retained. Use terminal_read only for full history/recovery. It never queues, retries, cancels or replays work.",
+        json!({"request_id":string(),"operation_id":string(),"operation_ids":{"type":"array","minItems":1,"maxItems":20,"items":string()},"wait_ms":{"type":"integer","minimum":0,"maximum":5000,"default":1200},"cursor":string(),"terminal_cursor":integer(0,100000000),"max_bytes":integer(4096,131072)}),
         vec![],
     );
     add(

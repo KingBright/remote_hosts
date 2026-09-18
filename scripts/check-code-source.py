@@ -38,7 +38,7 @@ def inputs(root):
                              'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') if (root/n).is_file()}
     # sqlx::migrate!("../../migrations") and root fixtures are compiled/tested
     # inputs too. Include their membership, not only .rs files inside crates.
-    for subtree in ('crates', 'skills', '.cargo', 'migrations', 'fixtures', 'tests', 'assets', '.sqlx'):
+    for subtree in ('crates', 'skills', '.cargo', '.github', 'migrations', 'fixtures', 'tests', 'assets', '.sqlx'):
         if (root/subtree).is_symlink():
             raise ValueError('unsupported linked verification subtree: '+subtree)
         for directory, children, files in os.walk(root/subtree, followlinks=False):
@@ -121,16 +121,35 @@ def summarize(checks, logs):
     summary = re.search(r'^(?:FAILED|OK)(?: \(([^\n]*)\))?$', py, re.MULTILINE)
     detail = dict((k, int(v)) for k, v in re.findall(r'(failures|errors|skipped|expected failures|unexpected successes)=(\d+)', summary[1] or '')) if summary else {}
     py_failed = detail.get('failures', 0)+detail.get('errors', 0)+detail.get('unexpected successes', 0)
-    py_skipped = detail.get('skipped', 0)+detail.get('expected failures', 0)
-    py_passed = max(0, int(ran[1])-py_failed-py_skipped) if ran and summary else 0
+    py_skipped = detail.get('skipped', 0)
+    py_expected_failures = detail.get('expected failures', 0)
+    py_selected = int(ran[1]) if ran and summary else 0
+    py_executed = max(0, py_selected-py_skipped)
+    py_passed = max(0, py_executed-py_failed-py_expected_failures)
     rust_passed = sum(int(p) for p, f, i in counts)
     rust_failed = sum(int(f) for p, f, i in counts)
-    complete = all(checks.get(name, {}).get('state') == 'finished' and checks[name].get('exit_code') == 0
+    rust_ignored = sum(int(i) for p, f, i in counts)
+    rust_selected = rust_passed+rust_failed+rust_ignored
+    rust_executed = rust_passed+rust_failed
+    gates_ok = all(checks.get(name, {}).get('state') == 'finished' and checks[name].get('exit_code') == 0
                    for name in ('rust_tests', 'python_tests'))
+    output_complete = all(checks.get(name, {}).get('output_complete', True)
+                          and not checks.get(name, {}).get('output_truncated', False)
+                          and not checks.get(name, {}).get('output_error')
+                          for name in ('rust_tests', 'python_tests'))
+    evidence_complete = (gates_ok and output_complete and rust_executed > 0 and py_executed > 0
+                         and rust_failed == 0 and py_failed == 0
+                         and py_selected >= py_skipped+py_failed+py_expected_failures)
     return {'passed': rust_passed+py_passed, 'failed': rust_failed+py_failed,
-            'rust_passed': rust_passed, 'python_passed': py_passed, 'python_failed': py_failed,
-            'python_skipped': py_skipped, 'ignored_benchmarks': sum(int(i) for p, f, i in counts),
-            'test_gates_completed_successfully': complete}
+            'rust_passed': rust_passed, 'rust_failed': rust_failed, 'rust_executed': rust_executed,
+            'python_passed': py_passed, 'python_failed': py_failed, 'python_executed': py_executed,
+            'rust_selected': rust_selected, 'python_selected': py_selected,
+            'python_skipped': py_skipped, 'python_expected_failures': py_expected_failures,
+            'rust_ignored': rust_ignored, 'ignored_benchmarks': rust_ignored,
+            'output_complete': output_complete, 'test_evidence_protocol': 2,
+            'test_gates_completed_successfully': gates_ok,
+            'evidence_complete': evidence_complete,
+            'evidence_note': 'verification requires executed tests, complete output and no recorded failures; skipped/ignored tests are not executions' if gates_ok and not evidence_complete else None}
 
 
 def snapshot_identity(root):
@@ -153,6 +172,7 @@ def receipt_current(proof, root):
             and all(proof['checks'][name].get('exit_code') == 0 for name in REQUIRED)
             and proof.get('functional_tests', {}).get('failed') == 0
             and proof.get('functional_tests', {}).get('test_gates_completed_successfully') is True
+            and proof.get('functional_tests', {}).get('evidence_complete') is True
             and proof.get('source_inputs') == inputs(root)
             and proof.get('snapshot_id') == snapshot_identity(root))
 
@@ -173,11 +193,17 @@ def run_verification(root, report, gates=None, timeout=900):
                       run_id=run, scope='native source verification, not deployment', source_inputs=inputs(root), state='running',
                       execution_root=str(root.resolve()), snapshot_id=snapshot_identity(root))
         publish(report, result)
+        # Cargo test includes compiling/linking every test executable. Keep a
+        # bounded build budget distinct from fast checks and caller test fixtures.
+        gate_timeouts = {'rust_tests': 2700, 'workspace': 1800} if gates is None else {}
         if gates is None:
             gates = [
-                ('fmt', ['cargo', 'fmt', '-p', 'remote-hosts-code', '--', '--check']),
-                ('clippy', ['cargo', 'clippy', '-p', 'remote-hosts-code', '--all-targets', '--locked', '--', '-D', 'warnings']),
-                ('rust_tests', ['cargo', 'test', '-p', 'remote-hosts-code', '-p', 'remote-hosts-mcp', '--locked', '--no-fail-fast', '--', '--test-threads=2', '--color', 'never']),
+                ('fmt', ['cargo', 'fmt', '-p', 'remote-hosts-code', '-p', 'remote-hosts-release', '--', '--check']),
+                ('clippy', ['cargo', 'clippy', '-p', 'remote-hosts-code', '-p', 'remote-hosts-release', '--all-targets', '--locked', '--', '-D', 'warnings']),
+                # Concurrency fixtures create their own parallel actors. Keep
+                # unrelated fsync-heavy cases from distorting their watchdogs;
+                # do not weaken assertions, deadlines, or in-test concurrency.
+                ('rust_tests', ['cargo', 'test', '-p', 'remote-hosts-code', '-p', 'remote-hosts-mcp', '-p', 'remote-hosts-release', '-p', 'remote-hosts-token-output', '--locked', '--no-fail-fast', '--', '--test-threads=1', '--color', 'never']),
                 ('python_tests', [sys.executable, '-W', 'error::ResourceWarning', '-m', 'unittest', 'discover', '-s', 'scripts/tests', '-v']),
                 ('workspace', ['cargo', 'check', '--workspace', '--locked']),
             ]
@@ -185,13 +211,18 @@ def run_verification(root, report, gates=None, timeout=900):
         for name, argv in gates:
             path = logs/(name+'.log')
             started = time.monotonic()
-            result['checks'][name] = {'state': 'running', 'exit_code': None, 'log': str(path.relative_to(root))}
+            command_timeout = gate_timeouts.get(name, timeout)
+            result['checks'][name] = {'state': 'running', 'exit_code': None,
+                                      'command': list(argv), 'working_directory': str(root.resolve()),
+                                      'log': str(path.relative_to(root)), 'timeout_seconds': command_timeout}
             publish(report, result)
             try:
-                outcome = run_command(argv, root, path, env, timeout)
+                outcome = run_command(argv, root, path, env, command_timeout)
             except Exception as error:
                 outcome = {'state': 'start_or_collection_failed', 'exit_code': None, 'failure_type': type(error).__name__}
             result['checks'][name].update(outcome, elapsed_seconds=time.monotonic()-started,
+                                         output_complete=outcome['state'] == 'finished' and path.is_file(),
+                                         output_truncated=False, step_index=len(result['checks'])-1,
                                          sha256=digest(path) if path.exists() else None)
             publish(report, result)
             print(json.dumps({'gate': name, **result['checks'][name]}), flush=True)
@@ -214,6 +245,9 @@ def run_verification(root, report, gates=None, timeout=900):
     except Exception as error:
         result.update(state='stale', source_inputs_unchanged=False, input_failure_type=type(error).__name__)
     result.update(functional_tests=summarize(result['checks'], logs), verified_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+    if result['state'] == 'passed' and not result['functional_tests']['evidence_complete']:
+        result['state'] = 'failed'
+        result['failure_type'] = 'IncompleteTestEvidence'
     publish(report, result)
     print(json.dumps({'state': result['state'], 'report': str(report), **result['functional_tests']}), flush=True)
     return result

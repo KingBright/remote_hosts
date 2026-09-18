@@ -62,6 +62,34 @@ enum Command {
         #[arg(long, default_value = "/bin/zsh")]
         shell: PathBuf,
     },
+    /// Pre-register an OAuth client and save credentials to a new private file.
+    /// The exact callback must already be allowed in the gateway configuration.
+    RegisterOauthClient {
+        #[arg(long)]
+        gateway_config: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long, required = true)]
+        redirect_uri: Vec<String>,
+        #[arg(long, default_value = "client_secret_basic", value_parser = ["none", "client_secret_basic", "client_secret_post"])]
+        auth_method: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Print the static machine-readable tool/protocol contract used by release packaging.
+    ReleaseManifest,
+    /// Serve the generated tools over stdio with durable request receipts and automatic catalog reports.
+    Adapter {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Generate or validate the adapter contract from the compiled Gateway catalog.
+    AdapterContract {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        check: bool,
+    },
     /// Validate configuration without starting services or printing credentials.
     Check {
         #[arg(long)]
@@ -141,6 +169,7 @@ async fn main() -> Result<()> {
                 password_hash,
                 devices: vec![],
                 redirect_uris: vec!["https://chatgpt.com/connector_platform_oauth_redirect".into()],
+                allowed_origins: remote_hosts_code::default_mcp_client_origins(),
             };
             write_private(&password_file, password.as_bytes())?;
             write_private(&config, &serde_json::to_vec_pretty(&c)?)?;
@@ -194,6 +223,79 @@ async fn main() -> Result<()> {
             write_private(&gateway_config, &serde_json::to_vec_pretty(&g)?)?;
             println!("Enrolled device {id}; reload gateway configuration before connecting.");
         }
+        Command::RegisterOauthClient {
+            gateway_config,
+            name,
+            redirect_uri,
+            auth_method,
+            output,
+        } => {
+            use std::io::Write;
+            ensure!(!output.exists(), "refusing to overwrite OAuth credentials");
+            let parent = output
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            let mut file = tempfile::NamedTempFile::new_in(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            let c: GatewayConfig = read_config(&gateway_config)?;
+            let gateway = remote_hosts_code::gateway::Gateway::new(c).await?;
+            let client = gateway
+                .auth
+                .register_client(&serde_json::json!({
+                    "client_name": name,
+                    "redirect_uris": redirect_uri,
+                    "token_endpoint_auth_method": auth_method,
+                }))
+                .await
+                .map_err(|(status, error)| {
+                    anyhow::anyhow!("OAuth client registration failed: {} {}", status, error.0)
+                })?;
+            let saved = (|| -> Result<()> {
+                file.write_all(&serde_json::to_vec_pretty(&client)?)?;
+                file.as_file().sync_all()?;
+                file.persist_noclobber(&output)?;
+                Ok(())
+            })();
+            if saved.is_err() {
+                // A credential file failure must not leave a usable orphan client.
+                if let Some(id) = client.get("client_id").and_then(serde_json::Value::as_str) {
+                    gateway
+                        .store
+                        .take::<serde_json::Value>(
+                            &remote_hosts_code::auth::oauth_state_kind("client", id),
+                            id,
+                        )
+                        .await?;
+                }
+            }
+            saved?;
+            println!(
+                "OAuth client created; credentials saved to the requested private file (values not displayed)."
+            );
+        }
+        Command::Adapter { config } => {
+            remote_hosts_code::adapter::serve(&config).await?;
+        }
+        Command::AdapterContract { output, check } => {
+            remote_hosts_code::contract::export(&output, check)?;
+            println!(
+                "{}",
+                serde_json::json!({"state":"passed","checked":check,"path":output})
+            );
+        }
+        Command::ReleaseManifest => {
+            println!(
+                "{}",
+                serde_json::to_string(&remote_hosts_code::release_manifest())?
+            );
+        }
         Command::Check { config, agent } => {
             if agent {
                 let c: AgentConfig = read_config(&config)?;
@@ -202,7 +304,7 @@ async fn main() -> Result<()> {
                 ensure!(!c.roots.is_empty(), "no project roots");
             } else {
                 let c: GatewayConfig = read_config(&config)?;
-                remote_hosts_code::validate_url(&c.public_url)?;
+                c.validate_oauth_policy()?;
             }
             println!("Configuration valid; secrets not displayed.");
         }
