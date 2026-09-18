@@ -53,14 +53,40 @@ def required_tool_names(version):
         tools |= {'change_resume','workspace_gc'}
     if parsed >= (0, 10, 2):
         tools |= {'fleet_status','outcome_resolve'}
+    if parsed >= (0, 10, 4):
+        tools |= {'task_context'}
     return tools
 
 
 def stable_operation_receipt(value):
-    """Compare durable operation content, not live observation snapshots."""
+    """Compare operation evidence, excluding per-call identity and observation time.
+
+    Errors, execution state, completeness, replay policy and operation identity
+    remain part of the comparison. A new observation is not a new execution.
+    """
     stable = dict(value)
-    stable.pop('operation_lifecycle', None)
+    for key in ('operation_lifecycle', 'request_id', 'observation', 'terminal_observation'):
+        stable.pop(key, None)
+    if isinstance(stable.get('receipt'), dict):
+        stable['receipt'] = dict(stable['receipt'])
+        for key in ('request_id', 'observed_at'):
+            stable['receipt'].pop(key, None)
     return stable
+
+
+def machine_tool_params(name, arguments):
+    """Acceptance consumes the full machine contract, not presentation compaction."""
+    arguments = dict(arguments)
+    arguments['response_mode'] = 'full'
+    return {'name': name, 'arguments': arguments}
+
+
+def rpc_attempt_limit(method, params):
+    """A transport failure cannot authorize replaying a mutation."""
+    observation = method in ('initialize', 'tools/list') or (
+        method == 'tools/call' and params.get('name') in
+        ('devices_list', 'fleet_status', 'operation_get', 'task_context'))
+    return 5 if observation else 1
 
 
 def acceptance_summary(report):
@@ -158,12 +184,13 @@ def main():
         nonlocal sequence
         sequence += 1
         payload = {"jsonrpc": "2.0", "id": sequence, "method": method, "params": params}
-        for attempt in range(5):
+        attempts = rpc_attempt_limit(method, params)
+        for attempt in range(attempts):
             try:
                 result = parsed("/mcp", payload, bearer=bearer)
                 break
             except (TimeoutError, urllib.error.URLError, OSError):
-                if attempt == 4:
+                if attempt + 1 == attempts:
                     raise
                 time.sleep(min(2 ** attempt, 8))
         if "error" in result:
@@ -203,7 +230,7 @@ def main():
         assert health.get("storage_reserve_bytes") == 268435456
 
     def tool(name, arguments, allow_error=False):
-        result = rpc("tools/call", {"name": name, "arguments": arguments})
+        result = rpc("tools/call", machine_tool_params(name, arguments))
         value = result.get("structuredContent")
         if value is None:
             value = json.loads(result["content"][0]["text"]) if not result.get("isError") else {"error": "tool_failed", "message": result["content"][0]["text"]}
@@ -212,7 +239,7 @@ def main():
             return bool(v.get("pending")) or v.get("next_action") == "operation_get"
         while needs_operation_poll(value) and time.monotonic() < deadline:
             time.sleep(0.5)
-            polled = rpc("tools/call", {"name": "operation_get", "arguments": {"operation_id": value["operation_id"]}})
+            polled = rpc("tools/call", machine_tool_params("operation_get", {"operation_id": value["operation_id"]}))
             value = polled.get("structuredContent") or {"error": "poll_failed"}
         if needs_operation_poll(value):
             raise RuntimeError("Operation pending: " + value["operation_id"])
