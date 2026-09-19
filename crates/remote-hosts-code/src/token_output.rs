@@ -246,10 +246,10 @@ pub(crate) fn compact_response(tool: &str, mut value: Value) -> Value {
         }
         _ => {}
     }
-    deduplicate_preview(&mut value);
+    deduplicate_preview(&mut value, "#/output");
     if let Some(rows) = value.get_mut("operations").and_then(Value::as_array_mut) {
-        for row in rows {
-            deduplicate_preview(row);
+        for (index, row) in rows.iter_mut().enumerate() {
+            deduplicate_preview(row, &format!("#/operations/{index}/output"));
         }
     }
     value
@@ -257,14 +257,14 @@ pub(crate) fn compact_response(tool: &str, mut value: Value) -> Value {
 
 /// Factor only identical text with identical byte coverage. Error, staleness
 /// and gap decisions remain explicit; full view keeps the original representation.
-fn deduplicate_preview(value: &mut Value) {
+fn deduplicate_preview(value: &mut Value, output_ref: &str) {
     let identical = value["output"].is_string()
         && value["terminal_observation"]["output"] == value["output"]
         && value["terminal_observation"]["output_cursor_start"] == value["raw_cursor_start"]
         && value["terminal_observation"]["output_cursor_end"] == value["cursor"];
     if identical && let Some(preview) = value["terminal_observation"].as_object_mut() {
         preview.remove("output");
-        preview.insert("output_ref".into(), json!("#/output"));
+        preview.insert("output_ref".into(), json!(output_ref));
     }
 }
 
@@ -355,6 +355,31 @@ pub(crate) fn compact_text(tool: &str, value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_batch_references_resolve_to_their_own_output_only() {
+        let row = |text: &str| {
+            json!({"output":text,"raw_cursor_start":0,"cursor":text.len(),
+            "terminal_observation":{"output":text,"output_cursor_start":0,"output_cursor_end":text.len(),"output_gap":false,"stale":true}})
+        };
+        let output = compact_response(
+            "operation_get",
+            json!({"operations":[row("first"),row("second")]}),
+        );
+        for (index, expected) in ["first", "second"].into_iter().enumerate() {
+            let path = output["operations"][index]["terminal_observation"]["output_ref"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                output.pointer(path.strip_prefix('#').unwrap()),
+                Some(&json!(expected))
+            );
+            assert_eq!(
+                output["operations"][index]["terminal_observation"]["stale"],
+                true
+            );
+        }
+    }
 
     #[test]
     fn recognizes_high_noise_commands_without_touching_ptys() {
