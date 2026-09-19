@@ -336,7 +336,46 @@ async fn status_validator_is_session_scoped_and_changes_with_task_outcome() {
     assert!(policy.contains("script-src 'self'"));
     assert!(policy.contains("connect-src 'self'"));
     assert!(!policy.contains("script-src 'unsafe-inline'"));
-    assert!(!f.g.config.authorization_csp().contains("script-src"));
+    let oauth =
+        f.g.router()
+            .unwrap()
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/oauth-authorization-server")
+                    .header("host", "fixture.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(oauth.status(), StatusCode::OK);
+    let oauth_policy = oauth.headers()["content-security-policy"].to_str().unwrap();
+    assert!(oauth_policy.contains("default-src 'none'"));
+    assert!(!oauth_policy.contains("script-src"));
+    let script =
+        f.g.router()
+            .unwrap()
+            .oneshot(
+                Request::builder()
+                    .uri("/status/live.js")
+                    .header("host", "fixture.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(script.status(), StatusCode::OK);
+    assert!(
+        script.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains("javascript")
+    );
+    let script_bytes = to_bytes(script.into_body(), 16384).await.unwrap();
+    assert_eq!(
+        script_bytes.as_ref(),
+        include_bytes!("../src/status_live.js").as_slice()
+    );
     let etag = first.headers()["etag"].to_str().unwrap().to_owned();
     let html = String::from_utf8(
         to_bytes(first.into_body(), 1024 * 1024)
