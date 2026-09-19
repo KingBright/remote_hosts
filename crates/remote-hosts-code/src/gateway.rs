@@ -1276,48 +1276,31 @@ async fn heartbeat(
     if !request.valid() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    // Renew the session and active dispatch leases, never another session's work.
-    let updated = sqlx::query("UPDATE kv SET value=json_set(value,'$.last_seen',?) WHERE kind='online' AND key=? AND json_extract(value,'$.hello.session')=?")
-        .bind(now()).bind(&device).bind(&request.hello.session).execute(&g.store.pool).await;
+    // One durable commit for the whole authenticated heartbeat. Never weaken
+    // FULL synchronous storage or leave a renewed lease with missing snapshots.
+    let updated: Result<bool> = async {
+        let mut tx = g.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let renewed = sqlx::query("UPDATE kv SET value=json_set(value,'$.last_seen',?) WHERE kind='online' AND key=? AND json_extract(value,'$.hello.session')=?")
+            .bind(now()).bind(&device).bind(&request.hello.session).execute(&mut *tx).await?;
+        if renewed.rows_affected() == 0 { return Ok(false); }
+        renew_jobs(&mut tx, &device, &request.hello.session, &request.active_operations).await?;
+        save_progress(&mut tx, &device, &request.hello.session, &request.progress).await?;
+        crate::terminal_sync::save_in_transaction(&mut tx, &device, &request.hello.session,
+            &request.terminal_updates, &request.terminal_previews).await?;
+        tx.commit().await?;
+        Ok(true)
+    }.await;
     match updated {
-        Ok(r) if r.rows_affected() == 1 => {
-            if renew_jobs(
-                &g,
-                &device,
-                &request.hello.session,
-                &request.active_operations,
-            )
-            .await
-            .is_err()
-            {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            if save_progress(&g, &device, &request.hello.session, &request.progress)
-                .await
-                .is_err()
-            {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            if crate::terminal_sync::save(
-                &g,
-                &device,
-                &request.hello.session,
-                &request.terminal_updates,
-                &request.terminal_previews,
-            )
-            .await
-            .is_err()
-            {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+        Ok(true) => {
+            g.observation_changed.notify_waiters();
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(_) => StatusCode::CONFLICT.into_response(),
+        Ok(false) => StatusCode::CONFLICT.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 async fn save_progress(
-    g: &Gateway,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     device: &str,
     session: &str,
     snapshots: &[crate::progress::Snapshot],
@@ -1326,16 +1309,20 @@ async fn save_progress(
         return Ok(());
     }
     sqlx::query("INSERT INTO kv(kind,key,value,expires) SELECT 'operation_progress',jobs.id,json_object('snapshot',json(p.value),'reported_at',?,'origin','agent'),? FROM json_each(?) AS p JOIN jobs ON jobs.id=json_extract(p.value,'$.operation_id') WHERE jobs.device=? AND jobs.state='dispatched' AND EXISTS (SELECT 1 FROM kv WHERE kind='online' AND key=? AND json_extract(value,'$.hello.session')=?) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value,expires=excluded.expires")
-        .bind(now()).bind(now()+86400).bind(serde_json::to_string(snapshots)?).bind(device).bind(device).bind(session).execute(&g.store.pool).await?;
-    g.observation_changed.notify_waiters();
+        .bind(now()).bind(now()+86400).bind(serde_json::to_string(snapshots)?).bind(device).bind(device).bind(session).execute(&mut **tx).await?;
     Ok(())
 }
-async fn renew_jobs(g: &Gateway, device: &str, session: &str, active: &[String]) -> Result<()> {
+async fn renew_jobs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    device: &str,
+    session: &str,
+    active: &[String],
+) -> Result<()> {
     if active.is_empty() {
         return Ok(());
     }
     sqlx::query("UPDATE jobs SET updated=? WHERE device=? AND state='dispatched' AND id IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM kv WHERE kind='online' AND key=? AND json_extract(value,'$.hello.session')=?)")
-        .bind(now()).bind(device).bind(serde_json::to_string(active)?).bind(device).bind(session).execute(&g.store.pool).await?;
+        .bind(now()).bind(device).bind(serde_json::to_string(active)?).bind(device).bind(session).execute(&mut **tx).await?;
     Ok(())
 }
 async fn poll(
@@ -1398,44 +1385,25 @@ async fn poll(
     };
     // Atomically claim/renew the lease. A separate SELECT then UPSERT permits two
     // fresh sessions to both pass the check and dispatch work for one identity.
-    let claim = sqlx::query("INSERT INTO kv(kind,key,value,expires) VALUES('online',?,?,?) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value,expires=excluded.expires WHERE json_extract(kv.value,'$.hello.session')=? OR json_extract(kv.value,'$.last_seen')<=?")
-        .bind(&device).bind(value).bind(i64::MAX)
-        .bind(&online.hello.session).bind(now()-45).execute(&g.store.pool).await;
+    let claim: Result<bool> = async {
+        let mut tx = g.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let claimed = sqlx::query("INSERT INTO kv(kind,key,value,expires) VALUES('online',?,?,?) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value,expires=excluded.expires WHERE json_extract(kv.value,'$.hello.session')=? OR json_extract(kv.value,'$.last_seen')<=?")
+            .bind(&device).bind(value).bind(i64::MAX)
+            .bind(&online.hello.session).bind(now()-45).execute(&mut *tx).await?;
+        if claimed.rows_affected() == 0 { return Ok(false); }
+        renew_jobs(&mut tx, &device, &online.hello.session, &request.active_operations).await?;
+        save_progress(&mut tx, &device, &online.hello.session, &request.progress).await?;
+        crate::terminal_sync::save_in_transaction(&mut tx, &device, &online.hello.session,
+            &request.terminal_updates, &request.terminal_previews).await?;
+        tx.commit().await?;
+        Ok(true)
+    }.await;
     match claim {
-        Ok(result) if result.rows_affected() == 0 => {
+        Ok(false) => {
             return (StatusCode::CONFLICT, "device session already active").into_response();
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        _ => {}
-    }
-    if renew_jobs(
-        &g,
-        &device,
-        &online.hello.session,
-        &request.active_operations,
-    )
-    .await
-    .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    if save_progress(&g, &device, &online.hello.session, &request.progress)
-        .await
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    if crate::terminal_sync::save(
-        &g,
-        &device,
-        &online.hello.session,
-        &request.terminal_updates,
-        &request.terminal_previews,
-    )
-    .await
-    .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        Ok(true) => g.observation_changed.notify_waiters(),
     }
     let Some(signals) = g.signals.get(&device) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();

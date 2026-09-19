@@ -179,8 +179,8 @@ fn merge(
     Some(value)
 }
 
-pub(crate) async fn save(
-    g: &Gateway,
+pub(crate) async fn save_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     device: &str,
     session: &str,
     statuses: &[Status],
@@ -197,14 +197,13 @@ pub(crate) async fn save(
         previews.len() <= 24 && previews.iter().all(valid_preview),
         "invalid_terminal_previews"
     );
-    // A single write transaction serializes heartbeat and poll snapshots. Each
-    // row is re-authorized against its original job and the current device session.
-    let mut tx = g.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    // The caller's write transaction binds session renewal, job leases and all
+    // observations to a single durable commit. Authorization stays in SQL.
     // Fetch authorization and previous snapshots in one bounded query rather
     // than running three statements for every terminal on every heartbeat.
     let rows:Vec<(String,Option<String>)>=sqlx::query_as(
         "SELECT j.id,p.value FROM json_each(?) s JOIN jobs j ON j.id=json_extract(s.value,'$.id') AND j.device=? AND json_extract(j.request,'$.tool')='terminal_exec' AND json_extract(j.request,'$.arguments.workspace_id')=json_extract(s.value,'$.workspace_id') JOIN kv o ON o.kind='online' AND o.key=j.device AND json_extract(o.value,'$.hello.session')=? LEFT JOIN kv p ON p.kind='terminal_observation' AND p.key=j.id")
-        .bind(serde_json::to_string(statuses)?).bind(device).bind(session).fetch_all(&mut *tx).await?;
+        .bind(serde_json::to_string(statuses)?).bind(device).bind(session).fetch_all(&mut **tx).await?;
     let mut updates = Vec::with_capacity(rows.len());
     for (id, previous) in rows {
         let Some(status) = statuses.iter().find(|s| s.id == id) else {
@@ -218,10 +217,8 @@ pub(crate) async fn save(
     }
     if !updates.is_empty() {
         sqlx::query("INSERT INTO kv(kind,key,value,expires) SELECT 'terminal_observation',json_extract(u.value,'$.id'),json_extract(u.value,'$.value'),? FROM json_each(?) u WHERE true ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value,expires=excluded.expires")
-            .bind(crate::receipts::RETAIN_UNTIL_EXPLICIT_CLEANUP).bind(serde_json::to_string(&updates)?).execute(&mut *tx).await?;
+            .bind(crate::receipts::RETAIN_UNTIL_EXPLICIT_CLEANUP).bind(serde_json::to_string(&updates)?).execute(&mut **tx).await?;
     }
-    tx.commit().await?;
-    g.observation_changed.notify_waiters();
     Ok(())
 }
 

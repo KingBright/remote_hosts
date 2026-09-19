@@ -169,6 +169,88 @@ fn request_id() -> String {
 }
 
 #[tokio::test]
+async fn device_snapshot_failure_rolls_back_session_and_job_lease_together() {
+    for path in ["/device/heartbeat", "/device/poll"] {
+        let f = Fixture::new().await;
+        let id = f.job(0, "dispatched", None).await;
+        let device = &f.g.config.devices[0].id;
+        let old_time = now() - 20;
+        let mut online: Value = f.g.store.get("online", device).await.unwrap().unwrap();
+        online["last_seen"] = json!(old_time);
+        f.g.store
+            .put("online", device, &online, i64::MAX)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET updated=? WHERE id=?")
+            .bind(old_time)
+            .bind(&id)
+            .execute(&f.g.store.pool)
+            .await
+            .unwrap();
+        let raw: String = sqlx::query_scalar("SELECT request FROM jobs WHERE id=?")
+            .bind(&id)
+            .fetch_one(&f.g.store.pool)
+            .await
+            .unwrap();
+        let job: Job = serde_json::from_str(&raw).unwrap();
+        let mut snapshot = terminal("running", now());
+        snapshot["id"] = json!(id);
+        snapshot["workspace_id"] = job.arguments["workspace_id"].clone();
+        sqlx::query("CREATE TRIGGER reject_snapshot BEFORE INSERT ON kv WHEN NEW.kind='terminal_observation' BEGIN SELECT RAISE(ABORT,'injected snapshot persistence failure'); END;")
+            .execute(&f.g.store.pool).await.unwrap();
+        let request = json!({"version":"0.10.4","session":"s".repeat(64),"roots":[],
+            "allow_write":true,"allow_exec":true,"active_operations":[id],
+            "terminal_updates":[snapshot],"poll_wait_ms":100});
+        let (status, _) = f
+            .request("POST", path, request.clone(), &f.tokens[0], &[])
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+        let retained: Value = f.g.store.get("online", device).await.unwrap().unwrap();
+        let lease: i64 = sqlx::query_scalar("SELECT updated FROM jobs WHERE id=?")
+            .bind(&id)
+            .fetch_one(&f.g.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            retained["last_seen"], old_time,
+            "failed {path} partially renewed its session"
+        );
+        assert_eq!(
+            lease, old_time,
+            "failed {path} partially renewed its job lease"
+        );
+        assert!(
+            f.g.store
+                .get::<Value>("terminal_observation", &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("DROP TRIGGER reject_snapshot")
+            .execute(&f.g.store.pool)
+            .await
+            .unwrap();
+        let (status, _) = f.request("POST", path, request, &f.tokens[0], &[]).await;
+        assert!(status.is_success(), "{path}: {status}");
+        let retained: Value = f.g.store.get("online", device).await.unwrap().unwrap();
+        let lease: i64 = sqlx::query_scalar("SELECT updated FROM jobs WHERE id=?")
+            .bind(&id)
+            .fetch_one(&f.g.store.pool)
+            .await
+            .unwrap();
+        assert!(retained["last_seen"].as_i64().unwrap() > old_time);
+        assert!(lease > old_time);
+        assert!(
+            f.g.store
+                .get::<Value>("terminal_observation", &id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
 async fn receipt_storage_failure_prevents_job_creation() {
     let f = Fixture::new().await;
     sqlx::query("CREATE TRIGGER fail_receipts BEFORE INSERT ON kv WHEN NEW.kind='request_receipt' BEGIN SELECT RAISE(ABORT,'injected storage failure'); END;")

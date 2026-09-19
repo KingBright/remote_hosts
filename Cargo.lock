@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "remote-hosts-code"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
