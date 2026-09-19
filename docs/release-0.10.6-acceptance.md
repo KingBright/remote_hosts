@@ -1,4 +1,4 @@
-# 0.10.5 observable-response release
+# 0.10.6 observable-response release
 
 This patch follows the immutable 0.10.4 release at 6f258c104e5a11149e7cdefb3475a7f282c4483b. Never overwrite its tag or artifacts.
 
@@ -21,3 +21,5 @@ Check each device through the actual runtime and installed artifact, not only a 
 ## Change discipline
 
 No new scheduler or task database. No unrelated repository edits. No unconditional upgrade retries. A blocked host request is not a remote process failure. If live acceptance reveals another reproducible defect, preserve its evidence, fix and test it, publish a new immutable patch release, then repeat the same acceptance cases.
+
+Version 0.10.5 is reserved by an older local Gemini candidate. That candidate was not overwritten; this release uses 0.10.6.
