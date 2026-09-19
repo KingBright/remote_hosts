@@ -144,7 +144,7 @@ fn merge(
             // A clock rollback must not suppress a first authoritative terminal
             // outcome. Within the same phase, older snapshots remain rejected.
             || (old["updated_at"].as_i64().unwrap_or(0) > status.updated_at
-                && !(ended(&terminal["state"]) && !ended(&old["state"])))
+                && (!ended(&terminal["state"]) || ended(&old["state"])))
             || (old["output_complete"] == true && !status.output_complete)
             || (old["exit_code"].is_i64() && old["exit_code"] != terminal["exit_code"])
             || (old["output_truncated"] == true && !status.output_truncated)
