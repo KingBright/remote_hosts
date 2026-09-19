@@ -12,11 +12,11 @@
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 6000);
     try {
-      const response = await fetch('/status', {
+      const response = await fetch('/status?revision=' + encodeURIComponent(body.dataset.revision), {
         credentials: 'same-origin', cache: 'no-store', signal: abort.signal,
         headers: {'If-None-Match': etag}
       });
-      if (response.status === 304) {
+      if (response.status === 304 || response.status === 204) {
         notice.textContent = '连接正常，任务状态无变化 · ' + new Date().toLocaleTimeString();
         notice.dataset.stale = 'false';
         return;

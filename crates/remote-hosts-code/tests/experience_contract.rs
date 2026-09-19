@@ -311,6 +311,90 @@ async fn compact_mcp_output_references_exact_duplicate_without_losing_evidence()
 }
 
 #[tokio::test]
+async fn explicit_status_revision_survives_stripped_headers_and_rechecks_authorization() {
+    let f = Fixture::new().await;
+    let id = f.job(0, "done", Some(terminal("running", now()))).await;
+    let cookie = random();
+    f.g.store
+        .put("status_session", &hash(&cookie), &true, now() + 100)
+        .await
+        .unwrap();
+    let get = |uri: String, authenticated: bool| {
+        let request = Request::builder()
+            .uri(uri)
+            .header("host", "fixture.example");
+        let request = if authenticated {
+            request.header("cookie", format!("rh_status={cookie}"))
+        } else {
+            request
+        };
+        f.g.router()
+            .unwrap()
+            .oneshot(request.body(Body::empty()).unwrap())
+    };
+    let first = get("/status".into(), true).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let revision = html
+        .split("data-revision='")
+        .nth(1)
+        .unwrap()
+        .split('\'')
+        .next()
+        .unwrap();
+    let uri = format!("/status?revision={revision}");
+    let same = get(uri.clone(), true).await.unwrap();
+    assert_eq!(same.status(), StatusCode::NO_CONTENT);
+    assert!(to_bytes(same.into_body(), 1024).await.unwrap().is_empty());
+    let unauthorized = get(uri.clone(), false).await.unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&to_bytes(unauthorized.into_body(), 16384).await.unwrap())
+            .contains("type=password")
+    );
+    assert_eq!(
+        get("/status?revision=invalid".into(), true)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let mut observed: Value =
+        f.g.store
+            .get("terminal_observation", &id)
+            .await
+            .unwrap()
+            .unwrap();
+    observed["terminal"]["state"] = json!("exited");
+    observed["terminal"]["exit_code"] = json!(0);
+    observed["terminal"]["output_complete"] = json!(true);
+    f.g.store
+        .put("terminal_observation", &id, &observed, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        get(uri.clone(), true).await.unwrap().status(),
+        StatusCode::OK
+    );
+    sqlx::query("DELETE FROM kv WHERE kind='status_session' AND key=?")
+        .bind(hash(&cookie))
+        .execute(&f.g.store.pool)
+        .await
+        .unwrap();
+    let expired = get(uri, true).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&to_bytes(expired.into_body(), 16384).await.unwrap())
+            .contains("type=password")
+    );
+}
+
+#[tokio::test]
 async fn status_validator_is_session_scoped_and_changes_with_task_outcome() {
     let f = Fixture::new().await;
     let id = f.job(0, "done", Some(terminal("running", now()))).await;

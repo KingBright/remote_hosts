@@ -24,6 +24,8 @@ mod scheduler;
 mod storage_gc;
 pub mod store;
 pub mod terminal;
+#[cfg(unix)]
+mod terminal_io;
 mod terminal_output;
 mod terminal_sync;
 mod token_output;

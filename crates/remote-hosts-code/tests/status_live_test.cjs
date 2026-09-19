@@ -26,6 +26,13 @@ test('unchanged snapshot does not replace task cards', async () => {
   assert.equal(f.calls[0][1].headers['If-None-Match'], 'W/"base"');
   assert.equal(f.calls[0][1].credentials, 'same-origin');
 });
+test('application revision works when a proxy strips ETag', async () => {
+  const f = fixture(); f.context.reply = async () => ({status: 204});
+  await f.refresh();
+  assert.equal(f.calls[0][0], '/status?revision=base');
+  assert.equal(f.notice.dataset.stale, 'false');
+  assert.equal(f.body.replaced, undefined);
+});
 test('network failure preserves the last snapshot and marks uncertainty', async () => {
   const f = fixture(); f.context.reply = async () => {throw new Error('network');};
   await f.refresh(); assert.equal(f.notice.dataset.stale, 'true');

@@ -249,10 +249,15 @@ def main():
     def save(): rr.atomic_json(directory/'fleet.json',state)
     save();client=Client(config['origin'],pathlib.Path(config['password_file'])).login()
     try:
-        gateway=gateway_upgrade_api(client,args.version,bundle_sha)
-        if gateway is None:
-            if 'gateway' not in config: raise RuntimeError('legacy gateway requires one-time SSH bootstrap configuration')
+        # Local package is the authority. The configured management path stages
+        # verified local bytes before cutover; GitHub releases/check-runs are not
+        # consulted. API-only setups must have staged the same bundle explicitly.
+        if 'gateway' in config:
             gateway=gateway_upgrade_ssh(config,package,manifest,args.version,directory)
+        else:
+            gateway=gateway_upgrade_api(client,args.version,bundle_sha)
+            if gateway is None:
+                raise RuntimeError('local gateway management configuration required')
         state['gateway']=gateway;save()
         fleet=client.tool('fleet_status',{'desired_version':args.version});devices=fleet['devices'];state['fleet']=fleet;save()
         if finish_observed_fleet(config,package,directory,args.version,state,fleet):return

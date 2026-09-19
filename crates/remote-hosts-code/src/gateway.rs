@@ -1183,7 +1183,16 @@ fn status_login_page(message: &str) -> String {
         status_html_escape(message)
     )
 }
-async fn status_page(State(g): State<Gateway>, headers: HeaderMap) -> Response {
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StatusQuery {
+    revision: Option<String>,
+}
+async fn status_page(
+    State(g): State<Gateway>,
+    axum::extract::Query(query): axum::extract::Query<StatusQuery>,
+    headers: HeaderMap,
+) -> Response {
     if !status_session_valid(&g, &headers).await {
         return Html(status_login_page(
             "Sign in with the existing Gateway owner password.",
@@ -1199,14 +1208,28 @@ async fn status_page(State(g): State<Gateway>, headers: HeaderMap) -> Response {
             .map(str::to_owned)
             .collect(),
     };
+    if query.revision.as_ref().is_some_and(|value| {
+        value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    }) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     match status_snapshot(&g, &principal).await {
         Ok(snapshot) => {
-            let etag = format!("W/\"{}\"", crate::status_view::revision(&snapshot));
+            let revision = crate::status_view::revision(&snapshot);
+            let etag = format!("W/\"{revision}\"");
             let unchanged = headers
                 .get(header::IF_NONE_MATCH)
                 .and_then(|h| h.to_str().ok())
                 == Some(etag.as_str());
-            let mut response = if unchanged {
+            // An explicit application validator survives proxies that strip ETag.
+            // It contains no credential, is re-authorized above, and uses 204 rather
+            // than misusing HTTP 304 for an unconditional request.
+            let mut response = if query.revision.as_deref() == Some(revision.as_str()) {
+                StatusCode::NO_CONTENT.into_response()
+            } else if unchanged {
                 StatusCode::NOT_MODIFIED.into_response()
             } else {
                 Html(crate::status_view::render(&snapshot)).into_response()

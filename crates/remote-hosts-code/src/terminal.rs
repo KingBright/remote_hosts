@@ -51,6 +51,8 @@ pub struct Status {
 type TerminalInput = Arc<Mutex<Box<dyn Write + Send>>>;
 struct Live {
     input: Option<TerminalInput>,
+    #[cfg(unix)]
+    io_control: Option<crate::terminal_io::Control>,
     #[cfg(not(unix))]
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     pid: Option<u32>,
@@ -192,6 +194,8 @@ impl Terminals {
                 mut reader,
                 input,
                 master,
+                #[cfg(unix)]
+                io_control,
             },
         ) = match setup {
             Ok(setup) => setup,
@@ -226,6 +230,8 @@ impl Terminals {
                 id.into(),
                 Live {
                     input: input.clone(),
+                    #[cfg(unix)]
+                    io_control: io_control.clone(),
                     #[cfg(not(unix))]
                     killer: child.clone_killer(),
                     pid,
@@ -308,12 +314,20 @@ impl Terminals {
                 && let Some(terminal) = live.get_mut(&key)
             {
                 terminal.pid = None;
+                #[cfg(unix)]
+                if let Some(control) = &terminal.io_control {
+                    control.close_input();
+                }
                 terminal.input.take();
             }
             let drained = matches!(
                 tokio::time::timeout(Duration::from_secs(3), &mut reader_task).await,
                 Ok(Ok(()))
             );
+            #[cfg(unix)]
+            if !drained && let Some(control) = &io_control {
+                control.stop_reader();
+            }
             if let Ok(mut output) = capture.lock() {
                 if !drained {
                     output.fail("output_drain_timeout");
@@ -412,6 +426,10 @@ impl Terminals {
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?;
         if let Some(t) = live.get_mut(id) {
+            #[cfg(unix)]
+            if let Some(control) = &t.io_control {
+                control.close_input();
+            }
             // Stop the owned process group before releasing its input. A PTY
             // writer must never try to enqueue EOF into a full input queue here.
             kill_group(t.pid)?;
@@ -569,6 +587,8 @@ struct Spawned {
     reader: Box<dyn Read + Send>,
     input: Option<Box<dyn Write + Send>>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    #[cfg(unix)]
+    io_control: Option<crate::terminal_io::Control>,
 }
 fn spawn(
     config: &AgentConfig,
@@ -585,20 +605,18 @@ fn spawn(
             pixel_width: 0,
             pixel_height: 0,
         })?;
+        #[cfg(not(unix))]
         let reader = pair.master.try_clone_reader()?;
         #[cfg(unix)]
-        let input: Box<dyn Write + Send> = {
+        let (reader, input, io_control) = {
             use std::os::fd::BorrowedFd;
             let fd = pair
                 .master
                 .as_raw_fd()
                 .context("native PTY master descriptor unavailable")?;
-            // SAFETY: the master owns fd throughout this borrow; try_clone_to_owned
-            // duplicates it with independent ownership. File::drop only closes it.
-            // portable-pty's writer Drop sends newline+EOF, which can block forever
-            // when a raw-mode child does not read and its input queue is full.
-            let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
-            Box::new(std::fs::File::from(owned))
+            // SAFETY: the master owns fd for this borrow. The I/O pair duplicates
+            // it before returning, has bounded writes, and never writes EOF on Drop.
+            crate::terminal_io::pair(unsafe { BorrowedFd::borrow_raw(fd) })?
         };
         #[cfg(not(unix))]
         let input = pair.master.take_writer()?;
@@ -610,11 +628,17 @@ fn spawn(
         cmd.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
+        #[cfg(unix)]
+        let reader: Box<dyn Read + Send> = Box::new(reader);
+        #[cfg(unix)]
+        let input: Box<dyn Write + Send> = Box::new(input);
         Ok(Spawned {
             child,
             reader,
             input: Some(input),
             master: Some(pair.master),
+            #[cfg(unix)]
+            io_control: Some(io_control),
         })
     } else {
         // A single kernel pipe preserves the observed stdout/stderr write order.
@@ -643,6 +667,8 @@ fn spawn(
             reader: Box::new(reader),
             input: None,
             master: None,
+            #[cfg(unix)]
+            io_control: None,
         })
     }
 }

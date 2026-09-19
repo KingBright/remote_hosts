@@ -109,7 +109,12 @@ async fn cancel_and_read_remain_available_when_terminal_inputs_are_busy() {
     )
     .await;
     for task in inputs {
-        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        // A dropped JoinHandle leaves spawn_blocking writes alive and can pin the
+        // entire test runtime on Linux. Require actual task completion after cancel.
+        let _ = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("terminal input worker did not exit after cancellation")
+            .expect("terminal input worker panicked");
     }
     assert!(blocked, "fixture did not exercise pending terminal input");
     assert!(read.is_ok(), "status read was blocked by terminal input");
@@ -117,6 +122,24 @@ async fn cancel_and_read_remain_available_when_terminal_inputs_are_busy() {
         cancelled.expect("cancel was blocked").unwrap()["terminal"]["state"],
         "cancelled"
     );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let out = agent
+                .execute(&job(
+                    &agent,
+                    "terminal_read",
+                    json!({"workspace_id":ws,"terminal_id":id}),
+                ))
+                .await
+                .unwrap();
+            if out["terminal"]["output_complete"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancelled PTY did not finish output capture");
 }
 
 #[tokio::test]
