@@ -1,8 +1,10 @@
 //! Authenticated personal MCP gateway and outbound local code agent.
 mod activity;
 pub mod agent;
+pub mod agent_log;
 pub mod auth;
 mod capabilities;
+mod poll_health;
 mod status_view;
 pub use capabilities::release_manifest;
 pub mod adapter;

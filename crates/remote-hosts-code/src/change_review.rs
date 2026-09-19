@@ -22,6 +22,8 @@ async fn git(ws: &Workspace, args: &[&str], paths: &[String]) -> Result<Vec<u8>>
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW, preserve piped Git output.
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take().context("missing git output")?;
     let mut bytes = Vec::new();

@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "remote-hosts-code"
-version = "0.10.9"
+version = "0.10.10"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -3038,6 +3038,7 @@ dependencies = [
  "tree-sitter-typescript",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

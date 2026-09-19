@@ -1,4 +1,5 @@
 //! Standalone gateway/device service alongside the existing Remote Hosts connector.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use remote_hosts_code::{
@@ -27,6 +28,9 @@ enum Command {
     Agent {
         #[arg(long)]
         config: PathBuf,
+        /// Also write diagnostics to the invoking console. Default Windows service mode has no window.
+        #[arg(long)]
+        foreground: bool,
     },
     /// Create private gateway configuration and a separate owner login password file.
     InitGateway {
@@ -111,13 +115,53 @@ fn lock(dir: &std::path::Path) -> Result<std::fs::File> {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        let background = args.first().is_some_and(|v| v == "agent")
+            && !args
+                .iter()
+                .any(|v| v == "--foreground" || v == "--help" || v == "-h");
+        if !background {
+            remote_hosts_code::agent_log::attach_parent_console();
+        }
+    }
+    let command = Cli::parse().command;
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if let Command::Agent { config, foreground } = &command {
+        use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
+        let c: AgentConfig = read_config(config)?;
+        let _lock = lock(&c.state_dir)?;
+        let file =
+            std::sync::Mutex::new(remote_hosts_code::agent_log::AgentLog::open(&c.state_dir)?);
+        let writer = if *foreground || !cfg!(windows) {
+            BoxMakeWriter::new(file.and(std::io::stderr))
+        } else {
+            BoxMakeWriter::new(file)
+        };
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(writer)
+            .init();
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            console = (*foreground || !cfg!(windows)),
+            "agent starting; bounded local logs enabled"
+        );
+        let result = async { remote_hosts_code::agent::Agent::new(c).await?.run().await }.await;
+        if result.is_err() {
+            tracing::error!("agent stopped with error; inspect preceding local diagnostics");
+        }
+        return result;
+    }
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
-    match Cli::parse().command {
+    match command {
         Command::Gateway { config } => {
             let c: GatewayConfig = read_config(&config)?;
             let bind: SocketAddr = c.bind.parse()?;
@@ -137,11 +181,7 @@ async fn main() -> Result<()> {
                 })
                 .await?;
         }
-        Command::Agent { config } => {
-            let c: AgentConfig = read_config(&config)?;
-            let _lock = lock(&c.state_dir)?;
-            remote_hosts_code::agent::Agent::new(c).await?.run().await?;
-        }
+        Command::Agent { .. } => unreachable!("agent handled before service logger initialization"),
         Command::InitGateway {
             config,
             public_url,

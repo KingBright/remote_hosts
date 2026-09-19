@@ -56,6 +56,67 @@ fn edit(a: &Agent, ws: &str, name: &str) -> Job {
     )
 }
 
+#[tokio::test]
+async fn actual_poll_classifies_http_body_and_recovers_without_executing_work() {
+    use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_dir, mut agent, _, _, _) = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    Arc::make_mut(&mut agent.config).gateway_url =
+        format!("http://{}", listener.local_addr().unwrap());
+    let step = Arc::new(AtomicUsize::new(0));
+    let current = step.clone();
+    let app = Router::new().route(
+        "/device/poll",
+        post(move || {
+            let current = current.clone();
+            async move {
+                match current.load(Ordering::SeqCst) {
+                    0 => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "private upstream body token=never-publish",
+                    )
+                        .into_response(),
+                    1 => (StatusCode::OK, "bad-json token=never-publish").into_response(),
+                    2 => (StatusCode::OK, "x".repeat(512 * 1024 + 1)).into_response(),
+                    _ => axum::Json(json!({"job":null})).into_response(),
+                }
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let hello:DeviceHello=serde_json::from_value(json!({"version":"test","session":random(),"roots":[],"allow_write":true,"allow_exec":true})).unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    for (index, expected) in [
+        (0, "gateway_unavailable"),
+        (1, "invalid_json"),
+        (2, "response_too_large"),
+    ] {
+        step.store(index, Ordering::SeqCst);
+        let error = agent
+            .poll_job(&client, &hello, Lane::Read)
+            .await
+            .err()
+            .expect("injected poll failure");
+        let classified = crate::poll_health::Failure::classify(&error);
+        assert_eq!(classified.category, expected);
+        assert!(!format!("{error:?}").contains("never-publish"));
+    }
+    step.store(3, Ordering::SeqCst);
+    assert!(
+        agent
+            .poll_job(&client, &hello, Lane::Read)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    server.abort();
+    let _ = server.await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn waiting_writes_do_not_take_sibling_execution_slots() {
     let (_d, a, wa, alias, wb) = fixture().await;

@@ -660,6 +660,12 @@ fn spawn(
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // Native pipes must not allocate a console when the Agent has none.
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         let child = cmd.spawn()?;
         drop(cmd); // Close the parent's pipe writers, or EOF would never arrive.
         Ok(Spawned {

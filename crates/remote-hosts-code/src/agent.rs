@@ -487,7 +487,7 @@ impl Agent {
         delivery: &Delivery,
     ) -> Result<()> {
         let mut workers = tokio::task::JoinSet::new();
-        let mut failures = 0u32;
+        let mut health = crate::poll_health::Health::default();
         loop {
             while let Some(result) = workers.try_join_next() {
                 Self::worker_result(result);
@@ -498,9 +498,15 @@ impl Agent {
                 }
                 continue;
             }
-            match self.poll_job(client, hello, lane).await {
+            let polled = self.poll_job(client, hello, lane).await;
+            if polled.is_ok()
+                && let Some(event) = health.succeeded(std::time::Instant::now(), crate::now())
+            {
+                tracing::info!(?lane, details=%event, "device polling recovered");
+                self.save_poll_health(hello, lane, event).await;
+            }
+            match polled {
                 Ok(Some(job)) => {
-                    failures = 0;
                     // Reserve the job's canonical scope before the next poll,
                     // not after its worker happens to get CPU time.
                     let resource = self.resource_hint(&job).await;
@@ -514,16 +520,39 @@ impl Agent {
                         agent.execute_report(&delivery, job).await
                     });
                 }
-                Ok(None) => {
-                    failures = 0;
-                }
-                Err(_) => {
-                    failures = failures.saturating_add(1);
-                    // Errors can contain URLs or request details; log only lane/attempt.
-                    tracing::warn!(?lane, attempt = failures, "device polling unavailable");
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(failures.min(5)))).await;
+                Ok(None) => {}
+                Err(error) => {
+                    let failure = crate::poll_health::Failure::classify(&error);
+                    let (delay, event) =
+                        health.failed(failure, std::time::Instant::now(), crate::now());
+                    if let Some(event) = event {
+                        // Typed fields only. Never format the raw HTTP error, URL,
+                        // token or response body into a console or persistent log.
+                        tracing::warn!(?lane, details=%event, "device polling unavailable; retrying observation only");
+                        self.save_poll_health(hello, lane, event).await;
+                    }
+                    tokio::time::sleep(delay).await;
                 }
             }
+        }
+    }
+    async fn save_poll_health(&self, hello: &DeviceHello, lane: Lane, mut event: Value) {
+        let lane = serde_json::to_value(lane).expect("static lane");
+        event["lane"] = lane.clone();
+        event["session"] = json!(hello.session);
+        event["version"] = json!(env!("CARGO_PKG_VERSION"));
+        let key = format!("poll_health_{}", lane.as_str().expect("lane string"));
+        // At most once per minute per unchanged outage, plus transitions. A
+        // telemetry failure must not discard a job already received from Gateway.
+        if self
+            .store
+            .put("runtime", &key, &event, i64::MAX)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "poll health persistence unavailable; bounded log retains the transition"
+            );
         }
     }
     fn worker_result(result: std::result::Result<Result<()>, tokio::task::JoinError>) {
@@ -664,33 +693,55 @@ impl Agent {
         );
         request["active_operations"] = json!(self.active.list()?);
         request["progress"] = json!(self.progress.snapshots());
-        let response = client
+        let mut response = client
             .post(format!("{}/device/poll", self.config.gateway_url))
             .bearer_auth(&self.config.device_token)
             .json(&request)
             .send()
             .await
-            .context("device poll transport failed")?;
-        ensure!(
-            response.status().is_success(),
-            "device poll rejected ({})",
-            response.status()
-        );
-        let bytes = response.bytes().await?;
-        ensure!(bytes.len() <= 512 * 1024, "oversized gateway response");
-        let response: Value = serde_json::from_slice(&bytes)?;
-        ensure!(
-            response.get("job").is_some(),
-            "gateway response missing job field"
-        );
+            .map_err(|error| crate::poll_health::Failure::transport("poll_send", &error))?;
+        if !response.status().is_success() {
+            return Err(crate::poll_health::Failure::http(
+                response.status().as_u16(),
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|h| h.to_str().ok()),
+            )
+            .into());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| crate::poll_health::Failure::transport("poll_receive", &error))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 512 * 1024 {
+                return Err(
+                    crate::poll_health::Failure::at("response_too_large", "poll_receive").into(),
+                );
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let response: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| crate::poll_health::Failure::at("invalid_json", "poll_decode"))?;
+        if response.get("job").is_none() {
+            return Err(
+                crate::poll_health::Failure::at("missing_job_field", "poll_validate").into(),
+            );
+        }
         let job = if response["job"].is_null() {
             None
         } else {
-            let job: Job = serde_json::from_value(response["job"].clone())?;
-            ensure!(
-                Lane::for_tool(&job.tool) == lane && job.device_id == self.config.device_id,
-                "gateway ignored execution lane or device"
-            );
+            let job: Job = serde_json::from_value(response["job"].clone())
+                .map_err(|_| crate::poll_health::Failure::at("invalid_job", "poll_validate"))?;
+            if Lane::for_tool(&job.tool) != lane || job.device_id != self.config.device_id {
+                return Err(crate::poll_health::Failure::at(
+                    "job_identity_mismatch",
+                    "poll_validate",
+                )
+                .into());
+            }
             Some(job)
         };
         let lane_name = serde_json::to_value(lane)?
