@@ -362,6 +362,52 @@ async fn status_counts_live_terminal_after_submission_completed() {
 }
 
 #[tokio::test]
+async fn completed_observation_replaces_stale_submission_summary_without_rewriting_receipt() {
+    let f = Fixture::new().await;
+    for exit_code in [0, 7] {
+        let mut ended = terminal("exited", now());
+        ended["exit_code"] = json!(exit_code);
+        let id = f.job(0, "done", Some(ended)).await;
+        let original = json!({"terminal_id":id,"state":"running","cursor":0,"output":"",
+            "next_action":"terminal_read","terminal":{"id":id,"state":"running","exit_code":null,"output_complete":false}});
+        sqlx::query("UPDATE jobs SET result=? WHERE id=?")
+            .bind(original.to_string())
+            .bind(&id)
+            .execute(&f.g.store.pool)
+            .await
+            .unwrap();
+        let value =
+            f.g.dispatch(
+                &f.p,
+                "operation_get",
+                json!({"operation_id":id,"wait_ms":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value["state"], "exited");
+        assert_eq!(value["terminal"]["state"], "exited");
+        assert_eq!(value["terminal"]["exit_code"], exit_code);
+        assert_eq!(value["receipt"]["process_exit_code"], exit_code);
+        assert_eq!(value["output"], "hello");
+        assert_eq!(value["cursor"], 5);
+        assert_eq!(
+            value["next_action"],
+            if exit_code == 0 {
+                Value::Null
+            } else {
+                json!("inspect_original_receipt")
+            }
+        );
+        let saved: String = sqlx::query_scalar("SELECT result FROM jobs WHERE id=?")
+            .bind(&id)
+            .fetch_one(&f.g.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), original);
+    }
+}
+
+#[tokio::test]
 async fn authenticated_late_running_snapshot_cannot_replace_terminal_outcome() {
     let f = Fixture::new().await;
     let id = f.job(0, "done", Some(terminal("exited", now()))).await;

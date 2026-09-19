@@ -962,7 +962,7 @@ impl Gateway {
             if job.tool == "terminal_exec"
                 && let Some(observed) = crate::terminal_sync::observed(self, id).await?
             {
-                result["terminal_observation"] = observed;
+                crate::terminal_sync::project_result(&mut result, observed);
             }
             result["operation_lifecycle"] = self.lifecycle(id, &job.device_id).await?;
             result["receipt"] = crate::receipts::decision(&result, None, Some(id), updated);

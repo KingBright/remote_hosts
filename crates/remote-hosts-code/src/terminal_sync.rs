@@ -225,6 +225,64 @@ pub(crate) async fn save(
     Ok(())
 }
 
+/// Project a durable submission plus the newest process observation into one
+/// consistent response. This never rewrites the original job receipt.
+pub(crate) fn project_result(result: &mut Value, observed: Value) {
+    let latest = &observed["terminal"];
+    if !latest.is_object() {
+        return;
+    }
+    // A submission may already contain the final process result. An older
+    // running heartbeat must not regress that result during delivery races.
+    if ended(&result["terminal"]["state"]) && !ended(&latest["state"]) {
+        return;
+    }
+    let mut complete_output_returned = result["terminal"]["output_complete"] == true
+        && result["output"].is_string()
+        && result["has_more"] == false
+        && result["terminal"]["output_truncated"] != true
+        && !result["terminal"]["output_error"].is_string();
+    let mut terminal = result["terminal"].as_object().cloned().unwrap_or_default();
+    for (key, value) in latest.as_object().expect("checked object") {
+        terminal.insert(key.clone(), value.clone());
+    }
+    result["terminal"] = Value::Object(terminal);
+    result["state"] = if observed["stale"] == true && !ended(&latest["state"]) {
+        json!("outcome_unknown")
+    } else {
+        latest["state"].clone()
+    };
+    // Only promote a complete contiguous prefix. A tail preview never becomes
+    // full stdout, and its cursor must not rewind the submission's byte cursor.
+    if let (Some(output), Some(0), Some(end)) = (
+        observed["output"].as_str(),
+        observed["output_cursor_start"].as_u64(),
+        observed["output_cursor_end"].as_u64(),
+    ) && observed["output_gap"] == false
+        && end == output.len() as u64
+        && end >= result["cursor"].as_u64().unwrap_or(0)
+    {
+        result["output"] = json!(output);
+        result["cursor"] = json!(end);
+        result["raw_cursor_start"] = json!(0);
+        result["has_more"] = json!(false);
+        result["cursor_format"] = json!("sanitized_utf8_v1");
+        complete_output_returned = latest["output_complete"] == true;
+    }
+    result["terminal_observation"] = observed;
+    if ended(&result["terminal"]["state"]) && !complete_output_returned {
+        // Older Agents may confirm exit without transmitting any log preview.
+        // Captured output is not the same as output returned to the caller.
+        result["result_omitted"] = json!(true);
+    }
+    let decision = crate::receipts::decision(result, None, result["operation_id"].as_str(), now());
+    result["next_action"] = match decision["next_action"].as_str() {
+        Some("observe_original" | "observe_original_and_reconcile") => json!("operation_get"),
+        Some("read_original_output") => json!("terminal_read"),
+        _ => decision["next_action"].clone(),
+    };
+}
+
 pub(crate) async fn observed(g: &Gateway, id: &str) -> Result<Option<Value>> {
     Ok(g.store.get::<Value>("terminal_observation",id).await?.map(|v|json!({
         "terminal":v["terminal"],"reported_at":v["reported_at"],
@@ -246,6 +304,60 @@ mod tests {
         serde_json::from_value(json!({"id":uuid::Uuid::nil().to_string(),"workspace_id":"w", "state":state,
             "exit_code":if state=="exited"{json!(0)}else{Value::Null},"created_at":1,"updated_at":updated,
             "output_complete":complete,"output_truncated":false,"log_format":1})).unwrap()
+    }
+
+    #[test]
+    fn response_projection_does_not_regress_a_final_submission() {
+        let mut result = json!({"state":"exited","terminal":{"state":"exited","exit_code":0,"output_complete":true},"output":"final"});
+        let original = result.clone();
+        project_result(
+            &mut result,
+            json!({"terminal":{"state":"running","exit_code":null},"stale":false}),
+        );
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn completed_legacy_agent_without_preview_requires_original_output() {
+        let mut result = json!({"state":"running","cursor":0,"output":"","has_more":false,
+            "terminal":{"state":"running","output_complete":false}});
+        project_result(
+            &mut result,
+            json!({"terminal":{"state":"exited","exit_code":0,"output_complete":true},
+            "stale":false,"output":null,"output_cursor_start":null,"output_cursor_end":null}),
+        );
+        assert_eq!(result["state"], "exited");
+        assert_eq!(result["next_action"], "terminal_read");
+        assert_eq!(result["result_omitted"], true);
+        assert_eq!(
+            crate::receipts::decision(&result, None, None, now())["evidence_complete"],
+            false
+        );
+    }
+
+    #[test]
+    fn response_projection_keeps_tail_gaps_and_staleness_visible() {
+        let mut result = json!({"state":"running","cursor":0,"output":""});
+        project_result(
+            &mut result,
+            json!({"terminal":{"state":"exited","exit_code":0,"output_complete":true},
+            "output":"tail","output_cursor_start":100,"output_cursor_end":104,"output_gap":true,"stale":false}),
+        );
+        assert_eq!(result["state"], "exited");
+        assert_eq!(result["cursor"], 0);
+        assert_eq!(result["output"], "");
+        assert_eq!(result["next_action"], "terminal_read");
+        assert_eq!(
+            crate::receipts::decision(&result, None, None, now())["evidence_complete"],
+            false
+        );
+        let mut stale = json!({"state":"running"});
+        project_result(
+            &mut stale,
+            json!({"terminal":{"state":"running","exit_code":null,"output_complete":false},"stale":true}),
+        );
+        assert_eq!(stale["state"], "outcome_unknown");
+        assert_eq!(stale["next_action"], "operation_get");
     }
 
     #[test]

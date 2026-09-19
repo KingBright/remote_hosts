@@ -41,6 +41,7 @@ pub fn decision(
         &value["terminal"]
     };
     let pending = value["pending"] == true;
+    let transfer_paused = matches!(value["state"].as_str(), Some("paused" | "awaiting_source"));
     let error = value.get("error").is_some()
         || value.get("observation_error").is_some()
         || value["error_code"].is_string()
@@ -60,6 +61,7 @@ pub fn decision(
         _ if stale => "unknown",
         _ if error => value["execution_state"].as_str().unwrap_or("unknown"),
         _ if terminal_unobserved => "unknown",
+        _ if transfer_paused => "paused",
         _ if pending => "not_started_or_unknown",
         _ => "completed",
     };
@@ -70,6 +72,7 @@ pub fn decision(
         || terminal["output_error"].is_string()
         || observed["output_gap"] == true;
     let evidence_complete = !pending
+        && !transfer_paused
         && !stale
         && !error
         && !incomplete
@@ -80,6 +83,8 @@ pub fn decision(
         Some("observe_original_and_reconcile")
     } else if pending || matches!(execution, "running" | "not_started_or_unknown") {
         Some("observe_original")
+    } else if transfer_paused {
+        Some("transfer_resume")
     } else if incomplete || (terminal.is_object() && !evidence_complete) {
         Some("read_original_output")
     } else if error || terminal["exit_code"].as_i64().is_some_and(|n| n != 0) {
@@ -87,7 +92,9 @@ pub fn decision(
     } else {
         None
     };
-    let stage = if terminal["exit_code"].is_number() {
+    let stage = if transfer_paused {
+        "transfer_paused_publication_unconfirmed"
+    } else if terminal["exit_code"].is_number() {
         "process_exited"
     } else if matches!(execution, "running") {
         "process_started"
@@ -110,7 +117,8 @@ pub fn decision(
     "evidence_complete":evidence_complete,"stale":stale,"observed_at":at,
     "retry_policy":value["retry_policy"].as_str().unwrap_or(if pending || execution=="unknown" || execution=="running" {
         "do_not_replay_observe_original"
-    } else {"do_not_replay_completed_operation"}),
+    } else if transfer_paused {"resume_original_transfer_only"}
+      else {"do_not_replay_completed_operation"}),
     "next_action":next,"user_action":value["user_action"].as_str().unwrap_or("none"),
     "error_code":value["error_code"],"transport_complete":!pending,
     "process_exit_code":terminal["exit_code"],"output_complete":terminal["output_complete"],
@@ -345,6 +353,28 @@ pub async fn invoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_bytes_received_does_not_make_a_paused_transfer_complete() {
+        for state in ["paused", "awaiting_source"] {
+            let value = json!({"state":state,"pending":false,"confirmed_bytes":901150,
+                "total_bytes":901150,"resumable":true,"next_action":"transfer_resume"});
+            let r = decision(&value, None, Some("original"), 1);
+            assert_eq!(r["execution_state"], "paused");
+            assert_eq!(r["evidence_complete"], false);
+            assert_eq!(r["next_action"], "transfer_resume");
+            assert_eq!(r["retry_policy"], "resume_original_transfer_only");
+            assert_eq!(r["transport_complete"], true);
+        }
+        let completed = decision(
+            &json!({"state":"completed","sha256":"verified"}),
+            None,
+            Some("original"),
+            2,
+        );
+        assert_eq!(completed["execution_state"], "completed");
+        assert_eq!(completed["next_action"], Value::Null);
+    }
+
     #[test]
     fn exit_zero_with_incomplete_output_is_not_acceptance() {
         let v = json!({"terminal":{"state":"exited","exit_code":0,"output_complete":true,"output_truncated":true}});
