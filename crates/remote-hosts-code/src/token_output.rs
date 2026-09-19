@@ -246,7 +246,26 @@ pub(crate) fn compact_response(tool: &str, mut value: Value) -> Value {
         }
         _ => {}
     }
+    deduplicate_preview(&mut value);
+    if let Some(rows) = value.get_mut("operations").and_then(Value::as_array_mut) {
+        for row in rows {
+            deduplicate_preview(row);
+        }
+    }
     value
+}
+
+/// Factor only identical text with identical byte coverage. Error, staleness
+/// and gap decisions remain explicit; full view keeps the original representation.
+fn deduplicate_preview(value: &mut Value) {
+    let identical = value["output"].is_string()
+        && value["terminal_observation"]["output"] == value["output"]
+        && value["terminal_observation"]["output_cursor_start"] == value["raw_cursor_start"]
+        && value["terminal_observation"]["output_cursor_end"] == value["cursor"];
+    if identical && let Some(preview) = value["terminal_observation"].as_object_mut() {
+        preview.remove("output");
+        preview.insert("output_ref".into(), json!("#/output"));
+    }
 }
 
 pub(crate) fn compact_text(tool: &str, value: &Value) -> String {

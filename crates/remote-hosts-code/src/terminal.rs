@@ -277,6 +277,10 @@ impl Terminals {
         });
         let this = self.clone();
         let key = id.to_owned();
+        // This invocation waits on its own finalization, not on 50 SQL reads/sec.
+        // The durable row remains authoritative; notifications only wake the reader.
+        let completion = Arc::new(tokio::sync::Notify::new());
+        let finalized = completion.clone();
         tokio::spawn(async move {
             let _slot = slot;
             let mut waiter = tokio::task::spawn_blocking(move || {
@@ -339,11 +343,14 @@ impl Terminals {
             if let Ok(mut live) = this.live.lock() {
                 live.remove(&key);
             }
+            finalized.notify_waiters();
         });
-        let mut result = json!({"terminal_id":id,"state":"running","cursor":0,"next_action":"terminal_read","pty":interactive});
+        let mut result = json!({"terminal_id":id,"state":"running","cursor":0,"next_action":"operation_get","pty":interactive});
         if wait_ms > 0 {
             let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms as u64);
             loop {
+                // Register before reading so a concurrent final commit is not lost.
+                let changed = completion.notified();
                 let status = match tokio::time::timeout_at(deadline, self.status(ws, id)).await {
                     Ok(Ok(status)) => status,
                     _ => break,
@@ -355,10 +362,10 @@ impl Terminals {
                 {
                     break;
                 }
-                tokio::time::sleep_until(
-                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(20)),
-                )
-                .await;
+                tokio::select! {
+                    _ = changed => {},
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
             }
             match self
                 .read(ws, &json!({"terminal_id":id,"max_bytes":16000}))

@@ -3,7 +3,7 @@
   "boundary": "Adapter-sent catalog is not proof of final host exposure. No final host report means unknown.",
   "protocol": 1,
   "server_tools_sha256": "3178659ff6cab98fec845ab3d0b34f8890798f8a3d5c76d2595e1683091798ba",
-  "skill_revision": "37932a1aa6461584486a930eb23e1a860be10b4b8322a376e3766202b590bb44",
+  "skill_revision": "924f63a36aafb0bd6c1cde15bb1fc5d1ecffa05b21dc6e9eefe313cdb3bfe5c7",
   "tools": [
     {
       "annotations": {
@@ -1472,5 +1472,5 @@
     "host_tools": "x-rh-host-tools",
     "request_id": "x-rh-request-id"
   },
-  "version": "0.10.7"
+  "version": "0.10.8"
 }

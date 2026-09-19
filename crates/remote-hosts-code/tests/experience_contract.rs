@@ -169,6 +169,273 @@ fn request_id() -> String {
 }
 
 #[tokio::test]
+async fn paused_transfer_is_consistent_in_task_and_status_views() {
+    let f = Fixture::new().await;
+    let id = f.job(0, "paused", None).await;
+    sqlx::query(
+        "UPDATE jobs SET request=json_set(request,'$.tool','file_upload'),result=? WHERE id=?",
+    )
+    .bind(
+        json!({"state":"paused","confirmed_bytes":9,"total_bytes":9,"resumable":true}).to_string(),
+    )
+    .bind(&id)
+    .execute(&f.g.store.pool)
+    .await
+    .unwrap();
+    f.link("paused-task", &id).await;
+    let task =
+        f.g.dispatch(&f.p, "task_context", json!({"task_id":"paused-task"}))
+            .await
+            .unwrap();
+    assert_eq!(task["operations"][0]["state"], "paused");
+    assert_eq!(task["operations"][0]["receipt"]["evidence_complete"], false);
+    assert_eq!(
+        task["operations"][0]["receipt"]["next_action"],
+        "transfer_resume"
+    );
+    assert_eq!(task["next_operation_id"], id);
+    let token = f.bearer().await;
+    let (status, view) = f
+        .request("GET", "/admin/status", json!({}), &token, &[])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["operations"][0]["state"], "paused");
+    assert_eq!(view["operations"][0]["active"], false);
+    assert_eq!(f.count().await, 1);
+}
+
+#[tokio::test]
+async fn terminal_cursor_changes_top_level_and_preview_byte_ranges_together() {
+    let f = Fixture::new().await;
+    let id = f.job(0, "done", Some(terminal("exited", now()))).await;
+    let value =
+        f.g.dispatch(
+            &f.p,
+            "operation_get",
+            json!({"operation_id":id,"terminal_cursor":2,"wait_ms":0}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["output"], "llo");
+    assert_eq!(value["terminal_observation"]["output"], "llo");
+    assert_eq!(value["raw_cursor_start"], 2);
+    assert_eq!(value["cursor"], 5);
+    assert_eq!(value["compression"]["output_bytes"], 3);
+    assert_eq!(value["compression"]["raw_bytes"], 3);
+    assert_eq!(value["output_range_complete"], true);
+    assert_eq!(value["whole_log_returned"], false);
+    let empty =
+        f.g.dispatch(
+            &f.p,
+            "operation_get",
+            json!({"operation_id":id,"terminal_cursor":5,"wait_ms":0}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty["output"], "");
+    assert_eq!(empty["compression"]["output_bytes"], 0);
+    assert!(
+        f.g.dispatch(
+            &f.p,
+            "operation_get",
+            json!({"operation_id":id,"terminal_cursor":6,"wait_ms":0})
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn requested_missing_range_never_leaves_an_old_top_level_prefix() {
+    let f = Fixture::new().await;
+    let id = f.job(0, "done", Some(terminal("exited", now()))).await;
+    let mut snapshot: Value =
+        f.g.store
+            .get("terminal_observation", &id)
+            .await
+            .unwrap()
+            .unwrap();
+    snapshot["output_preview"] = json!("tail");
+    snapshot["output_cursor_start"] = json!(100);
+    snapshot["output_cursor_end"] = json!(104);
+    snapshot["output_truncated_before"] = json!(true);
+    f.g.store
+        .put("terminal_observation", &id, &snapshot, i64::MAX)
+        .await
+        .unwrap();
+    let value =
+        f.g.dispatch(
+            &f.p,
+            "operation_get",
+            json!({"operation_id":id,"terminal_cursor":2,"wait_ms":0}),
+        )
+        .await
+        .unwrap();
+    assert!(value.get("output").is_none());
+    assert_eq!(value["result_omitted"], true);
+    assert_eq!(value["output_range_complete"], false);
+    assert_eq!(value["receipt"]["evidence_complete"], false);
+    assert_eq!(value["next_action"], "terminal_read");
+    snapshot["output_preview"] = json!("中x");
+    snapshot["output_cursor_start"] = json!(0);
+    snapshot["output_cursor_end"] = json!(4);
+    snapshot["output_truncated_before"] = json!(false);
+    f.g.store
+        .put("terminal_observation", &id, &snapshot, i64::MAX)
+        .await
+        .unwrap();
+    assert!(
+        f.g.dispatch(
+            &f.p,
+            "operation_get",
+            json!({"operation_id":id,"terminal_cursor":1,"wait_ms":0})
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn compact_mcp_output_references_exact_duplicate_without_losing_evidence() {
+    let f = Fixture::new().await;
+    let id = f.job(0, "done", Some(terminal("exited", now()))).await;
+    let token = f.bearer().await;
+    let (status,response)=f.request("POST","/mcp",json!({"jsonrpc":"2.0","id":81,"method":"tools/call","params":{"name":"operation_get","arguments":{"operation_id":id,"terminal_cursor":2,"wait_ms":0}}}),&token,&[("MCP-Protocol-Version","2025-06-18".into())]).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let value = &response["result"]["structuredContent"];
+    assert_eq!(value["output"], "llo", "{response}");
+    assert_eq!(value["terminal_observation"]["output_ref"], "#/output");
+    assert!(value["terminal_observation"].get("output").is_none());
+    assert_eq!(value["receipt"]["process_exit_code"], 0);
+    assert_eq!(value["terminal_observation"]["output_gap"], false);
+}
+
+#[tokio::test]
+async fn status_validator_is_session_scoped_and_changes_with_task_outcome() {
+    let f = Fixture::new().await;
+    let id = f.job(0, "done", Some(terminal("running", now()))).await;
+    let cookie = random();
+    f.g.store
+        .put("status_session", &hash(&cookie), &true, now() + 100)
+        .await
+        .unwrap();
+    let request = || {
+        Request::builder()
+            .uri("/status")
+            .header("host", "fixture.example")
+            .header("cookie", format!("rh_status={cookie}"))
+    };
+    let first =
+        f.g.router()
+            .unwrap()
+            .oneshot(request().body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let etag = first.headers()["etag"].to_str().unwrap().to_owned();
+    let html = String::from_utf8(
+        to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("/status/live.js"));
+    assert!(html.contains("data-operation="));
+    let same =
+        f.g.router()
+            .unwrap()
+            .oneshot(
+                request()
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(same.status(), StatusCode::NOT_MODIFIED);
+    assert!(to_bytes(same.into_body(), 1024).await.unwrap().is_empty());
+    let unauth =
+        f.g.router()
+            .unwrap()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header("host", "fixture.example")
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(unauth.status(), StatusCode::OK);
+    let mut snapshot: Value =
+        f.g.store
+            .get("terminal_observation", &id)
+            .await
+            .unwrap()
+            .unwrap();
+    snapshot["terminal"]["state"] = json!("exited");
+    snapshot["terminal"]["exit_code"] = json!(0);
+    snapshot["terminal"]["output_complete"] = json!(true);
+    f.g.store
+        .put("terminal_observation", &id, &snapshot, i64::MAX)
+        .await
+        .unwrap();
+    let changed =
+        f.g.router()
+            .unwrap()
+            .oneshot(
+                request()
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(changed.status(), StatusCode::OK);
+    assert_ne!(changed.headers()["etag"].to_str().unwrap(), etag);
+}
+
+#[tokio::test]
+async fn batched_task_rechecks_all_original_scopes_before_returning_rows() {
+    let f = Fixture::new().await;
+    for device in [0, 1] {
+        let id = f.job(device, "done", Some(terminal("exited", now()))).await;
+        f.link("scoped-batch", &id).await;
+    }
+    let mut restricted = f.p.clone();
+    restricted.scopes = vec!["code:read".into()];
+    assert!(
+        f.g.dispatch(
+            &restricted,
+            "task_context",
+            json!({"task_id":"scoped-batch"})
+        )
+        .await
+        .is_err()
+    );
+    let allowed =
+        f.g.dispatch(&f.p, "task_context", json!({"task_id":"scoped-batch"}))
+            .await
+            .unwrap();
+    assert_eq!(allowed["operations"].as_array().unwrap().len(), 2);
+    assert_eq!(f.count().await, 2);
+}
+
+#[tokio::test]
+async fn initialization_and_embedded_skill_prefer_same_operation_observation() {
+    use rmcp::ServerHandler;
+    let f = Fixture::new().await;
+    let instructions = f.g.get_info().instructions.unwrap();
+    assert!(instructions.contains("Observe operation_get"));
+    assert!(!instructions.contains("terminal_read for running commands"));
+    let skill = include_str!("../../../skills/remote-hosts-agent/SKILL.md");
+    assert!(skill.contains("byte `terminal_cursor`"));
+    assert!(skill.contains("output_ref"));
+}
+
+#[tokio::test]
 async fn device_snapshot_failure_rolls_back_session_and_job_lease_together() {
     for path in ["/device/heartbeat", "/device/poll"] {
         let f = Fixture::new().await;

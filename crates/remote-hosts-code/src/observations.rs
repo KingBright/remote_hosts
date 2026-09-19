@@ -92,6 +92,13 @@ fn apply_terminal_cursor(result: &mut Value, args: &Value) -> Result<()> {
     if requested < start {
         observation["output_gap"] = json!(true);
         observation["requested_output_cursor"] = json!(requested);
+        // Do not leave a stale top-level prefix alongside the requested tail.
+        let object = result.as_object_mut().context("invalid result object")?;
+        object.remove("output");
+        object.remove("compression");
+        object.insert("result_omitted".into(), json!(true));
+        object.insert("output_range_complete".into(), json!(false));
+        object.insert("next_action".into(), json!("terminal_read"));
         return Ok(());
     }
     let output = observation["output"]
@@ -103,9 +110,23 @@ fn apply_terminal_cursor(result: &mut Value, args: &Value) -> Result<()> {
         offset <= output.len() && output.is_char_boundary(offset),
         "invalid_arguments: terminal_cursor is not a UTF-8 output boundary"
     );
-    observation["output"] = json!(&output[offset..]);
+    let delta = &output[offset..];
+    observation["output"] = json!(delta);
     observation["output_cursor_start"] = json!(requested);
     observation["output_gap"] = json!(false);
+    result["output"] = json!(delta);
+    result["raw_cursor_start"] = json!(requested);
+    result["cursor"] = json!(end);
+    result["has_more"] = json!(false);
+    result["output_view"] = json!("delta");
+    result["output_range_complete"] = json!(true);
+    result["whole_log_returned"] =
+        json!(requested == 0 && result["terminal"]["output_complete"] == true);
+    result["compression"] = json!({"profile":"identity","raw_bytes":end-requested,"output_bytes":delta.len(),"saved_tokens":0,"full_output_available":true});
+    result
+        .as_object_mut()
+        .context("invalid result object")?
+        .remove("result_omitted");
     Ok(())
 }
 async fn view(g: &Gateway, p: &Principal, ids: &[String]) -> Result<View> {
@@ -329,6 +350,12 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
     if let Some(id) = single {
         let mut result = g.result(p, id).await?;
         apply_terminal_cursor(&mut result, args)?;
+        if args.get("terminal_cursor").is_some() {
+            let at = result["receipt"]["observed_at"]
+                .as_i64()
+                .unwrap_or_else(now);
+            result["receipt"] = crate::receipts::decision(&result, None, Some(id), at);
+        }
         if let Some(receipt) = &request_receipt {
             result["request_receipt"] = receipt.clone();
         }

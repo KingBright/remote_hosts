@@ -42,6 +42,10 @@ Use this skill to interact with the user's Remote Hosts service instead of openi
 31. For Remote Hosts Code rollout, prefer one immutable release bundle plus `fleet_status`: upgrade the Gateway before Agents, require explicit wire compatibility, and declare convergence only when version, tool schema, and embedded Skill revision all match. Never interpret an incompatible/offline Agent as proof that installation failed.
 32. If a mutating Code operation returns `outcome_unknown`, observe the original operation and verify scoped side effects. A new idempotency key must not bypass the semantic guard; use `outcome_resolve` only after evidence proves `verified_applied` or `verified_not_applied`.
 
+## Remote Hosts Code Observation Contract
+
+For Code tools, submit once with a stable idempotency key, then observe `operation_get` with the same `operation_id`, including while its terminal is running. Use `wait_ms`, state `cursor` and byte `terminal_cursor` only when actually exposed by the host. `terminal_read` is the full-log or missing-range recovery path, not a mandatory second task. A compact preview may use `output_ref: "#/output"` to reference the identical top-level output; do not treat it as missing bytes. Byte cursors apply to sanitized UTF-8, not compressed character counts. `output_complete` means capture is sealed; also inspect range completeness, gaps, truncation and the exit code. Process success does not imply business acceptance. `paused` and `awaiting_source` require recovery of the original transfer, never a replacement upload. A server or adapter catalog report is not proof of final host exposure; missing host reports remain unknown.
+
 ## Service Assumptions
 
 Platform install paths, service managers, local API checks, upgrade/version gates, and MCP client setup are cold-path context. Read [setup-and-runtime.md](references/setup-and-runtime.md) only when tools are unavailable or the task is explicitly about installation, upgrade, runtime version, or service diagnosis. Do not infer a live deployment path or version from an example.

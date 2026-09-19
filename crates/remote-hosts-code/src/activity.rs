@@ -7,15 +7,34 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
-pub(crate) async fn operation(g: &Gateway, p: &Principal, id: &str) -> Result<Value> {
-    let row: (String, String, i64, Option<String>) =
-        sqlx::query_as("SELECT request,state,updated,result FROM jobs WHERE id=?")
-            .bind(id)
-            .fetch_one(&g.store.pool)
-            .await?;
-    let job: Job = serde_json::from_str(&row.0)?;
+#[derive(sqlx::FromRow)]
+struct ActivityRow {
+    id: String,
+    request: String,
+    state: String,
+    updated: i64,
+    result: Option<String>,
+    terminal: Option<String>,
+    progress: Option<String>,
+    online: Option<String>,
+}
+
+/// One bounded read supplies every operation projection. No N+1 queries, and
+/// no result decoration that could issue new download credentials while reading.
+async fn load(g: &Gateway, ids: &[String]) -> Result<HashMap<String, ActivityRow>> {
+    ensure!(ids.len() <= 100, "activity_page_too_large");
+    let rows: Vec<ActivityRow> = sqlx::query_as(
+        "SELECT j.id,j.request,j.state,j.updated,j.result,t.value AS terminal,COALESCE(r.value,p.value) AS progress,o.value AS online FROM jobs j LEFT JOIN kv t ON t.kind='terminal_observation' AND t.key=j.id AND t.expires>? LEFT JOIN kv p ON p.kind='operation_progress' AND p.key=j.id AND p.expires>? LEFT JOIN kv r ON r.kind='receive_progress' AND r.key=j.id AND r.expires>? AND json_extract(j.request,'$.tool')='file_download' LEFT JOIN kv o ON o.kind='online' AND o.key=j.device AND o.expires>? WHERE j.id IN (SELECT value FROM json_each(?))")
+        .bind(now()).bind(now()).bind(now()).bind(now()).bind(serde_json::to_string(ids)?)
+        .fetch_all(&g.store.pool).await?;
+    Ok(rows.into_iter().map(|row| (row.id.clone(), row)).collect())
+}
+
+fn operation(g: &Gateway, p: &Principal, row: &ActivityRow) -> Result<Value> {
+    let id = &row.id;
+    let job: Job = serde_json::from_str(&row.request)?;
     let scope = tools::scope(&job.tool).context("unknown original tool")?;
     ensure!(
         job.owner == p.owner
@@ -30,49 +49,74 @@ pub(crate) async fn operation(g: &Gateway, p: &Principal, id: &str) -> Result<Va
     // Do not decorate results with download URLs or refreshable credentials.
     // A status read must not mutate transfers or depend on an expired artifact.
     let mut value: Value = row
-        .3
+        .result
         .as_deref()
         .map(serde_json::from_str)
         .transpose()?
         .unwrap_or_else(|| json!({}));
     value["operation_id"] = json!(id);
-    value["pending"] = json!(matches!(row.1.as_str(), "queued" | "dispatched"));
+    value["pending"] = json!(matches!(row.state.as_str(), "queued" | "dispatched"));
+    if matches!(row.state.as_str(), "paused" | "awaiting_source") {
+        value["state"] = json!(row.state);
+    }
     if job.tool == "terminal_exec" {
         value["terminal_id"] = json!(id);
-        if let Some(observed) = crate::terminal_sync::observed(g, id).await? {
-            value["terminal_observation"] = observed;
+        if let Some(raw) = row.terminal.as_deref() {
+            let observed =
+                crate::terminal_sync::observation_value(&serde_json::from_str(raw)?, now());
+            crate::terminal_sync::project_result(&mut value, observed);
         }
     }
-    if let Some(progress) = g.store.get::<Value>("operation_progress", id).await? {
+    if let Some(raw) = row.progress.as_deref() {
+        let progress: Value = serde_json::from_str(raw)?;
         value["progress"] = progress["snapshot"].clone();
         value["progress_stale"] = json!(
             value["pending"] == true
                 && !(0..=45).contains(&(now() - progress["reported_at"].as_i64().unwrap_or(0)))
         );
     }
-    let receipt = receipts::decision(&value, None, Some(id), row.2);
+    let receipt = receipts::decision(&value, None, Some(id), row.updated);
     let terminal = &value["terminal_observation"]["terminal"];
     let terminal = if terminal.is_object() {
         terminal
     } else {
         &value["terminal"]
     };
-    let online: Option<Value> = g.store.get("online", &job.device_id).await?;
+    let online: Option<Value> = row
+        .online
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?;
     let device_seen = online.as_ref().and_then(|v| v["last_seen"].as_i64());
     let online = device_seen.is_some_and(|at| (0..45).contains(&(now() - at)));
     let executing = matches!(receipt["execution_state"].as_str(), Some("running"));
     let unresolved = receipt["execution_state"] == "unknown" || receipt["stale"] == true;
-    let display = if matches!(row.1.as_str(), "queued" | "dispatched") && !online {
+    let display = if matches!(row.state.as_str(), "queued" | "dispatched") && !online {
         "waiting_device"
     } else if unresolved {
         "stale_or_unknown"
+    } else if receipt["execution_state"] == "paused" {
+        if value["state"] == "awaiting_source" {
+            "awaiting_source"
+        } else {
+            "paused"
+        }
     } else if executing {
         "process_running"
-    } else if row.1 == "queued" {
+    } else if row.state == "queued" {
         "queued"
-    } else if row.1 == "dispatched" {
+    } else if row.state == "dispatched" {
         "awaiting_device_result"
-    } else if value.get("error").is_some() {
+    } else if matches!(
+        receipt["process_outcome"].as_str(),
+        Some("cancelled" | "timed_out")
+    ) {
+        if receipt["process_outcome"] == "cancelled" {
+            "process_cancelled"
+        } else {
+            "process_timed_out"
+        }
+    } else if value.get("error").is_some() || receipt["execution_state"] == "not_started" {
         "operation_failed"
     } else if terminal["exit_code"].as_i64().is_some_and(|exit| exit != 0) {
         "process_failed"
@@ -91,11 +135,11 @@ pub(crate) async fn operation(g: &Gateway, p: &Principal, id: &str) -> Result<Va
         json!({"operation_id":id,"device_id":job.device_id,"device_name":device_name,
         "workspace_id":job.arguments["workspace_id"],"tool":job.tool,
         "working_directory":terminal.get("working_directory").or_else(||job.arguments.get("root")),
-        "transport_state":row.1,"state":display,"updated_at":row.2,
-        "active":executing || matches!(row.1.as_str(),"queued"|"dispatched"),
+        "transport_state":row.state,"state":display,"updated_at":row.updated,
+        "active":executing || matches!(row.state.as_str(),"queued"|"dispatched"),
         "uncertain":unresolved,"stale":receipt["stale"],
         "process":{"pid":terminal["process_id"],"state":terminal["state"],"exit_code":terminal["exit_code"],"evidence_source":"agent_terminal_snapshot"},
-        "last_confirmed_event":{"stage":receipt["last_confirmed_stage"],"at":value["terminal_observation"].get("reported_at").cloned().unwrap_or(json!(row.2))},
+        "last_confirmed_event":{"stage":receipt["last_confirmed_stage"],"at":value["terminal_observation"].get("reported_at").cloned().unwrap_or(json!(row.updated))},
         "last_progress_at":value["terminal_observation"]["last_progress_at"],
         "progress":value["progress"],"heartbeat_at":device_seen,
         "blocked_reason":receipt["error_code"],"needs_user_action":receipt["user_action"].as_str().is_some_and(|a|a!="none"&&!a.starts_with("none_")),
@@ -119,11 +163,15 @@ pub(crate) async fn task(g: &Gateway, p: &Principal, args: &Value) -> Result<Val
         .bind(&p.owner).bind(task).bind(now()).bind(after).bind(after).bind((limit+1) as i64).fetch_all(&g.store.pool).await?;
     let more = ids.len() > limit;
     ids.truncate(limit);
+    let rows = load(g, &ids).await?;
     let mut items = Vec::with_capacity(ids.len());
-    // Every handle is re-authorized before any page is returned. Task labels are
-    // names, never capabilities. No execution API is used by this projection.
+    // Reauthorize every row before returning the batch. A task label never grants access.
     for id in &ids {
-        items.push(operation(g, p, id).await?);
+        items.push(operation(
+            g,
+            p,
+            rows.get(id).context("operation_unavailable")?,
+        )?);
     }
     let mut devices = BTreeSet::new();
     let mut workspaces = BTreeSet::new();
@@ -139,7 +187,9 @@ pub(crate) async fn task(g: &Gateway, p: &Principal, args: &Value) -> Result<Val
     let uncertain = items.iter().filter(|v| v["uncertain"] == true).count();
     let next = items
         .iter()
-        .find(|v| v["uncertain"] == true || v["active"] == true)
+        .find(|v| {
+            v["uncertain"] == true || v["active"] == true || !v["receipt"]["next_action"].is_null()
+        })
         .map(|v| v["operation_id"].clone());
     let identity = hash(serde_json::to_vec(
         &json!({"task":task,"owner":p.owner,"page":after,"items":items.iter().map(|v|
@@ -165,12 +215,17 @@ pub(crate) async fn status(g: &Gateway, p: &Principal) -> Result<Value> {
     let ids:Vec<String>=sqlx::query_scalar("SELECT j.id FROM jobs j LEFT JOIN kv t ON t.kind='terminal_observation' AND t.key=j.id AND t.expires>? WHERE json_extract(j.request,'$.owner')=? ORDER BY (j.state IN ('queued','dispatched') OR json_extract(t.value,'$.terminal.state') IN ('running','starting')) DESC,j.updated DESC,j.id LIMIT 101")
         .bind(now()).bind(&p.owner).fetch_all(&g.store.pool).await?;
     let truncated = ids.len() > 100;
+    let rows = load(g, &ids.iter().take(100).cloned().collect::<Vec<_>>()).await?;
     let mut items = Vec::new();
     let mut unavailable = 0usize;
     for id in ids.iter().take(100) {
         // Filtering or an observation failure cannot turn an incomplete page
         // into evidence that there is no active work.
-        match operation(g, p, id).await {
+        match rows
+            .get(id)
+            .context("operation_unavailable")
+            .and_then(|row| operation(g, p, row))
+        {
             Ok(item) => items.push(item),
             Err(_) => unavailable += 1,
         }

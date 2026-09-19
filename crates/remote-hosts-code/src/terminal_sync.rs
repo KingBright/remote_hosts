@@ -141,7 +141,10 @@ fn merge(
         // session reports recovered historical rows.
         if (ended(&old["state"]) && old["state"] != terminal["state"])
             || (old["state"] == "running" && terminal["state"] == "starting")
-            || old["updated_at"].as_i64().unwrap_or(0) > status.updated_at
+            // A clock rollback must not suppress a first authoritative terminal
+            // outcome. Within the same phase, older snapshots remain rejected.
+            || (old["updated_at"].as_i64().unwrap_or(0) > status.updated_at
+                && !(ended(&terminal["state"]) && !ended(&old["state"])))
             || (old["output_complete"] == true && !status.output_complete)
             || (old["exit_code"].is_i64() && old["exit_code"] != terminal["exit_code"])
             || (old["output_truncated"] == true && !status.output_truncated)
@@ -175,6 +178,18 @@ fn merge(
     };
     if previous.is_none_or(|old| signature(old) != signature(&value)) {
         value["last_progress_at"] = json!(now());
+    }
+    if let Some(old) = previous {
+        let same = old["terminal"] == value["terminal"]
+            && old["session"] == value["session"]
+            && old["output_cursor_end"] == value["output_cursor_end"]
+            && old["output_preview"] == value["output_preview"];
+        let age = now() - old["reported_at"].as_i64().unwrap_or(0);
+        // Immutable final snapshots need no rewrite. Live snapshots retain a
+        // bounded freshness renewal, independent from meaningful progress.
+        if same && (ended(&value["terminal"]["state"]) || (0..5).contains(&age)) {
+            return None;
+        }
     }
     Some(value)
 }
@@ -265,8 +280,17 @@ pub(crate) fn project_result(result: &mut Value, observed: Value) {
         result["has_more"] = json!(false);
         result["cursor_format"] = json!("sanitized_utf8_v1");
         complete_output_returned = latest["output_complete"] == true;
+        // The preview is exact sanitized text, not the old compressed prefix.
+        result["compression"] = json!({"profile":"identity","raw_bytes":end,"output_bytes":output.len(),"saved_tokens":0,"full_output_available":true});
+        result["output_view"] = json!("full");
     }
     result["terminal_observation"] = observed;
+    if complete_output_returned {
+        result
+            .as_object_mut()
+            .expect("result object")
+            .remove("result_omitted");
+    }
     if ended(&result["terminal"]["state"]) && !complete_output_returned {
         // Older Agents may confirm exit without transmitting any log preview.
         // Captured output is not the same as output returned to the caller.
@@ -280,17 +304,24 @@ pub(crate) fn project_result(result: &mut Value, observed: Value) {
     };
 }
 
-pub(crate) async fn observed(g: &Gateway, id: &str) -> Result<Option<Value>> {
-    Ok(g.store.get::<Value>("terminal_observation",id).await?.map(|v|json!({
+pub(crate) fn observation_value(v: &Value, observed_at: i64) -> Value {
+    json!({
         "terminal":v["terminal"],"reported_at":v["reported_at"],
-        "stale":!ended(&v["terminal"]["state"]) && !(0..=45).contains(&(now()-v["reported_at"].as_i64().unwrap_or(0))),
+        "stale":!ended(&v["terminal"]["state"]) && !(0..=45).contains(&(observed_at-v["reported_at"].as_i64().unwrap_or(0))),
         "last_progress_at":v["last_progress_at"],
         "progress_semantics":"terminal transition or changed final nonempty output line; not business acceptance",
         "output":v["output_preview"],"output_cursor_start":v["output_cursor_start"],
         "output_cursor_end":v["output_cursor_end"],"output_gap":v["output_truncated_before"],
         "output_next_action":"operation_get for live preview; terminal_read only for full history/recovery",
         "protocol":2
-    })))
+    })
+}
+
+pub(crate) async fn observed(g: &Gateway, id: &str) -> Result<Option<Value>> {
+    Ok(g.store
+        .get::<Value>("terminal_observation", id)
+        .await?
+        .map(|v| observation_value(&v, now())))
 }
 
 #[cfg(test)]
@@ -370,9 +401,8 @@ mod tests {
         let old = merge(None, &done, Some(&preview), "session").unwrap();
         assert!(merge(Some(&old), &fixture("running", 10, false), None, "session").is_none());
         assert!(merge(Some(&old), &fixture("running", 30, false), None, "session").is_none());
-        let renewed = merge(Some(&old), &done, None, "session").unwrap();
-        assert_eq!(renewed["output_preview"], "end");
-        assert_eq!(renewed["last_progress_at"], old["last_progress_at"]);
+        assert!(merge(Some(&old), &done, None, "session").is_none());
+        assert_eq!(old["output_preview"], "end");
     }
 
     #[test]
@@ -387,6 +417,7 @@ mod tests {
         };
         let mut old = merge(None, &running, Some(&p), "session").unwrap();
         old["last_progress_at"] = json!(7);
+        old["reported_at"] = json!(now() - 6);
         let backward = Preview {
             cursor_end: 2,
             output: "ab".into(),
@@ -417,6 +448,37 @@ mod tests {
         let next = merge(Some(&old), &running, Some(&repeated), "session").unwrap();
         assert_eq!(next["output_cursor_end"], 10);
         assert_eq!(next["last_progress_at"], 7);
+    }
+
+    #[test]
+    fn clock_rollback_does_not_hide_final_exit() {
+        let old = merge(None, &fixture("running", 100, false), None, "s").unwrap();
+        let final_row = merge(Some(&old), &fixture("exited", 50, true), None, "s").unwrap();
+        assert_eq!(final_row["terminal"]["state"], "exited");
+        assert!(merge(Some(&final_row), &fixture("running", 110, false), None, "s").is_none());
+    }
+
+    #[test]
+    fn identical_live_snapshot_is_coalesced_but_freshness_is_renewed() {
+        let running = fixture("running", 10, false);
+        let mut old = merge(None, &running, None, "s").unwrap();
+        assert!(merge(Some(&old), &running, None, "s").is_none());
+        old["reported_at"] = json!(now() - 6);
+        let next = merge(Some(&old), &running, None, "s").unwrap();
+        assert_eq!(next["last_progress_at"], old["last_progress_at"]);
+        assert!(next["reported_at"].as_i64().unwrap() > old["reported_at"].as_i64().unwrap());
+    }
+
+    #[test]
+    fn projected_output_replaces_obsolete_compression_statistics() {
+        let mut value = json!({"terminal":{"state":"running","output_complete":false},"cursor":0,"output":"","compression":{"raw_bytes":0,"output_bytes":0}});
+        project_result(
+            &mut value,
+            json!({"terminal":{"state":"exited","exit_code":0,"output_complete":true},"stale":false,"output":"done","output_cursor_start":0,"output_cursor_end":4,"output_gap":false}),
+        );
+        assert_eq!(value["output"], "done");
+        assert_eq!(value["compression"]["output_bytes"], 4);
+        assert_eq!(value["compression"]["raw_bytes"], 4);
     }
 
     #[test]

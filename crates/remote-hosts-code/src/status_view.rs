@@ -17,9 +17,46 @@ fn text(value: &Value) -> String {
         escape(&value.to_string())
     }
 }
+/// Freshness clocks are not task changes. State/stale/error/permission fields
+/// stay in the validator, so a 304 never masks an actual outcome change.
+pub(crate) fn revision(snapshot: &Value) -> String {
+    fn stable(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for key in ["observed_at", "heartbeat_at", "last_seen", "reported_at"] {
+                    object.remove(key);
+                }
+                if let Some(event) = object
+                    .get_mut("last_confirmed_event")
+                    .and_then(Value::as_object_mut)
+                {
+                    event.remove("at");
+                }
+                for value in object.values_mut() {
+                    stable(value);
+                }
+            }
+            Value::Array(items) => {
+                for value in items {
+                    stable(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = snapshot.clone();
+    stable(&mut value);
+    crate::hash(serde_json::to_vec(&value).expect("JSON value"))
+}
+
 pub(crate) fn render(snapshot: &Value) -> String {
     let mut html = String::from(
-        "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta http-equiv=refresh content=5><title>Remote Hosts Status</title><style>body{font-family:system-ui;margin:0;background:#11151c;color:#e9edf5}main{max-width:1200px;margin:auto;padding:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,350px),1fr));gap:16px}.card{border:1px solid #354153;border-radius:12px;padding:16px;background:#19222e;overflow-wrap:anywhere}h1,h2,h3{line-height:1.3}.muted{color:#adb8c7}.state{font-weight:700}dl{display:grid;grid-template-columns:112px 1fr;gap:6px;margin:12px 0}dt{color:#adb8c7}dd{margin:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}button{padding:8px 16px;font:inherit}code{font-size:12px}</style></head><body><main><h1>Remote Hosts Status</h1><p>Authoritative Gateway state. Heartbeat is not counted as business progress.</p><p class=muted>每 5 秒更新。进程结果、日志完整性和业务验收分别显示；unknown 不代表失败，也不允许重放。</p>",
+        "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><noscript><meta http-equiv=refresh content=30></noscript><script src='/status/live.js' defer></script><title>Remote Hosts Status</title><style>body{font-family:system-ui;margin:0;background:#11151c;color:#e9edf5}main{max-width:1200px;margin:auto;padding:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,350px),1fr));gap:16px}.card{border:1px solid #354153;border-radius:12px;padding:16px;background:#19222e;overflow-wrap:anywhere}h1,h2,h3{line-height:1.3}.muted{color:#adb8c7}.state{font-weight:700}dl{display:grid;grid-template-columns:112px 1fr;gap:6px;margin:12px 0}dt{color:#adb8c7}dd{margin:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}button{padding:8px 16px;font:inherit}code{font-size:12px}</style></head><body><p id='rh-observation' role='status' style='margin:16px 24px'>正在显示已确认快照</p><main id='rh-status'><h1>Remote Hosts Status</h1><p>Authoritative Gateway state. Heartbeat is not counted as business progress.</p><p class=muted>每 5 秒核对变化，无变化不重传任务卡。进程结果、日志完整性和业务验收分别显示；unknown 不代表失败，也不允许重放。</p>",
+    );
+    html = html.replacen(
+        "id='rh-status'",
+        &format!("id='rh-status' data-revision='{}'", revision(snapshot)),
+        1,
     );
     html.push_str(&format!("<section class=card><h2>{}</h2><p>观察时间：{} · 活跃操作：{} · 待核对：{} · 当前页完整：{}</p></section>",
         text(&snapshot["summary"]["state"]),text(&snapshot["observed_at"]),text(&snapshot["summary"]["active_operations"]),
@@ -40,7 +77,8 @@ pub(crate) fn render(snapshot: &Value) -> String {
     if let Some(items) = snapshot["operations"].as_array() {
         for item in items {
             html.push_str(&format!(
-                "<section class=card><h3>{} · {}</h3><p class=state>{}</p><dl>",
+                "<section class=card data-operation='{}' data-view='{}'><h3>{} · {}</h3><p class=state>{}</p><dl>",
+                text(&item["operation_id"]), revision(item),
                 text(&item["device_name"]),
                 text(&item["tool"]),
                 text(&item["state"])
@@ -84,6 +122,21 @@ pub(crate) fn render(snapshot: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn conditional_revision_preserves_stale_errors_and_real_progress() {
+        let first = json!({"observed_at":10,"operations":[{"state":"running","stale":false,"heartbeat_at":10,"last_confirmed_event":{"stage":"started","at":10},"last_progress_at":8}]});
+        let mut heartbeat = first.clone();
+        heartbeat["observed_at"] = json!(20);
+        heartbeat["operations"][0]["heartbeat_at"] = json!(20);
+        heartbeat["operations"][0]["last_confirmed_event"]["at"] = json!(20);
+        assert_eq!(revision(&first), revision(&heartbeat));
+        for key in ["stale", "state", "last_progress_at"] {
+            let mut changed = heartbeat.clone();
+            changed["operations"][0][key] = json!("changed");
+            assert_ne!(revision(&first), revision(&changed));
+        }
+    }
+
     #[test]
     fn task_cards_escape_data_and_show_unknown_instead_of_fake_progress() {
         let html = render(
