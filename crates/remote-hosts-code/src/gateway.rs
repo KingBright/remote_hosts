@@ -1983,7 +1983,7 @@ async fn security_headers(
         );
     }
     let csp_text = if status_response {
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'".to_owned()
+        "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'".to_owned()
     } else {
         config.authorization_csp()
     };

@@ -332,6 +332,11 @@ async fn status_validator_is_session_scoped_and_changes_with_task_outcome() {
             .await
             .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
+    let policy = first.headers()["content-security-policy"].to_str().unwrap();
+    assert!(policy.contains("script-src 'self'"));
+    assert!(policy.contains("connect-src 'self'"));
+    assert!(!policy.contains("script-src 'unsafe-inline'"));
+    assert!(!f.g.config.authorization_csp().contains("script-src"));
     let etag = first.headers()["etag"].to_str().unwrap().to_owned();
     let html = String::from_utf8(
         to_bytes(first.into_body(), 1024 * 1024)
