@@ -82,6 +82,7 @@ def main():
         'release_targets.py': ROOT/'scripts/release_targets.py',
         'sync_bundle.py': ROOT/'scripts/sync_bundle.py',
         'release_client.py': ROOT/'scripts/release_client.py',
+        'native_release_client.py': ROOT/'scripts/native_release_client.py',
         'publish-code.py': ROOT/'scripts/publish-code.py',
         'check-collaboration.py': ROOT/'scripts/check-collaboration.py',
         'install-code-agent.py': ROOT/'scripts/install-code-agent.py',

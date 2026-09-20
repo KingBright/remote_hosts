@@ -126,7 +126,7 @@ class ReleaseHardening0103Tests(unittest.TestCase):
         self.assertEqual(result['last_seen'], 13)
 
     def test_release_client_retries_same_rpc_identity(self):
-        client = release_client.Client('https://example.invalid', access='token')
+        client = release_client.Client('https://example.invalid', access='token', transport='legacy')
         success = {'result': {'tools': []}}
         with mock.patch.object(client, 'parsed', side_effect=[TimeoutError(), success]) as parsed, \
              mock.patch.object(release_client.time, 'sleep'):

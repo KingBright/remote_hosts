@@ -13,9 +13,9 @@ check_collaboration=importlib.util.module_from_spec(COLLAB_SPEC);COLLAB_SPEC.loa
 
 class ClientTests(unittest.TestCase):
     def test_complete_process_still_drains_buffered_output(self):
-        c=Client('https://example.test',access='fixture')
+        c=Client('https://example.test',access='fixture',transport='legacy')
         status={'exit_code':0,'output_complete':True}
-        results=[{'terminal_id':'id','output':'first','cursor':5,'has_more':True,'terminal':status}, {'output':'second','cursor':11,'has_more':False,'terminal':status}]
+        results=[{'terminal_id':'id','output':'first','cursor':5,'has_more':True,'terminal':status,'output_view':'full','raw_cursor_start':0}, {'output':'second','cursor':11,'has_more':False,'terminal':status,'output_view':'full','raw_cursor_start':5}]
         with mock.patch.object(c,'tool',side_effect=results) as call:
             self.assertEqual(c.terminal('workspace','fixture','once'),'firstsecond');self.assertEqual(call.call_count,2)
             self.assertEqual(call.call_args_list[1].args[0],'terminal_read')
