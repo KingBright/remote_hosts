@@ -610,7 +610,9 @@ impl Gateway {
                 "idempotency_conflict: same key used with different arguments"
             );
             if let Some(request_id) = request_id {
-                let mut tx = self.store.pool.begin().await?;
+                // Binding reads the saved request before updating it. Acquire the
+                // writer before that read to avoid a WAL read-to-write upgrade race.
+                let mut tx = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
                 let mut existing_job = job.clone();
                 existing_job.id = id.clone();
                 crate::receipts::bind(&mut tx, request_id, &existing_job).await?;
@@ -1353,7 +1355,7 @@ async fn heartbeat(
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => StatusCode::CONFLICT.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(error) => crate::job_dispatch::storage_error("heartbeat_snapshot", &error),
     }
 }
 async fn save_progress(
@@ -1459,60 +1461,39 @@ async fn poll(
         Ok(false) => {
             return (StatusCode::CONFLICT, "device session already active").into_response();
         }
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(error) => return crate::job_dispatch::storage_error("poll_snapshot", &error),
         Ok(true) => g.observation_changed.notify_waiters(),
     }
     let Some(signals) = g.signals.get(&device) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let deadline = Instant::now() + poll_wait;
+    let selection = crate::job_dispatch::Selection {
+        device: &device,
+        session: &online.hello.session,
+        active: &active_json,
+        lanes: &lanes_json,
+        defer_writes,
+        write_workspaces: &filtered_workspaces,
+        terminal_inputs: &filtered_inputs,
+    };
     loop {
         let notified = signals.jobs.notified();
         let completed = signals.results.notified();
-        // Filter before dequeueing: a full transfer lane cannot hide reads behind it.
-        // Recheck the session in the atomic claim, including already-waiting polls.
-        let row: Result<Option<(String,String)>, _> = sqlx::query_as(
-            r#"UPDATE jobs SET state='dispatched',updated=? WHERE id=(
-                SELECT id FROM (
-                    SELECT id,device,request,updated FROM jobs WHERE device=? AND state='queued'
-                    UNION ALL
-                    SELECT id,device,request,updated FROM jobs WHERE device=? AND state='dispatched' AND updated<?
-                ) jobs
-                WHERE id NOT IN (SELECT value FROM json_each(?))
-                AND (json_extract(request,'$.tool') IN ('code_read','code_list','code_search','code_symbols','code_diff','workspace_context','terminal_read','terminal_cancel')
-                    OR EXISTS(SELECT 1 FROM kv c WHERE c.kind='transfer_control' AND c.key=jobs.id AND json_extract(c.value,'$.cancel_requested')=1)
-                    OR NOT EXISTS(SELECT 1 FROM kv WHERE kind='device_drain' AND key=jobs.device AND expires>unixepoch()))
-                AND (CASE WHEN json_extract(request,'$.tool') IN ('file_upload','file_download') THEN 'transfer'
-                    WHEN json_extract(request,'$.tool') IN ('terminal_read','terminal_cancel','workspace_gc') THEN 'control'
-                    WHEN json_extract(request,'$.tool') IN ('terminal_exec','terminal_input') THEN 'terminal'
-                    WHEN json_extract(request,'$.tool') IN ('workspace_open','code_apply_edits','change_resume','files_sync') THEN 'write'
-                    ELSE 'read' END) IN (SELECT value FROM json_each(?))
-                AND (json_extract(request,'$.tool') NOT IN ('code_apply_edits','change_resume','files_sync')
-                    OR (?=0 AND COALESCE(json_extract(request,'$.arguments.workspace_id'),'') NOT IN (SELECT value FROM json_each(?))))
-                AND (json_extract(request,'$.tool')<>'terminal_input'
-                    OR COALESCE(json_extract(request,'$.arguments.terminal_id'),'') NOT IN (SELECT value FROM json_each(?)))
-                AND EXISTS (SELECT 1 FROM kv WHERE kind='online' AND key=? AND json_extract(value,'$.hello.session')=?)
-                ORDER BY updated,id LIMIT 1
-            ) RETURNING id,request"#,
-        )
-            .bind(now()).bind(&device).bind(&device).bind(now()-30)
-            .bind(&active_json).bind(&lanes_json).bind(defer_writes)
-            .bind(&filtered_workspaces).bind(&filtered_inputs)
-            .bind(&device).bind(&online.hello.session).fetch_optional(&g.store.pool).await;
-        match row {
-            Ok(Some((id, request))) => {
-                if sqlx::query("UPDATE operation_timing SET dispatched_ms=COALESCE(dispatched_ms,?) WHERE id=?")
-                    .bind(now_ms()).bind(&id).execute(&g.store.pool).await.is_err()
-                {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
+        tokio::pin!(notified, completed);
+        // Register before the read: a notification during the query must not
+        // disappear between the empty result and the subsequent bounded wait.
+        notified.as_mut().enable();
+        completed.as_mut().enable();
+        match crate::job_dispatch::claim(&g.store, &selection, now()).await {
+            Ok(Some((_id, request))) => {
                 return match serde_json::from_str::<Value>(&request) {
                     Ok(v) => Json(json!({"job":v})).into_response(),
                     Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                 };
             }
             Ok(None) => {}
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(error) => return crate::job_dispatch::storage_error("poll_claim", &error),
         }
         if Instant::now() >= deadline {
             return Json(json!({"job":null})).into_response();
