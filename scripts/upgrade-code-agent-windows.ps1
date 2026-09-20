@@ -32,7 +32,10 @@ function Maintenance-Call { param([string]$Action) $body=@{action=$Action;lease_
 function Gateway-Ready { param([string]$Expected,[long]$Baseline) $deadline=(Get-Date).AddSeconds(240);$samples=0;$session=$null;$last=$Baseline;$headers=@{Authorization=('Bearer '+$config.device_token);'Cache-Control'='no-cache'};while ((Get-Date) -lt $deadline) { try {$v=Invoke-RestMethod -Method Get -Uri ($config.gateway_url+'/device/readiness') -Headers $headers -TimeoutSec 10;if ($v.agent_version -eq $Expected -and $v.ready -eq $true -and [long]$v.last_seen -gt $last) {if ($session -ne $v.session) {$session=$v.session;$samples=1} else {$samples++};$last=[long]$v.last_seen;if ($samples -ge 3) {return @{gateway_verified=$true;session=$session;samples=$samples;last_seen=$last}}}} catch {};Start-Sleep -Seconds 2};throw 'gateway readiness did not converge' }
 try {
   if ((Get-FileHash -Algorithm SHA256 $Candidate).Hash.ToLowerInvariant() -ne $Sha256) { throw 'candidate checksum mismatch' }
-  if ((& $Candidate --version).Trim() -ne "remote-hosts-code $Version") { throw 'candidate version mismatch' }
+  # GUI-subsystem executables must participate in a pipeline so PowerShell waits
+  # and captures stdout even when Task Scheduler starts us without a console.
+  $candidateVersion = (& $Candidate --version | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or $candidateVersion -ne "remote-hosts-code $Version") { throw 'candidate version mismatch or nonzero exit' }
   $config=Get-Content -Raw -LiteralPath $ConfigPath|ConvertFrom-Json
   $headers=@{Authorization=('Bearer '+$config.device_token);'Cache-Control'='no-cache'};$before=Invoke-RestMethod -Method Get -Uri ($config.gateway_url+'/device/readiness') -Headers $headers -TimeoutSec 10
   Maintenance-Call 'acquire';$maintenance=$true
