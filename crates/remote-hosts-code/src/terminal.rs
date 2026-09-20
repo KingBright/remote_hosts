@@ -65,6 +65,8 @@ pub struct Terminals {
     live: Arc<Mutex<HashMap<String, Live>>>,
     secret: String,
     slots: Arc<tokio::sync::Semaphore>,
+    // Latest change only, not another task queue or source of execution truth.
+    changes: tokio::sync::watch::Sender<u64>,
 }
 impl Terminals {
     pub async fn new(store: Store, dir: PathBuf, secret: String) -> Result<Self> {
@@ -79,7 +81,17 @@ impl Terminals {
             live: Arc::new(Mutex::new(HashMap::new())),
             secret,
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            changes: tokio::sync::watch::channel(0).0,
         })
+    }
+    pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+    fn publish_change(&self) {
+        // A change while the heartbeat is in flight remains unseen by its
+        // receiver. Coalescing never discards the need to read durable state.
+        self.changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
     /// Reconcile durable terminal rows that can no longer be owned by this runtime.
     /// A grace window prevents racing a freshly inserted `starting` row before its
@@ -133,6 +145,9 @@ impl Terminals {
             .execute(&self.store.pool)
             .await?;
             reconciled += 1;
+        }
+        if reconciled > 0 {
+            self.publish_change();
         }
         Ok(reconciled)
     }
@@ -204,6 +219,7 @@ impl Terminals {
                 status.updated_at = now();
                 status.output_complete = true;
                 self.store.put("terminal", id, &status, i64::MAX).await?;
+                self.publish_change();
                 return Err(error);
             }
         };
@@ -353,6 +369,10 @@ impl Terminals {
             };
             if !saved {
                 tracing::error!(terminal_id=%key,"terminal status persistence failed");
+            } else {
+                // Do not wait for the next periodic heartbeat to expose an exit.
+                // Failed persistence never emits a successful-completion hint.
+                this.publish_change();
             }
             if let Ok(mut live) = this.live.lock() {
                 live.remove(&key);
@@ -574,6 +594,7 @@ impl Terminals {
         let changed: Option<(String,)> = sqlx::query_as("UPDATE kv SET value=json_set(value,'$.state','cancelled','$.updated_at',?) WHERE kind='terminal' AND key=? AND json_extract(value,'$.workspace_id')=? AND json_extract(value,'$.state')='running' RETURNING value")
             .bind(now()).bind(id).bind(&ws.id).fetch_optional(&self.store.pool).await?;
         let status = if let Some((value,)) = changed {
+            self.publish_change();
             self.kill(id)?;
             serde_json::from_str::<Status>(&value)?
         } else {

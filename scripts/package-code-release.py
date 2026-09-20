@@ -77,6 +77,7 @@ def main():
         'macos_code_identity.py': ROOT/'scripts/macos_code_identity.py',
         'upgrade-code-gateway.py': ROOT/'scripts/upgrade-code-gateway.py',
         'check-code-gateway.py': ROOT/'scripts/check-code-gateway.py',
+        'check-terminal-delivery.py': ROOT/'scripts/check-terminal-delivery.py',
         'release_receipts.py': ROOT/'scripts/release_receipts.py',
         'maintenance_client.py': ROOT/'scripts/maintenance_client.py',
         'release_targets.py': ROOT/'scripts/release_targets.py',

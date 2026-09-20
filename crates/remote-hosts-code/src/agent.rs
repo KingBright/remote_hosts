@@ -561,11 +561,34 @@ impl Agent {
         }
     }
     async fn heartbeat_loop(&self, client: &reqwest::Client, hello: &DeviceHello) -> Result<()> {
+        self.heartbeat_with_period(client, hello, Duration::from_secs(2))
+            .await
+    }
+    async fn heartbeat_with_period(
+        &self,
+        client: &reqwest::Client,
+        hello: &DeviceHello,
+        period: Duration,
+    ) -> Result<()> {
+        let mut terminal_changes = self.terminals.subscribe_changes();
+        let mut periodic = tokio::time::interval(period);
+        periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut acknowledged_terminal_fingerprint = String::new();
         let mut last_reconcile = tokio::time::Instant::now() - Duration::from_secs(30);
         let mut last_acknowledged = tokio::time::Instant::now() - Duration::from_secs(30);
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                changed = terminal_changes.changed() => {
+                    changed.context("terminal_change_channel_closed")?;
+                    // Merge concurrent exits without spinning or opening a second
+                    // heartbeat request. Output streaming keeps its periodic path.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                _ = periodic.tick() => {}
+            }
+            // Mark BEFORE reading/sending. An exit during an in-flight request
+            // must wake the following iteration, not disappear with that reply.
+            let _revision = *terminal_changes.borrow_and_update();
             if last_reconcile.elapsed() >= Duration::from_secs(15) {
                 match self.terminals.reconcile_orphans(30).await {
                     Ok(count) if count > 0 => {
@@ -787,6 +810,9 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 #[path = "agent_scheduling_tests.rs"]
 mod scheduling_tests;
+#[cfg(all(test, unix))]
+#[path = "terminal_completion_tests.rs"]
+mod terminal_completion_tests;
 
 #[cfg(test)]
 mod tests {
