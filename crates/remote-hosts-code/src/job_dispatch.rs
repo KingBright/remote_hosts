@@ -10,9 +10,10 @@ use axum::{
 };
 use serde_json::json;
 use sqlx::{Row, Sqlite, query::Query, sqlite::SqliteArguments};
-use std::sync::LazyLock;
-
-const CANDIDATE: &str = r#"SELECT id FROM (
+// Keep one compile-time SQL literal for both paths. Values always use bindings;
+// no runtime SQL concatenation or unchecked SQL-safety assertion is needed.
+macro_rules! candidate_sql {
+    () => { r#"SELECT id FROM (
     SELECT id,device,request,updated FROM jobs WHERE device=? AND state='queued'
     UNION ALL
     SELECT id,device,request,updated FROM jobs WHERE device=? AND state='dispatched' AND updated<?
@@ -31,12 +32,14 @@ AND (json_extract(request,'$.tool') NOT IN ('code_apply_edits','change_resume','
 AND (json_extract(request,'$.tool')<>'terminal_input'
     OR COALESCE(json_extract(request,'$.arguments.terminal_id'),'') NOT IN (SELECT value FROM json_each(?)))
 AND EXISTS (SELECT 1 FROM kv WHERE kind='online' AND key=? AND json_extract(value,'$.hello.session')=?)
-ORDER BY updated,id LIMIT 1"#;
-static CLAIM: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "UPDATE jobs SET state='dispatched',updated=? WHERE id=({CANDIDATE}) RETURNING id,request"
-    )
-});
+ORDER BY updated,id LIMIT 1"# };
+}
+const CANDIDATE: &str = candidate_sql!();
+const CLAIM: &str = concat!(
+    "UPDATE jobs SET state='dispatched',updated=? WHERE id=(",
+    candidate_sql!(),
+    ") RETURNING id,request"
+);
 
 pub(crate) struct Selection<'a> {
     pub device: &'a str,
@@ -50,9 +53,9 @@ pub(crate) struct Selection<'a> {
 impl Selection<'_> {
     fn bind<'q>(
         &'q self,
-        query: Query<'q, Sqlite, SqliteArguments<'q>>,
+        query: Query<'q, Sqlite, SqliteArguments>,
         at: i64,
-    ) -> Query<'q, Sqlite, SqliteArguments<'q>> {
+    ) -> Query<'q, Sqlite, SqliteArguments> {
         query
             .bind(self.device)
             .bind(self.device)
@@ -89,7 +92,7 @@ pub(crate) async fn claim(
         .await
         .context("poll_claim_begin")?;
     let row = selection
-        .bind(sqlx::query(&CLAIM).bind(at), at)
+        .bind(sqlx::query(CLAIM).bind(at), at)
         .fetch_optional(&mut *tx)
         .await
         .context("poll_claim_update")?;
