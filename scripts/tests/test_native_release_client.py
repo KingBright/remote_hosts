@@ -205,6 +205,35 @@ class NativeStdioTests(unittest.TestCase):
         self.assertFalse(s.close())
         self.assertEqual(sum(r.get('method')=='tools/call' for r in self.received(s)), 1)
 
+    def test_bootstrap_failure_is_not_an_uncertain_remote_tool(self):
+        s = self.session()
+        s.receipts.mkdir()
+        rid = 'req_' + 'a' * 32
+        record = {'kind': 'adapter_bootstrap', 'request_id': rid, 'method': 'initialize',
+                  'state': 'bootstrap_failed', 'error_code': 'upstream_collection_incomplete',
+                  'attempts': [{'number': 1}], 'tool_calls_submitted': 0}
+        (s.receipts/(rid+'.json')).write_text(json.dumps(record))
+        with self.assertRaises(native.NativeTransportError) as caught:
+            s._fail('native_adapter_stdout_closed')
+        self.assertEqual(caught.exception.requests, [])
+        self.assertEqual(s.status['execution_state'], 'not_started')
+        self.assertEqual(s.status['bootstrap_receipts'][0]['request_id'], rid)
+        self.spawn.assert_not_called()
+
+    def test_bootstrap_receipt_is_separate_from_later_uncertain_tool(self):
+        s = self.session()
+        s.start()
+        rid = 'req_' + 'f' * 32
+        (s.receipts/(rid+'.json')).write_text(json.dumps({'kind':'adapter_bootstrap',
+            'request_id':rid,'method':'tools/list','state':'bootstrap_step_completed'}))
+        with self.assertRaises(native.NativeTransportError) as caught:
+            s.rpc('tools/call', {'mode':'drop'})
+        self.assertEqual(len(caught.exception.requests), 1)
+        self.assertNotEqual(caught.exception.requests[0]['request_id'], rid)
+        self.assertEqual(s.status['execution_state'], 'unknown')
+        self.assertEqual(s.status['tool_calls_submitted'], 1)
+        self.assertEqual(len(s.status['bootstrap_receipts']), 1)
+
     def test_two_sessions_do_not_share_credentials_or_processes(self):
         a, b = self.session(), self.session()
         a.start(); b.start()

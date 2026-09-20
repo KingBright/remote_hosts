@@ -34,6 +34,7 @@ pub struct Adapter {
     host_report_file: Option<PathBuf>,
 }
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
+mod bootstrap;
 fn private_regular(path: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     ensure!(
@@ -100,21 +101,7 @@ impl Adapter {
             state_dir: config.state_dir,
             host_report_file: config.host_report_file,
         };
-        let init=adapter.rpc("initialize",json!({"protocolVersion":adapter.protocol,"capabilities":{},
-            "clientInfo":{"name":"remote-hosts-generated-adapter","version":env!("CARGO_PKG_VERSION")}}),&format!("req_{}",uuid::Uuid::new_v4().simple())).await?;
-        adapter.protocol = init["protocolVersion"]
-            .as_str()
-            .context("initialize_protocol_missing")?
-            .to_owned();
-        // The controlled Gateway is stateless. Notifications have no JSON-RPC id.
-        adapter.notify_initialized().await?;
-        let list = adapter
-            .rpc(
-                "tools/list",
-                json!({}),
-                &format!("req_{}", uuid::Uuid::new_v4().simple()),
-            )
-            .await?;
+        let list = adapter.bootstrap().await?;
         adapter.catalog = serde_json::from_value(list["tools"].clone())?;
         ensure!(
             adapter.catalog.len() <= crate::tools::catalog().len(),
@@ -233,8 +220,23 @@ impl Adapter {
             .map_err(|_| anyhow::anyhow!("upstream_initialize_notification_failed"))?;
         ensure!(
             response.status().is_success(),
-            "upstream_initialize_notification_rejected"
+            "upstream_http_status_{}",
+            response.status().as_u16()
         );
+        // Fully consume a bounded acknowledgement so its connection is reusable.
+        // A malformed or oversized reply is never silently accepted.
+        let mut response = response;
+        let mut collected = 0usize;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow::anyhow!("upstream_collection_incomplete"))?
+        {
+            collected = collected
+                .checked_add(chunk.len())
+                .context("upstream_response_budget")?;
+            ensure!(collected <= MAX_RESPONSE, "upstream_response_budget");
+        }
         Ok(())
     }
 }

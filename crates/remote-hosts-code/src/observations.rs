@@ -10,9 +10,29 @@ use std::{
 };
 use tokio::time::Instant;
 
+#[cfg(test)]
+mod completion_tests;
+
 struct View {
     cursor: String,
     pending: usize,
+}
+fn terminal_pending(terminal: &Value, stale: bool) -> bool {
+    !stale
+        && (matches!(terminal["state"].as_str(), Some("running" | "starting"))
+            || (terminal["state"] == "exited"
+                && terminal["output_complete"] == false
+                && terminal["output_error"].is_null()
+                && terminal["output_truncated"] != true))
+}
+fn awaiting_result(result: &Value) -> bool {
+    if result.get("error").is_some()
+        || result["receipt"]["stale"] == true
+        || result["state"] == "outcome_unknown"
+    {
+        return false;
+    }
+    result["pending"] == true || terminal_pending(&result["terminal"], false)
 }
 fn omitted(id: &str, original: &Value) -> Value {
     let mut value = json!({"operation_id":id,"result_omitted":true,"reason":"response_budget",
@@ -130,7 +150,7 @@ fn apply_terminal_cursor(result: &mut Value, args: &Value) -> Result<()> {
     Ok(())
 }
 async fn view(g: &Gateway, p: &Principal, ids: &[String]) -> Result<View> {
-    let rows = sqlx::query("SELECT j.id,j.device,j.state,json_extract(j.request,'$.owner') AS owner,json_extract(j.request,'$.tool') AS tool,COALESCE(r.value,a.value) AS progress FROM jobs j LEFT JOIN kv a ON a.kind='operation_progress' AND a.key=j.id AND a.expires>? LEFT JOIN kv r ON r.kind='receive_progress' AND r.key=j.id AND r.expires>? AND json_extract(j.request,'$.tool')='file_download' WHERE j.id IN (SELECT value FROM json_each(?))")
+    let rows = sqlx::query("SELECT j.id,j.device,j.state,json_extract(j.request,'$.owner') AS owner,json_extract(j.request,'$.tool') AS tool,json_extract(j.result,'$.terminal') AS saved_terminal,j.updated AS job_updated,COALESCE(r.value,a.value) AS progress FROM jobs j LEFT JOIN kv a ON a.kind='operation_progress' AND a.key=j.id AND a.expires>? LEFT JOIN kv r ON r.kind='receive_progress' AND r.key=j.id AND r.expires>? AND json_extract(j.request,'$.tool')='file_download' WHERE j.id IN (SELECT value FROM json_each(?))")
         .bind(now()).bind(now()).bind(serde_json::to_string(ids)?).fetch_all(&g.store.pool).await?;
     ensure!(
         rows.len() == ids.len(),
@@ -158,17 +178,31 @@ async fn view(g: &Gateway, p: &Principal, ids: &[String]) -> Result<View> {
         let state: String = row.try_get("state")?;
         let progress: Option<String> = row.try_get("progress")?;
         let mut stamp = json!({"id":id,"state":state});
-        if tool == "terminal_exec"
-            && let Some(observed) = crate::terminal_sync::observed(g, id).await?
-        {
+        let observed = if tool == "terminal_exec" {
+            match crate::terminal_sync::observed(g, id).await? {
+                Some(observed) => Some(observed),
+                None => {
+                    let saved: Option<String> = row.try_get("saved_terminal")?;
+                    let updated: i64 = row.try_get("job_updated")?;
+                    saved
+                        .map(|raw| {
+                            serde_json::from_str::<Value>(&raw).map(|terminal| {
+                                json!({"terminal":terminal,
+                            "stale":!(0..=45).contains(&(now()-updated))})
+                            })
+                        })
+                        .transpose()?
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(observed) = observed {
             let t = &observed["terminal"];
             stamp["terminal"] = json!({"state":t["state"],"exit_code":t["exit_code"],"output_complete":t["output_complete"],
                 "output_truncated":t["output_truncated"],"output_error":t["output_error"],
                 "output_cursor_end":observed["output_cursor_end"],"output_gap":observed["output_gap"],"stale":observed["stale"]});
-            if state == "done"
-                && observed["stale"] == false
-                && matches!(t["state"].as_str(), Some("running" | "starting"))
-            {
+            if state == "done" && terminal_pending(t, observed["stale"] != false) {
                 pending += 1;
             }
         }
@@ -302,11 +336,13 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
         let deadline = Instant::now() + Duration::from_millis(1200);
         loop {
             let changed = g.observation_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let mut result = g.result(p, id).await?;
             if let Some(receipt) = &request_receipt {
                 result["request_receipt"] = receipt.clone();
             }
-            if result.get("pending") != Some(&json!(true)) || Instant::now() >= deadline {
+            if !awaiting_result(&result) || Instant::now() >= deadline {
                 return Ok(result);
             }
             tokio::select! {
@@ -332,9 +368,13 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
     let final_view = loop {
         // Subscribe before durable read, so a committed result cannot be missed.
         let changed = g.observation_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
         let current = view(g, p, &ids).await?;
         let previous = baseline.get_or_insert_with(|| current.cursor.clone());
-        if current.cursor != *previous
+        // With a cursor the caller requested the next change. Without one,
+        // wait for the process result, not merely transport bookkeeping.
+        if (supplied.is_some() && current.cursor != *previous)
             || wait == 0
             || current.pending == 0
             || Instant::now() >= deadline

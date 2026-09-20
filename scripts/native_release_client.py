@@ -100,6 +100,7 @@ class NativeSession:
             'binary': str(self.binary), 'binary_sha256': binary_sha256,
             'evidence_dir': str(self.directory),
             'auto_replay': False, 'started_at': int(time.time()), 'rpc_calls': 0,
+            'tool_calls_submitted': 0,
         }
         try:
             self._persist_status()
@@ -207,6 +208,8 @@ class NativeSession:
             self._fail('native_adapter_request_budget')
         try:
             self._outbox.put_nowait(frame)
+            if request.get('method') == 'tools/call':
+                self.status['tool_calls_submitted'] += 1
         except queue.Full:
             self._fail('native_adapter_write_queue_full')
 
@@ -266,6 +269,8 @@ class NativeSession:
                 if path.stat().st_size > MAX_FRAME:
                     continue
                 value = json.loads(path.read_text())
+                if value.get('kind') == 'adapter_bootstrap':
+                    continue
                 records.append({k: value.get(k) for k in ('request_id', 'operation_id', 'state')})
             except (OSError, ValueError):
                 continue
@@ -281,6 +286,21 @@ class NativeSession:
             self.status.update(close_success=False, cleanup_error='cleanup_unconfirmed')
         records = self._unconfirmed_receipts()
         self.status['unconfirmed_requests'] = records
+        self.status['execution_state'] = ('not_started' if self.status['tool_calls_submitted'] == 0 else 'unknown')
+        bootstrap = []
+        for path in self.receipts.glob('req_*.json'):
+            if path.is_symlink() or not REQUEST_ID.fullmatch(path.stem):
+                continue
+            try:
+                if path.stat().st_size > MAX_FRAME:
+                    continue
+                value = json.loads(path.read_text())
+                if value.get('kind') == 'adapter_bootstrap':
+                    bootstrap.append({k: value.get(k) for k in
+                        ('request_id', 'method', 'state', 'error_code', 'attempts', 'tool_calls_submitted')})
+            except (OSError, ValueError):
+                continue
+        self.status['bootstrap_receipts'] = bootstrap
         try:
             self._persist_status()
         except OSError:
