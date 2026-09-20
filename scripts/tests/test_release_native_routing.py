@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 sys.path[:0] = [str(pathlib.Path(__file__).resolve().parents[1]), str(pathlib.Path(__file__).resolve().parent)]
-from release_client import Client
+from release_client import Client, OperationIncomplete
 
 
 class NativeRoutingTests(unittest.TestCase):
@@ -76,6 +76,40 @@ class NativeRoutingTests(unittest.TestCase):
         with mock.patch.object(c,'raw',side_effect=[{'pending':True,'operation_id':'original'},{'operation_id':'original','state':'completed'}]) as call:
             c.tool('code_read',{'workspace_id':'w'})
         self.assertEqual(call.call_args_list[1].args,('operation_get',{'operation_id':'original','wait_ms':5000}))
+
+
+class TransferCompletionTests(unittest.TestCase):
+    def test_paused_communication_retains_recovery_without_resubmission(self):
+        for state in ('paused', 'awaiting_source'):
+            with self.subTest(state=state):
+                c=Client('https://fixture.example',access='synthetic',transport='legacy')
+                v={'operation_id':'original-transfer','state':state,'pending':False,
+                   'resumable':True,'next_action':'transfer_resume',
+                   'receipt':{'evidence_complete':False,'retry_policy':'resume_original_transfer_only'}}
+                with mock.patch.object(c,'raw',return_value=v) as raw:
+                    with self.assertRaises(OperationIncomplete) as caught:
+                        c.tool('file_download',{'path':'probe'})
+                self.assertEqual(raw.call_count,1)
+                self.assertEqual(caught.exception.operation_id,'original-transfer')
+                self.assertEqual(caught.exception.state,state)
+                self.assertEqual(caught.exception.next_action,'transfer_resume')
+                self.assertTrue(caught.exception.resumable)
+                self.assertFalse(caught.exception.receipt['evidence_complete'])
+
+    def test_pending_then_paused_is_not_returned_as_success(self):
+        c=Client('https://fixture.example',access='synthetic',transport='legacy')
+        paused={'operation_id':'original-transfer','state':'paused','pending':False,
+                'receipt':{'next_action':'transfer_resume'}}
+        with mock.patch.object(c,'raw',side_effect=[{'operation_id':'original-transfer','pending':True},paused]) as raw:
+            with self.assertRaises(OperationIncomplete):c.tool('file_upload',{})
+        self.assertEqual([v.args[0] for v in raw.call_args_list],['file_upload','operation_get'])
+        self.assertEqual(raw.call_args.args[1]['operation_id'],'original-transfer')
+
+    def test_raw_keeps_paused_receipt_available_for_explicit_recovery(self):
+        c=Client('https://fixture.example',access='synthetic',transport='legacy')
+        value={'operation_id':'original-transfer','state':'paused','resumable':True}
+        with mock.patch.object(c,'rpc',return_value={'structuredContent':value}):
+            self.assertIs(c.raw('operation_get',{'operation_id':'original-transfer'}),value)
 
 
 class TerminalObserverTests(unittest.TestCase):

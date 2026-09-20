@@ -18,6 +18,8 @@ There is no automatic replay, process restart, or switch to legacy HTTP after na
 
 An upstream structured error is returned as an error, not translated into a success. Authentication, proxy selection, and TLS validation remain the responsibility of the existing Rust adapter. OAuth/admin/artifact requests retain the original urllib path and its existing cookie/redirect/TLS policy.
 
+A paused or source-waiting transfer is not success merely because `pending=false`. `Client.tool(...)` raises `OperationIncomplete`, preserving `operation_id`, state, next action and the original receipt. `Client.raw(...)` retains the full response for an explicit recovery controller. Only a deliberate `transfer_resume` of the original transfer may continue it; the convenience client never silently resumes or submits a replacement.
+
 ## Terminal observation
 
 `Client.terminal(...)` follows the same `operation_id` with bounded `operation_get` waits. Ordinary short output does not require a second queued `terminal_read` operation. Tail-only, incomplete, or legacy previews use exact full-history recovery from byte zero. A tail is never appended to an unrelated prefix. UTF-8 byte cursor gaps, truncation, log errors, nonzero exit status, and unconfirmed final capture are failures.

@@ -23,6 +23,23 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class OperationIncomplete(RuntimeError):
+    """A completed communication is not a completed remote transfer.
+
+    Preserve the original operation for explicit recovery; never resume or
+    resubmit it merely because a convenience caller expected a final result.
+    """
+    def __init__(self, value):
+        self.operation_id = value.get('operation_id')
+        self.state = value.get('state')
+        self.next_action = value.get('next_action') or value.get('receipt', {}).get('next_action')
+        self.receipt = dict(value.get('receipt') or {})
+        self.resumable = value.get('resumable') is True
+        super().__init__('operation_incomplete:' + str(self.operation_id)
+                         + '; state=' + str(self.state)
+                         + '; next_action=' + str(self.next_action))
+
+
 class Client:
     def __init__(self, origin, password_file=None, access=None, *, transport=None,
                  native_binary=None, native_state_dir=None):
@@ -148,6 +165,8 @@ class Client:
             value = self.raw('operation_get', {'operation_id': value['operation_id'], 'wait_ms': 5000})
         if 'error' in value:
             raise RuntimeError(name + ':' + str(value.get('error_code', value['error'])) + '; operation=' + str(value.get('operation_id')))
+        if value.get('state') in ('paused', 'awaiting_source'):
+            raise OperationIncomplete(value)
         return value
 
     def terminal(self, ws, command, key, timeout=60):
