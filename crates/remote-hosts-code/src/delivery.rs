@@ -128,6 +128,15 @@ impl Delivery {
         Ok(())
     }
     async fn claim(&self) -> Result<Option<Claim>> {
+        // An empty UPDATE still acquires SQLite's writer. Idle senders run four
+        // times per second, so inspect the indexed queue before attempting a claim.
+        // The UPDATE below repeats every predicate and remains the authority.
+        let due: Option<String> = sqlx::query_scalar("SELECT id FROM receipt_outbox WHERE device=? AND origin=? AND state IN ('pending','sending') AND next_attempt<=? ORDER BY next_attempt,id LIMIT 1")
+            .bind(&self.config.device_id).bind(&self.config.gateway_url).bind(now())
+            .fetch_optional(&self.store.pool).await?;
+        if due.is_none() {
+            return Ok(None);
+        }
         let lease = crate::random();
         let row = sqlx::query("UPDATE receipt_outbox SET state='sending',attempts=attempts+1,next_attempt=?,lease=? WHERE id=(SELECT id FROM receipt_outbox WHERE device=? AND origin=? AND state IN ('pending','sending') AND next_attempt<=? ORDER BY next_attempt,id LIMIT 1) RETURNING id,payload,attempts")
             .bind(now()+15).bind(&lease).bind(&self.config.device_id).bind(&self.config.gateway_url)
@@ -225,15 +234,23 @@ impl Delivery {
             .bind(&self.config.device_id).bind(&self.config.gateway_url).fetch_one(&self.store.pool).await?;
         let total: i64 = row.try_get("total")?;
         let blocked: i64 = row.try_get("blocked")?;
-        self.store
-            .put(
-                "runtime",
-                "receipt_delivery",
-                &json!({"protocol":1,"pending":total-blocked,
+        let value = json!({"protocol":1,"pending":total-blocked,
             "blocked":blocked,"sending":row.try_get::<i64,_>("sending")?,
-            "oldest_created_at":row.try_get::<Option<i64>,_>("oldest")?,"reported_at":now()}),
-                i64::MAX,
-            )
+            "oldest_created_at":row.try_get::<Option<i64>,_>("oldest")?,"reported_at":now()});
+        if let Some(previous) = self
+            .store
+            .get::<Value>("runtime", "receipt_delivery")
+            .await?
+        {
+            let equal = ["pending", "blocked", "sending", "oldest_created_at"]
+                .iter()
+                .all(|key| previous[*key] == value[*key]);
+            if equal && (0..10).contains(&(now() - previous["reported_at"].as_i64().unwrap_or(0))) {
+                return Ok(());
+            }
+        }
+        self.store
+            .put("runtime", "receipt_delivery", &value, i64::MAX)
             .await
     }
     pub async fn run(&self, client: &reqwest::Client) -> Result<()> {
@@ -241,6 +258,8 @@ impl Delivery {
         let mut last_report = tokio::time::Instant::now() - Duration::from_secs(3);
         loop {
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             while let Some(outcome) = workers.try_join_next() {
                 if !matches!(outcome, Ok(Ok(()))) {
                     tracing::warn!("receipt sender unavailable; lease and saved result retained");

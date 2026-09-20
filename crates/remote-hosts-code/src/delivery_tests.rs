@@ -1,5 +1,41 @@
 use super::*;
 
+#[tokio::test]
+async fn idle_outbox_and_unchanged_health_do_not_need_a_writer() {
+    let (_tmp, d) = fixture().await;
+    d.report().await.unwrap();
+    let mut connections = Vec::new();
+    for _ in 0..4 {
+        connections.push(d.store.pool.acquire().await.unwrap());
+    }
+    drop(connections);
+    let tx = d.store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let read = tokio::time::timeout(Duration::from_secs(1), async {
+        assert!(d.claim().await.unwrap().is_none());
+        d.report().await.unwrap();
+    })
+    .await;
+    tx.rollback().await.unwrap();
+    read.expect("idle receipt polling attempted a SQLite write");
+}
+
+#[tokio::test]
+async fn changed_receipt_health_is_persisted_without_cooldown() {
+    let (_tmp, d) = fixture().await;
+    d.report().await.unwrap();
+    d.enqueue(&uuid::Uuid::new_v4().to_string(), &json!({"answer":1}))
+        .await
+        .unwrap();
+    d.report().await.unwrap();
+    let v: Value = d
+        .store
+        .get("runtime", "receipt_delivery")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v["pending"], 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_responses_use_two_senders_and_do_not_allocate_unbounded_tasks() {
     use std::sync::atomic::{AtomicUsize, Ordering};

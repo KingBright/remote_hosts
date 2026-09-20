@@ -563,6 +563,7 @@ impl Agent {
     async fn heartbeat_loop(&self, client: &reqwest::Client, hello: &DeviceHello) -> Result<()> {
         let mut acknowledged_terminal_fingerprint = String::new();
         let mut last_reconcile = tokio::time::Instant::now() - Duration::from_secs(30);
+        let mut last_acknowledged = tokio::time::Instant::now() - Duration::from_secs(30);
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             if last_reconcile.elapsed() >= Duration::from_secs(15) {
@@ -583,22 +584,33 @@ impl Agent {
                 crate::terminal_sync::previews(&terminals, self.config.state_dir.join("terminals"))
                     .await
                     .unwrap_or_default();
+            let progress = self.progress.snapshots();
+            let mut progress_identity = serde_json::to_value(&progress)?;
+            if let Some(items) = progress_identity.as_array_mut() {
+                for item in items {
+                    if let Some(object) = item.as_object_mut() {
+                        for key in ["elapsed_ms", "average_bps", "instantaneous_bps"] {
+                            object.remove(key);
+                        }
+                    }
+                }
+            }
             let fingerprint = crate::hash(serde_json::to_vec(&json!({
-                "terminals":terminals,
-                "previews":terminal_previews,
+                "terminals":terminals,"previews":terminal_previews,
+                "active":active,"progress":progress_identity,
             }))?);
             let running_terminal = terminals
                 .iter()
                 .any(|s| matches!(s.state.as_str(), "starting" | "running"));
-            if active.is_empty()
-                && !running_terminal
-                && fingerprint == acknowledged_terminal_fingerprint
+            if fingerprint == acknowledged_terminal_fingerprint
+                && ((active.is_empty() && !running_terminal)
+                    || last_acknowledged.elapsed() < Duration::from_secs(10))
             {
                 continue;
             }
             let mut request = serde_json::to_value(hello)?;
             request["active_operations"] = json!(active);
-            request["progress"] = json!(self.progress.snapshots());
+            request["progress"] = json!(progress);
             request["terminal_updates"] = json!(terminals);
             request["terminal_previews"] = json!(terminal_previews);
             let response = client
@@ -610,6 +622,7 @@ impl Agent {
                 .await;
             if response.is_ok_and(|r| r.status().is_success()) {
                 acknowledged_terminal_fingerprint = fingerprint;
+                last_acknowledged = tokio::time::Instant::now();
             }
         }
     }

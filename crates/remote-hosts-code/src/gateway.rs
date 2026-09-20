@@ -36,6 +36,9 @@ use tokio::{io::AsyncWriteExt, sync::Notify, time::Instant};
 struct DeviceSignals {
     jobs: Notify,
     results: Notify,
+    // Coalesce the five poll lanes before they occupy SQLite connections. This
+    // is only a write-elision hint; each use rechecks the durable session lease.
+    poll_snapshot: tokio::sync::Mutex<Option<(String, Instant)>>,
 }
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -1442,9 +1445,52 @@ async fn poll(
     let Ok(value) = serde_json::to_string(&online) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    let Some(signals) = g.signals.get(&device) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let mut identity = json!({"online":online,"active":request.active_operations,
+        "progress":request.progress,"terminals":request.terminal_updates,"previews":request.terminal_previews});
+    identity["online"]
+        .as_object_mut()
+        .expect("online object")
+        .remove("last_seen");
+    if let Some(delivery) = identity["online"]["receipt_delivery"].as_object_mut() {
+        delivery.remove("reported_at");
+    }
+    if let Some(progress) = identity["progress"].as_array_mut() {
+        for snapshot in progress {
+            if let Some(object) = snapshot.as_object_mut() {
+                for key in ["elapsed_ms", "average_bps", "instantaneous_bps"] {
+                    object.remove(key);
+                }
+            }
+        }
+    }
+    let fingerprint = hash(identity.to_string());
+    // The per-device lock is acquired BEFORE a database connection. Matching
+    // concurrent lanes do not queue multiple FULL commits for the same snapshot.
+    let mut cached = signals.poll_snapshot.lock().await;
+    let reusable = cached
+        .as_ref()
+        .is_some_and(|(old, at)| old == &fingerprint && at.elapsed() < Duration::from_secs(10));
+    let lease_current = if reusable {
+        match g.store.get::<Online>("online", &device).await {
+            Ok(Some(saved)) => {
+                saved.hello.session == online.hello.session
+                    && (0..10).contains(&(now() - saved.last_seen))
+            }
+            Ok(None) => false,
+            Err(error) => return crate::job_dispatch::storage_error("poll_snapshot_read", &error),
+        }
+    } else {
+        false
+    };
     // Atomically claim/renew the lease. A separate SELECT then UPSERT permits two
     // fresh sessions to both pass the check and dispatch work for one identity.
-    let claim: Result<bool> = async {
+    let claim: Result<bool> = if lease_current {
+        Ok(true)
+    } else {
+        async {
         let mut tx = g.store.pool.begin_with("BEGIN IMMEDIATE").await?;
         let claimed = sqlx::query("INSERT INTO kv(kind,key,value,expires) VALUES('online',?,?,?) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value,expires=excluded.expires WHERE json_extract(kv.value,'$.hello.session')=? OR json_extract(kv.value,'$.last_seen')<=?")
             .bind(&device).bind(value).bind(i64::MAX)
@@ -1456,17 +1502,23 @@ async fn poll(
             &request.terminal_updates, &request.terminal_previews).await?;
         tx.commit().await?;
         Ok(true)
-    }.await;
+    }.await
+    };
+    if matches!(claim, Ok(true)) && !lease_current {
+        *cached = Some((fingerprint, Instant::now()));
+    }
+    drop(cached);
     match claim {
         Ok(false) => {
             return (StatusCode::CONFLICT, "device session already active").into_response();
         }
         Err(error) => return crate::job_dispatch::storage_error("poll_snapshot", &error),
-        Ok(true) => g.observation_changed.notify_waiters(),
+        Ok(true) => {
+            if !lease_current {
+                g.observation_changed.notify_waiters();
+            }
+        }
     }
-    let Some(signals) = g.signals.get(&device) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
     let deadline = Instant::now() + poll_wait;
     let selection = crate::job_dispatch::Selection {
         device: &device,
