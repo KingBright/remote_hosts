@@ -308,7 +308,21 @@ pub async fn invoke(
     if operation.is_some() {
         value["operation_id"] = json!(operation);
     }
-    let receipt = decision(&value, Some(request_id), operation.as_deref(), now());
+    let receipt = if tool == "operation_get" && value["unchanged_payload_omitted"] == true {
+        // observe() already re-authorized and projected the current durable facts.
+        // Removing unchanged output must not erase the exit code, stale flag or
+        // recovery policy by recomputing a decision from that shortened payload.
+        let mut receipt = value["receipt"].clone();
+        ensure!(
+            receipt.is_object() && receipt["operation_id"] == value["operation_id"],
+            "unchanged_observation_receipt_unavailable"
+        );
+        receipt["request_id"] = json!(request_id);
+        receipt["observed_at"] = json!(now());
+        receipt
+    } else {
+        decision(&value, Some(request_id), operation.as_deref(), now())
+    };
     saved["receipt"] = receipt.clone();
     if let Some(observed) = observed_request_id {
         saved["observed_request_id"] = json!(observed);

@@ -985,6 +985,106 @@ async fn real_mcp_call_reports_adapter_and_host_as_independent_layers() {
     assert!(value["request_id"].as_str().is_some());
 }
 
+async fn assert_unchanged_receipt_preserves_facts(status: Value, stale: bool) {
+    let f = Fixture::new().await;
+    let id = f.job(0, "done", Some(status)).await;
+    if stale {
+        let mut observed: Value =
+            f.g.store
+                .get("terminal_observation", &id)
+                .await
+                .unwrap()
+                .unwrap();
+        observed["reported_at"] = json!(now() - 60);
+        f.g.store
+            .put("terminal_observation", &id, &observed, now() + 100)
+            .await
+            .unwrap();
+    }
+    let first = receipts::invoke(
+        &f.g,
+        &f.p,
+        "operation_get",
+        json!({"operation_id":id,"wait_ms":0}),
+        &request_id(),
+    )
+    .await
+    .unwrap();
+    let second_request = request_id();
+    let second = receipts::invoke(
+        &f.g,
+        &f.p,
+        "operation_get",
+        json!({"operation_id":id,"wait_ms":0,"cursor":first["observation"]["cursor"]}),
+        &second_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second["unchanged_payload_omitted"], true);
+    assert_eq!(second["observation"]["changed"], false);
+    assert!(second.get("output").is_none());
+    for key in [
+        "execution_state",
+        "process_exit_code",
+        "process_outcome",
+        "output_complete",
+        "evidence_complete",
+        "stale",
+        "last_confirmed_stage",
+        "retry_policy",
+        "next_action",
+        "business_state",
+    ] {
+        assert_eq!(
+            second["receipt"][key], first["receipt"][key],
+            "lost decision field {key}"
+        );
+    }
+    assert_eq!(second["receipt"]["request_id"], second_request);
+    assert_eq!(second["receipt"]["operation_id"], id);
+    let stored: Value =
+        f.g.store
+            .get("request_receipt", &second_request)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        stored["receipt"]["process_exit_code"],
+        first["receipt"]["process_exit_code"]
+    );
+    assert_eq!(
+        f.count().await,
+        1,
+        "observation must not create another job"
+    );
+    let mut limited = f.p.clone();
+    limited.scopes = vec!["code:read".into()];
+    assert!(
+        f.g.dispatch(
+            &limited,
+            "operation_get",
+            json!({"operation_id":id,"wait_ms":0,"cursor":first["observation"]["cursor"]})
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn unchanged_observation_retains_failed_exit_and_incomplete_output() {
+    let mut failed = terminal("exited", now());
+    failed["exit_code"] = json!(7);
+    assert_unchanged_receipt_preserves_facts(failed.clone(), false).await;
+    failed["output_truncated"] = json!(true);
+    assert_unchanged_receipt_preserves_facts(failed, false).await;
+}
+
+#[tokio::test]
+async fn unchanged_observation_retains_success_and_stale_running_uncertainty() {
+    assert_unchanged_receipt_preserves_facts(terminal("exited", now()), false).await;
+    assert_unchanged_receipt_preserves_facts(terminal("running", now()), true).await;
+}
+
 #[test]
 fn checked_adapter_artifact_matches_this_compiled_catalog_and_skill() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("adapter-contract.json");
