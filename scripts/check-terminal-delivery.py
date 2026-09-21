@@ -129,9 +129,12 @@ def main():
             report['original_request_recovery'] = error.requests
             report['recovery_directory'] = error.evidence_dir
     finally:
+        # login can obtain tokens and then fail during native MCP bootstrap.
+        # Record the issued grant BEFORE close clears it, not after login returns.
+        report['oauth_grant_issued'] = report['oauth_grant_issued'] or bool(client.refresh)
         try:
             report['cleanup_success'] = client.close()
-            report['oauth_grant_revoked'] = report['oauth_grant_issued'] and client.refresh is None
+            report['oauth_grant_revoked'] = (client.refresh is None) if report['oauth_grant_issued'] else None
         except Exception as error:
             report.update(cleanup_success=False, oauth_grant_revoked=False, cleanup_error=type(error).__name__)
         if not report['cleanup_success']:
