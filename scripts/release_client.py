@@ -6,6 +6,8 @@ from a selected native session to HTTP after an uncertain execution.
 import base64
 import hashlib
 import http.cookiejar
+import http.client
+import ssl
 import json
 import os
 import pathlib
@@ -161,6 +163,60 @@ class Client:
                 raise error
             time.sleep(min(attempt, 2))
         raise AssertionError('unreachable HTTP retry state')
+
+    def read_artifact(self, artifact, *, max_bytes=67108864, attempts=3, timeout=20):
+        """Read the same completed artifact, never reissue its producing operation.
+
+        Uses the existing TLS/proxy/redirect policy. Transient GET failures alone
+        may retry; authorization, certificate and identity failures stop. Private
+        capability URLs never enter diagnostics. Large streaming transfers retain
+        their separate durable checkpoint protocol.
+        """
+        url = artifact.get('download_url', '')
+        parsed, origin = urllib.parse.urlsplit(url), urllib.parse.urlsplit(self.origin)
+        size, checksum = artifact.get('size'), artifact.get('sha256')
+        if (artifact.get('state') != 'completed' or artifact.get('download_available') is False
+                or type(size) is not int or not 0 <= size <= max_bytes
+                or not isinstance(checksum, str) or not re.fullmatch(r'[0-9a-f]{64}', checksum)
+                or parsed.scheme != 'https' or parsed.netloc != origin.netloc
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or not parsed.path.startswith('/files/')
+                or type(attempts) is not int or not 1 <= attempts <= 3
+                or not 0 < timeout <= 30):
+            raise ValueError('artifact_read_precondition_failed; observe original export')
+        for attempt in range(1, attempts + 1):
+            retryable = False
+            try:
+                request = urllib.request.Request(url, headers={'Accept': 'application/octet-stream'})
+                try:
+                    response = self.opener.open(request, timeout=timeout)
+                except urllib.error.HTTPError as error:
+                    response = error
+                with response:
+                    if response.status != 200:
+                        raise ReleaseHttpError(response.status, '/files/<redacted>',
+                                               response.headers, response.read(4096))
+                    data = response.read(size + 1)
+                if len(data) != size or hashlib.sha256(data).hexdigest() != checksum:
+                    raise ValueError('artifact_identity_mismatch; original export retained')
+                return data
+            except ReleaseHttpError as error:
+                diagnostic = dict(error.diagnostic)
+                retryable = diagnostic['retryable']
+            except (urllib.error.URLError, OSError, http.client.IncompleteRead) as error:
+                reason = getattr(error, 'reason', error)
+                certificate = isinstance(reason, (ssl.SSLCertVerificationError, ssl.CertificateError))
+                retryable = not certificate
+                diagnostic = {'failure_boundary': 'tls_certificate' if certificate else 'artifact_transport',
+                              'exception_type': type(reason).__name__, 'retryable': retryable,
+                              'path': '/files/<redacted>', 'body_retained': False}
+            diagnostic.update(attempt=attempt, producer_replayed=False)
+            self.http_observations.append(diagnostic)
+            self.http_observations = self.http_observations[-32:]
+            if not retryable or attempt == attempts:
+                raise RuntimeError('artifact_read_unconfirmed; ' + json.dumps(diagnostic, sort_keys=True)) from None
+            time.sleep(min(attempt, 2))
+        raise AssertionError('unreachable artifact read state')
 
     def login(self):
         metadata = self.parsed('/.well-known/oauth-protected-resource')
