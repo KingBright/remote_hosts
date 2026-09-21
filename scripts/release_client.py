@@ -9,6 +9,7 @@ import http.cookiejar
 import json
 import os
 import pathlib
+import re
 import secrets
 import time
 import urllib.error
@@ -38,6 +39,36 @@ def evidence_is_durable(receipt):
     return (receipt.get('request_record_persisted') is False
             and receipt.get('durable') is False
             and receipt.get('durability_scope') == 'observed_facts_only_not_this_query')
+
+
+class ReleaseHttpError(RuntimeError):
+    """Bounded decision fields, never upstream bodies, tokens or query strings."""
+    def __init__(self, status, path, headers, body):
+        edge_code = None
+        declared_no_retry = False
+        try:
+            value = json.loads(body)
+            if isinstance(value, dict):
+                code = value.get('error_code')
+                if type(code) is int and 1000 <= code <= 1999:
+                    edge_code = code
+                declared_no_retry = value.get('retryable') is False
+        except (ValueError, TypeError):
+            pass
+        ray = headers.get('CF-Ray') if headers else None
+        if not isinstance(ray, str) or not re.fullmatch(r'[A-Za-z0-9-]{1,80}', ray):
+            ray = None
+        self.diagnostic = {
+            'http_status': status,
+            'path': urllib.parse.urlsplit(path).path[:180],
+            'failure_boundary': 'edge_policy' if status == 403 and edge_code else 'upstream_http',
+            'edge_error_code': edge_code,
+            'cf_ray': ray,
+            'retryable': not declared_no_retry and status in (408, 425, 500, 502, 503, 504, 520, 522, 523, 524),
+            'user_action': 'review_owner_edge_policy' if status == 403 and edge_code else 'none',
+            'body_retained': False,
+        }
+        super().__init__('release_http_' + str(status) + '; ' + json.dumps(self.diagnostic, sort_keys=True))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -90,6 +121,7 @@ class Client:
         self.native_state_dir = pathlib.Path(state) if state else None
         self._native = None
         self._closed = False
+        self.http_observations = []
         self.opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
         self.opener.addheaders = [('User-Agent', 'RemoteHosts-Release/0.5.0')]
 
@@ -114,10 +146,21 @@ class Client:
             return response.status, response.headers, body
 
     def parsed(self, path, data=None, form=False, auth=False):
-        status, _, body = self.call(path, data, form, auth)
-        if status not in (200, 201):
-            raise RuntimeError('release_http_' + str(status) + '; body suppressed')
-        return json.loads(body)
+        # Only public, side-effect-free metadata GETs may recover automatically.
+        # OAuth writes and MCP requests keep their original recovery semantics.
+        safe_get = data is None and path in ('/.well-known/oauth-protected-resource', '/.well-known/oauth-authorization-server', '/healthz')
+        attempts = 3 if safe_get else 1
+        for attempt in range(1, attempts + 1):
+            status, headers, body = self.call(path, data, form, auth)
+            if status in (200, 201):
+                return json.loads(body)
+            error = ReleaseHttpError(status, path, headers, body)
+            self.http_observations.append(dict(error.diagnostic, attempt=attempt))
+            self.http_observations = self.http_observations[-32:]
+            if not safe_get or not error.diagnostic['retryable'] or attempt == attempts:
+                raise error
+            time.sleep(min(attempt, 2))
+        raise AssertionError('unreachable HTTP retry state')
 
     def login(self):
         metadata = self.parsed('/.well-known/oauth-protected-resource')

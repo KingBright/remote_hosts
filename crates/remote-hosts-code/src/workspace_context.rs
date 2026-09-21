@@ -44,7 +44,12 @@ impl TerminalCursor {
     }
 }
 
-pub(crate) async fn read(store: &Store, ws: &Workspace, args: &Value) -> Result<Value> {
+pub(crate) async fn read(
+    store: &Store,
+    config: &crate::AgentConfig,
+    ws: &Workspace,
+    args: &Value,
+) -> Result<Value> {
     let limit = files::number(args, "limit", 20, 1, 50)?;
     let active_only = args
         .get("active_only")
@@ -133,12 +138,20 @@ pub(crate) async fn read(store: &Store, ws: &Workspace, args: &Value) -> Result<
     }
     let change_set_count = change_sets.len();
     let build = store.get::<Value>("runtime", "build").await?;
-    let delivery = store.get::<Value>("runtime", "receipt_delivery").await?;
+    // Use the same authoritative, device-and-origin scoped queue as poll.
+    // The obsolete runtime copy is no longer updated and cannot prove freshness.
+    let delivery = crate::delivery::Delivery::status(store, config)
+        .await
+        .ok()
+        .filter(crate::delivery::Status::valid)
+        .map(serde_json::to_value)
+        .transpose()?;
     let delivery_stale = delivery
         .as_ref()
         .map(|v| !(0..=45).contains(&(now() - v["reported_at"].as_i64().unwrap_or(0))));
     let mut result = json!({"workspace_id":ws.id,"device_id":ws.device_id,"root":ws.root,
         "runtime":build,"receipt_delivery":delivery,"receipt_delivery_stale":delivery_stale,
+        "receipt_delivery_unavailable":delivery.is_none(),
         "receipt_delivery_scope":"device-wide counts only; no other workspace records",
         "transfers":transfers,"terminals":terminals,"change_sets":change_sets,"active_only":active_only,
         "summary":{"terminals":terminal_count,"active_terminals":active_terminals,

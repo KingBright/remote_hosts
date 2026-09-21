@@ -25,6 +25,7 @@ pub struct Agent {
     scheduler: Arc<Scheduler>,
     active: Arc<ActiveJobs>,
     progress: Arc<crate::progress::Registry>,
+    readiness: Arc<crate::readiness::Readiness>,
 }
 #[derive(Serialize, Deserialize)]
 struct LocalOperation {
@@ -78,6 +79,7 @@ impl Agent {
             scheduler: Arc::default(),
             active: Arc::default(),
             progress: Arc::default(),
+            readiness: Arc::default(),
         })
     }
     pub async fn execute(&self, job: &Job) -> Result<Value> {
@@ -279,7 +281,9 @@ impl Agent {
                 )
                 .await
             }
-            "workspace_context" => crate::workspace_context::read(&self.store, &ws, v).await,
+            "workspace_context" => {
+                crate::workspace_context::read(&self.store, &self.config, &ws, v).await
+            }
             "workspace_gc" => crate::storage_gc::run(&self.config, &self.store, &ws, v).await,
             "terminal_exec" => self.terminals.start(&self.config, &ws, v, &job.id).await,
             "terminal_read" => self.terminals.read(&ws, v).await,
@@ -408,6 +412,7 @@ impl Agent {
                 i64::MAX,
             )
             .await?;
+        self.readiness.start(&hello.session)?;
         let mut attempt = 0u32;
         loop {
             let health = async {
@@ -589,6 +594,16 @@ impl Agent {
             // Mark BEFORE reading/sending. An exit during an in-flight request
             // must wake the following iteration, not disappear with that reply.
             let _revision = *terminal_changes.borrow_and_update();
+            if self
+                .readiness
+                .flush(&self.store, &hello.session)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "readiness snapshot unavailable; original poll facts retained, work continues"
+                );
+            }
             if last_reconcile.elapsed() >= Duration::from_secs(15) {
                 match self.terminals.reconcile_orphans(30).await {
                     Ok(count) if count > 0 => {
@@ -782,11 +797,14 @@ impl Agent {
             .as_str()
             .context("invalid lane")?
             .to_owned();
-        // Telemetry persistence failure must not discard an already received job.
-        if sqlx::query("UPDATE kv SET value=json_set(value,'$.phase','polling',?,?, '$.updated_at',?) WHERE kind='runtime' AND key='readiness' AND json_extract(value,'$.session')=?")
-            .bind(format!("$.lanes.{lane_name}")).bind(crate::now()).bind(crate::now()).bind(&hello.session)
-            .execute(&self.store.pool).await.is_err() {
-            tracing::warn!("readiness persistence unavailable; work continues");
+        // Poll lanes never wait for telemetry writes. The existing heartbeat
+        // merges these real acknowledgements; failed lanes keep their old time.
+        if self
+            .readiness
+            .record(&hello.session, &lane_name, crate::now())
+            .is_err()
+        {
+            tracing::warn!("readiness cache unavailable; work continues");
         }
         Ok(job)
     }

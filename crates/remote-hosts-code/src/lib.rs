@@ -21,6 +21,7 @@ mod job_receipts;
 mod maintenance;
 mod observations;
 mod progress;
+mod readiness;
 mod reads;
 pub mod receipts;
 mod resumable;
