@@ -269,7 +269,9 @@ pub(crate) async fn observe(g: &Gateway, p: &Principal, args: &Value) -> Result<
                 "execution_state":"unknown","business_state":"not_evaluated","evidence_complete":false,
                 "failure_boundary":"unknown","last_confirmed_stage":"receipt_lookup_only","stale":true,
                 "retry_policy":"do_not_replay_until_reconciled","next_action":"check_original_transport_receipt",
-                "user_action":"none","observed_at":now()}),
+                "user_action":"none","observed_at":now(),
+                "lookup_scope":"durable_execution_and_audited_request_records",
+                "unretained_observation_possible":true}),
             );
         };
         ensure!(

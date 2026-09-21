@@ -8,6 +8,8 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sqlx::{Sqlite, Transaction};
 
+mod observation;
+
 /// Durable evidence is not a seven-day cache. Removal requires explicit owner cleanup.
 pub const RETAIN_UNTIL_EXPLICIT_CLEANUP: i64 = i64::MAX;
 pub const RETENTION: Option<u64> = None;
@@ -189,8 +191,27 @@ fn storage_failure(request_id: &str, before_dispatch: bool) -> Value {
 }
 
 /// Entry point shared by MCP and authenticated in-process acceptance tests.
-/// The transport, never the model's tool arguments, supplies request_id.
+/// Successful pure observations reference durable facts without journaling a new
+/// request. Mutations, capability issuance and full-audit mode retain the journal.
 pub async fn invoke(
+    g: &Gateway,
+    p: &Principal,
+    tool: &str,
+    args: Value,
+    request_id: &str,
+) -> Result<Value> {
+    ensure!(valid_request_id(request_id), "invalid_request_id");
+    ensure!(p.owner == g.config.owner, "unknown owner");
+    if !g.audit_observations && observation::eligible(g, tool, &args).await.unwrap_or(false) {
+        observation::invoke(g, p, tool, args, request_id).await
+    } else {
+        invoke_durable(g, p, tool, args, request_id).await
+    }
+}
+
+/// Full per-request audit path. The transport, never model arguments, supplies
+/// request_id. This is also used when a read can issue a download capability.
+pub async fn invoke_durable(
     g: &Gateway,
     p: &Principal,
     tool: &str,

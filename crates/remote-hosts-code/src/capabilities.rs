@@ -275,7 +275,7 @@ pub(crate) fn gateway_manifest(known: Option<&str>) -> Value {
         ("capabilities_protocol", json!(2)),
         ("schema_diagnostics_protocol", json!(2)),
         ("admin_status_protocol", json!(1)),
-        ("request_receipt_protocol", json!(1)),
+        ("request_receipt_protocol", json!(2)),
         ("resource_dispatch_protocol", json!(1)),
         ("transfer_protocol", json!(2)),
         ("transfer_limits_protocol", json!(1)),
@@ -371,7 +371,7 @@ mod release_manifest_tests {
         assert_eq!(manifest["tool_schema_revision"], tool_schema_revision());
         assert_eq!(manifest["tools_sha256"], tool_schema_revision());
         assert_eq!(manifest["terminal_observation_protocol"], 2);
-        assert_eq!(manifest["request_receipt_protocol"], 1);
+        assert_eq!(manifest["request_receipt_protocol"], 2);
         assert_eq!(manifest["machine_contract_protocol"], 1);
         assert!(manifest.get("host_schema_status").is_none());
         assert!(manifest.get("client_schema_comparison").is_none());

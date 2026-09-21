@@ -5,10 +5,46 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from release_client import Client
+from release_client import Client, evidence_is_durable
 
 
 class ReleaseClientContractTests(unittest.TestCase):
+    def test_query_trace_and_original_evidence_have_separate_durability(self):
+        observed = {'protocol': 2, 'durable': False, 'evidence_durable': True,
+                    'request_record_persisted': False,
+                    'durability_scope': 'observed_facts_only_not_this_query'}
+        self.assertTrue(evidence_is_durable(observed))
+        for key in observed:
+            incomplete = dict(observed)
+            incomplete.pop(key)
+            self.assertFalse(evidence_is_durable(incomplete), key)
+        for key, value in [('durable', True), ('evidence_durable', False),
+                           ('durability_scope', 'observation_error_record_only')]:
+            self.assertFalse(evidence_is_durable(dict(observed, **{key: value})))
+        self.assertFalse(evidence_is_durable({'protocol': 2, 'durable': True}))
+        self.assertTrue(evidence_is_durable({'protocol': 1, 'durable': True}))
+        self.assertFalse(evidence_is_durable({'protocol': 1, 'durable': False}))
+
+    def test_unknown_or_malformed_protocol_is_not_durable_evidence(self):
+        observed = {'protocol': 2, 'durable': False, 'evidence_durable': True,
+                    'request_record_persisted': False,
+                    'durability_scope': 'observed_facts_only_not_this_query'}
+        for protocol in (0, 3, 99, None, True, False, '2', 2.0):
+            with self.subTest(protocol=protocol):
+                self.assertFalse(evidence_is_durable(dict(observed, protocol=protocol)))
+        for value in (None, [], 'receipt'):
+            self.assertFalse(evidence_is_durable(value))
+
+    def test_persisted_request_must_not_contradict_durability(self):
+        saved = {'protocol': 2, 'evidence_durable': True,
+                 'request_record_persisted': True, 'durable': True}
+        self.assertTrue(evidence_is_durable(saved))
+        for value in (False, None, 'true', 1):
+            with self.subTest(durable=value):
+                self.assertFalse(evidence_is_durable(dict(saved, durable=value)))
+        self.assertFalse(evidence_is_durable({'protocol': 1, 'durable': 'true'}))
+        self.assertTrue(evidence_is_durable({}))
+
     def test_machine_view_is_full_and_does_not_mutate_caller_arguments(self):
         client = Client('https://fixture.example', access='synthetic', transport='legacy')
         arguments = {'operation_id': 'fixture'}

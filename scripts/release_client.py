@@ -18,6 +18,28 @@ import urllib.request
 from native_release_client import NativeSession, installed_binary
 
 
+def evidence_is_durable(receipt):
+    """A query trace may be unretained while its original facts are durable.
+
+    Protocol 2 must explicitly prove the new split. Unknown or contradictory
+    forms are not accepted as durable execution evidence.
+    """
+    if not isinstance(receipt, dict):
+        return False
+    protocol = receipt.get('protocol', 1)
+    if type(protocol) is not int:
+        return False
+    if protocol == 1:
+        return receipt.get('durable', True) is True
+    if protocol != 2 or receipt.get('evidence_durable') is not True:
+        return False
+    if receipt.get('request_record_persisted') is True:
+        return receipt.get('durable') is True
+    return (receipt.get('request_record_persisted') is False
+            and receipt.get('durable') is False
+            and receipt.get('durability_scope') == 'observed_facts_only_not_this_query')
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -190,7 +212,7 @@ class Client:
         if status['exit_code'] != 0 or status.get('state', 'exited') != 'exited':
             raise RuntimeError('terminal_failed:' + ident)
         if (value.get('receipt', {}).get('evidence_complete') is True
-                and value.get('receipt', {}).get('durable') is not False
+                and evidence_is_durable(value.get('receipt', {}))
                 and not value.get('has_more') and not value.get('result_omitted')
                 and value.get('raw_cursor_start', 0) == 0):
             text = value.get('output')

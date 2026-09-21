@@ -47,6 +47,9 @@ pub struct Gateway {
     pub config: Arc<GatewayConfig>,
     pub store: Store,
     pub auth: Auth,
+    /// Full observation journaling is an explicit operator policy. Execution
+    /// requests always retain their durable pre-dispatch recovery binding.
+    pub audit_observations: bool,
     config_path: Option<PathBuf>,
     signals: Arc<HashMap<String, DeviceSignals>>,
     pub(crate) observation_changed: Arc<Notify>,
@@ -218,6 +221,12 @@ impl Gateway {
         config.validate_oauth_policy()?;
         let store = Store::open(&config.state_dir).await?;
         store.install_gateway_schema().await?;
+        let audit_observations = match std::env::var("REMOTE_HOSTS_OBSERVATION_AUDIT") {
+            Ok(value) if value == "full" => true,
+            Ok(value) if value == "minimal" => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => anyhow::bail!("invalid REMOTE_HOSTS_OBSERVATION_AUDIT: expected minimal or full"),
+        };
         let config = Arc::new(config);
         let auth = Auth::new(config.clone(), store.clone());
         let signals = Arc::new(
@@ -234,6 +243,7 @@ impl Gateway {
             config,
             store,
             auth,
+            audit_observations,
             config_path,
             signals,
             observation_changed: Arc::new(Notify::new()),

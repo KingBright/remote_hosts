@@ -13,6 +13,9 @@ use remote_hosts_code::{
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+#[path = "experience_contract/observation_persistence.rs"]
+mod observation_persistence;
+
 struct Fixture {
     dir: tempfile::TempDir,
     g: Gateway,
@@ -751,7 +754,7 @@ async fn final_receipt_save_failure_is_visible_and_keeps_the_original_record() {
     sqlx::query("CREATE TRIGGER fail_final_receipt BEFORE UPDATE ON kv WHEN NEW.kind='request_receipt' AND json_extract(NEW.value,'$.receipt') IS NOT NULL BEGIN SELECT RAISE(ABORT,'injected final receipt failure'); END;")
         .execute(&f.g.store.pool).await.unwrap();
     let id = request_id();
-    let value = receipts::invoke(&f.g, &f.p, "devices_list", json!({}), &id)
+    let value = receipts::invoke_durable(&f.g, &f.p, "devices_list", json!({}), &id)
         .await
         .unwrap();
     assert_eq!(value["receipt"]["durable"], false);
@@ -1056,16 +1059,16 @@ async fn assert_unchanged_receipt_preserves_facts(status: Value, stale: bool) {
     }
     assert_eq!(second["receipt"]["request_id"], second_request);
     assert_eq!(second["receipt"]["operation_id"], id);
-    let stored: Value =
+    assert!(
         f.g.store
-            .get("request_receipt", &second_request)
+            .get::<Value>("request_receipt", &second_request)
             .await
             .unwrap()
-            .unwrap();
-    assert_eq!(
-        stored["receipt"]["process_exit_code"],
-        first["receipt"]["process_exit_code"]
+            .is_none()
     );
+    assert_eq!(second["receipt"]["durable"], false);
+    assert_eq!(second["receipt"]["evidence_durable"], true);
+    assert_eq!(second["receipt"]["request_record_persisted"], false);
     assert_eq!(
         f.count().await,
         1,

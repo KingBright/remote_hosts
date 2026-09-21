@@ -15,7 +15,7 @@ import tempfile
 import time
 
 from native_release_client import NativeTransportError
-from release_client import Client
+from release_client import Client, evidence_is_durable
 
 
 def save(path, value):
@@ -96,7 +96,7 @@ def main():
                 original = value['operation_id']
                 while (value.get('terminal',{}).get('exit_code') is None
                        or value.get('receipt',{}).get('evidence_complete') is not True
-                       or value.get('receipt',{}).get('durable') is False):
+                       or not evidence_is_durable(value.get('receipt',{}))):
                     if time.monotonic()-start > 90:
                         raise TimeoutError('original_operation_unconfirmed:' + original)
                     value = call('operation_get', {'operation_id':original,'wait_ms':5000,'max_bytes':16384})

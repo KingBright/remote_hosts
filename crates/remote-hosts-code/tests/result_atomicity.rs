@@ -68,34 +68,50 @@ async fn completed(g: &Gateway, p: &Principal, device: &str) -> String {
 }
 #[tokio::test]
 async fn optional_timing_failure_does_not_erase_authorized_durable_failed_exit() {
-    let (_dir, g, p, d) = fixture().await;
-    let id = completed(&g, &p, &d).await;
-    sqlx::query("DROP TABLE operation_timing")
-        .execute(&g.store.pool)
+    for audit in [false, true] {
+        let (_dir, mut g, p, d) = fixture().await;
+        g.audit_observations = audit;
+        let id = completed(&g, &p, &d).await;
+        sqlx::query("DROP TABLE operation_timing")
+            .execute(&g.store.pool)
+            .await
+            .unwrap();
+        let request = format!("req_{}", uuid::Uuid::new_v4().simple());
+        let v = receipts::invoke(
+            &g,
+            &p,
+            "operation_get",
+            json!({"operation_id":id,"response_mode":"full"}),
+            &request,
+        )
         .await
         .unwrap();
-    let request = format!("req_{}", uuid::Uuid::new_v4().simple());
-    let v = receipts::invoke(
-        &g,
-        &p,
-        "operation_get",
-        json!({"operation_id":id,"response_mode":"full"}),
-        &request,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v["state"], "exited");
-    assert_eq!(v["output"], "failed\n");
-    assert_eq!(v["receipt"]["process_exit_code"], 7);
-    assert_eq!(v["receipt"]["process_outcome"], "failed");
-    assert_eq!(v["receipt"]["evidence_complete"], true);
-    assert_eq!(v["receipt"]["durable"], true);
-    assert_eq!(v["operation_lifecycle"]["available"], false);
-    assert_eq!(
-        v["operation_lifecycle"]["error_code"],
-        "operation_lifecycle_unavailable"
-    );
-    assert!(v.get("error").is_none());
+        assert_eq!(v["state"], "exited");
+        assert_eq!(v["output"], "failed\n");
+        assert_eq!(v["receipt"]["process_exit_code"], 7);
+        assert_eq!(v["receipt"]["process_outcome"], "failed");
+        assert_eq!(v["receipt"]["evidence_complete"], true);
+        assert_eq!(v["receipt"]["durable"], audit);
+        if !audit {
+            assert_eq!(v["receipt"]["protocol"], 2);
+            assert_eq!(v["receipt"]["evidence_durable"], true);
+            assert_eq!(v["receipt"]["request_record_persisted"], false);
+        }
+        assert_eq!(
+            g.store
+                .get::<Value>("request_receipt", &request)
+                .await
+                .unwrap()
+                .is_some(),
+            audit
+        );
+        assert_eq!(v["operation_lifecycle"]["available"], false);
+        assert_eq!(
+            v["operation_lifecycle"]["error_code"],
+            "operation_lifecycle_unavailable"
+        );
+        assert!(v.get("error").is_none());
+    }
 }
 #[tokio::test]
 async fn optional_metadata_failure_cannot_bypass_original_scope() {

@@ -233,3 +233,9 @@ A PTY may be activated only while both its own state and the backing workspace a
 - Never paste secrets even if they appear in remote output; rely on redaction and still be cautious.
 - For repeated polling, track sequence or requested limit to avoid rereading old chunks.
 - Use `remote_hosts_read_output_artifact_content` for complete redacted logs. Start at `offset=0`, keep each request bounded, and continue with exactly `next_offset` until `eof=true`.
+
+## Observation receipt persistence (0.10.16)
+
+Normal Gateway observations (devices_list, fleet_status, task_context and direct operation_get except download-capability paths) do not journal another request in the business database. They still validate the current owner and all relevant scopes. Protocol 2 separates `receipt.evidence_durable=true` from `receipt.durable=false` and `receipt.request_record_persisted=false`: the original facts are durable, this observation trace is not. The scope must be `observed_facts_only_not_this_query`. Do not infer missing execution evidence or retry a command from the unretained query flag. Output completeness, exit code, staleness and recovery policy remain independent requirements.
+
+Query failures are separately audited, once. Download-link issuance and lookup by an original request_id retain full audit. `REMOTE_HOSTS_OBSERVATION_AUDIT=full` on the Gateway keeps full per-call journaling; default `minimal` uses the split above. Full-audit and mutation receipts keep their durable request binding. A request_id for an unretained observation cannot be recovered as an execution identity: use the original operation_id, and do not infer that an unknown request means a command never ran.
