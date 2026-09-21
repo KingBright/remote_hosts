@@ -40,6 +40,10 @@ impl Store {
         sqlx::query("CREATE INDEX IF NOT EXISTS kv_kind_state_created ON kv(kind,json_extract(value,'$.state'),json_extract(value,'$.created_at'))")
             .execute(&pool)
             .await?;
+        // Only finite-lived rows participate. Permanent execution evidence does
+        // not pay an index-entry cost or get scanned by expiry maintenance.
+        sqlx::query("CREATE INDEX IF NOT EXISTS kv_expiring ON kv(expires,kind,key) WHERE expires<9223372036854775807")
+            .execute(&pool).await?;
         Ok(Self { pool })
     }
     pub async fn install_agent_schema(&self) -> Result<()> {
@@ -138,13 +142,27 @@ impl Store {
         Ok(StatePage { entries, next_key })
     }
     pub async fn prune(&self) -> Result<()> {
-        sqlx::query("DELETE FROM kv WHERE expires<=?")
-            .bind(crate::now())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        self.prune_batch().await.map(|_| ())
+    }
+    /// Reclamation is bounded; get/take still enforce expiry immediately.
+    /// The read-before-write is a hint only. The DELETE rechecks eligibility
+    /// atomically, so a concurrent renewal can never be deleted from a stale list.
+    pub async fn prune_batch(&self) -> Result<u64> {
+        let cutoff = crate::now();
+        let due: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kv WHERE expires<9223372036854775807 AND expires<=? LIMIT 1)")
+            .bind(cutoff).fetch_one(&self.pool).await?;
+        if !due {
+            return Ok(0);
+        }
+        let deleted = sqlx::query("DELETE FROM kv WHERE (kind,key) IN (SELECT kind,key FROM kv WHERE expires<9223372036854775807 AND expires<=? ORDER BY expires,kind,key LIMIT 256) AND expires<9223372036854775807 AND expires<=?")
+            .bind(cutoff).bind(cutoff).execute(&self.pool).await?;
+        Ok(deleted.rows_affected())
     }
 }
+
+#[cfg(test)]
+#[path = "store_cost_tests.rs"]
+mod cost_tests;
 
 #[cfg(test)]
 mod tests {

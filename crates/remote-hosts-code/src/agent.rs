@@ -720,11 +720,9 @@ impl Agent {
         // Heartbeat owns terminal-state replication. Independent poll lanes must
         // not repeat the same SQLite snapshot on every long poll.
         request["receipt_delivery"] = json!(
-            self.store
-                .get::<crate::delivery::Status>("runtime", "receipt_delivery")
+            Delivery::status(&self.store, &self.config)
                 .await
                 .ok()
-                .flatten()
                 .filter(crate::delivery::Status::valid)
         );
         request["active_operations"] = json!(self.active.list()?);

@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn idle_outbox_and_unchanged_health_do_not_need_a_writer() {
     let (_tmp, d) = fixture().await;
-    d.report().await.unwrap();
+    Delivery::status(&d.store, &d.config).await.unwrap();
     let mut connections = Vec::new();
     for _ in 0..4 {
         connections.push(d.store.pool.acquire().await.unwrap());
@@ -12,7 +12,7 @@ async fn idle_outbox_and_unchanged_health_do_not_need_a_writer() {
     let tx = d.store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
     let read = tokio::time::timeout(Duration::from_secs(1), async {
         assert!(d.claim().await.unwrap().is_none());
-        d.report().await.unwrap();
+        Delivery::status(&d.store, &d.config).await.unwrap();
     })
     .await;
     tx.rollback().await.unwrap();
@@ -20,20 +20,15 @@ async fn idle_outbox_and_unchanged_health_do_not_need_a_writer() {
 }
 
 #[tokio::test]
-async fn changed_receipt_health_is_persisted_without_cooldown() {
+async fn changed_receipt_health_is_read_from_queue_without_cooldown() {
     let (_tmp, d) = fixture().await;
-    d.report().await.unwrap();
+    Delivery::status(&d.store, &d.config).await.unwrap();
     d.enqueue(&uuid::Uuid::new_v4().to_string(), &json!({"answer":1}))
         .await
         .unwrap();
-    d.report().await.unwrap();
-    let v: Value = d
-        .store
-        .get("runtime", "receipt_delivery")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(v["pending"], 1);
+    Delivery::status(&d.store, &d.config).await.unwrap();
+    let v = Delivery::status(&d.store, &d.config).await.unwrap();
+    assert_eq!(v.pending, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -382,13 +377,9 @@ async fn permanent_conflict_is_retained_without_automatic_retry_or_reexecution()
     assert!(d.claim().await.unwrap().is_none());
     assert_eq!(rows(&d).await[0].1, "blocked");
     assert_eq!(rows(&d).await[0].2, 1);
-    d.report().await.unwrap();
+    Delivery::status(&d.store, &d.config).await.unwrap();
     assert_eq!(
-        d.store
-            .get::<Value>("runtime", "receipt_delivery")
-            .await
-            .unwrap()
-            .unwrap()["blocked"],
+        Delivery::status(&d.store, &d.config).await.unwrap().blocked,
         1
     );
     server.abort();
@@ -456,4 +447,170 @@ async fn accepted_edit_receipt_keeps_change_resume_anchor() {
         saved
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn telemetry_cost_budget_is_zero_writes_and_ignores_old_runtime_copy() {
+    let (_tmp, d) = fixture().await;
+    d.store
+        .put(
+            "runtime",
+            "receipt_delivery",
+            &json!({"pending":99,"reported_at":now()-120}),
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+    d.enqueue(&uuid::Uuid::new_v4().to_string(), &json!({"answer":1}))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE health_writes(n INTEGER)")
+        .execute(&d.store.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO health_writes VALUES(0)")
+        .execute(&d.store.pool)
+        .await
+        .unwrap();
+    for statement in [
+        "CREATE TRIGGER count_health_insert AFTER INSERT ON kv BEGIN UPDATE health_writes SET n=n+1; END",
+        "CREATE TRIGGER count_health_update AFTER UPDATE ON kv BEGIN UPDATE health_writes SET n=n+1; END",
+        "CREATE TRIGGER count_health_delete AFTER DELETE ON kv BEGIN UPDATE health_writes SET n=n+1; END",
+    ] {
+        sqlx::query(statement).execute(&d.store.pool).await.unwrap();
+    }
+    for _ in 0..100 {
+        let status = Delivery::status(&d.store, &d.config).await.unwrap();
+        assert_eq!(status.pending, 1);
+        assert_eq!(status.blocked, 0);
+        assert!(status.valid());
+    }
+    let writes: i64 = sqlx::query_scalar("SELECT n FROM health_writes")
+        .fetch_one(&d.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a sampled queue must not create a telemetry write"
+    );
+    assert_eq!(
+        rows(&d).await.len(),
+        1,
+        "sampling must retain the delivery intent"
+    );
+}
+
+#[tokio::test]
+async fn queue_health_failure_is_unavailable_not_an_empty_queue() {
+    let (_tmp, d) = fixture().await;
+    d.store.pool.close().await;
+    assert!(Delivery::status(&d.store, &d.config).await.is_err());
+}
+
+#[tokio::test]
+async fn queue_health_rebuilds_after_restart_without_saved_telemetry() {
+    let (_tmp, d) = fixture().await;
+    d.enqueue(&uuid::Uuid::new_v4().to_string(), &json!({"answer":1}))
+        .await
+        .unwrap();
+    let store = d.store.clone();
+    let config = d.config.clone();
+    drop(d);
+    let reopened = Delivery::new(store, config).await.unwrap();
+    let status = Delivery::status(&reopened.store, &reopened.config)
+        .await
+        .unwrap();
+    assert_eq!(status.pending, 1);
+    assert!(
+        reopened
+            .store
+            .get::<Value>("runtime", "receipt_delivery")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut other = (*reopened.config).clone();
+    other.gateway_url = "http://127.0.0.1:2".into();
+    assert_eq!(
+        Delivery::status(&reopened.store, &other)
+            .await
+            .unwrap()
+            .pending,
+        0
+    );
+    other = (*reopened.config).clone();
+    other.device_id = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        Delivery::status(&reopened.store, &other)
+            .await
+            .unwrap()
+            .pending,
+        0
+    );
+}
+
+#[test]
+fn idle_retry_deadlines_are_bounded_without_a_busy_loop() {
+    assert_eq!(wake_delay(None, 100), Duration::from_secs(5));
+    assert_eq!(wake_delay(Some(102), 100), Duration::from_secs(2));
+    assert_eq!(wake_delay(Some(200), 100), Duration::from_secs(5));
+    assert_eq!(wake_delay(Some(99), 100), Duration::from_secs(1));
+    assert_eq!(wake_delay(Some(i64::MAX), i64::MIN), Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn idle_retry_deadline_does_not_take_the_writer() {
+    let (_tmp, d) = fixture().await;
+    let mut connections = Vec::new();
+    for _ in 0..4 {
+        connections.push(d.store.pool.acquire().await.unwrap());
+    }
+    drop(connections);
+    let tx = d.store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let delay = tokio::time::timeout(Duration::from_secs(1), d.next_wake_delay()).await;
+    tx.rollback().await.unwrap();
+    assert_eq!(delay.unwrap().unwrap(), Duration::from_secs(5));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_receipt_interrupts_idle_deadline_and_retains_original_payload() {
+    use axum::{Json, Router, routing::post};
+    let (_tmp, mut d) = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    Arc::make_mut(&mut d.config).gateway_url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(2);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/device/result",
+                post(move |Json(value): Json<Value>| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send(value).await.unwrap();
+                        Json(json!({"accepted":true}))
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let worker = {
+        let d = d.clone();
+        tokio::spawn(async move { d.run(&reqwest::Client::new()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    d.enqueue(&id, &json!({"answer":42})).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+    worker.abort();
+    let _ = worker.await;
+    server.abort();
+    let _ = server.await;
+    let received = received
+        .expect("enqueue waited for the five-second idle timer")
+        .unwrap();
+    assert_eq!(received["operation_id"], id);
+    assert_eq!(received["result"]["answer"], 42);
 }

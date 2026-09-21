@@ -229,33 +229,31 @@ impl Delivery {
         self.changed.notify_waiters();
         Ok(())
     }
-    async fn report(&self) -> Result<()> {
+    /// Read authoritative queue facts when constructing an outbound snapshot.
+    /// Never persist a second copy of telemetry or reuse a previous process's
+    /// health timestamp. A read failure is unavailable, not an empty queue.
+    pub(crate) async fn status(store: &Store, config: &AgentConfig) -> Result<Status> {
         let row = sqlx::query("SELECT COUNT(*) AS total,COALESCE(SUM(state='blocked'),0) AS blocked,COALESCE(SUM(state='sending'),0) AS sending,MIN(created) AS oldest FROM receipt_outbox WHERE device=? AND origin=?")
-            .bind(&self.config.device_id).bind(&self.config.gateway_url).fetch_one(&self.store.pool).await?;
+            .bind(&config.device_id).bind(&config.gateway_url).fetch_one(&store.pool).await?;
         let total: i64 = row.try_get("total")?;
         let blocked: i64 = row.try_get("blocked")?;
-        let value = json!({"protocol":1,"pending":total-blocked,
-            "blocked":blocked,"sending":row.try_get::<i64,_>("sending")?,
-            "oldest_created_at":row.try_get::<Option<i64>,_>("oldest")?,"reported_at":now()});
-        if let Some(previous) = self
-            .store
-            .get::<Value>("runtime", "receipt_delivery")
-            .await?
-        {
-            let equal = ["pending", "blocked", "sending", "oldest_created_at"]
-                .iter()
-                .all(|key| previous[*key] == value[*key]);
-            if equal && (0..10).contains(&(now() - previous["reported_at"].as_i64().unwrap_or(0))) {
-                return Ok(());
-            }
-        }
-        self.store
-            .put("runtime", "receipt_delivery", &value, i64::MAX)
-            .await
+        Ok(Status {
+            protocol: 1,
+            pending: u64::try_from(total - blocked)?,
+            blocked: u64::try_from(blocked)?,
+            sending: u64::try_from(row.try_get::<i64, _>("sending")?)?,
+            oldest_created_at: row.try_get("oldest")?,
+            reported_at: now(),
+        })
+    }
+    async fn next_wake_delay(&self) -> Result<Duration> {
+        let next: Option<i64> = sqlx::query_scalar("SELECT MIN(next_attempt) FROM receipt_outbox WHERE device=? AND origin=? AND state IN ('pending','sending')")
+            .bind(&self.config.device_id).bind(&self.config.gateway_url)
+            .fetch_one(&self.store.pool).await?;
+        Ok(wake_delay(next, now()))
     }
     pub async fn run(&self, client: &reqwest::Client) -> Result<()> {
         let mut workers = tokio::task::JoinSet::new();
-        let mut last_report = tokio::time::Instant::now() - Duration::from_secs(3);
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -281,19 +279,29 @@ impl Delivery {
                     }
                 }
             }
-            if last_report.elapsed() >= Duration::from_secs(2) {
-                let _ = self.report().await;
-                last_report = tokio::time::Instant::now();
-            }
+            // Subscribe above, then read the durable queue: enqueue/complete
+            // wakes immediately even when it races with this deadline lookup.
+            // Timers are only for due retries, old leases and lost notifications.
+            let delay = if workers.len() >= 2 {
+                Duration::from_secs(5)
+            } else {
+                self.next_wake_delay()
+                    .await
+                    .unwrap_or(Duration::from_secs(1))
+            };
             tokio::select! {
                 _=notified=>{},
-                _=tokio::time::sleep(Duration::from_millis(250))=>{},
+                _=tokio::time::sleep(delay)=>{},
                 Some(outcome)=workers.join_next(),if !workers.is_empty()=>{
                     if !matches!(outcome,Ok(Ok(()))) {tracing::warn!("receipt delivery interrupted; lease retained");}
                 }
             }
         }
     }
+}
+
+fn wake_delay(next: Option<i64>, at: i64) -> Duration {
+    Duration::from_secs(next.map_or(5, |due| due.saturating_sub(at).clamp(1, 5) as u64))
 }
 
 #[cfg(test)]
