@@ -33,6 +33,29 @@ def stamp():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def prepare_build_limits(resource_api=None, platform=None):
+    """Raise only the builder's soft limit before expensive compilation.
+
+    macOS launchd commonly supplies 256 descriptors, which is insufficient for
+    large Zig link steps. Never alter the system setting or hard resource limit.
+    """
+    if (platform or sys.platform) != 'darwin':
+        return {'state': 'not_required', 'scope': 'builder_process_tree'}
+    if resource_api is None:
+        import resource as resource_api
+    soft, hard = resource_api.getrlimit(resource_api.RLIMIT_NOFILE)
+    minimum = 4096
+    if soft != resource_api.RLIM_INFINITY and soft < minimum:
+        if hard != resource_api.RLIM_INFINITY and hard < minimum:
+            raise ValueError('build_fd_limit_insufficient: hard limit below 4096; no compiler started')
+        resource_api.setrlimit(resource_api.RLIMIT_NOFILE, (minimum, hard))
+    after, after_hard = resource_api.getrlimit(resource_api.RLIMIT_NOFILE)
+    if after_hard != hard or (after != resource_api.RLIM_INFINITY and after < minimum):
+        raise ValueError('build_fd_limit_unconfirmed; no compiler started')
+    return {'state': 'ready', 'before_soft': soft, 'after_soft': after,
+            'hard': hard, 'scope': 'builder_process_tree', 'global_limits_changed': False}
+
+
 def current_status(report):
     result = load(report)
     result['observation'] = {'observed_at': stamp(), 'mutates_build': False,
@@ -176,6 +199,8 @@ def run_pipeline(snapshot, report, slot, verify_only=False):
         json.dump(state, stream, indent=2)
     try:
         with build_slot.lease(slot, report, manifest['snapshot_id']) as checkout:
+            state['build_process_limits'] = prepare_build_limits()
+            build_slot.atomic_json(report, state)
             state['synchronization'] = build_slot.synchronize(snapshot, checkout)
             if not verify_only and (checkout/'dist'/('remote-hosts-code-'+version)).exists():
                 raise FileExistsError('release_version_already_packaged; observe its original report or use a new version')
