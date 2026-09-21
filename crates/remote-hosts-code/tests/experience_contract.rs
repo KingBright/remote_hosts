@@ -669,7 +669,11 @@ async fn receipt_storage_failure_prevents_job_creation() {
 #[tokio::test]
 async fn failure_after_enqueue_retains_atomic_request_binding_and_does_not_replay() {
     let f = Fixture::new().await;
-    sqlx::query("CREATE TRIGGER fail_timing BEFORE INSERT ON operation_timing BEGIN SELECT RAISE(ABORT,'injected after job commit'); END;")
+    // Timing is now a prerequisite in the enqueue transaction; failing that
+    // INSERT correctly creates no job (covered by result_atomicity.rs).
+    // Publish a deliberately unreadable fixture result instead: the commit
+    // succeeds, then result collection fails while its request binding survives.
+    sqlx::query("CREATE TRIGGER inject_unreadable_result AFTER INSERT ON operation_timing BEGIN UPDATE jobs SET result='not-json' WHERE id=NEW.id; END;")
         .execute(&f.g.store.pool).await.unwrap();
     let id = request_id();
     let args = json!({"device_id":f.g.config.devices[0].id,"root":"/fixture","idempotency_key":"original","task_id":"release.fixture"});
@@ -679,6 +683,16 @@ async fn failure_after_enqueue_retains_atomic_request_binding_and_does_not_repla
     assert!(value["operation_id"].as_str().is_some());
     assert_eq!(value["execution_state"], "unknown");
     assert_eq!(f.count().await, 1);
+    // Repair only the injected collection fault, never recreate or execute work.
+    sqlx::query("DROP TRIGGER inject_unreadable_result")
+        .execute(&f.g.store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET result=NULL WHERE id=? AND result='not-json'")
+        .bind(value["operation_id"].as_str().unwrap())
+        .execute(&f.g.store.pool)
+        .await
+        .unwrap();
     let observed =
         f.g.dispatch(&f.p, "operation_get", json!({"request_id":id,"wait_ms":0}))
             .await
