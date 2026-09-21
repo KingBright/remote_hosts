@@ -17,6 +17,7 @@ pub mod files;
 mod files_sync;
 pub mod gateway;
 mod job_dispatch;
+mod job_receipts;
 mod maintenance;
 mod observations;
 mod progress;

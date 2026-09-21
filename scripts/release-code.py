@@ -199,6 +199,10 @@ def run_pipeline(snapshot, report, slot, verify_only=False):
                 raise ValueError('source verification failed or is no longer current')
             state['verification'] = {'path': str(directory/'verification.json'), 'sha256': build_slot.digest(directory/'verification.json'),
                                      'tests': proof['functional_tests']}
+            # The completed same-source receipt supersedes the last sampled
+            # progress tick, which may still have said running.
+            state['verification_gate'] = 'passed'
+            build_slot.atomic_json(report, state)
             if not verify_only:
                 for name, args in [('macos_release', ['cargo', 'build', '-p', 'remote-hosts-code', '--release', '--locked']),
                                    ('linux_release', ['cargo', 'zigbuild', '-p', 'remote-hosts-code', '--release', '--locked', '--target', 'x86_64-unknown-linux-musl']),

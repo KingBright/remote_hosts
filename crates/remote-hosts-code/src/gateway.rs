@@ -692,7 +692,7 @@ impl Gateway {
                 online.as_ref().is_some_and(|o| now() - o.last_seen < 45),
                 "device_offline: reconnect the selected device; do not fail over"
             );
-            let mut transaction = self.store.pool.begin().await?;
+            let mut transaction = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
             if let Some(semantic) = &semantic {
                 let inserted =
                     sqlx::query("INSERT OR IGNORE INTO semantic_guards VALUES(?,?,'active',?)")
@@ -748,24 +748,35 @@ impl Gateway {
                 transaction.commit().await?;
                 (selected_id, false)
             } else {
-                transaction.commit().await?;
+                // All dispatch prerequisites share the job's commit. A failure
+                // cannot publish a job without timing, recovery or source data.
                 if let Some(semantic) = &semantic {
-                    self.store
-                        .put("operation_semantic", &id, semantic, i64::MAX)
+                    sqlx::query("INSERT INTO kv VALUES('operation_semantic',?,?,?)")
+                        .bind(&id)
+                        .bind(serde_json::to_string(semantic)?)
+                        .bind(i64::MAX)
+                        .execute(&mut *transaction)
                         .await?;
                 }
+                sqlx::query("INSERT OR IGNORE INTO operation_timing(id,queued_ms) VALUES(?,?)")
+                    .bind(&id)
+                    .bind(now_ms())
+                    .execute(&mut *transaction)
+                    .await?;
+                if let Some(source) = &source {
+                    sqlx::query("INSERT INTO kv VALUES('file_source',?,?,?)")
+                        .bind(&id)
+                        .bind(serde_json::to_string(source)?)
+                        .bind(now() + crate::transfers::SOURCE_TTL)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                transaction.commit().await?;
                 (id, true)
             }
         };
-        if created_new {
-            sqlx::query("INSERT OR IGNORE INTO operation_timing(id,queued_ms) VALUES(?,?)")
-                .bind(&id)
-                .bind(now_ms())
-                .execute(&self.store.pool)
-                .await?;
-        }
-        if let Some(source) = &source {
-            // Also refresh URLs on an exact retry without changing operation identity.
+        if !created_new && let Some(source) = &source {
+            // Refresh URLs on an exact retry without changing operation identity.
             self.store
                 .put(
                     "file_source",
@@ -948,6 +959,23 @@ impl Gateway {
             "device_receipt_delivery":online.as_ref().and_then(|o|o.receipt_delivery.clone()),
             "receipt_delivery_scope":"device-wide queue snapshot; operation result presence is authoritative for this operation"}))
     }
+    async fn lifecycle_or_unavailable(&self, id: &str, device: &str) -> Value {
+        match self.lifecycle(id, device).await {
+            Ok(value) => value,
+            Err(_) => {
+                // Timing and queue telemetry are not the execution receipt.
+                // A telemetry read failure must stay visible without erasing
+                // an already authorized, durably saved process result.
+                tracing::warn!(
+                    operation_id = id,
+                    "optional operation lifecycle unavailable; execution evidence retained"
+                );
+                json!({"available":false,"error_code":"operation_lifecycle_unavailable",
+                    "failure_boundary":"gateway_storage","next_action":"observe_original_operation",
+                    "scope":"optional_timing_and_device_queue_metrics"})
+            }
+        }
+    }
     pub(crate) async fn result(&self, p: &Principal, id: &str) -> Result<Value> {
         let (request, result, state, updated): (String, Option<String>, String, i64) =
             sqlx::query_as("SELECT request,result,state,updated FROM jobs WHERE id=?")
@@ -981,12 +1009,12 @@ impl Gateway {
             {
                 crate::terminal_sync::project_result(&mut result, observed);
             }
-            result["operation_lifecycle"] = self.lifecycle(id, &job.device_id).await?;
+            result["operation_lifecycle"] = self.lifecycle_or_unavailable(id, &job.device_id).await;
             result["receipt"] = crate::receipts::decision(&result, None, Some(id), updated);
             return Ok(result);
         }
         let mut pending = json!({"operation_id":id,"device_id":job.device_id,"state":state,"pending":true,"next_action":"operation_get","retry_after_ms":1000});
-        pending["operation_lifecycle"] = self.lifecycle(id, &job.device_id).await?;
+        pending["operation_lifecycle"] = self.lifecycle_or_unavailable(id, &job.device_id).await;
         if job.tool == "terminal_exec"
             && let Some(observed) = crate::terminal_sync::observed(self, id).await?
         {
@@ -1576,96 +1604,29 @@ async fn receipt(
     if result.len() > 256 * 1024 {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    let owned: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM jobs WHERE id=? AND device=?")
-        .bind(&receipt.operation_id)
-        .bind(&device)
-        .fetch_optional(&g.store.pool)
-        .await
-        .unwrap_or(None);
-    if owned.is_none() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    match crate::transfer_control::obsolete(&g, &receipt.operation_id, &receipt.result).await {
-        Ok(true) => return Json(json!({"accepted":true,"obsolete":true})).into_response(),
-        Ok(false) => {}
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-    let revision = receipt
-        .result
-        .get("transfer_revision")
-        .and_then(Value::as_i64);
-    if receipt.result.get("transfer_revision").is_some() && revision.is_none() {
+    if receipt.result.get("transfer_revision").is_some()
+        && receipt.result["transfer_revision"]
+            .as_i64()
+            .is_none_or(|revision| revision < 0)
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    // Commit the generation check in the same SQL statement as the result. A
-    // late pre-resume receipt cannot race a fresh resume and finish its task.
-    let updated = sqlx::query("UPDATE jobs SET result=?,state='done',updated=? WHERE id=? AND device=? AND result IS NULL AND (state='dispatched' OR (? IS NOT NULL AND state='queued' AND json_extract(request,'$.tool') IN ('file_upload','file_download'))) AND COALESCE((SELECT json_extract(value,'$.revision') FROM kv WHERE kind='transfer_control' AND key=jobs.id),0)=COALESCE(?,0)")
-        .bind(result).bind(now()).bind(&receipt.operation_id).bind(&device)
-        .bind(revision).bind(revision).execute(&g.store.pool).await;
-    let duplicate = match updated {
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        Ok(updated) if updated.rows_affected() == 1 => false,
-        Ok(_) => {
-            match crate::transfer_control::obsolete(&g, &receipt.operation_id, &receipt.result)
-                .await
-            {
-                Ok(true) => return Json(json!({"accepted":true,"obsolete":true})).into_response(),
-                Ok(false) => {}
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
-            let existing: Result<Option<(String, Option<String>)>, _> =
-                sqlx::query_as("SELECT state,result FROM jobs WHERE id=? AND device=?")
-                    .bind(&receipt.operation_id)
-                    .bind(&device)
-                    .fetch_optional(&g.store.pool)
-                    .await;
-            match existing {
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-                Ok(Some((state, Some(saved))))
-                    if state == "done"
-                        && serde_json::from_str::<Value>(&saved).ok().as_ref()
-                            == Some(&receipt.result) =>
-                {
-                    true
-                }
-                _ => return StatusCode::CONFLICT.into_response(),
-            }
+    let duplicate = match crate::job_receipts::commit(
+        &g.store,
+        &device,
+        &receipt.operation_id,
+        &receipt.result,
+    )
+    .await
+    {
+        Ok(crate::job_receipts::Outcome::Accepted { duplicate }) => duplicate,
+        Ok(crate::job_receipts::Outcome::Obsolete) => {
+            return Json(json!({"accepted":true,"obsolete":true})).into_response();
         }
+        Ok(crate::job_receipts::Outcome::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(crate::job_receipts::Outcome::Conflict) => return StatusCode::CONFLICT.into_response(),
+        Err(error) => return crate::job_receipts::storage_response(&receipt.operation_id, &error),
     };
-    if !duplicate {
-        if let Ok(Some(semantic)) = g
-            .store
-            .get::<String>("operation_semantic", &receipt.operation_id)
-            .await
-        {
-            if receipt.result["error"] == "outcome_unknown" {
-                let _ = sqlx::query("UPDATE semantic_guards SET state='outcome_unknown',updated=? WHERE semantic=? AND operation_id=?")
-                    .bind(now()).bind(&semantic).bind(&receipt.operation_id).execute(&g.store.pool).await;
-            } else {
-                let _ =
-                    sqlx::query("DELETE FROM semantic_guards WHERE semantic=? AND operation_id=?")
-                        .bind(&semantic)
-                        .bind(&receipt.operation_id)
-                        .execute(&g.store.pool)
-                        .await;
-                let _ = sqlx::query("DELETE FROM kv WHERE kind='operation_semantic' AND key=?")
-                    .bind(&receipt.operation_id)
-                    .execute(&g.store.pool)
-                    .await;
-            }
-        }
-        let _ =
-            sqlx::query("UPDATE operation_timing SET result_ms=COALESCE(result_ms,?) WHERE id=?")
-                .bind(now_ms())
-                .bind(&receipt.operation_id)
-                .execute(&g.store.pool)
-                .await;
-    }
-    let _ = sqlx::query("DELETE FROM kv WHERE kind='file_source' AND key=?")
-        .bind(&receipt.operation_id)
-        .execute(&g.store.pool)
-        .await;
     if let Some(signals) = g.signals.get(&device) {
         signals.results.notify_waiters();
     }

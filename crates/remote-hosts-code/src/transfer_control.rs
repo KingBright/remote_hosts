@@ -263,12 +263,4 @@ pub(crate) async fn apply(g: &Gateway, p: &Principal, name: &str, args: &Value) 
     Ok(output)
 }
 
-/// Late results from a pre-resume attempt are acknowledged as obsolete, not
-/// allowed to overwrite the current attempt. Old clients without revisions keep
-/// their existing receipt behavior until explicitly controlled by a new client.
-pub(crate) async fn obsolete(g: &Gateway, id: &str, value: &Value) -> Result<bool> {
-    if let Some(revision) = value.get("transfer_revision").and_then(Value::as_u64) {
-        return Ok(revision < control(g, id).await?.revision);
-    }
-    Ok(false)
-}
+// Receipt generation checks now share the result transaction in job_receipts.
