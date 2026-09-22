@@ -178,6 +178,12 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::OK);
+        let csp = headers["content-security-policy"].to_str().unwrap();
+        assert_eq!(
+            csp.split_whitespace()
+                .any(|source| source == "https://gemini.google.com"),
+            callback.contains("googleusercontent.com/")
+        );
         if callback.starts_with("http://") || callback.contains("googleusercontent.com/") {
             let origin = url::Url::parse(callback)
                 .unwrap()
@@ -204,6 +210,12 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
+        let csp = headers["content-security-policy"].to_str().unwrap();
+        assert_eq!(
+            csp.split_whitespace()
+                .any(|source| source == "https://gemini.google.com"),
+            callback.contains("googleusercontent.com/")
+        );
         if callback.starts_with("http://") || callback.contains("googleusercontent.com/") {
             let origin = url::Url::parse(callback)
                 .unwrap()

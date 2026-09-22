@@ -55,6 +55,14 @@ query-bearing callbacks, fragments, or browser origins as OAuth callbacks. The a
 adds the active callback's exact Google Account Linking origin; test/sandbox browser request
 origins are not added to the CORS allowlist.
 
+From 0.10.22, an authorization using the bounded Google callback family also permits
+the exact `https://gemini.google.com` origin in `form-action`. Chrome checks this directive
+across the full form redirect chain: `/oauth/approve` returns 303 to Google's callback,
+which returns 302 to Gemini `/apps`. Omitting the final origin leaves the password page
+visible even though the Gateway has issued an authorization code. This continuation is
+not an OAuth callback registration or a CORS grant. Ordinary and native callbacks do not
+receive it, and wildcard origins remain forbidden.
+
 Manual/pre-registered credentials still use a complete exact callback from the real Gemini flow.
 Callback URLs, account identifiers, credentials, and live deployment receipts belong in the
 private ops profile, not in this public repository.

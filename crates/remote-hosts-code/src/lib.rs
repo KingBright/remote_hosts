@@ -156,13 +156,18 @@ impl GatewayConfig {
             .filter_map(|uri| reqwest::Url::parse(uri).ok())
             .map(|uri| uri.origin().ascii_serialization())
             .collect();
-        // A validated grant contributes only its concrete callback origin,
-        // never a wildcard host/port or an unrelated browser origin.
+        // A validated grant contributes its concrete callback origin, never
+        // a wildcard host/port or an unrelated browser origin.
         if let Some(callback) =
             callback.filter(|uri| native_oauth_callback(uri) || google_oauth_callback(uri))
             && let Ok(uri) = reqwest::Url::parse(callback)
         {
             origins.push(uri.origin().ascii_serialization());
+            if google_oauth_callback(callback) {
+                // Chrome also checks form-action on subsequent redirects.
+                // Google Account Linking returns to Gemini after its callback.
+                origins.push("https://gemini.google.com".into());
+            }
         }
         if self
             .allowed_origins
