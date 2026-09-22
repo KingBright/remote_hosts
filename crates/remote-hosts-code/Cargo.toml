@@ -1,6 +1,6 @@
 [package]
 name = "remote-hosts-code"
-version = "0.10.19"
+version = "0.10.20"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

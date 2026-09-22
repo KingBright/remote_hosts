@@ -156,9 +156,10 @@ impl GatewayConfig {
             .filter_map(|uri| reqwest::Url::parse(uri).ok())
             .map(|uri| uri.origin().ascii_serialization())
             .collect();
-        // A validated native grant contributes only its concrete local listener,
-        // never a wildcard port, arbitrary localhost name, or browser origin.
-        if let Some(callback) = callback.filter(|uri| native_oauth_callback(uri))
+        // A validated grant contributes only its concrete callback origin,
+        // never a wildcard host/port or an unrelated browser origin.
+        if let Some(callback) =
+            callback.filter(|uri| native_oauth_callback(uri) || google_oauth_callback(uri))
             && let Ok(uri) = reqwest::Url::parse(callback)
         {
             origins.push(uri.origin().ascii_serialization());
@@ -177,6 +178,41 @@ impl GatewayConfig {
             origins.join(" ")
         )
     }
+}
+
+/// The six callback variants registered together by the real Spark client.
+/// This is an exact host/path family, never a googleusercontent wildcard.
+pub(crate) fn google_oauth_callback(candidate: &str) -> bool {
+    let Ok(uri) = reqwest::Url::parse(candidate) else {
+        return false;
+    };
+    let Some(suffix) = uri
+        .path()
+        .strip_prefix("/r/user_bound_custom-mcp-")
+        .or_else(|| uri.path().strip_prefix("/a/user_bound_custom-mcp-"))
+    else {
+        return false;
+    };
+    uri.as_str() == candidate
+        && uri.scheme() == "https"
+        && matches!(
+            uri.host_str(),
+            Some(
+                "oauth-redirect.googleusercontent.com"
+                    | "oauth-redirect-sandbox.googleusercontent.com"
+                    | "oauth-redirect-test.googleusercontent.com"
+            )
+        )
+        && uri.port().is_none()
+        && uri.username().is_empty()
+        && uri.password().is_none()
+        && uri.query().is_none()
+        && uri.fragment().is_none()
+        && !suffix.is_empty()
+        && suffix.len() <= 512
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.~".contains(&b))
 }
 
 /// Bounded native OAuth redirects. The concrete URI is still bound to the

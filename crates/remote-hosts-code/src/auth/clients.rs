@@ -32,30 +32,9 @@ struct Registration {
 /// Native clients use literal loopback listeners; Spark uses one bounded Google
 /// Account Linking family. Neither rule permits wildcard hosts or redirects.
 pub(super) fn redirect_uri_allowed(config: &GatewayConfig, candidate: &str) -> bool {
-    if config.redirect_uris.iter().any(|uri| uri == candidate)
+    config.redirect_uris.iter().any(|uri| uri == candidate)
         || crate::native_oauth_callback(candidate)
-    {
-        return true;
-    }
-    let Ok(uri) = reqwest::Url::parse(candidate) else {
-        return false;
-    };
-    let Some(suffix) = uri.path().strip_prefix("/r/user_bound_custom-mcp-") else {
-        return false;
-    };
-    uri.scheme() == "https"
-        && uri.host_str() == Some("oauth-redirect.googleusercontent.com")
-        && uri.port().is_none()
-        && uri.username().is_empty()
-        && uri.password().is_none()
-        && uri.query().is_none()
-        && uri.fragment().is_none()
-        && !suffix.is_empty()
-        && suffix.len() <= 512
-        && !suffix.contains('/')
-        && suffix
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.~".contains(&b))
+        || crate::google_oauth_callback(candidate)
 }
 fn invalid_client() -> (StatusCode, Json<Value>) {
     (
@@ -73,7 +52,8 @@ impl Auth {
             .as_deref()
             .unwrap_or("client_secret_basic");
         if r.redirect_uris.is_empty()
-            || r.redirect_uris.len() > 5
+            // Spark registers /r and /a on three exact Google callback hosts.
+            || r.redirect_uris.len() > 6
             || !r
                 .redirect_uris
                 .iter()

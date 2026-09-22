@@ -32,14 +32,16 @@ Older configuration files without `allowed_origins` enable both supported hosted
 `https://chatgpt.com` and `https://gemini.google.com`. The Gateway's own origin is always included.
 Both HTTP security layers use the same list.
 
-OAuth callbacks remain exact for ordinary clients. Gemini Spark DCR is the bounded exception
-needed for automatic registration: the Gateway accepts only HTTPS callbacks on the exact
-`oauth-redirect.googleusercontent.com` host whose path starts with
-`/r/user_bound_custom-mcp-` and contains one bounded URL-safe suffix. The concrete callback is
+OAuth callbacks remain exact for ordinary clients. From 0.10.20, Gemini Spark DCR accepts its
+observed six-callback registration: HTTPS on the exact `oauth-redirect.googleusercontent.com`,
+`oauth-redirect-sandbox.googleusercontent.com`, or `oauth-redirect-test.googleusercontent.com`
+host, with `/r/user_bound_custom-mcp-` or `/a/user_bound_custom-mcp-` followed by one bounded
+URL-safe suffix. The registration limit is six, and every entry must pass validation. The concrete callback is
 then stored on that registered client and every authorize/token exchange still has to match it
 exactly. This deliberately does **not** allow `*.googleusercontent.com`, arbitrary Google paths,
 query-bearing callbacks, fragments, or browser origins as OAuth callbacks. The authorization CSP
-adds only that exact Google Account Linking origin when Gemini browser support is enabled.
+adds the active callback's exact Google Account Linking origin; test/sandbox browser request
+origins are not added to the CORS allowlist.
 
 Manual/pre-registered credentials still use a complete exact callback from the real Gemini flow.
 Callback URLs, account identifiers, credentials, and live deployment receipts belong in the

@@ -152,7 +152,7 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::OK);
-        if callback.starts_with("http://") {
+        if callback.starts_with("http://") || callback.contains("googleusercontent.com/") {
             let origin = url::Url::parse(callback)
                 .unwrap()
                 .origin()
@@ -178,7 +178,7 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
-        if callback.starts_with("http://") {
+        if callback.starts_with("http://") || callback.contains("googleusercontent.com/") {
             let origin = url::Url::parse(callback)
                 .unwrap()
                 .origin()
@@ -820,6 +820,55 @@ async fn unknown_or_another_clients_revoke_does_not_revoke_the_owner() {
     );
 }
 #[tokio::test]
+async fn spark_six_callback_registration_and_exact_code_exchange() {
+    let f = Fixture::new().await;
+    let callbacks: Vec<_> = [
+        "oauth-redirect-sandbox.googleusercontent.com",
+        "oauth-redirect-test.googleusercontent.com",
+        "oauth-redirect.googleusercontent.com",
+    ]
+    .into_iter()
+    .flat_map(|host| {
+        ["r", "a"].map(|kind| format!("https://{host}/{kind}/user_bound_custom-mcp-fixture-spark"))
+    })
+    .collect();
+    let registration = json!({"redirect_uris":callbacks,"client_name":"Google",
+        "token_endpoint_auth_method":"client_secret_post",
+        "grant_types":["authorization_code","refresh_token"],"response_types":["code"]});
+    let (status, _, client) = f
+        .request("POST", "/oauth/register", registration.clone(), false, &[])
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(client["redirect_uris"], registration["redirect_uris"]);
+    for callback in &callbacks {
+        let mut selected = client.clone();
+        selected["redirect_uris"] = json!([callback]);
+        let code = f.code(&selected).await;
+        let mut wrong = code.clone();
+        // Even another registered callback cannot exchange this callback's code.
+        wrong["redirect_uri"] = json!(callbacks.iter().find(|uri| *uri != callback).unwrap());
+        assert_eq!(
+            f.authenticated(&client, "/oauth/token", wrong).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, _, token) = f.authenticated(&client, "/oauth/token", code).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(f.refresh(&client, &token).await.0, StatusCode::OK);
+    }
+    let mut too_many = registration;
+    too_many["redirect_uris"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(GPT));
+    assert_eq!(
+        f.request("POST", "/oauth/register", too_many, false, &[])
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
 async fn origin_allowlist_and_csp_are_separate_from_exact_callbacks() {
     let f = Fixture::new().await;
     for origin in [
@@ -861,6 +910,14 @@ async fn origin_allowlist_and_csp_are_separate_from_exact_callbacks() {
         "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-ok/extra",
         "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-ok?next=evil",
         "https://oauth-redirect.googleusercontent.com.evil.test/r/user_bound_custom-mcp-ok",
+        "https://oauth-redirect-sandbox.googleusercontent.com.evil.test/a/user_bound_custom-mcp-ok",
+        "https://oauth-redirect-other.googleusercontent.com/a/user_bound_custom-mcp-ok",
+        "https://oauth-redirect-test.googleusercontent.com/b/user_bound_custom-mcp-ok",
+        "https://oauth-redirect-test.googleusercontent.com/a/user_bound_custom-mcp-ok#fragment",
+        "https://oauth-redirect-test.googleusercontent.com/a/user_bound_custom-mcp-%2fescape",
+        "http://oauth-redirect-test.googleusercontent.com/a/user_bound_custom-mcp-ok",
+        "https://user@oauth-redirect-test.googleusercontent.com/a/user_bound_custom-mcp-ok",
+        "https://oauth-redirect-test.googleusercontent.com:444/a/user_bound_custom-mcp-ok",
     ] {
         assert_eq!(
             f.request(

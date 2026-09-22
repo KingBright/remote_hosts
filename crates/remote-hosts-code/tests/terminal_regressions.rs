@@ -269,9 +269,9 @@ async fn cancellation_kills_the_process_group_and_is_repeatable() {
     let f = Fixture::new().await;
     let id = f
         .start(
-            "(sleep 1; touch child-survived) & touch ready; wait",
+            "(while [ ! -f release-child ]; do sleep 0.02; done; touch child-survived) & touch ready; wait",
             false,
-            5,
+            10,
         )
         .await;
     f.ready().await;
@@ -281,6 +281,11 @@ async fn cancellation_kills_the_process_group_and_is_repeatable() {
     assert_eq!(first["terminal"]["state"], "cancelled");
     assert_eq!(second["terminal"]["state"], "cancelled");
     assert_eq!(f.done(&id).await["terminal"]["state"], "cancelled");
+    // Release a surviving child only after cancellation. A one-second sleep
+    // could finish before the cancellation request on a busy test host.
+    tokio::fs::write(f.ws.root.join("release-child"), b"")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert!(!f.ws.root.join("child-survived").exists());
 }
