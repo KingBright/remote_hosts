@@ -28,12 +28,13 @@ struct Registration {
     grant_types: Option<Vec<String>>,
     response_types: Option<Vec<String>>,
 }
-/// OAuth callbacks are exact by default. Gemini Spark's DCR client is the one
-/// exception: Google allocates a per-connection path under one fixed Account
-/// Linking host. Store the concrete URI on registration and require it exactly
-/// thereafter; never allow a wildcard host or a generic googleusercontent URL.
+/// Store every concrete callback on registration and require it exactly thereafter.
+/// Native clients use literal loopback listeners; Spark uses one bounded Google
+/// Account Linking family. Neither rule permits wildcard hosts or redirects.
 pub(super) fn redirect_uri_allowed(config: &GatewayConfig, candidate: &str) -> bool {
-    if config.redirect_uris.iter().any(|uri| uri == candidate) {
+    if config.redirect_uris.iter().any(|uri| uri == candidate)
+        || crate::native_oauth_callback(candidate)
+    {
         return true;
     }
     let Ok(uri) = reqwest::Url::parse(candidate) else {

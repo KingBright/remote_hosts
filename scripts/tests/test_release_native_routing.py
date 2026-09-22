@@ -64,7 +64,8 @@ class NativeRoutingTests(unittest.TestCase):
     def test_unsuccessful_revocation_retains_handle_for_explicit_retry(self):
         c=Client('https://fixture.example',access='synthetic',transport='legacy')
         c.refresh='synthetic-refresh'
-        with mock.patch.object(c,'call',side_effect=[(503,{},b''),(200,{},b'')]):
+        # Exhaust the bounded same-grant retry budget before explicit recovery.
+        with mock.patch.object(c,'call',side_effect=[(503,{},b'')]*3+[(200,{},b'')]):
             self.assertFalse(c.close())
             self.assertEqual(c.refresh,'synthetic-refresh')
             self.assertTrue(c.close())

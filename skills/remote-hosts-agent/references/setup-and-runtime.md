@@ -152,6 +152,25 @@ From 0.10.3, rollout hardening also treats a paused transfer with `publication_r
 
 ## Codex MCP Config
 
+Code editing uses an additional Streamable HTTP server, independent of the SSH
+server below. With Gateway 0.10.19+, register `remote-hosts-code` using
+`codex mcp add remote-hosts-code --url https://YOUR_GATEWAY/mcp` and complete
+`codex mcp login remote-hosts-code` if the add flow did not already authorize it.
+Use the canonical public origin. Codex owns its OAuth storage/refresh; do not copy
+owner passwords, Agent credentials or short-lived access tokens into configuration.
+
+```toml
+[mcp_servers.remote-hosts-code]
+url = "https://YOUR_GATEWAY/mcp"
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+```
+
+Keep the SSH MCP entry for managed host/credential/transport operations. Reload
+MCP or start a new task after adding the Code server. Verify the desktop catalog
+and actual device read/edit/execute separately; server capability is not proof of
+host exposure. The Rust stdio Code adapter alone does not renew its access token.
+
 Expected `~/.codex/config.toml` entry:
 
 ```toml

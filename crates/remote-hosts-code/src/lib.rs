@@ -127,12 +127,12 @@ impl GatewayConfig {
                     && !uri
                         .bytes()
                         .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-                    && u.scheme() == "https"
+                    && (u.scheme() == "https" || native_oauth_callback(uri))
                     && u.host_str().is_some()
                     && u.username().is_empty()
                     && u.password().is_none()
                     && u.fragment().is_none(),
-                "OAuth callback must be an exact HTTPS URL without userinfo or fragment"
+                "OAuth callback must be exact HTTPS or a native loopback callback without userinfo or fragment"
             );
         }
         Ok(())
@@ -145,6 +145,9 @@ impl GatewayConfig {
         origins
     }
     pub(crate) fn authorization_csp(&self) -> String {
+        self.authorization_csp_for_callback(None)
+    }
+    pub(crate) fn authorization_csp_for_callback(&self, callback: Option<&str>) -> String {
         // Only configured callbacks contribute redirect destinations. Browser
         // request origins must never implicitly authorize an OAuth callback.
         let mut origins: Vec<_> = self
@@ -153,6 +156,13 @@ impl GatewayConfig {
             .filter_map(|uri| reqwest::Url::parse(uri).ok())
             .map(|uri| uri.origin().ascii_serialization())
             .collect();
+        // A validated native grant contributes only its concrete local listener,
+        // never a wildcard port, arbitrary localhost name, or browser origin.
+        if let Some(callback) = callback.filter(|uri| native_oauth_callback(uri))
+            && let Ok(uri) = reqwest::Url::parse(callback)
+        {
+            origins.push(uri.origin().ascii_serialization());
+        }
         if self
             .allowed_origins
             .iter()
@@ -167,6 +177,32 @@ impl GatewayConfig {
             origins.join(" ")
         )
     }
+}
+
+/// Bounded native OAuth redirects. The concrete URI is still bound to the
+/// registered client and every authorization/code exchange; PKCE is mandatory.
+pub(crate) fn native_oauth_callback(candidate: &str) -> bool {
+    let Ok(uri) = reqwest::Url::parse(candidate) else {
+        return false;
+    };
+    let path_allowed = uri.path() == "/callback"
+        || uri.path().strip_prefix("/callback/").is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix.len() <= 128
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        });
+    candidate.len() <= 512
+        && uri.as_str() == candidate
+        && uri.scheme() == "http"
+        && matches!(uri.host_str(), Some("127.0.0.1" | "[::1]"))
+        && uri.port().is_some_and(|port| port != 0)
+        && uri.username().is_empty()
+        && uri.password().is_none()
+        && uri.query().is_none()
+        && uri.fragment().is_none()
+        && path_allowed
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

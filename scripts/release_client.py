@@ -73,6 +73,18 @@ class ReleaseHttpError(RuntimeError):
         super().__init__('release_http_' + str(status) + '; ' + json.dumps(self.diagnostic, sort_keys=True))
 
 
+def transport_diagnostic(error, path):
+    """Keep only fixed transport facts, not exception text or capability URLs."""
+    reason = getattr(error, 'reason', error)
+    certificate = isinstance(reason, (ssl.SSLCertVerificationError, ssl.CertificateError))
+    route = urllib.parse.urlsplit(path).path
+    if route.startswith('/files/'):
+        route = '/files/<redacted>'
+    return {'failure_boundary': 'tls_certificate' if certificate else 'http_transport',
+            'exception_type': type(reason).__name__, 'retryable': not certificate,
+            'path': route[:180], 'body_retained': False}
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -153,7 +165,21 @@ class Client:
         safe_get = data is None and path in ('/.well-known/oauth-protected-resource', '/.well-known/oauth-authorization-server', '/healthz')
         attempts = 3 if safe_get else 1
         for attempt in range(1, attempts + 1):
-            status, headers, body = self.call(path, data, form, auth)
+            try:
+                status, headers, body = self.call(path, data, form, auth)
+            except (urllib.error.URLError, OSError, http.client.IncompleteRead) as error:
+                diagnostic = dict(transport_diagnostic(error, path), attempt=attempt,
+                                  request_replayed=False, recovery_scope='public_metadata_only')
+                self.http_observations.append(diagnostic)
+                self.http_observations = self.http_observations[-32:]
+                if not safe_get:
+                    # Preserve the caller's existing original-operation recovery.
+                    # This layer must never replay OAuth writes or tools/call.
+                    raise
+                if not diagnostic['retryable'] or attempt == attempts:
+                    raise RuntimeError('metadata_read_unconfirmed; ' + json.dumps(diagnostic, sort_keys=True)) from None
+                time.sleep(min(attempt, 2))
+                continue
             if status in (200, 201):
                 return json.loads(body)
             error = ReleaseHttpError(status, path, headers, body)
@@ -364,9 +390,27 @@ class Client:
             native_closed = False
         finally:
             self._closed = True
+        self.native_close_complete = native_closed
+        self.oauth_revoke_complete = self.refresh is None
         if self.refresh:
-            status, _, _ = self.call('/oauth/revoke', {'token': self.refresh}, form=True)
-            if status not in (200, 204):
-                return False
-            self.refresh, self.access = None, None
-        return native_closed
+            # Revocation targets the SAME grant. The server marks that family
+            # revoked before acknowledging; repeating this endpoint cannot issue
+            # a grant or repeat a tool. No other OAuth POST inherits retries.
+            for attempt in range(1, 4):
+                try:
+                    status, headers, body = self.call('/oauth/revoke', {'token': self.refresh}, form=True)
+                    if status in (200, 204):
+                        self.refresh, self.access = None, None
+                        self.oauth_revoke_complete = True
+                        break
+                    diagnostic = dict(ReleaseHttpError(status, '/oauth/revoke', headers, body).diagnostic)
+                except (urllib.error.URLError, OSError, http.client.IncompleteRead) as error:
+                    diagnostic = transport_diagnostic(error, '/oauth/revoke')
+                diagnostic.update(attempt=attempt, recovery_scope='same_grant_revocation_only',
+                                  tool_calls_replayed=False)
+                self.http_observations.append(diagnostic)
+                self.http_observations = self.http_observations[-32:]
+                if not diagnostic['retryable'] or attempt == 3:
+                    return False  # Keep this grant for an explicit close() recovery.
+                time.sleep(min(attempt, 2))
+        return native_closed and self.oauth_revoke_complete

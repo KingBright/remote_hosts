@@ -5,7 +5,15 @@ description: Operate and maintain the user's transport-first Remote Hosts system
 
 # Remote Hosts Agent Skill
 
-Use this skill to interact with the user's Remote Hosts service instead of opening raw SSH sessions directly.
+Use this skill for Remote Hosts code editing across authorized devices and for managed SSH operations.
+
+For code work, prefer the Code Gateway tools (`devices_list`, `workspace_open`,
+`code_search`, `code_read`, `code_apply_edits`, `terminal_exec`) whether exposed by
+a desktop MCP server or a hosted connector. Choose the device explicitly, open a
+project under its advertised roots, use bounded reads and version-checked edits,
+and reuse the returned workspace and operation identities. The SSH inventory's
+host IDs are not Code Gateway device IDs. Never silently substitute one for the
+other or fail over an offline device to a different machine.
 
 ## Core Rules
 

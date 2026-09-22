@@ -152,6 +152,15 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::OK);
+        if callback.starts_with("http://") {
+            let origin = url::Url::parse(callback)
+                .unwrap()
+                .origin()
+                .ascii_serialization();
+            let csp = headers["content-security-policy"].to_str().unwrap();
+            assert!(csp.contains(&origin));
+            assert!(!csp.contains('*'));
+        }
         let cookie = headers["set-cookie"]
             .to_str()
             .unwrap()
@@ -169,6 +178,18 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
+        if callback.starts_with("http://") {
+            let origin = url::Url::parse(callback)
+                .unwrap()
+                .origin()
+                .ascii_serialization();
+            assert!(
+                headers["content-security-policy"]
+                    .to_str()
+                    .unwrap()
+                    .contains(&origin)
+            );
+        }
         let location = url::Url::parse(headers["location"].to_str().unwrap()).unwrap();
         let query: std::collections::HashMap<_, _> = location.query_pairs().into_owned().collect();
         assert_eq!(query["iss"], ORIGIN);
@@ -335,6 +356,103 @@ async fn discovery_and_dcr_secret_defaults() {
             .unwrap();
     assert_eq!(stored["client_secret_hash"], hash(secret));
     assert!(!stored.to_string().contains(secret));
+}
+#[tokio::test]
+async fn native_loopback_login_refresh_and_revoke_preserve_scope_and_pkce() {
+    for callback in [
+        "http://127.0.0.1:45231/callback",
+        "http://[::1]:45232/callback/native-client",
+    ] {
+        let f = Fixture::new().await;
+        let mut configured = (*f.g.config).clone();
+        configured.redirect_uris = vec![callback.into()];
+        configured.validate_oauth_policy().unwrap();
+        let client = f.register("none", callback).await;
+        let code = f.code(&client).await;
+        for (field, value) in [
+            ("redirect_uri", callback.replace("4523", "5523")),
+            ("code_verifier", random()),
+            ("resource", "https://untrusted.example/mcp".into()),
+        ] {
+            let mut bad = code.clone();
+            bad[field] = value.into();
+            assert_eq!(
+                f.authenticated(&client, "/oauth/token", bad).await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let (status, _, token) = f.authenticated(&client, "/oauth/token", code).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(token["scope"], "code:read");
+        let (status, _, renewed) = f.refresh(&client, &token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(renewed["scope"], "code:read");
+        let (status, _, _) = f
+            .authenticated(
+                &client,
+                "/oauth/revoke",
+                json!({"token":renewed["refresh_token"]}),
+            )
+            .await;
+        assert!(status.is_success());
+        assert_ne!(
+            f.mcp(&renewed, "tools/list", json!({})).await.0,
+            StatusCode::OK
+        );
+    }
+}
+#[tokio::test]
+async fn native_callbacks_reject_aliases_external_addresses_and_ambiguous_paths() {
+    let f = Fixture::new().await;
+    for callback in [
+        "http://localhost:45231/callback",
+        "http://127.0.0.2:45231/callback",
+        "http://0.0.0.0:45231/callback",
+        "http://192.168.1.1:45231/callback",
+        "http://127.0.0.1.evil.test:45231/callback",
+        "http://127.1:45231/callback",
+        "http://2130706433:45231/callback",
+        "http://[::ffff:127.0.0.1]:45231/callback",
+        "http://user@127.0.0.1:45231/callback",
+        "http://127.0.0.1/callback",
+        "http://127.0.0.1:0/callback",
+        "http://127.0.0.1:45231/callback?next=evil",
+        "http://127.0.0.1:45231/callback#fragment",
+        "http://127.0.0.1:45231/other",
+        "http://127.0.0.1:45231/a/../callback",
+        "http://127.0.0.1:45231/callback/../callback",
+        "http://127.0.0.1:45231/callback/%61",
+        "http://127.0.0.1:45231/callback/nested/path",
+    ] {
+        let (status, _, _) = f
+            .request(
+                "POST",
+                "/oauth/register",
+                json!({"redirect_uris":[callback],"token_endpoint_auth_method":"none"}),
+                false,
+                &[],
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{callback}");
+        let mut bad = (*f.g.config).clone();
+        bad.redirect_uris = vec![callback.into()];
+        assert!(bad.validate_oauth_policy().is_err(), "{callback}");
+    }
+    let (_, headers, _) = f
+        .request(
+            "GET",
+            "/.well-known/oauth-authorization-server",
+            json!({}),
+            false,
+            &[],
+        )
+        .await;
+    assert!(
+        !headers["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("127.0.0.1")
+    );
 }
 #[tokio::test]
 async fn confidential_state_is_invisible_to_pre_authentication_binaries() {

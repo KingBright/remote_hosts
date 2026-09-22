@@ -282,6 +282,13 @@ async fn authorize(State(a): State<Auth>, Query(q): Query<Authorize>) -> HttpRes
     );
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        a.config
+            .authorization_csp_for_callback(Some(&pending.grant.redirect_uri))
+            .parse()
+            .map_err(internal)?,
+    );
+    response.headers_mut().insert(
         header::SET_COOKIE,
         format!("rh_oauth={nonce}; Secure; HttpOnly; SameSite=Lax; Path=/oauth; Max-Age=600")
             .parse()
@@ -353,6 +360,13 @@ async fn approve(
         .append_pair("state", &pending.state)
         .append_pair("iss", &a.config.public_url);
     let mut response = Redirect::to(redirect.as_str()).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        a.config
+            .authorization_csp_for_callback(Some(&pending.grant.redirect_uri))
+            .parse()
+            .map_err(internal)?,
+    );
     response.headers_mut().insert(
         header::SET_COOKIE,
         "rh_oauth=; Secure; HttpOnly; SameSite=Lax; Path=/oauth; Max-Age=0"

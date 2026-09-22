@@ -2017,7 +2017,9 @@ async fn security_headers(
     let Ok(csp) = axum::http::HeaderValue::from_str(&csp_text) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    r.headers_mut().insert("content-security-policy", csp);
+    r.headers_mut()
+        .entry("content-security-policy")
+        .or_insert(csp);
     if file_response {
         r.headers_mut().insert(
             "referrer-policy",
