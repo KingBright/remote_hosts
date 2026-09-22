@@ -12,15 +12,15 @@
     "closed": "已满足该项验收且附证据；代码存在不能关闭"
   },
   "release_policy": {
-    "package_manifest_sha256": "0a7136f1fe64a276bc1f80319da5fb2acc8ab2eb2ab9076bebef6b668664ff9a",
+    "package_manifest_sha256": "fecca9fa24a03fac4f096c7a25a0910fc2dbf6cc91bf9acb8bb6fe279abdda56",
     "deployment_state_source": "private deployment/runtime system; not this public backlog",
     "close_only_with_acceptance_evidence": true,
     "all_known_issues_must_be_fixed_before_every_release": false,
     "rule": "公共 backlog 记录产品问题和 repository/release facts；真实 release targets、installed/running/accepted 状态和现场 receipts 属于 private deployment/runtime system。",
-    "last_packaged_release": "0.10.19",
-    "last_packaged_validation": "Frozen snapshot 4dda195c7d86ee2a52ee53e7e4af9012055fcece1eebfdd04b3b31fc23d0207f: 752 passed, 0 failed (470 Rust, 282 Python), 2 Rust ignored, 3 Python skipped; fmt, strict Clippy, workspace check and macOS arm64/Linux x86_64 musl/Windows x86_64 MSVC release builds passed.",
-    "current_main_state": "0.10.19 runtime source at 89f2d71; subsequent Python acceptance/coordinator and product assessment fixes do not change the frozen package.",
-    "current_source_validation": "39 acceptance/coordinator regression tests plus 32 release-client regression tests passed. Native Codex acceptance passed on all 4 deployed devices. Expanded standard acceptance is incomplete: transient TLS failures, then MacBook host pressure and binary probe timeout; private receipts retained."
+    "last_packaged_release": "0.10.22",
+    "last_packaged_validation": "Frozen snapshot 962de77e1adebe279bb00dbef30efeef93edfeec52c338bc523230d1097df42e: 762 passed, 0 failed (473 Rust, 289 Python), 2 Rust ignored, 3 Python skipped; fmt, strict Clippy, workspace check and all three platform release builds passed.",
+    "current_main_state": "0.10.22 runtime source at d863a96; subsequent live-acceptance documentation does not change the frozen package.",
+    "current_source_validation": "The 0.10.22 frozen verification passed 762 tests. Native Codex four-device acceptance remains valid for 0.10.19 Agents. Spark live authorization, 24-tool synchronization and real devices_list and a bounded README code_read with an independently matched SHA-256 passed against Gateway 0.10.22. Gemini attachment compatibility and the expanded four-device failure matrix remain unverified."
   },
   "milestones": [
     {
@@ -78,6 +78,10 @@
     {
       "version": "0.10.19",
       "goal": "原生桌面 OAuth 接入及发布客户端传输诊断；本轮评估见 DESKTOP-REVIEW-2026-09-22.md，现场状态留在 private ops。"
+    },
+    {
+      "version": "0.10.22",
+      "goal": "打通真实 Gemini Spark 授权和工具调用，保持原生桌面、ChatGPT 与四台 Agent 的兼容边界；现场回执留在 private ops。"
     }
   ],
   "items": [
@@ -1004,7 +1008,7 @@
       "title": "工具与协议能力发现、schema变更兼容",
       "discovery": "code_review",
       "problem": "ChatGPT工具目录可能仍缓存旧描述；包版本不能表达所有功能/限制。",
-      "current_resolution": "0.10.19 Gateway 和原生 Codex 客户端均实测列出 24 项工具；版本、wire protocol、tool schema、Skill revision 分层报告。旧会话仍需刷新，其他宿主当前实际暴露程度不能从服务端自报推断。原生桌面 OAuth 回调接入由 RH-054 单独记录。",
+      "current_resolution": "原生 Codex 已实测列出 24 工具；0.10.22 Gemini Spark 已完成真实授权、同步 24 工具并实际调用 devices_list，返回四台设备在线。版本、wire protocol、tool schema、Skill revision 仍分层报告。宿主对 compact/structuredContent 与 full 的消费差异、刷新和附件契约仍需独立回归，不能由服务端目录推断。原生桌面 OAuth 回调接入由 RH-054 记录。",
       "acceptance": [
         "新Gateway旧Agent与新Agent旧Gateway行为明确；无静默忽略lane导致错调度。"
       ],
@@ -1018,7 +1022,8 @@
         "docs/releases/0.3.2/verification-final.json",
         "docs/releases/0.7.1/native-acceptance.json",
         "docs/releases/0.7.1/RELEASE.md",
-        "docs/product/DESKTOP-REVIEW-2026-09-22.md"
+        "docs/product/DESKTOP-REVIEW-2026-09-22.md",
+        "docs/gemini-spark-mcp.md"
       ],
       "depends_on": [],
       "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
@@ -1522,7 +1527,7 @@
       "id": "RH-053",
       "priority": "P0",
       "status": "open",
-      "target_version": "0.10.20",
+      "target_version": "0.10.x",
       "title": "设备时钟偏差使诊断回执阻断全部轮询",
       "discovery": "0.10.19_desktop_integration",
       "introduced_or_observed": "0.10.18 Agent / 0.10.18 and 0.10.19 Gateway",
@@ -1595,6 +1600,52 @@
         "本地完成或超时应在有界时间内可观察；状态滞后须明确标注，不得自动重放命令。"
       ],
       "evidence": [
+        "docs/product/DESKTOP-REVIEW-2026-09-22.md"
+      ],
+      "depends_on": [],
+      "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
+      "last_reviewed": "2026-09-22",
+      "closure_evidence": []
+    },
+    {
+      "id": "RH-057",
+      "priority": "P1",
+      "status": "open",
+      "target_version": "0.10.x",
+      "title": "OAuth 过期、重复提交和限流缺少清楚的页面反馈",
+      "discovery": "gemini_spark_live_linking",
+      "introduced_or_observed": "0.10.20-0.10.22 Gateway and real Chrome flow",
+      "problem": "多次授权尝试期间出现 429，旧会话还可能在 Google 回调处过期。页面未清楚区分等待、失败与已发放授权码，易诱发继续点击。",
+      "current_resolution": "0.10.22 已修复可确认的完整跳转链 CSP 问题，单次授权自动返回并完成 Spark 调用。重复提交防护、Retry-After/错误页面和过期后的新会话入口尚未验收。",
+      "acceptance": [
+        "真实浏览器覆盖 approve 303、Google callback 302、最终 Gemini 返回，且普通/native 客户端 CSP 保持原边界。",
+        "重复点击只产生一次授权提交；429 明确等待时间；过期会话明确引导重新发起，不重用已消费的回调。"
+      ],
+      "evidence": [
+        "docs/gemini-spark-mcp.md",
+        "docs/product/DESKTOP-REVIEW-2026-09-22.md"
+      ],
+      "depends_on": [],
+      "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
+      "last_reviewed": "2026-09-22",
+      "closure_evidence": []
+    },
+    {
+      "id": "RH-058",
+      "priority": "P1",
+      "status": "partial",
+      "target_version": "0.10.x",
+      "title": "发布调用入口可能误用可变工作树中的旧协调器",
+      "discovery": "0.10.22_frozen_release",
+      "introduced_or_observed": "Mac Studio release invocation",
+      "problem": "固定源码已有进程 FD 上限修复，但调用了可变工作树中的旧 release-code.py，验证和 macOS 构建通过后 Linux linker 报 ProcessFdQuotaExceeded。长 PTY heredoc 的不完整输入也增加了启动状态不确定性。",
+      "current_resolution": "保留原失败回执，通过状态/进程观察证明后续不完整输入未启动，校验上传小 runner 并仅以单行启动冻结协调器；进程软上限从 256 提到 4096 后三端构建与打包通过。没有修改系统上限、绕过测试或更换冻结源码。",
+      "acceptance": [
+        "正常发布入口强制绑定冻结协调器身份，并在回执记录该身份、资源上限和可复用 build slot。",
+        "不确定启动只观察原报告/进程；已知失败保留原回执；回归覆盖旧入口和不完整输入，不能重复执行未确认结束的构建。"
+      ],
+      "evidence": [
+        "docs/gemini-spark-mcp.md",
         "docs/product/DESKTOP-REVIEW-2026-09-22.md"
       ],
       "depends_on": [],

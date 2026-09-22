@@ -118,6 +118,39 @@ Conversation attachment import is not declared Gemini-compatible by this change.
 reference/authorization contract must be verified separately; do not expand the URL allowlist to
 arbitrary external sources.
 
+### Live acceptance, 2026-09-22
+
+Gateway 0.10.22 (`d863a96`) was built from frozen snapshot
+`962de77e1adebe279bb00dbef30efeef93edfeec52c338bc523230d1097df42e` on Mac Studio.
+The final verification passed 762 tests (473 Rust, 289 Python), with zero failures;
+two benchmarks were ignored and three Python cases were skipped. Formatting, strict Clippy,
+workspace checks and all three release builds passed. The immutable bundle SHA-256 is
+`7eed0dcebc309a374c37f17e606f066765b710dd133ac6e0b1ba5f106a8a5fe5`.
+Only the Gateway was upgraded. Its installed and running identity was verified; all four
+0.10.19 Agents remained online and wire-compatible.
+
+The real Chrome flow reused the signed-in Google session, completed Google consent and one
+Gateway password submission, and automatically returned to Gemini `/apps`. Gemini synchronized
+24 tools and saved the enabled custom app as `Remote Hosts`. A new Spark task actually invoked
+`devices_list` and returned all four authorized devices online, covering two macOS devices,
+Linux and Windows. The test prompt did not supply the expected device names.
+
+In the same Spark task, `workspace_open` selected the Mac Studio project and `code_read`
+returned `README.md` lines 1–12. The returned file SHA-256 matched a separate managed read
+on that device. Spark requested `response_mode: full` for workspace information while
+retaining the same idempotency key; its expected workspace confirmations were completed.
+Host behavior for compact structured results still deserves a dedicated regression matrix.
+The file check performed no edits or terminal execution through Spark.
+
+Spark's first task view remained on initialization/processing after the underlying task completed.
+Refreshing and reopening that same task displayed its saved result; no replacement task or
+Gateway command replay was needed. This is a client-view observation, not a proven root cause
+in Spark. Private receipts and screenshots are retained under `spark-mcp-20260922`; account
+identifiers, OAuth query strings and credentials are excluded from this document.
+
+This acceptance does not establish Gemini attachment interoperability, a complete refresh/revoke
+browser matrix, or the expanded four-device failure-injection matrix.
+
 ## Rollback boundary
 
 Gateway configuration and OAuth state must be part of the rollback plan. Old binaries deny unknown
