@@ -57,3 +57,15 @@ The desktop app and CLI share the Codex host's MCP configuration. See the
 Verify desktop exposure separately from server capability: initialize/list with
 the configured desktop client, then perform read/edit/execute/transfer acceptance
 on disposable files on each online device. Offline devices remain unverified.
+
+## Updating an acceptance script without replacing a release
+
+A validator-only repair does not justify rebuilding or modifying an immutable
+runtime package. Verify the updated script and invoke `fleet-upgrade.py` with
+`--acceptance-script /absolute/path/to/check-code-gateway.py` alongside the normal
+version, package, deployment configuration and report directory. The coordinator
+records the validator SHA-256 and package manifest identity separately. A changed
+validator gets a distinct probe run identity; saved successful rows from another
+validator require a new report directory. If the fleet already converged, only
+acceptance runs. Device installation and receipt recovery retain their original
+identities.

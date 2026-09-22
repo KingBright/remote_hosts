@@ -76,6 +76,34 @@ class OfflineFleetTests(unittest.TestCase):
         self.assertFalse(self.state['online_converged'])
         self.assertIsNone(self.state['acceptance'])
 
+    def test_explicit_validator_update_preserves_package_and_records_identity(self):
+        package=self.directory/'package';package.mkdir()
+        (package/'manifest.json').write_text('{"version":"0.10.19"}')
+        packaged=package/'check-code-gateway.py';packaged.write_text('original immutable validator')
+        patched=self.directory/'patched.py';patched.write_text('verified validator update')
+        config={'origin':'https://example.com','password_file':'private-password',
+                'acceptance_script':str(patched)}
+        def complete(argv, timeout):
+            self.assertEqual(argv[1],str(patched.resolve()))
+            self.assertEqual(timeout,1200)
+            (self.directory/'acceptance.json').write_text('{"state":"passed"}')
+        with mock.patch.object(fleet,'command',side_effect=complete):
+            fleet.accept_fleet(config,package,self.directory,'0.10.19',{'devices':[self.controller]})
+        identity=json.loads((self.directory/'acceptance-validator.json').read_text())
+        self.assertEqual(identity['sha256'],fleet.rr.digest(patched))
+        self.assertEqual(identity['package_manifest_sha256'],fleet.rr.digest(package/'manifest.json'))
+        self.assertFalse(identity['packaged_validator'])
+        self.assertEqual(packaged.read_text(),'original immutable validator')
+        def mutate(argv, timeout):
+            patched.write_text('changed while validating')
+        with mock.patch.object(fleet,'command',side_effect=mutate):
+            with self.assertRaisesRegex(RuntimeError,'validator changed'):
+                fleet.accept_fleet(config,package,self.directory,'0.10.19',{'devices':[self.controller]})
+        with mock.patch.object(fleet,'command') as command:
+            with self.assertRaisesRegex(RuntimeError,'another validator'):
+                fleet.accept_fleet(config,package,self.directory,'0.10.19',{'devices':[self.controller]})
+        command.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

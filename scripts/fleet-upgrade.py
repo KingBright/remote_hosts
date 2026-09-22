@@ -10,6 +10,7 @@ uncertain mutation: its journal is the recovery boundary.
 import argparse
 import json
 import pathlib
+import re
 import shlex
 import subprocess
 import tarfile
@@ -125,8 +126,27 @@ def verified_import(client, imported, exported, bundle, bundle_sha, version, ide
 
 def accept_fleet(config,package,directory,version,fleet):
     ids=[d['device_id'] for d in fleet['devices']]
-    acceptance=directory/'acceptance.json';run_id='fleet-'+version.replace('.','-')+'-'+rr.identity(ids)[:8]
-    command(['python3',str(package/'check-code-gateway.py'),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(acceptance),'--run-id',run_id,'--expected-version',version,'--dispatch-protocol','2',*[x for ident in ids for x in ('--device-id',ident)]],1200)
+    acceptance=directory/'acceptance.json'
+    validator=pathlib.Path(config.get('acceptance_script') or package/'check-code-gateway.py').resolve()
+    validator_sha=rr.digest(validator)
+    run_id='fleet-'+version.replace('.','-')+'-'+rr.identity(ids)[:8]+'-'+validator_sha[:8]
+    identity_path=directory/'acceptance-validator.json'
+    if acceptance.exists():
+        previous=json.loads(identity_path.read_text()) if identity_path.exists() else {}
+        if previous.get('sha256')!=validator_sha:
+            raise RuntimeError('saved acceptance belongs to another validator; use a new report directory')
+    rr.atomic_json(identity_path,{'path':str(validator),'sha256':validator_sha,
+        'packaged_validator':validator==(package/'check-code-gateway.py').resolve(),
+        'package_manifest_sha256':rr.digest(package/'manifest.json')})
+    try:
+        command(['python3',str(validator),'--origin',config['origin'],'--password-file',config['password_file'],'--report',str(acceptance),'--run-id',run_id,'--expected-version',version,'--dispatch-protocol','2',*[x for ident in ids for x in ('--device-id',ident)]],1200)
+    except subprocess.CalledProcessError as error:
+        diagnostic=re.sub(r'https?://\S+', '<url omitted>', error.stderr or '')
+        diagnostic=re.sub(r'(?i)Bearer\s+\S+', 'Bearer <redacted>', diagnostic)
+        rr.atomic_json(directory/'acceptance-failure.json',{'exit_code':error.returncode,
+            'validator_sha256':validator_sha,'stderr_tail':diagnostic[-4096:]})
+        raise RuntimeError('acceptance failed; inspect '+str(directory/'acceptance-failure.json')) from None
+    if rr.digest(validator)!=validator_sha:raise RuntimeError('acceptance validator changed during execution')
     result=json.loads(acceptance.read_text())
     if result.get('state')!='passed':raise RuntimeError('fleet capability acceptance failed')
     return acceptance
@@ -243,8 +263,11 @@ def launch_command(device,destination,manifest,version):
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--version',required=True);p.add_argument('--package',type=pathlib.Path,required=True);p.add_argument('--config',type=pathlib.Path,required=True);p.add_argument('--report-dir',type=pathlib.Path,required=True);args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--version',required=True);p.add_argument('--package',type=pathlib.Path,required=True);p.add_argument('--config',type=pathlib.Path,required=True);p.add_argument('--report-dir',type=pathlib.Path,required=True)
+    p.add_argument('--acceptance-script',type=pathlib.Path,help='Explicit verified validator update; keep the immutable package unchanged and record both identities')
+    args=p.parse_args()
     package=args.package.resolve();directory=args.report_dir.resolve();directory.mkdir(parents=True,exist_ok=True);config=json.loads(args.config.read_text());manifest=verify_package(package,args.version);bundle,bundle_sha=ensure_bundle(package,manifest)
+    if args.acceptance_script:config['acceptance_script']=str(args.acceptance_script.resolve(strict=True))
     state={'state':'running','phase':'gateway','version':args.version,'manifest_sha256':rr.digest(package/'manifest.json'),'bundle_sha256':bundle_sha,'agents':{}}
     def save(): rr.atomic_json(directory/'fleet.json',state)
     save();client=Client(config['origin'],pathlib.Path(config['password_file'])).login()

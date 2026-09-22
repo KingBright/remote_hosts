@@ -2,11 +2,11 @@
 
 > 唯一事实源：`docs/product/backlog.json`。本页由 `scripts/product-backlog.py --render` 生成。
 
-更新日期：2026-09-11。共 52 项。
+更新日期：2026-09-22。共 56 项。
 
 已验证候选不等于线上修复；部分修复不能关闭整项。关闭必须附本项验收证据。
 
-状态汇总：未修复 10；部分修复 21；候选已验证 13；外部阻塞 1；已验收关闭 7。
+状态汇总：未修复 11；部分修复 24；候选已验证 13；外部阻塞 1；已验收关闭 7。
 
 ## 版本规划
 
@@ -36,6 +36,8 @@
 
 **0.7.1**：修复跨版本接收端暂态持久化错误被误报永久409；补齐发布/验收器动态观察字段边界。
 
+**0.10.19**：原生桌面 OAuth 接入及发布客户端传输诊断；本轮评估见 DESKTOP-REVIEW-2026-09-22.md，现场状态留在 private ops。
+
 ## 问题索引
 
 | ID | 优先级 | 状态 | 目标版本 | 问题 |
@@ -48,7 +50,7 @@
 | RH-006 | P1 | 候选已验证 | 0.3.0 | 上传全程占工作区写锁 |
 | RH-007 | P0 | 部分修复 | 0.4.0 | 双向且跨进程的持久化断点续传 |
 | RH-008 | P0 | 未修复 | 0.3.1 | 原生file_upload偶发file source lookup failed |
-| RH-009 | P1 | 部分修复 | 0.4.1 | 传输重试状态机与错误结果永久done |
+| RH-009 | P1 | 部分修复 | 0.10.20 | 传输重试状态机与错误结果永久done |
 | RH-010 | P1 | 部分修复 | 0.4.1 | 短期文件URL到期后重新授权恢复 |
 | RH-011 | P1 | 部分修复 | 0.4.0 | 独立文件任务取消及清理证明 |
 | RH-012 | P1 | 部分修复 | 0.3.3 | 等待资源的任务占满同类执行名额 |
@@ -56,7 +58,7 @@
 | RH-014 | P1 | 部分修复 | 0.4.1 | 进度口径、停滞速率和重试代际 |
 | RH-015 | P1 | 部分修复 | 0.4.1 | 统一workspace_context和事件恢复游标 |
 | RH-016 | P1 | 部分修复 | 0.3.2 | 短命令与观察操作的多层轮询 |
-| RH-017 | P1 | 未修复 | 0.3.1 | 分层错误码与耗时追踪 |
+| RH-017 | P1 | 部分修复 | 0.10.20 | 分层错误码与耗时追踪 |
 | RH-018 | P2 | 未修复 | 0.4.0 | 完整JSON在文本和structuredContent中重复 |
 | RH-019 | P2 | 已验收关闭 | 0.3.1 | 同文件多范围重复读取和计算哈希 |
 | RH-020 | P1 | 已验收关闭 | 0.3.1 | 超长单行读取无法推进及部分读取可用性 |
@@ -67,14 +69,14 @@
 | RH-025 | P1 | 部分修复 | 0.3.1 | 源码/构建/已安装/实际运行版本未统一 |
 | RH-026 | P1 | 已验收关闭 | 0.3.3 | 验证证据自动生成并绑定源码 |
 | RH-027 | P0 | 已验收关闭 | 0.3.5 | 完成真实发布、运行构建确认和回滚记录 |
-| RH-028 | P1 | 已验收关闭 | 0.3.5 | 验收脚本固定0.2.0及跨版本复用回执 |
+| RH-028 | P1 | 部分修复 | 0.10.x | 验收脚本固定0.2.0及跨版本复用回执 |
 | RH-029 | P1 | 部分修复 | 0.3.2 | 升级执行器与被升级Agent相互依赖 |
 | RH-030 | P0 | 外部阻塞 | 0.3.3 | 工具平台安全拦截的可见性与授权边界 |
-| RH-031 | P1 | 未修复 | 0.3.1 | CI故障注入、跨平台和原生网页验收门禁 |
+| RH-031 | P1 | 部分修复 | 0.10.x | 本机故障注入、跨平台和原生宿主验收 |
 | RH-032 | P2 | 未修复 | 0.5.0 | 快照和重复hash读取成本、内容寻址缓存 |
 | RH-033 | P2 | 部分修复 | 0.7.1 | 64 MiB限制提高与动态容量协商 |
 | RH-034 | P1 | 未修复 | 0.3.1 | 过程反馈与产品负责人使用纪律 |
-| RH-035 | P1 | 部分修复 | 0.3.2 | 工具与协议能力发现、schema变更兼容 |
+| RH-035 | P1 | 部分修复 | 0.10.x | 工具与协议能力发现、schema变更兼容 |
 | RH-036 | P1 | 未修复 | 0.4.0 | 源码脚本与安全策略的真实边界 |
 | RH-037 | P1 | 候选已验证 | 0.6.0 | 多文件改动的部分失败和恢复记录 |
 | RH-038 | P1 | 已验收关闭 | 0.3.5 | 构建资源竞争与长编译无进展反馈 |
@@ -92,6 +94,10 @@
 | RH-047 | P0 | 部分修复 | 0.4.2 | 发布等待器缺少构建任务身份核对，启动确认被误当作交付进展 |
 | RH-051 | P1 | 未修复 | 0.8.0 | 终端进程与持久状态失配会长期阻塞升级排空 |
 | RH-052 | P1 | 未修复 | 0.8.0 | 升级就绪把短时全lane网络故障误判成候选失败 |
+| RH-053 | P0 | 未修复 | 0.10.20 | 设备时钟偏差使诊断回执阻断全部轮询 |
+| RH-054 | P1 | 已验收关闭 | 0.10.19 | 原生桌面 OAuth loopback 回调未开放 |
+| RH-055 | P1 | 未修复 | next-ssh-runtime | 旧 SSH PowerShell 多行命令可能空输出退出而未执行 |
+| RH-056 | P1 | 未修复 | 0.10.x | 高负载下终端完成状态滞后与控制请求延迟 |
 
 ## 逐项验收
 
@@ -209,15 +215,15 @@
 
 ### RH-009 · 传输重试状态机与错误结果永久done
 
-**P1 / 部分修复 / 0.4.1**
+**P1 / 部分修复 / 0.10.20**
 
 现象与范围：可恢复传输错误当前也作为done结果；同一幂等键只返回旧失败，不能刷新授权继续。
 
-当前处理：0.4.1短控制事务提前取得写意向；8路同幂等恢复只形成一个代际，避免读转写SQLITE_BUSY。未来代际回执不再被当作过期成功确认，缺少代际结果不能覆盖新尝试。全回归通过，NAS/MacBook已安装，Studio未安装。
+当前处理：0.10.19 现场再次证明 transfer_resume 能在同一 operation 上续传并校验 SHA。但 release_client.Client.tool 对 paused/awaiting_source 抛出 OperationIncomplete，fleet-upgrade 的 verified_import/export 尚未接住该边界，仍需人工观察并恢复原操作。保留 partial；下一轮打通有界恢复与仅验收入口。 验收器已支持已知瞬时连接故障最多两次原操作恢复，并拒绝把任意错误视作校验通过；该范围不关闭发布协调器的缺口。
 
 验收：临时故障恢复同一任务；确定失败不可盲重放；发布后丢回执只补回执。
 
-证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`docs/releases/0.4.0/verification-q1.json`、`docs/releases/0.4.0/deployment.json`、`docs/releases/0.4.0/workflow-acceptance-q1.json`、`docs/releases/0.4.1/verification.json`、`docs/releases/0.4.1/deployment.json`、`docs/releases/0.4.1/incidents.json`
+证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`docs/releases/0.4.0/verification-q1.json`、`docs/releases/0.4.0/deployment.json`、`docs/releases/0.4.0/workflow-acceptance-q1.json`、`docs/releases/0.4.1/verification.json`、`docs/releases/0.4.1/deployment.json`、`docs/releases/0.4.1/incidents.json`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`
 
 依赖：无
 
@@ -321,15 +327,15 @@
 
 ### RH-017 · 分层错误码与耗时追踪
 
-**P1 / 未修复 / 0.3.1**
+**P1 / 部分修复 / 0.10.20**
 
 现象与范围：tool_failed消息不足以区分宿主拦截、排队、网络、Agent执行、回执失败。
 
-当前处理：统一error_code/stage/retryable/outcome/recovery/trace_id及queue/lock/execute/return计时；未知阶段标unknown。
+当前处理：0.10.19 已有工具执行分层诊断和发布客户端 HTTP/TLS 元数据；Agent poll 仍只报告 HTTP 400，无法直接定位 receipt_delivery 时间校验。需返回固定、脱敏的校验字段原因，并区分入口、认证、协议、时钟、存储和传输控制故障。
 
 验收：所有常见失败都有下一动作；日志关联同一操作且不泄漏命令敏感值；不能把平台拦截记成测试失败。
 
-证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`crates/remote-hosts-code/src/gateway.rs`
+证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`crates/remote-hosts-code/src/gateway.rs`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`
 
 依赖：无
 
@@ -483,19 +489,17 @@
 
 ### RH-028 · 验收脚本固定0.2.0及跨版本复用回执
 
-**P1 / 已验收关闭 / 0.3.5**
+**P1 / 部分修复 / 0.10.x**
 
 现象与范围：脚本写死版本并可复用旧报告中的已验收设备。
 
-当前处理：版本、run_id、选中设备集合和临时OAuth撤销均由回执校验；0.3.5真实验收摘要准确报告1个MacBook，单/双设备及错误范围回归已纳入258项验证。
+当前处理：0.10.19 现场修复回执协议 1/2 兼容、原操作持久证据比较、Windows Python 命令编码、校验器 SHA/不可变包身份绑定，并复用原生 MCP 发布客户端。39 项验收脚本和 32 项客户端回归通过；原生 Codex 四设备通过。扩展标准验收在 MacBook 高负载期间命令超时，完整四机报告仍未完成，保留 partial。
 
 验收：0.3.0接收新版版本参数；旧版报告不得复用为新版通过；仅探测选中设备。
 
-证据或实现位置：`scripts/check-code-gateway.py`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`、`docs/releases/0.3.5/deployment.json`、`docs/releases/0.3.5/verification.json`、`docs/releases/0.3.5/acceptance-macbook.json`
+证据或实现位置：`scripts/check-code-gateway.py`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`、`docs/releases/0.3.5/deployment.json`、`docs/releases/0.3.5/verification.json`、`docs/releases/0.3.5/acceptance-macbook.json`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`
 
 依赖：无
-
-关闭证据：`docs/releases/0.3.5/deployment.json`、`docs/releases/0.3.5/verification.json`、`docs/releases/0.3.5/acceptance-macbook.json`
 
 ### RH-029 · 升级执行器与被升级Agent相互依赖
 
@@ -525,17 +529,17 @@
 
 依赖：无
 
-### RH-031 · CI故障注入、跨平台和原生网页验收门禁
+### RH-031 · 本机故障注入、跨平台和原生宿主验收
 
-**P1 / 未修复 / 0.3.1**
+**P1 / 部分修复 / 0.10.x**
 
 现象与范围：本机合成HTTP不覆盖NAS/公网/原生附件/所有OS；历史测试数不能代替场景。
 
-当前处理：建立测试矩阵：正常、慢流、断网、重启、磁盘/权限/额度/交互取消；每门禁附证据。
+当前处理：Mac Studio 固定源码验证与三平台构建已建立，禁止新增 GitHub Actions 发布门禁。继续补本机故障注入、跨平台运行、真实宿主附件和恢复矩阵；交叉编译不代替目标机执行。 0.10.19 四设备通过原生 Codex 实际读改、执行、文件往返。扩展验收暴露 MacBook 高负载期间 SQLite 查询延迟与终端状态滞后，完整故障矩阵继续开放。
 
 验收：Mac/NAS分别通过；Windows不标支持到通过；真实网页文件往返独立核对。
 
-证据或实现位置：`docs/iteration-0.3.0-2026-09-10.md`、`scripts/check-code-gateway.py`
+证据或实现位置：`docs/iteration-0.3.0-2026-09-10.md`、`scripts/check-code-gateway.py`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`
 
 依赖：无
 
@@ -583,15 +587,15 @@
 
 ### RH-035 · 工具与协议能力发现、schema变更兼容
 
-**P1 / 部分修复 / 0.3.2**
+**P1 / 部分修复 / 0.10.x**
 
 现象与范围：ChatGPT工具目录可能仍缓存旧描述；包版本不能表达所有功能/限制。
 
-当前处理：Gateway当前报告21项工具、工具SHA和可选入参，两台0.7.1 Agent独立上报runtime features与transfer_limits。当前宿主仍暴露file_*的64MiB旧参数上限，因此server catalog / Agent capability / host-visible schema三者已能明确区分，但宿主刷新仍不能由服务器强制。
+当前处理：0.10.19 Gateway 和原生 Codex 客户端均实测列出 24 项工具；版本、wire protocol、tool schema、Skill revision 分层报告。旧会话仍需刷新，其他宿主当前实际暴露程度不能从服务端自报推断。原生桌面 OAuth 回调接入由 RH-054 单独记录。
 
 验收：新Gateway旧Agent与新Agent旧Gateway行为明确；无静默忽略lane导致错调度。
 
-证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`crates/remote-hosts-code/src/gateway.rs`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`、`docs/releases/0.7.1/native-acceptance.json`、`docs/releases/0.7.1/RELEASE.md`
+证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`crates/remote-hosts-code/src/gateway.rs`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`、`docs/releases/0.7.1/native-acceptance.json`、`docs/releases/0.7.1/RELEASE.md`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`
 
 依赖：无
 
@@ -834,5 +838,63 @@
 验收：候选进程崩溃仍快速失败并回滚；Gateway/网络短暂不可达不会过早判定候选坏；持续不可达最终仍有界失败；回执记录每lane最近成功、失败类别与时间。
 
 证据或实现位置：`docs/releases/0.7.1/RELEASE.md`、`docs/releases/0.7.1/deployment-final.json`
+
+依赖：无
+
+### RH-053 · 设备时钟偏差使诊断回执阻断全部轮询
+
+**P0 / 未修复 / 0.10.20**
+
+现象与范围：receipt_delivery.reported_at 比 Gateway 快约 93 秒时，Status.valid 的 now()+90 校验让全部 poll 返回 400。设备仍可进行 HTTPS/SSH 访问，用户却看到代码 Agent 离线。
+
+当前处理：现场恢复系统时间服务后设备不重启即可恢复；此运维修复不等于协议缺陷关闭。下一版将不可信诊断时间与工作准入分离，保留计数、结构和授权校验，并显式报告偏差。
+
+验收：模拟时钟前后偏移 2 分钟、1 小时仍可完成 poll 和真实代码任务；异常诊断时间明确标注且不变成设备在线/授权依据。；负数、溢出和错误计数仍被有界处理；认证、PKCE、令牌到期等安全时间检查保持独立。
+
+证据或实现位置：`docs/product/DESKTOP-REVIEW-2026-09-22.md`
+
+依赖：无
+
+### RH-054 · 原生桌面 OAuth loopback 回调未开放
+
+**P1 / 已验收关闭 / 0.10.19**
+
+现象与范围：仅有 ChatGPT/Gemini 远程连接配置不能使独立 Codex 桌面客户端获得 Code 工具；Gateway 先前拒绝原生 loopback HTTP 回调。
+
+当前处理：0.10.19 保留精确 URI、S256 PKCE、resource、owner consent 与刷新/撤销校验，支持严格 IP loopback 回调。独立 Codex 完成 OAuth 登录并列出 24 工具；4 台授权设备通过原生客户端范围读取、按 SHA 精确修改、执行、上传下载和清理验收。私有现场回执见 desktop-code-20260922。
+
+验收：原生 Codex 完成登录、列出 24 工具，并在全部授权设备上读、按 SHA 精确编辑、执行和传输。；非 loopback HTTP、主机名别名、userinfo、query/fragment、未注册回调仍被拒绝；刷新及撤销测试通过。
+
+证据或实现位置：`docs/product/DESKTOP-REVIEW-2026-09-22.md`
+
+依赖：无
+
+关闭证据：`docs/product/DESKTOP-REVIEW-2026-09-22.md`、`crates/remote-hosts-code/tests/oauth_clients.rs`
+
+### RH-055 · 旧 SSH PowerShell 多行命令可能空输出退出而未执行
+
+**P1 / 未修复 / next-ssh-runtime**
+
+现象与范围：一次多行恢复命令报告 exit 0 且无输出，但预期回执文件未创建、目标 PID 与维护状态均未改变；退出码不能作为执行证明。
+
+当前处理：本轮改用已校验上传的 ps1 和单行 -File 调用，现场回执可核对。尚未修复旧 SSH 命令编码/调用路径，不能把 workaround 标为关闭。
+
+验收：同一组多行/引号/Unicode/非零退出脚本在直接调用与上传 -File 路径产生一致输出和副作用回执。；传输层必须保留真实 PowerShell 退出状态与完成帧；空输出不能被自动认定为业务成功。
+
+证据或实现位置：`docs/product/DESKTOP-REVIEW-2026-09-22.md`
+
+依赖：无
+
+### RH-056 · 高负载下终端完成状态滞后与控制请求延迟
+
+**P1 / 未修复 / 0.10.x**
+
+现象与范围：MacBook load average 超过 160 时，Agent SQLite 查询出现约 38 秒延迟。2 MiB 探针创建命令超时，本地终端已有 timed_out/exit 1，Gateway 观察仍暂时显示 running，扩展验收未完成。
+
+当前处理：保留原操作、现场负载和失败证据，未重放命令或中断其他任务。已验证清理本轮文件；需将资源拥塞、Agent 处理延迟和 Gateway 终端快照新鲜度分别定位，不把延迟直接判为命令成功。
+
+验收：在可控 CPU/IO/SQLite 竞争下量化控制调用 P95、终端完成回执延迟及回执新鲜度。；本地完成或超时应在有界时间内可观察；状态滞后须明确标注，不得自动重放命令。
+
+证据或实现位置：`docs/product/DESKTOP-REVIEW-2026-09-22.md`
 
 依赖：无
