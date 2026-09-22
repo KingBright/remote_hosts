@@ -18,6 +18,18 @@ The server supports:
   code exchange, refresh, and confidential-client revocation. Missing DCR auth method defaults to
   `client_secret_basic` per RFC 7591; existing ChatGPT/public clients keep their `none` registration.
 - S256 PKCE and an exact resource audience remain mandatory, including for confidential clients.
+  From 0.10.21, Spark's `client_secret_post` registration may omit the `resource` parameter
+  during authorization, code exchange, and refresh only when every registered callback is in
+  the bounded Google Account Linking family below. The server binds it to its one configured
+  `/mcp` resource. Explicit empty or different resources are rejected; public clients, ordinary
+  callbacks, and mixed callback registrations still require the parameter. Client-provided
+  names never select this compatibility behavior. Stored grants, tokens, PKCE, client secrets,
+  owner consent, and audience enforcement are unchanged.
+  The same bounded Spark registration may include Google's exact consent markers
+  `ACCESS_VIEW_MANAGE_MCP_CONTENT`, `SHARE_THROUGH_MCP_CONVERSATION_INFO`, and
+  `TRIGGER_TOOLS_AND_FUNCTION`. These markers are removed before creating the grant;
+  they never grant Gateway privileges. At least one Gateway scope must remain, and
+  unknown scopes are rejected. Tokens return only the actual granted Gateway scopes.
 - New client secrets are returned once and stored only as hashes. The CLI writes a new mode-0600
   file atomically and refuses to overwrite an existing file. No secret is printed to stdout.
 - Failed client authentication, wrong resource, wrong callback, or wrong PKCE cannot consume a

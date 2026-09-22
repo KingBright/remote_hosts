@@ -212,7 +212,7 @@ struct Authorize {
     code_challenge: String,
     code_challenge_method: String,
     state: String,
-    resource: String,
+    resource: Option<String>,
     scope: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
@@ -233,7 +233,8 @@ async fn authorize(State(a): State<Auth>, Query(q): Query<Authorize>) -> HttpRes
         .await
         .map_err(internal)?
         .ok_or_else(invalid)?;
-    let scope = q.scope.unwrap_or_else(|| SCOPES.into());
+    let resource = a.client_resource(&c, q.resource.as_deref())?;
+    let scope = a.client_scope(&c, q.scope.as_deref())?;
     if !c.redirect_uris.contains(&q.redirect_uri)
         || !redirect_uri_allowed(&a.config, &q.redirect_uri)
         || q.response_type != "code"
@@ -243,12 +244,7 @@ async fn authorize(State(a): State<Auth>, Query(q): Query<Authorize>) -> HttpRes
             .code_challenge
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
-        || q.resource != format!("{}/mcp", a.config.public_url)
         || q.state.len() > 4096
-        || scope.is_empty()
-        || !scope
-            .split_whitespace()
-            .all(|s| SCOPES.split_whitespace().any(|x| x == s))
     {
         return Err(invalid());
     }
@@ -258,7 +254,7 @@ async fn authorize(State(a): State<Auth>, Query(q): Query<Authorize>) -> HttpRes
             client_id: q.client_id,
             redirect_uri: q.redirect_uri,
             code_challenge: q.code_challenge,
-            resource: q.resource,
+            resource,
             scope: scope.clone(),
         },
         state: q.state,
@@ -383,7 +379,7 @@ struct TokenRequest {
     code: Option<String>,
     code_verifier: Option<String>,
     redirect_uri: Option<String>,
-    resource: String,
+    resource: Option<String>,
     refresh_token: Option<String>,
 }
 async fn token(State(a): State<Auth>, headers: HeaderMap, Form(f): Form<TokenRequest>) -> Response {
@@ -410,9 +406,7 @@ async fn token_inner(a: Auth, headers: &HeaderMap, f: TokenRequest) -> HttpResul
         .authenticate_client(headers, f.client_id.as_deref(), f.client_secret.as_deref())
         .await?;
     let client_id = &client.client_id;
-    if f.resource != format!("{}/mcp", a.config.public_url) {
-        return Err(invalid());
-    }
+    let resource = a.client_resource(&client, f.resource.as_deref())?;
     let access = match f.grant_type.as_str() {
         "authorization_code" => {
             let code = f.code.ok_or_else(invalid)?;
@@ -432,7 +426,7 @@ async fn token_inner(a: Auth, headers: &HeaderMap, f: TokenRequest) -> HttpResul
                 .ok_or_else(invalid)?;
             if &g.client_id != client_id
                 || Some(g.redirect_uri) != f.redirect_uri
-                || g.resource != f.resource
+                || g.resource != resource
                 || !secret_eq(
                     &g.code_challenge,
                     &URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
@@ -453,7 +447,7 @@ async fn token_inner(a: Auth, headers: &HeaderMap, f: TokenRequest) -> HttpResul
                     scopes: g.scope.split_whitespace().map(str::to_owned).collect(),
                 },
                 client_id: client_id.clone(),
-                resource: f.resource,
+                resource,
                 family: random(),
             }
         }
@@ -466,7 +460,7 @@ async fn token_inner(a: Auth, headers: &HeaderMap, f: TokenRequest) -> HttpResul
                 a.store.get(&refresh_kind, &key).await.map_err(internal)?;
             if let Some(access) = &access
                 && (&access.client_id != client_id
-                    || access.resource != f.resource
+                    || access.resource != resource
                     || a.store
                         .get::<bool>("revoked", &access.family)
                         .await
@@ -526,7 +520,7 @@ async fn token_inner(a: Auth, headers: &HeaderMap, f: TokenRequest) -> HttpResul
                 return Err(invalid());
             };
             let access: Access = serde_json::from_str(&encoded).map_err(internal)?;
-            if &access.client_id != client_id || access.resource != f.resource {
+            if &access.client_id != client_id || access.resource != resource {
                 tx.rollback().await.map_err(internal)?;
                 return Err(invalid());
             }

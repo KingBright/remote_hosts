@@ -20,6 +20,17 @@ pub(super) struct Client {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) client_secret_hash: Option<String>,
 }
+impl Client {
+    fn is_spark_account_linking(&self) -> bool {
+        self.token_endpoint_auth_method == "client_secret_post"
+            && self.client_secret_hash.is_some()
+            && !self.redirect_uris.is_empty()
+            && self
+                .redirect_uris
+                .iter()
+                .all(|uri| crate::google_oauth_callback(uri))
+    }
+}
 #[derive(Deserialize)]
 struct Registration {
     redirect_uris: Vec<String>,
@@ -43,6 +54,53 @@ fn invalid_client() -> (StatusCode, Json<Value>) {
     )
 }
 impl Auth {
+    /// Spark Account Linking omits RFC 8707's resource indicator. Its
+    /// confidential client can target only this Gateway's single MCP resource.
+    /// An explicit wrong/empty resource is never repaired, and ordinary/public
+    /// clients still have to supply it. All issued grants retain the audience.
+    pub(super) fn client_resource(
+        &self,
+        client: &Client,
+        requested: Option<&str>,
+    ) -> HttpResult<String> {
+        let expected = format!("{}/mcp", self.config.public_url);
+        match requested {
+            Some(value) if value == expected => Ok(expected),
+            None if client.is_spark_account_linking() => Ok(expected),
+            _ => Err(invalid()),
+        }
+    }
+
+    /// Google adds these three Account Linking consent markers to its scope
+    /// request. They grant no Gateway permission and must never enter a token's
+    /// principal. At least one explicitly requested Gateway scope is required.
+    pub(super) fn client_scope(
+        &self,
+        client: &Client,
+        requested: Option<&str>,
+    ) -> HttpResult<String> {
+        let spark = client.is_spark_account_linking();
+        let mut granted = Vec::new();
+        for scope in requested.unwrap_or(super::SCOPES).split_whitespace() {
+            if super::SCOPES.split_whitespace().any(|known| known == scope) {
+                granted.push(scope);
+            } else if !(spark
+                && matches!(
+                    scope,
+                    "ACCESS_VIEW_MANAGE_MCP_CONTENT"
+                        | "SHARE_THROUGH_MCP_CONVERSATION_INFO"
+                        | "TRIGGER_TOOLS_AND_FUNCTION"
+                ))
+            {
+                return Err(invalid());
+            }
+        }
+        if granted.is_empty() {
+            return Err(invalid());
+        }
+        Ok(granted.join(" "))
+    }
+
     /// Register one client. Returned secrets are disclosed once, never stored in plaintext.
     /// This does not grant access; owner login and S256 PKCE remain mandatory.
     pub async fn register_client(&self, value: &Value) -> HttpResult<Value> {

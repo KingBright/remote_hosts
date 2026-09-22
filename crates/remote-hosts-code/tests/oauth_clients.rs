@@ -19,6 +19,33 @@ const GPT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
 // Synthetic, deliberately not a real user's Google callback.
 const SPARK: &str =
     "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-fixture-gemini";
+
+fn authorization_path(client: &Value, challenge: &str, resource: Option<&str>) -> String {
+    authorization_path_scoped(client, challenge, resource, "code:read")
+}
+
+fn authorization_path_scoped(
+    client: &Value,
+    challenge: &str,
+    resource: Option<&str>,
+    scope: &str,
+) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.extend_pairs([
+        ("client_id", client["client_id"].as_str().unwrap()),
+        ("redirect_uri", client["redirect_uris"][0].as_str().unwrap()),
+        ("response_type", "code"),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("state", "fixture-state"),
+        ("scope", scope),
+    ]);
+    if let Some(resource) = resource {
+        query.append_pair("resource", resource);
+    }
+    format!("/oauth/authorize?{}", query.finish())
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     g: Gateway,
@@ -127,25 +154,24 @@ impl Fixture {
         client
     }
     async fn code(&self, client: &Value) -> Value {
+        self.code_with_resource(client, Some(RESOURCE)).await
+    }
+    async fn code_with_resource(&self, client: &Value, resource: Option<&str>) -> Value {
+        self.code_with_options(client, resource, "code:read").await
+    }
+    async fn code_with_options(
+        &self,
+        client: &Value,
+        resource: Option<&str>,
+        scope: &str,
+    ) -> Value {
         let verifier = random();
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let callback = client["redirect_uris"][0].as_str().unwrap();
-        let query = url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs([
-                ("client_id", client["client_id"].as_str().unwrap()),
-                ("redirect_uri", callback),
-                ("response_type", "code"),
-                ("code_challenge", challenge.as_str()),
-                ("code_challenge_method", "S256"),
-                ("resource", RESOURCE),
-                ("state", "fixture-state"),
-                ("scope", "code:read"),
-            ])
-            .finish();
         let (status, headers, _) = self
             .request(
                 "GET",
-                &format!("/oauth/authorize?{query}"),
+                &authorization_path_scoped(client, &challenge, resource, scope),
                 json!({}),
                 false,
                 &[],
@@ -819,6 +845,163 @@ async fn unknown_or_another_clients_revoke_does_not_revoke_the_owner() {
         StatusCode::OK
     );
 }
+#[tokio::test]
+async fn spark_missing_resource_still_binds_authorize_code_and_refresh_to_gateway() {
+    let f = Fixture::new().await;
+    let client = f.register("client_secret_post", SPARK).await;
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(random().as_bytes()));
+    for scope in [
+        "ACCESS_VIEW_MANAGE_MCP_CONTENT SHARE_THROUGH_MCP_CONVERSATION_INFO TRIGGER_TOOLS_AND_FUNCTION",
+        "code:read UNKNOWN_GOOGLE_PERMISSION",
+        "code:read ACCESS_VIEW_MANAGE_MCP_CONTENT_EXTRA",
+        "",
+    ] {
+        assert_eq!(
+            f.request(
+                "GET",
+                &authorization_path_scoped(&client, &challenge, None, scope),
+                json!({}),
+                false,
+                &[]
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    for resource in ["", "https://other.example/mcp"] {
+        assert_eq!(
+            f.request(
+                "GET",
+                &authorization_path(&client, &challenge, Some(resource)),
+                json!({}),
+                false,
+                &[]
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // Exact scope additions from the real Spark authorization request.
+    let scope = "ACCESS_VIEW_MANAGE_MCP_CONTENT SHARE_THROUGH_MCP_CONVERSATION_INFO TRIGGER_TOOLS_AND_FUNCTION code:read code:write terminal:exec";
+    let mut code = f.code_with_options(&client, None, scope).await;
+    code.as_object_mut().unwrap().remove("resource");
+    for (field, value) in [
+        ("resource", "".to_owned()),
+        ("resource", "https://other.example/mcp".to_owned()),
+        ("code_verifier", random()),
+        ("redirect_uri", GPT.to_owned()),
+    ] {
+        let mut bad = code.clone();
+        bad[field] = value.into();
+        assert_eq!(
+            f.authenticated(&client, "/oauth/token", bad).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let mut wrong_secret = client.clone();
+    wrong_secret["client_secret"] = random().into();
+    assert_eq!(
+        f.authenticated(&wrong_secret, "/oauth/token", code.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, _, token) = f.authenticated(&client, "/oauth/token", code).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(token["resource"], RESOURCE);
+    assert_eq!(token["scope"], "code:read code:write terminal:exec");
+    let refresh = json!({"grant_type":"refresh_token","refresh_token":token["refresh_token"]});
+    for resource in ["", "https://other.example/mcp"] {
+        let mut bad = refresh.clone();
+        bad["resource"] = resource.into();
+        assert_eq!(
+            f.authenticated(&client, "/oauth/token", bad).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let (status, _, renewed) = f.authenticated(&client, "/oauth/token", refresh).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renewed["resource"], RESOURCE);
+    assert_eq!(renewed["scope"], "code:read code:write terminal:exec");
+    assert_eq!(
+        f.mcp(&renewed, "tools/list", json!({})).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn missing_resource_is_not_enabled_by_client_name_or_mixed_callbacks() {
+    let f = Fixture::new().await;
+    let mut clients = Vec::new();
+    for (method, callback) in [
+        ("none", GPT),
+        ("client_secret_post", GPT),
+        ("none", SPARK),
+        ("client_secret_basic", SPARK),
+    ] {
+        clients.push(f.register(method, callback).await);
+    }
+    let (status, _, mixed) = f.request("POST", "/oauth/register", json!({
+        "client_name":"Google", "redirect_uris":[SPARK,GPT], "token_endpoint_auth_method":"client_secret_post"
+    }), false, &[]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    clients.push(mixed);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(random().as_bytes()));
+    for client in clients {
+        assert_eq!(
+            f.request(
+                "GET",
+                &authorization_path_scoped(
+                    &client,
+                    &challenge,
+                    Some(RESOURCE),
+                    "code:read TRIGGER_TOOLS_AND_FUNCTION"
+                ),
+                json!({}),
+                false,
+                &[]
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            f.request(
+                "GET",
+                &authorization_path(&client, &challenge, None),
+                json!({}),
+                false,
+                &[]
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let code = f.code(&client).await;
+        let mut missing = code.clone();
+        missing.as_object_mut().unwrap().remove("resource");
+        assert_eq!(
+            f.authenticated(&client, "/oauth/token", missing).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, _, token) = f.authenticated(&client, "/oauth/token", code).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            f.authenticated(
+                &client,
+                "/oauth/token",
+                json!({"grant_type":"refresh_token","refresh_token":token["refresh_token"]})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(f.refresh(&client, &token).await.0, StatusCode::OK);
+    }
+}
+
 #[tokio::test]
 async fn spark_six_callback_registration_and_exact_code_exchange() {
     let f = Fixture::new().await;
