@@ -482,3 +482,200 @@ async fn changed_observation_prevents_initializing_a_stale_legacy_clock() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn bounded_ticks_preserve_progress_across_restart() {
+    let (_dir, store) = fixture().await;
+    for _ in 0..21 {
+        job(
+            &store,
+            "code_read",
+            40,
+            &json!({"output":"private history body"}),
+        )
+        .await;
+    }
+    let at = crate::now();
+    let policy = Policy::default();
+    let mut scan = scan::Scan::default();
+    let mut first = scan::Tick::default();
+    scan::step(&store, &policy, at, &mut scan, &mut first)
+        .await
+        .unwrap();
+    assert!(first.expired_bodies > 0 && first.expired_bodies <= 8);
+    assert!(first.writes <= 8 && first.scanned <= 256);
+    assert!(!scan.complete);
+    let encoded = serde_json::to_value(&scan).unwrap();
+    assert!(!encoded.to_string().contains("private history body"));
+    assert!(encoded.to_string().len() < 4096);
+    let mut scan = scan::Scan::restore(&encoded, at);
+    let mut retired = first.expired_bodies;
+    for _ in 0..30 {
+        let mut tick = scan::Tick::default();
+        scan::step(&store, &policy, at, &mut scan, &mut tick)
+            .await
+            .unwrap();
+        assert!(tick.writes <= 8 && tick.scanned <= 256);
+        retired += tick.expired_bodies;
+        if scan.complete {
+            break;
+        }
+    }
+    assert!(scan.complete);
+    assert_eq!(retired, 21);
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM history_result_digests")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 21);
+}
+
+#[tokio::test]
+async fn read_budget_carries_partial_inventory_instead_of_restarting_from_head() {
+    let (_dir, store) = fixture().await;
+    for _ in 0..300 {
+        job(&store, "code_read", 0, &json!({"output":"fresh"})).await;
+    }
+    let at = crate::now();
+    let policy = Policy::default();
+    let mut scan = scan::Scan::default();
+    let mut seen = 0;
+    for _ in 0..20 {
+        let mut tick = scan::Tick::default();
+        scan::step(&store, &policy, at, &mut scan, &mut tick)
+            .await
+            .unwrap();
+        assert!(tick.scanned <= 256);
+        assert_eq!(tick.writes, 0);
+        seen += tick.scanned;
+        if scan.complete {
+            break;
+        }
+        assert!(!scan.after.is_empty());
+        assert!(tick.budget_yield);
+        scan = scan::Scan::restore(&serde_json::to_value(&scan).unwrap(), at);
+    }
+    assert!(scan.complete);
+    assert_eq!(seen, 300);
+    assert_eq!(scan.retained, 300);
+}
+
+#[tokio::test]
+async fn failed_write_keeps_the_last_successful_cursor_and_original_uncommitted_body() {
+    let (_dir, store) = fixture().await;
+    let mut rows = Vec::new();
+    for _ in 0..4 {
+        rows.push(
+            job(
+                &store,
+                "code_read",
+                40,
+                &json!({"output":"keep until committed"}),
+            )
+            .await,
+        );
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    sqlx::query("CREATE TABLE fixture_reject(id TEXT PRIMARY KEY)")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO fixture_reject VALUES(?)")
+        .bind(&rows[1].0)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fixture_history_failure BEFORE UPDATE ON jobs WHEN EXISTS(SELECT 1 FROM fixture_reject WHERE id=OLD.id) BEGIN SELECT RAISE(ABORT,'fixture'); END").execute(&store.pool).await.unwrap();
+    let policy = Policy::default();
+    let at = crate::now();
+    let mut scan = scan::Scan::default();
+    let mut retired = 0;
+    for _ in 0..5 {
+        let mut tick = scan::Tick::default();
+        let result = scan::step(&store, &policy, at, &mut scan, &mut tick).await;
+        retired += tick.expired_bodies;
+        if result.is_err() {
+            break;
+        }
+    }
+    assert_eq!(retired, 1);
+    assert_eq!(scan.after, rows[0].0);
+    assert_eq!(
+        result(&store, &rows[1].0).await["output"],
+        "keep until committed"
+    );
+    sqlx::query("DROP TRIGGER fixture_history_failure")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        let mut tick = scan::Tick::default();
+        scan::step(&store, &policy, at, &mut scan, &mut tick)
+            .await
+            .unwrap();
+        retired += tick.expired_bodies;
+        if scan.complete {
+            break;
+        }
+    }
+    assert!(scan.complete);
+    assert_eq!(retired, 4);
+}
+
+#[tokio::test]
+async fn contended_writer_preserves_cursor_and_recovers_without_replaying_a_job() {
+    let (dir, store) = fixture().await;
+    let row = job(&store, "code_read", 40, &json!({"output":"original"})).await;
+    let low = crate::history_retention::maintenance_store(dir.path())
+        .await
+        .unwrap();
+    let tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let at = crate::now();
+    let mut scan = scan::Scan::default();
+    let mut tick = scan::Tick::default();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        scan::step(&low, &Policy::default(), at, &mut scan, &mut tick),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        error_category(&error),
+        "storage_busy" | "writer_budget" | "connection_budget"
+    ));
+    assert!(scan.after.is_empty());
+    assert_eq!(tick.expired_bodies, 0);
+    tx.rollback().await.unwrap();
+    let mut tick = scan::Tick::default();
+    scan::step(&low, &Policy::default(), at, &mut scan, &mut tick)
+        .await
+        .unwrap();
+    assert_eq!(tick.expired_bodies, 1);
+    assert_eq!(result(&store, &row.0).await["error"], "history_expired");
+}
+
+#[test]
+fn restored_cursor_is_bounded_and_failed_rounds_back_off_without_hiding_progress() {
+    for value in [
+        json!({"at":1,"after":"not-a-uuid"}),
+        json!({"at":i64::MAX}),
+        json!({"at":1,"oldest":[{"id":"../x","at":1,"bytes":0}]}),
+        json!("bad"),
+    ] {
+        assert_eq!(scan::Scan::restore(&value, crate::now()).at, 0);
+    }
+    assert_eq!(next_delay(&json!({"has_more":true})), 5);
+    assert_eq!(
+        next_delay(&json!({"has_more":true,"deferred":true,"expired_bodies":3})),
+        60
+    );
+    assert_eq!(
+        next_delay(&json!({"has_more":false,"pressure_remaining":false})),
+        300
+    );
+    assert_eq!(
+        error_category(&anyhow::anyhow!("secret body must not be logged")),
+        "maintenance_error"
+    );
+}

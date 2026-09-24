@@ -152,88 +152,31 @@ async fn retire(store: &Store, row: &Row, brief: &Value) -> Result<bool> {
     Ok(true)
 }
 
+#[path = "history_gateway_scan.rs"]
+mod scan;
+
+// Test adapter drains exactly one cycle through the same production stepper.
+#[cfg(test)]
 pub(crate) async fn sweep(store: &Store, policy: &Policy, at: i64) -> Result<Value> {
-    let mut after = String::new();
-    let mut kept = 0usize;
-    let mut bytes = 0u64;
-    let mut expired = 0u64;
-    let mut protected = 0u64;
-    let mut item_errors = 0u64;
-    let mut legacy_clocks_initialized = 0u64;
-    let mut oldest = Vec::<(Row, Value)>::new();
-    loop {
-        let rows: Vec<Row> = sqlx::query_as(SCAN)
-            .bind(&after)
-            .fetch_all(&store.pool)
-            .await?;
-        if rows.is_empty() {
-            break;
-        }
-        for mut row in rows {
-            after = row.0.clone();
-            let (brief, failed, finished_at) = match summary(&row, at) {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    protected += 1;
-                    continue;
-                }
-                Err(_) => {
-                    protected += 1;
-                    item_errors += 1;
-                    continue;
-                }
-            };
-            row.4 = if finished_at == 0 {
-                let Some((confirmed, initialized)) = legacy_clock(store, &row, at).await? else {
-                    protected += 1;
-                    continue;
-                };
-                legacy_clocks_initialized += u64::from(initialized);
-                confirmed
-            } else {
-                finished_at
-            };
-            let age = at.saturating_sub(row.4);
-            let ttl = if failed {
-                policy.failed_seconds
-            } else {
-                policy.successful_seconds
-            };
-            if age >= ttl && retire(store, &row, &brief).await? {
-                expired += 1;
-                continue;
-            }
-            kept += 1;
-            bytes = bytes.saturating_add((row.2.len() + row.3.len()) as u64);
-            if age >= policy.minimum_seconds {
-                oldest.push((row, brief));
-                oldest.sort_unstable_by(|a, b| (a.0.4, &a.0.0).cmp(&(b.0.4, &b.0.0)));
-                oldest.truncate(64);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    for (row, brief) in oldest {
-        if kept <= policy.max_items && bytes <= policy.max_bytes {
-            break;
-        }
-        if retire(store, &row, &brief).await? {
-            expired += 1;
-            kept = kept.saturating_sub(1);
-            bytes = bytes.saturating_sub((row.2.len() + row.3.len()) as u64);
+    let mut scan = scan::Scan::default();
+    let mut total = scan::Tick::default();
+    for _ in 0..10000 {
+        let mut tick = scan::Tick::default();
+        scan::step(store, policy, at, &mut scan, &mut tick).await?;
+        total.scanned += tick.scanned;
+        total.writes += tick.writes;
+        total.expired_bodies += tick.expired_bodies;
+        total.legacy_clocks_initialized += tick.legacy_clocks_initialized;
+        if scan.complete {
+            let mut report = scan.report(&total, policy);
+            report["expired_cache_rows"] = json!(store.prune_batch().await?);
+            return Ok(report);
         }
     }
-    // Existing finite-lived auth/cache entries also get autonomous cleanup,
-    // rather than depending on a later file-transfer request to trigger pruning.
-    let expired_cache_rows = store.prune_batch().await?;
-    Ok(
-        json!({"expired_bodies":expired,"retained_bodies":kept,"retained_body_bytes":bytes,
-        "protected_bodies":protected,"expired_cache_rows":expired_cache_rows,"item_errors":item_errors,
-        "legacy_clocks_initialized":legacy_clocks_initialized,
-        "pressure_remaining":kept>policy.max_items || bytes>policy.max_bytes,
-        "idempotency_records_preserved":true}),
-    )
+    anyhow::bail!("fixture_scan_budget_exhausted")
 }
+
+#[cfg(test)]
 pub(crate) async fn maintenance_tick(
     gateway: &Gateway,
     store: &Store,
@@ -246,28 +189,151 @@ pub(crate) async fn maintenance_tick(
     Ok(report)
 }
 
+/// Sanitized classifications only. Database bodies, SQL parameters and tokens
+/// must not leak into warnings merely because a maintenance pass was deferred.
+fn error_category(error: &anyhow::Error) -> &'static str {
+    if let Some(error) = error.downcast_ref::<sqlx::Error>() {
+        return match error {
+            sqlx::Error::PoolTimedOut => "connection_budget",
+            sqlx::Error::Database(db)
+                if db
+                    .code()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .is_some_and(|v| matches!(v & 255, 5 | 6)) =>
+            {
+                "storage_busy"
+            }
+            sqlx::Error::Database(_) => "storage_error",
+            _ => "storage_unavailable",
+        };
+    }
+    if error.to_string() == "maintenance_writer_wait_budget" {
+        "writer_budget"
+    } else {
+        "maintenance_error"
+    }
+}
+
+async fn bounded_tick(
+    gateway: &Gateway,
+    store: &Store,
+    policy: &Policy,
+    at: i64,
+    scan: &mut scan::Scan,
+) -> Value {
+    let mut tick = scan::Tick::default();
+    let result = scan::step(store, policy, at, scan, &mut tick).await;
+    let mut report = scan.report(&tick, policy);
+    if let Err(error) = result {
+        report["deferred"] = json!(true);
+        report["error_category"] = json!(error_category(&error));
+    }
+    // Independent stages: a busy body scan must not permanently prevent the
+    // transfer cache and ordinary expiry queues from making their own progress.
+    report["transfer_cache"] = match crate::history_artifacts::sweep(gateway, store, at).await {
+        Ok(value) => serde_json::to_value(value).expect("bounded report serializes"),
+        Err(error) => json!({"deferred":true,"error_category":error_category(&error)}),
+    };
+    match store.prune_batch().await {
+        Ok(count) => report["expired_cache_rows"] = json!(count),
+        Err(error) => report["cache_prune_error"] = json!(error_category(&error)),
+    }
+    report
+}
+
+fn next_delay(report: &Value) -> u64 {
+    if report["deferred"] == true
+        || report["transfer_cache"]["deferred"] == true
+        || !report["cache_prune_error"].is_null()
+    {
+        60
+    } else if report["has_more"] == true
+        || report["transfer_cache"]["has_more"] == true
+        || (report["pressure_remaining"] == true
+            && report["expired_bodies"].as_u64().unwrap_or(0) > 0)
+    {
+        5
+    } else {
+        300
+    }
+}
+
 pub(crate) async fn run(gateway: &Gateway) -> Result<()> {
     tokio::time::sleep(Duration::from_secs(30)).await;
     let policy = Policy::default();
+    let mut scan = scan::Scan::default();
+    let mut restored = false;
+    // Keep the private maintenance connection across ticks; repeated pool
+    // initialization must not compete with all five live polling lanes.
+    let mut connection = None;
     loop {
-        let work=async {
-            let store=crate::history_retention::maintenance_store(&gateway.config.state_dir).await?;
-            let report=maintenance_tick(gateway,&store,&policy,crate::now()).await?;
-            store.put("runtime","automatic_history_cleanup",&json!({"protocol":1,"automatic":true,
-                "observed_at":crate::now(),"policy":policy,"last_run":report,
-                "scope":"gateway result bodies; immutable idempotency and recovery anchors retained"}),i64::MAX).await?;
-            let _=sqlx::query("PRAGMA wal_checkpoint(PASSIVE)").execute(&store.pool).await;
-            store.pool.close().await;
-            Ok::<_,anyhow::Error>(report["transfer_cache"]["has_more"]==true || (report["pressure_remaining"]==true && report["expired_bodies"].as_u64().unwrap_or(0)>0))
-        }.await;
-        let delay = match work {
-            Ok(true) => 5,
-            Ok(false) => 300,
-            Err(_) => {
-                tracing::warn!("gateway automatic retention deferred; original evidence retained");
-                60
+        if connection.is_none() {
+            match crate::history_retention::maintenance_store(&gateway.config.state_dir).await {
+                Ok(store) => connection = Some(store),
+                Err(error) => {
+                    tracing::warn!(
+                        category = error_category(&error),
+                        stage = "connect",
+                        "gateway automatic retention deferred"
+                    );
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    continue;
+                }
             }
-        };
+        }
+        let store = connection
+            .as_ref()
+            .expect("maintenance connection initialized");
+        if !restored {
+            match store
+                .get::<Value>("runtime", "automatic_history_cleanup")
+                .await
+            {
+                Ok(saved) => {
+                    if let Some(saved) = saved {
+                        scan = scan::Scan::restore(&saved["scan_checkpoint"], crate::now());
+                    }
+                    restored = true;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        category = error_category(&error),
+                        stage = "restore",
+                        "gateway automatic retention deferred"
+                    );
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    continue;
+                }
+            }
+        }
+        let started = std::time::Instant::now();
+        let report = bounded_tick(gateway, store, &policy, crate::now(), &mut scan).await;
+        let mut delay = next_delay(&report);
+        let status = json!({"protocol":2,"automatic":true,"observed_at":crate::now(),
+            "elapsed_ms":started.elapsed().as_millis(),"policy":policy,"last_run":report,
+            "scan_checkpoint":scan,"scope":"gateway result bodies; immutable idempotency and recovery anchors retained",
+            "budgets":{"body_rows_per_tick":scan::READ_BUDGET,"body_writes_per_tick":scan::WRITE_BUDGET,
+                "cooperative_wall_ms":1000,"commits_cancelled":false}});
+        // Publish even a partial/failed round. Failed publication keeps the
+        // in-memory cursor. A crash resumes the last durable cursor safely.
+        if let Err(error) = store
+            .put("runtime", "automatic_history_cleanup", &status, i64::MAX)
+            .await
+        {
+            tracing::warn!(
+                category = error_category(&error),
+                stage = "publish",
+                scanned = report["scanned"].as_u64().unwrap_or(0),
+                retired = report["expired_bodies"].as_u64().unwrap_or(0),
+                "gateway retention progress retained in memory; status write deferred"
+            );
+            delay = 60;
+        }
+        if scan.complete && delay == 300 {
+            let _ = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                .execute(&store.pool)
+                .await;
+        }
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 }
