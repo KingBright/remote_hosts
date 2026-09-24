@@ -17,6 +17,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "agent_liveness.rs"]
+mod liveness;
+
 #[derive(Clone)]
 pub struct Agent {
     pub config: Arc<AgentConfig>,
@@ -26,6 +29,8 @@ pub struct Agent {
     active: Arc<ActiveJobs>,
     progress: Arc<crate::progress::Registry>,
     readiness: Arc<crate::readiness::Readiness>,
+    liveness: Arc<liveness::Liveness>,
+    poll_health_revision: Arc<std::sync::atomic::AtomicU64>,
 }
 #[derive(Serialize, Deserialize)]
 struct LocalOperation {
@@ -80,6 +85,8 @@ impl Agent {
             active: Arc::default(),
             progress: Arc::default(),
             readiness: Arc::default(),
+            liveness: Arc::default(),
+            poll_health_revision: Arc::default(),
         })
     }
     pub async fn execute(&self, job: &Job) -> Result<Value> {
@@ -358,11 +365,7 @@ impl Agent {
         self.run_loop(Some(&home)).await
     }
     async fn run_loop(&self, skill_home: Option<&std::path::Path>) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .build()?;
+        let client = liveness::network_client()?;
         let delivery = Delivery::new(self.store.clone(), self.config.clone()).await?;
         let skill_sync = match skill_home {
             Some(home) => crate::capabilities::sync_embedded_skill_at(home),
@@ -480,6 +483,7 @@ impl Agent {
             self.run_lane(&client, &hello, Lane::Terminal, &delivery),
             self.run_lane(&client, &hello, Lane::Control, &delivery),
             self.heartbeat_loop(&client, &hello),
+            self.keepalive_loop(&hello),
             delivery.run(&client),
         )?;
         Ok(())
@@ -493,6 +497,7 @@ impl Agent {
     ) -> Result<()> {
         let mut workers = tokio::task::JoinSet::new();
         let mut health = crate::poll_health::Health::default();
+        let mut poll_client = client.clone();
         loop {
             while let Some(result) = workers.try_join_next() {
                 Self::worker_result(result);
@@ -503,7 +508,7 @@ impl Agent {
                 }
                 continue;
             }
-            let polled = self.poll_job(client, hello, lane).await;
+            let polled = self.poll_job(&poll_client, hello, lane).await;
             if polled.is_ok()
                 && let Some(event) = health.succeeded(std::time::Instant::now(), crate::now())
             {
@@ -528,6 +533,14 @@ impl Agent {
                 Ok(None) => {}
                 Err(error) => {
                     let failure = crate::poll_health::Failure::classify(&error);
+                    // A timed-out pooled connection must not pin every retry to
+                    // the same failed HTTP/2 session. This replaces transport,
+                    // not the device identity, origin, job or durable receipt.
+                    if matches!(failure.stage, "poll_send" | "poll_receive")
+                        && let Ok(fresh) = liveness::network_client()
+                    {
+                        poll_client = fresh;
+                    }
                     let (delay, event) =
                         health.failed(failure, std::time::Instant::now(), crate::now());
                     if let Some(event) = event {
@@ -547,14 +560,21 @@ impl Agent {
         event["session"] = json!(hello.session);
         event["version"] = json!(env!("CARGO_PKG_VERSION"));
         let key = format!("poll_health_{}", lane.as_str().expect("lane string"));
-        // At most once per minute per unchanged outage, plus transitions. A
-        // telemetry failure must not discard a job already received from Gateway.
-        if self
-            .store
-            .put("runtime", &key, &event, i64::MAX)
-            .await
-            .is_err()
-        {
+        // A cancelled SQLite future can still commit later. Fence optional
+        // telemetry by runtime session and revision before bounding its wait.
+        let revision = self
+            .poll_health_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        event["publication_revision"] = json!(revision);
+        let value = event.to_string();
+        let update = sqlx::query("INSERT INTO kv(kind,key,value,expires) SELECT 'runtime',?,?,? WHERE EXISTS(SELECT 1 FROM kv WHERE kind='runtime' AND key='readiness' AND json_extract(value,'$.session')=?) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value,expires=excluded.expires WHERE json_extract(kv.value,'$.session') IS NOT ? OR COALESCE(json_extract(kv.value,'$.publication_revision'),0)<?")
+            .bind(&key).bind(value).bind(i64::MAX).bind(&hello.session)
+            .bind(&hello.session).bind(revision as i64).execute(&self.store.pool);
+        if !matches!(
+            tokio::time::timeout(Duration::from_millis(250), update).await,
+            Ok(Ok(_))
+        ) {
             tracing::warn!(
                 "poll health persistence unavailable; bounded log retains the transition"
             );
@@ -579,6 +599,7 @@ impl Agent {
         let mut periodic = tokio::time::interval(period);
         periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut acknowledged_terminal_fingerprint = String::new();
+        let mut terminal_snapshot = crate::terminal_sync::SnapshotCache::default();
         let mut last_reconcile = tokio::time::Instant::now() - Duration::from_secs(30);
         let mut last_acknowledged = tokio::time::Instant::now() - Duration::from_secs(30);
         loop {
@@ -593,7 +614,7 @@ impl Agent {
             }
             // Mark BEFORE reading/sending. An exit during an in-flight request
             // must wake the following iteration, not disappear with that reply.
-            let _revision = *terminal_changes.borrow_and_update();
+            let revision = *terminal_changes.borrow_and_update();
             if self
                 .readiness
                 .flush(&self.store, &hello.session)
@@ -615,13 +636,23 @@ impl Agent {
                 last_reconcile = tokio::time::Instant::now();
             }
             let active = self.active.list()?;
-            let terminals = crate::terminal_sync::collect(&self.store)
+            if terminal_snapshot
+                .refresh(
+                    &self.store,
+                    self.config.state_dir.join("terminals"),
+                    revision,
+                    self.terminals.has_live()?,
+                )
                 .await
-                .unwrap_or_default();
-            let terminal_previews =
-                crate::terminal_sync::previews(&terminals, self.config.state_dir.join("terminals"))
-                    .await
-                    .unwrap_or_default();
+                .is_err()
+            {
+                // Unavailable is not an authoritative empty snapshot. Keep the
+                // old cache dirty; independent keepalive still renews the lease.
+                tracing::warn!("terminal snapshot unavailable; retained for next observation");
+                continue;
+            }
+            let terminals = &terminal_snapshot.terminals;
+            let terminal_previews = &terminal_snapshot.previews;
             let progress = self.progress.snapshots();
             let mut progress_identity = serde_json::to_value(&progress)?;
             if let Some(items) = progress_identity.as_array_mut() {
@@ -651,6 +682,7 @@ impl Agent {
             request["progress"] = json!(progress);
             request["terminal_updates"] = json!(terminals);
             request["terminal_previews"] = json!(terminal_previews);
+            let contact_started = tokio::time::Instant::now();
             let response = client
                 .post(format!("{}/device/heartbeat", self.config.gateway_url))
                 .bearer_auth(&self.config.device_token)
@@ -661,6 +693,7 @@ impl Agent {
             if response.is_ok_and(|r| r.status().is_success()) {
                 acknowledged_terminal_fingerprint = fingerprint;
                 last_acknowledged = tokio::time::Instant::now();
+                self.liveness.observed(contact_started);
             }
         }
     }
@@ -735,13 +768,18 @@ impl Agent {
         // Heartbeat owns terminal-state replication. Independent poll lanes must
         // not repeat the same SQLite snapshot on every long poll.
         request["receipt_delivery"] = json!(
-            Delivery::status(&self.store, &self.config)
-                .await
-                .ok()
-                .filter(crate::delivery::Status::valid)
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                Delivery::status(&self.store, &self.config),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .filter(crate::delivery::Status::valid)
         );
         request["active_operations"] = json!(self.active.list()?);
         request["progress"] = json!(self.progress.snapshots());
+        let contact_started = tokio::time::Instant::now();
         let mut response = client
             .post(format!("{}/device/poll", self.config.gateway_url))
             .bearer_auth(&self.config.device_token)
@@ -806,6 +844,7 @@ impl Agent {
         {
             tracing::warn!("readiness cache unavailable; work continues");
         }
+        self.liveness.observed(contact_started);
         Ok(job)
     }
     async fn execute_report(&self, delivery: &Delivery, job: Job) -> Result<()> {

@@ -84,6 +84,15 @@ impl Terminals {
             changes: tokio::sync::watch::channel(0).0,
         })
     }
+    /// Process-owned, bounded live set; never scan durable terminal history to
+    /// decide whether output needs refreshing. This is not execution authority.
+    pub(crate) fn has_live(&self) -> Result<bool> {
+        Ok(!self
+            .live
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?
+            .is_empty())
+    }
     pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changes.subscribe()
     }

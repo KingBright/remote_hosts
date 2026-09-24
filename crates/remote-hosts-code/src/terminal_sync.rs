@@ -11,6 +11,48 @@ use std::{
 
 const PREVIEW_BYTES: usize = 2048;
 
+/// Disposable observation cache: no execution, authorization or receipt truth.
+/// Idle ticks do not reread historical rows or reopen 24 completed log files.
+#[derive(Default)]
+pub(crate) struct SnapshotCache {
+    pub terminals: Vec<Status>,
+    pub previews: Vec<Preview>,
+    revision: Option<u64>,
+    refreshed_at: Option<tokio::time::Instant>,
+}
+impl SnapshotCache {
+    pub async fn refresh(
+        &mut self,
+        store: &Store,
+        dir: PathBuf,
+        revision: u64,
+        has_live: bool,
+    ) -> Result<bool> {
+        if self.revision == Some(revision)
+            && !has_live
+            && self
+                .refreshed_at
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(30))
+        {
+            return Ok(false);
+        }
+        let snapshot = async {
+            let terminals = collect(store).await?;
+            let previews = previews(&terminals, dir).await?;
+            Ok::<_, anyhow::Error>((terminals, previews))
+        };
+        let (terminals, previews) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), snapshot)
+                .await
+                .map_err(|_| anyhow::anyhow!("terminal_snapshot_timeout"))??;
+        self.terminals = terminals;
+        self.previews = previews;
+        self.revision = Some(revision);
+        self.refreshed_at = Some(tokio::time::Instant::now());
+        Ok(true)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Preview {
@@ -49,10 +91,12 @@ pub(crate) fn valid_preview(p: &Preview) -> bool {
         && p.cursor_end.saturating_sub(p.cursor_start) == p.output.len() as u64
 }
 
+pub(crate) const COLLECT_SQL: &str = "SELECT value FROM kv WHERE kind='terminal' ORDER BY (json_extract(value,'$.state') IN ('running','starting')) DESC,COALESCE(json_extract(value,'$.updated_at'),json_extract(value,'$.created_at'),0) DESC,key LIMIT 24";
+
 pub(crate) async fn collect(s: &Store) -> Result<Vec<Status>> {
     // Terminal replication is live state, not an audit-log query. Keep active
     // terminals first, then the most recently changed terminal rows directly.
-    let rows:Vec<(String,)>=sqlx::query_as("SELECT value FROM kv WHERE kind='terminal' ORDER BY (json_extract(value,'$.state') IN ('running','starting')) DESC,COALESCE(json_extract(value,'$.updated_at'),json_extract(value,'$.created_at'),0) DESC,key LIMIT 24").fetch_all(&s.pool).await?;
+    let rows: Vec<(String,)> = sqlx::query_as(COLLECT_SQL).fetch_all(&s.pool).await?;
     rows.into_iter()
         .map(|(v,)| Ok(serde_json::from_str(&v)?))
         .collect()
@@ -505,3 +549,7 @@ mod tests {
         assert!(std::str::from_utf8(output.as_bytes()).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_sync_cost_tests.rs"]
+mod cost_tests;

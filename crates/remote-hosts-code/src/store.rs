@@ -47,6 +47,11 @@ impl Store {
         Ok(Self { pool })
     }
     pub async fn install_agent_schema(&self) -> Result<()> {
+        // One agent-only partial index matches the bounded replication order.
+        // Without it LIMIT 24 still sorts/parses every historical terminal row.
+        // Other KV kinds and the Gateway do not pay this write amplification.
+        sqlx::query("CREATE INDEX IF NOT EXISTS terminal_sync_recent ON kv(kind,(json_extract(value,'$.state') IN ('running','starting')) DESC,COALESCE(json_extract(value,'$.updated_at'),json_extract(value,'$.created_at'),0) DESC,key) WHERE kind='terminal'")
+            .execute(&self.pool).await?;
         crate::work_events::install(self).await
     }
     pub async fn install_gateway_schema(&self) -> Result<()> {
