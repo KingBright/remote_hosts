@@ -15,6 +15,10 @@ pub(crate) async fn install(store: &Store) -> Result<()> {
 fn summary(row: &Row, at: i64) -> Result<Option<(Value, bool, i64)>> {
     let request: Value = serde_json::from_str(&row.2)?;
     let result: Value = serde_json::from_str(&row.3)?;
+    anyhow::ensure!(
+        request.is_object() && result.is_object(),
+        "invalid_history_payload_shape"
+    );
     if result["history_hold"] == true || at < row.4 {
         return Ok(None);
     }
@@ -154,6 +158,7 @@ pub(crate) async fn sweep(store: &Store, policy: &Policy, at: i64) -> Result<Val
     let mut bytes = 0u64;
     let mut expired = 0u64;
     let mut protected = 0u64;
+    let mut item_errors = 0u64;
     let mut legacy_clocks_initialized = 0u64;
     let mut oldest = Vec::<(Row, Value)>::new();
     loop {
@@ -166,9 +171,17 @@ pub(crate) async fn sweep(store: &Store, policy: &Policy, at: i64) -> Result<Val
         }
         for mut row in rows {
             after = row.0.clone();
-            let Some((brief, failed, finished_at)) = summary(&row, at)? else {
-                protected += 1;
-                continue;
+            let (brief, failed, finished_at) = match summary(&row, at) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    protected += 1;
+                    continue;
+                }
+                Err(_) => {
+                    protected += 1;
+                    item_errors += 1;
+                    continue;
+                }
             };
             row.4 = if finished_at == 0 {
                 let Some((confirmed, initialized)) = legacy_clock(store, &row, at).await? else {
@@ -215,25 +228,37 @@ pub(crate) async fn sweep(store: &Store, policy: &Policy, at: i64) -> Result<Val
     let expired_cache_rows = store.prune_batch().await?;
     Ok(
         json!({"expired_bodies":expired,"retained_bodies":kept,"retained_body_bytes":bytes,
-        "protected_bodies":protected,"expired_cache_rows":expired_cache_rows,
+        "protected_bodies":protected,"expired_cache_rows":expired_cache_rows,"item_errors":item_errors,
         "legacy_clocks_initialized":legacy_clocks_initialized,
         "pressure_remaining":kept>policy.max_items || bytes>policy.max_bytes,
         "idempotency_records_preserved":true}),
     )
 }
+pub(crate) async fn maintenance_tick(
+    gateway: &Gateway,
+    store: &Store,
+    policy: &Policy,
+    at: i64,
+) -> Result<Value> {
+    let artifacts = crate::history_artifacts::sweep(gateway, store, at).await?;
+    let mut report = sweep(store, policy, at).await?;
+    report["transfer_cache"] = serde_json::to_value(artifacts)?;
+    Ok(report)
+}
+
 pub(crate) async fn run(gateway: &Gateway) -> Result<()> {
     tokio::time::sleep(Duration::from_secs(30)).await;
     let policy = Policy::default();
     loop {
         let work=async {
             let store=crate::history_retention::maintenance_store(&gateway.config.state_dir).await?;
-            let report=sweep(&store,&policy,crate::now()).await?;
+            let report=maintenance_tick(gateway,&store,&policy,crate::now()).await?;
             store.put("runtime","automatic_history_cleanup",&json!({"protocol":1,"automatic":true,
                 "observed_at":crate::now(),"policy":policy,"last_run":report,
                 "scope":"gateway result bodies; immutable idempotency and recovery anchors retained"}),i64::MAX).await?;
             let _=sqlx::query("PRAGMA wal_checkpoint(PASSIVE)").execute(&store.pool).await;
             store.pool.close().await;
-            Ok::<_,anyhow::Error>(report["pressure_remaining"]==true && report["expired_bodies"].as_u64().unwrap_or(0)>0)
+            Ok::<_,anyhow::Error>(report["transfer_cache"]["has_more"]==true || (report["pressure_remaining"]==true && report["expired_bodies"].as_u64().unwrap_or(0)>0))
         }.await;
         let delay = match work {
             Ok(true) => 5,

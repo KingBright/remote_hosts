@@ -1,5 +1,38 @@
 use super::*;
 use crate::job_receipts::{self, Outcome};
+
+#[tokio::test]
+async fn malformed_results_are_preserved_without_stopping_other_history_cleanup() {
+    let (_dir, store) = fixture().await;
+    let mut protected = Vec::new();
+    for malformed in ["[", "[]", "null"] {
+        let row = job(&store, "code_read", 40, &json!({"state":"completed"})).await;
+        sqlx::query("UPDATE jobs SET result=? WHERE id=?")
+            .bind(malformed)
+            .bind(&row.0)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        protected.push((row.0, malformed));
+    }
+    let valid = job(&store, "code_read", 40, &json!({"output":"expired"})).await;
+    let report = sweep(&store, &Policy::default(), crate::now())
+        .await
+        .unwrap();
+    assert_eq!(report["expired_bodies"], 1);
+    assert_eq!(report["item_errors"], 3);
+    assert_eq!(report["protected_bodies"], 3);
+    assert_eq!(result(&store, &valid.0).await["state"], "history_expired");
+    for (id, expected) in protected {
+        let stored: String = sqlx::query_scalar("SELECT result FROM jobs WHERE id=?")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, expected);
+    }
+}
+
 async fn fixture() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
