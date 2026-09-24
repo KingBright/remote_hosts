@@ -10,8 +10,8 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-type Saved = (String, Option<String>, String, i64);
-const SNAPSHOT: &str = "SELECT j.state,j.result,COALESCE(json_extract(j.request,'$.tool'),''),COALESCE(json_extract(c.value,'$.revision'),0) FROM jobs j LEFT JOIN kv c ON c.kind='transfer_control' AND c.key=j.id WHERE j.id=? AND j.device=?";
+type Saved = (String, Option<String>, String, i64, Option<String>);
+const SNAPSHOT: &str = "SELECT j.state,j.result,COALESCE(json_extract(j.request,'$.tool'),''),COALESCE(json_extract(c.value,'$.revision'),0),h.digest FROM jobs j LEFT JOIN kv c ON c.kind='transfer_control' AND c.key=j.id LEFT JOIN history_result_digests h ON h.id=j.id WHERE j.id=? AND j.device=?";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -22,7 +22,7 @@ pub(crate) enum Outcome {
 }
 
 fn inspect(saved: Option<&Saved>, value: &Value, revision: Option<i64>) -> Result<Option<Outcome>> {
-    let Some((state, previous, tool, current)) = saved else {
+    let Some((state, previous, tool, current, retired_digest)) = saved else {
         return Ok(Some(Outcome::NotFound));
     };
     if revision.is_some_and(|v| v < *current) {
@@ -34,7 +34,11 @@ fn inspect(saved: Option<&Saved>, value: &Value, revision: Option<i64>) -> Resul
     if let Some(previous) = previous {
         let previous: Value =
             serde_json::from_str(previous).context("receipt_saved_result_invalid")?;
-        return Ok(Some(if state == "done" && previous == *value {
+        let identical = retired_digest.as_ref().map_or_else(
+            || previous == *value,
+            |digest| *digest == crate::hash(value.to_string()),
+        );
+        return Ok(Some(if state == "done" && identical {
             Outcome::Accepted { duplicate: true }
         } else {
             Outcome::Conflict

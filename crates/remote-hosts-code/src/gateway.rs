@@ -192,6 +192,11 @@ pub struct Receipt {
     pub result: Value,
 }
 impl Gateway {
+    /// Default-on retention of completed result bodies, independent of requests.
+    pub async fn maintain_history(&self) -> Result<()> {
+        crate::history_gateway::run(self).await
+    }
+
     pub async fn new(config: GatewayConfig) -> Result<Self> {
         Self::new_inner(config, None).await
     }

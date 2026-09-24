@@ -438,13 +438,29 @@ async fn accepted_edit_receipt_keeps_change_resume_anchor() {
     let claim = d.claim().await.unwrap().unwrap();
     d.deliver(&reqwest::Client::new(), claim).await.unwrap();
     assert!(rows(&d).await.is_empty());
+    let mut acknowledged = saved;
+    acknowledged["gateway_accepted"] = json!(true);
     assert_eq!(
         d.store
             .get::<Value>("local_operation", &id)
             .await
             .unwrap()
             .unwrap(),
-        saved
+        acknowledged
+    );
+    // Delivery acknowledgement is not business completion. Startup must keep
+    // the whole partial-edit recovery anchor even though its receipt arrived.
+    let reopened = Delivery::new(d.store.clone(), d.config.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .store
+            .get::<Value>("local_operation", &id)
+            .await
+            .unwrap()
+            .unwrap(),
+        acknowledged
     );
     server.abort();
 }

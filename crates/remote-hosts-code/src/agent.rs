@@ -31,6 +31,7 @@ pub struct Agent {
     readiness: Arc<crate::readiness::Readiness>,
     liveness: Arc<liveness::Liveness>,
     poll_health_revision: Arc<std::sync::atomic::AtomicU64>,
+    history_access: Arc<tokio::sync::RwLock<()>>,
 }
 #[derive(Serialize, Deserialize)]
 struct LocalOperation {
@@ -87,6 +88,7 @@ impl Agent {
             readiness: Arc::default(),
             liveness: Arc::default(),
             poll_health_revision: Arc::default(),
+            history_access: Arc::default(),
         })
     }
     pub async fn execute(&self, job: &Job) -> Result<Value> {
@@ -276,6 +278,14 @@ impl Agent {
         // Controls never take the terminal-input lock, so cancellation stays independent.
         let permit = self.scheduler.acquire(Lane::for_tool(&job.tool)).await?;
         progress.phase("running");
+        let history_access = if matches!(
+            job.tool.as_str(),
+            "terminal_read" | "change_resume" | "workspace_gc"
+        ) {
+            Some(self.history_access.clone().read_owned().await)
+        } else {
+            None
+        };
         match job.tool.as_str() {
             "file_upload" | "file_download" => {
                 crate::durable_transfer::run(
@@ -310,6 +320,10 @@ impl Agent {
                         && op.workspace_id.as_deref() == Some(&ws.id),
                     "change_set_unavailable: original edit belongs to another workspace or tool"
                 );
+                ensure!(
+                    !(op.gateway_accepted && op.result.is_none()),
+                    "history_expired: completed edit journal was retired; do not replay the original edit"
+                );
                 let journal = self
                     .config
                     .state_dir
@@ -318,6 +332,7 @@ impl Agent {
                 let ws = ws.clone();
                 let progress = progress.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _history_access = history_access;
                     let _write_guard = _write;
                     let _execution_permit = permit;
                     progress.phase("running");
@@ -355,14 +370,22 @@ impl Agent {
         }
     }
     pub async fn run(&self) -> Result<()> {
-        self.run_loop(None).await
+        tokio::try_join!(
+            self.run_loop(None),
+            crate::history_retention::agent_loop(self.config.clone(), self.history_access.clone())
+        )?;
+        Ok(())
     }
     /// Run the real device lifecycle with Skill files isolated below this
     /// instance's state directory. Test/embedded callers must not overwrite
     /// the operator's installed Codex or Gemini Skill files.
     pub async fn run_isolated(&self) -> Result<()> {
         let home = self.config.state_dir.join("isolated-skill-home");
-        self.run_loop(Some(&home)).await
+        tokio::try_join!(
+            self.run_loop(Some(&home)),
+            crate::history_retention::agent_loop(self.config.clone(), self.history_access.clone())
+        )?;
+        Ok(())
     }
     async fn run_loop(&self, skill_home: Option<&std::path::Path>) -> Result<()> {
         let client = liveness::network_client()?;

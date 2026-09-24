@@ -16,6 +16,8 @@ mod durable_transfer;
 pub mod files;
 mod files_sync;
 pub mod gateway;
+mod history_gateway;
+mod history_retention;
 mod job_dispatch;
 mod job_receipts;
 mod maintenance;

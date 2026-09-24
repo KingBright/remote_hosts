@@ -149,6 +149,11 @@ pub(crate) async fn read(
     let delivery_stale = delivery
         .as_ref()
         .map(|v| !(0..=45).contains(&(now() - v["reported_at"].as_i64().unwrap_or(0))));
+    let automatic_cleanup = store
+        .get::<Value>("runtime", "automatic_history_cleanup")
+        .await
+        .ok()
+        .flatten();
     let mut result = json!({"workspace_id":ws.id,"device_id":ws.device_id,"root":ws.root,
         "runtime":build,"receipt_delivery":delivery,"receipt_delivery_stale":delivery_stale,
         "receipt_delivery_unavailable":delivery.is_none(),
@@ -157,7 +162,9 @@ pub(crate) async fn read(
         "summary":{"terminals":terminal_count,"active_terminals":active_terminals,
             "transfers":transfer_count,"retained_transfers":retained,"paused_transfers":paused,
             "change_sets":change_set_count},
-        "workspace_gc":{"supported":true,"mode":"explicit_preview_then_apply","automatic":false},
+        "workspace_gc":{"supported":true,"mode":"explicit_preview_then_apply","automatic":true,
+            "automatic_policy":crate::history_retention::Policy::default(),"automatic_status":automatic_cleanup,
+            "automatic_status_scope":"device-wide aggregate; no other workspace details"},
         "transfers_truncated":transfers_truncated,
         "next_transfer_id":if transfers_truncated {transfers.last().map(|v|v["operation_id"].clone())}else{None},
         "terminal_limit":limit,"terminals_truncated":terminals_truncated,"next_terminal_cursor":next_terminal,

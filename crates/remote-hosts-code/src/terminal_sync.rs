@@ -261,7 +261,7 @@ pub(crate) async fn save_in_transaction(
     // Fetch authorization and previous snapshots in one bounded query rather
     // than running three statements for every terminal on every heartbeat.
     let rows:Vec<(String,Option<String>)>=sqlx::query_as(
-        "SELECT j.id,p.value FROM json_each(?) s JOIN jobs j ON j.id=json_extract(s.value,'$.id') AND j.device=? AND json_extract(j.request,'$.tool')='terminal_exec' AND json_extract(j.request,'$.arguments.workspace_id')=json_extract(s.value,'$.workspace_id') JOIN kv o ON o.kind='online' AND o.key=j.device AND json_extract(o.value,'$.hello.session')=? LEFT JOIN kv p ON p.kind='terminal_observation' AND p.key=j.id")
+        "SELECT j.id,p.value FROM json_each(?) s JOIN jobs j ON j.id=json_extract(s.value,'$.id') AND j.device=? AND json_extract(j.request,'$.tool')='terminal_exec' AND json_extract(j.request,'$.arguments.workspace_id')=json_extract(s.value,'$.workspace_id') JOIN kv o ON o.kind='online' AND o.key=j.device AND json_extract(o.value,'$.hello.session')=? LEFT JOIN kv p ON p.kind='terminal_observation' AND p.key=j.id WHERE NOT EXISTS(SELECT 1 FROM history_result_digests h WHERE h.id=j.id)")
         .bind(serde_json::to_string(statuses)?).bind(device).bind(session).fetch_all(&mut **tx).await?;
     let mut updates = Vec::with_capacity(rows.len());
     for (id, previous) in rows {

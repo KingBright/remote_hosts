@@ -175,11 +175,18 @@ async fn main() -> Result<()> {
                     .await?;
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(%bind,"gateway listening");
-            axum::serve(listener, gateway.router()?)
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
+            let router = gateway.router()?;
+            let serving = async {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    })
+                    .await
+            };
+            tokio::select! {
+                result = serving => result?,
+                result = gateway.maintain_history() => result?,
+            }
         }
         Command::Agent { .. } => unreachable!("agent handled before service logger initialization"),
         Command::InitGateway {

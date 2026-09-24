@@ -10,7 +10,8 @@ use sqlx::{Sqlite, Transaction};
 
 mod observation;
 
-/// Durable evidence is not a seven-day cache. Removal requires explicit owner cleanup.
+/// Recovery and idempotency metadata remain durable. Completed bulky payloads
+/// have an independent, default-on history-retention policy.
 pub const RETAIN_UNTIL_EXPLICIT_CLEANUP: i64 = i64::MAX;
 pub const RETENTION: Option<u64> = None;
 pub fn valid_request_id(id: &str) -> bool {
@@ -36,6 +37,9 @@ pub fn decision(
     operation_id: Option<&str>,
     at: i64,
 ) -> Value {
+    let history_expired = value["state"] == "history_expired"
+        && value["history"]["body_available"] == false
+        && value["history"]["automatic"] == true;
     let observed = &value["terminal_observation"];
     let terminal = if observed["terminal"].is_object() {
         &observed["terminal"]
@@ -60,6 +64,7 @@ pub fn decision(
         Some("cancelled" | "timed_out" | "runtime_lost") => "unknown",
         Some("failed") if terminal["process_id"].is_number() => "unknown",
         Some("failed") => "not_started",
+        _ if history_expired => "completed",
         _ if stale => "unknown",
         _ if error => value["execution_state"].as_str().unwrap_or("unknown"),
         _ if terminal_unobserved => "unknown",
@@ -81,7 +86,9 @@ pub fn decision(
         && !terminal_unobserved
         && (!terminal.is_object()
             || (terminal["output_complete"] == true && terminal["exit_code"].is_number()));
-    let next = if stale || execution == "unknown" {
+    let next = if history_expired {
+        Some("history_expired_do_not_replay")
+    } else if stale || execution == "unknown" {
         Some("observe_original_and_reconcile")
     } else if pending || matches!(execution, "running" | "not_started_or_unknown") {
         Some("observe_original")

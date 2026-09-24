@@ -52,6 +52,7 @@ impl Store {
         // Other KV kinds and the Gateway do not pay this write amplification.
         sqlx::query("CREATE INDEX IF NOT EXISTS terminal_sync_recent ON kv(kind,(json_extract(value,'$.state') IN ('running','starting')) DESC,COALESCE(json_extract(value,'$.updated_at'),json_extract(value,'$.created_at'),0) DESC,key) WHERE kind='terminal'")
             .execute(&self.pool).await?;
+        crate::history_retention::install(self).await?;
         crate::work_events::install(self).await
     }
     pub async fn install_gateway_schema(&self) -> Result<()> {
@@ -73,6 +74,7 @@ impl Store {
         sqlx::query("CREATE TABLE IF NOT EXISTS operation_timing (id TEXT PRIMARY KEY,queued_ms INTEGER NOT NULL,dispatched_ms INTEGER,result_ms INTEGER)")
             .execute(&self.pool)
             .await?;
+        crate::history_gateway::install(self).await?;
         Ok(())
     }
     pub async fn put(
