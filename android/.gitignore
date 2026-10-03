@@ -1,0 +1,11 @@
+.gradle/
+.kotlin/
+**/build/
+local.properties
+.idea/
+*.jks
+*.keystore
+*.p12
+*.apk
+*.aab
+app/src/debug/res/raw/fixture_ca.pem

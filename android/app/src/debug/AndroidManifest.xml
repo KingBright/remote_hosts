@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <application android:networkSecurityConfig="@xml/integration_network_security">
+        <activity android:name="io.remotehosts.agent.ProbeActivity" android:exported="true" />
+    </application>
+</manifest>

@@ -25,6 +25,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 def platform(device):
     caps=device.get('capabilities') or {}
     value=caps.get('platform') or ''
+    if value == 'android':
+        raise ValueError('android_requires_separate_apk_release: desktop fleet upgrade refused; never infer Linux from an Android path')
     if value in ('macos','linux','windows'): return value
     roots=caps.get('roots') or []
     root=roots[0] if roots else ''
@@ -152,6 +154,22 @@ def accept_fleet(config,package,directory,version,fleet):
     return acceptance
 
 
+def desktop_scope(fleet):
+    """Android APKs use a separate signing/version lane, never a desktop bundle.
+
+    Keep the original all_converged fact, and report desktop convergence separately.
+    Excluded devices remain visible rather than being labelled upgraded.
+    """
+    selected=dict(fleet)
+    android=[d for d in fleet['devices'] if (d.get('capabilities') or {}).get('platform')=='android']
+    selected['devices']=[d for d in fleet['devices'] if (d.get('capabilities') or {}).get('platform')!='android']
+    selected['excluded_devices']=[{'device_id':d['device_id'],'name':d.get('name'),
+        'platform':'android','reason':'separate_signed_apk_release'} for d in android]
+    gateway_ready=fleet.get('summary',{}).get('gateway_converged',fleet.get('all_converged',False))
+    selected['desktop_converged']=bool(gateway_ready and all(d.get('converged') for d in selected['devices']))
+    return selected
+
+
 def rollout_targets(devices, controller_id):
     online=[d for d in devices if d.get('online')]
     deferred=[d for d in devices if not d.get('online')]
@@ -161,10 +179,14 @@ def rollout_targets(devices, controller_id):
 
 def finish_observed_fleet(config,package,directory,version,state,fleet):
     """Accept the actual reachable scope; never label offline devices as upgraded."""
-    if fleet.get('all_converged'):
-        acceptance=accept_fleet(config,package,directory,version,fleet)
-        state.update(state='passed',phase='finished',all_converged=True,online_converged=True,
-                     pending_device_ids=[],acceptance_scope='all_devices',acceptance=str(acceptance))
+    excluded=fleet.get('excluded_devices',[])
+    state['excluded_devices']=excluded
+    if fleet.get('desktop_converged',fleet.get('all_converged')):
+        acceptance=accept_fleet(config,package,directory,version,fleet) if fleet['devices'] else None
+        state.update(state='passed',phase='finished',all_converged=bool(fleet.get('all_converged')),online_converged=True,
+                     desktop_converged=True,pending_device_ids=[],
+                     acceptance_scope='desktop_devices' if excluded else 'all_devices',
+                     acceptance=str(acceptance) if acceptance else None)
     else:
         pending=[d for d in fleet['devices'] if not d['converged']]
         if not fleet.get('summary',{}).get('gateway_converged') or not pending or any(d.get('online') for d in pending):
@@ -178,7 +200,7 @@ def finish_observed_fleet(config,package,directory,version,state,fleet):
             state['agents'][d['device_id']]={'name':d['name'],'platform':platform(d),'state':'waiting_online'}
         state.update(state='waiting_online',phase='offline_devices',all_converged=False,
                      online_converged=bool(online),pending_device_ids=[d['device_id'] for d in pending],
-                     acceptance_scope='online_devices',acceptance=str(acceptance) if acceptance else None,
+                     acceptance_scope='online_desktop_devices' if excluded else 'online_devices',acceptance=str(acceptance) if acceptance else None,
                      next_action='rerun this fleet command after the deferred devices reconnect; no offline upgrade was queued')
     state['fleet']=fleet
     rr.atomic_json(directory/'fleet.json',state)
@@ -282,7 +304,7 @@ def main():
             if gateway is None:
                 raise RuntimeError('local gateway management configuration required')
         state['gateway']=gateway;save()
-        fleet=client.tool('fleet_status',{'desired_version':args.version});devices=fleet['devices'];state['fleet']=fleet;save()
+        fleet=desktop_scope(client.tool('fleet_status',{'desired_version':args.version}));devices=fleet['devices'];state['fleet']=fleet;save()
         if finish_observed_fleet(config,package,directory,args.version,state,fleet):return
         controller_id=controller_device_id(config)
         local_candidates=[d for d in devices if d['online'] and platform(d) in ('macos','linux')
@@ -318,7 +340,7 @@ def main():
                 save();print(json.dumps({'state':state['state'],'version':args.version,'all_converged':False,'report':str(directory/'fleet.json')}));return
         deadline=time.monotonic()+900
         while time.monotonic()<deadline:
-            fleet=client.tool('fleet_status',{'desired_version':args.version});state['fleet']=fleet;save()
+            fleet=desktop_scope(client.tool('fleet_status',{'desired_version':args.version}));state['fleet']=fleet;save()
             if finish_observed_fleet(config,package,directory,args.version,state,fleet):return
             time.sleep(3)
         else: raise RuntimeError('fleet did not converge; inspect fleet.json without replaying upgrades')

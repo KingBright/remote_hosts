@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Remote Hosts</string>
+    <string name="access_label">Remote Hosts · 读屏与操作</string>
+    <string name="access_description">仅在你主动开启远程连接后，允许你授权的 Remote Hosts 服务读取当前页面、按需截图、点击、滑动与输入文字。不记录键盘输入，不后台收集页面，不上传通讯录、短信或位置。你可随时在通知栏停止远程连接或在此撤销授权。密码字段会隐藏，系统安全窗口无法截图。</string>
+</resources>

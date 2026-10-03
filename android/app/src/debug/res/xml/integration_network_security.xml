@@ -1,0 +1,7 @@
+<network-security-config>
+    <!-- Local fixture CA is generated on the owner's builder. This resource exists ONLY in debug APKs. -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="false">localhost</domain>
+        <trust-anchors><certificates src="system" /><certificates src="@raw/fixture_ca" /></trust-anchors>
+    </domain-config>
+</network-security-config>
