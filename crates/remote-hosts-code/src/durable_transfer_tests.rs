@@ -502,3 +502,115 @@ async fn inbound_checkpoint_survives_a_real_process_kill_and_resumes_only_the_ta
     );
     server.abort();
 }
+
+// Actual source authorization failure followed by an independently spawned
+// transfer process. All URLs/state/credentials belong to this temporary fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_source_refresh_resumes_same_checkpoint_in_a_new_process() {
+    let (d, c, ws, mut job, store, mut j) = fixture().await;
+    let bytes = b"old-and-unchanged-tail".to_vec();
+    job.arguments["sha256"] = json!(crate::hash(&bytes));
+    j.fingerprint = crate::hash(serde_json::to_vec(&job).unwrap());
+    prefix(&c, &mut j, b"old");
+    j.etag = Some("\"v1\"".into());
+    j.save(&store).await.unwrap();
+    let (raw, digest) = transfer_journal::restore_prefix(
+        transfer_journal::open_data(&j.data_path(&c), false).unwrap(),
+        j.offset,
+        &j.prefix_sha256,
+    )
+    .unwrap();
+    let mut file = tokio::fs::File::from_std(raw);
+    let (expired, expired_server) = static_source(vec![], "expired").await;
+    let error = fetch(
+        &http().unwrap(),
+        &expired,
+        &mut file,
+        &job,
+        &Progress::new(&job.id),
+        &store,
+        &mut j,
+        digest,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Fault>().unwrap().state,
+        "awaiting_source"
+    );
+    drop(file);
+    expired_server.abort();
+    assert_eq!(std::fs::read(j.data_path(&c)).unwrap(), b"old");
+    assert!(!ws.root.join("received.bin").exists());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fresh = format!("http://{}/source", listener.local_addr().unwrap());
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let captured = ranges.clone();
+    let tail = bytes[3..].to_vec();
+    let router = Router::new().route(
+        "/source",
+        get(move |headers: axum::http::HeaderMap| {
+            let captured = captured.clone();
+            let tail = tail.clone();
+            async move {
+                let range = headers.get("range").unwrap().to_str().unwrap().to_owned();
+                captured.lock().unwrap().push(range);
+                Response::builder()
+                    .status(206)
+                    .header("etag", "\"v1\"")
+                    .header(
+                        "content-range",
+                        format!("bytes 3-{}/{}", tail.len() + 2, tail.len() + 3),
+                    )
+                    .body(Body::from(tail))
+                    .unwrap()
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let spec = d.path().join("refresh-child.json");
+    std::fs::write(&spec, json!({"config":c,"job":job,"url":fresh}).to_string()).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "durable_transfer::tests::inbound_child_process",
+            "--nocapture",
+        ])
+        .env("RH040_CHECKPOINT_FIXTURE", &spec)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let finished = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if finished.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    server.abort();
+    assert!(
+        finished.unwrap().success(),
+        "refreshed transfer child failed"
+    );
+    let reopened = Store::open(&c.state_dir).await.unwrap();
+    let saved: Journal = reopened
+        .get("transfer_local", &job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.operation_id, job.id);
+    assert_eq!(saved.offset, bytes.len() as u64);
+    assert_eq!(saved.content_sha256, Some(crate::hash(&bytes)));
+    assert_eq!(std::fs::read(saved.data_path(&c)).unwrap(), bytes);
+    assert_eq!(ranges.lock().unwrap().as_slice(), ["bytes=3-"]);
+}

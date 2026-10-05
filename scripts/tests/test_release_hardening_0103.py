@@ -33,7 +33,7 @@ class FakeClient:
         self.result = result
         self.calls = []
 
-    def tool(self, name, args):
+    def tool(self, name, args, **kwargs):
         self.calls.append((name, args))
         return self.result
 
@@ -65,7 +65,7 @@ class ReleaseHardening0103Tests(unittest.TestCase):
                      'artifact_id':'artifact-1','download_url':'https://example.invalid/export','size':7}
         class SequenceClient:
             def __init__(self): self.calls=[];self.results=[queued,completed]
-            def tool(self,name,args): self.calls.append((name,args));return self.results.pop(0)
+            def tool(self,name,args,**kwargs): self.calls.append((name,args));return self.results.pop(0)
         client=SequenceClient()
         result=fleet.verified_export(client,paused,pathlib.Path('bundle.tgz'),sha,'0.10.3')
         self.assertEqual(result,completed)
