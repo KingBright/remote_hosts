@@ -152,7 +152,7 @@ async fn stalled_transfer_does_not_block_reads_or_terminal_start() {
 
 #[tokio::test]
 async fn concurrent_duplicate_mutation_returns_one_durable_result() {
-    let (_dir, agent, ws) = fixture().await;
+    let (dir, agent, ws) = fixture().await;
     let create = job(
         &agent,
         "code_apply_edits",
@@ -160,7 +160,15 @@ async fn concurrent_duplicate_mutation_returns_one_durable_result() {
     );
     let (first, second) = tokio::join!(agent.execute(&create), agent.execute(&create));
     assert_eq!(first.as_ref().unwrap(), second.as_ref().unwrap());
-    assert!(first.unwrap().get("error").is_none());
+    let first = first.unwrap();
+    assert!(first.get("error").is_none());
+    assert_eq!(first["change_set"]["change_set_id"], create.id);
+    let path = dir.path().join("project/once.txt");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "exactly once");
+    std::fs::write(&path, "later local edit").unwrap();
+    let repeated = agent.execute(&create).await.unwrap();
+    assert_eq!(repeated, first);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "later local edit");
     let mut conflict = create.clone();
     conflict.arguments["files"][0]["content"] = json!("different");
     assert!(

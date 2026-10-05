@@ -813,6 +813,70 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.path().join("a")).unwrap(), "one");
     }
     #[test]
+    fn create_requires_literal_absent_and_preflights_entire_batch() {
+        let (d, w) = fixture();
+        std::fs::create_dir(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/existing.rs"), "before").unwrap();
+        let mut args = json!({"files":[
+            {"path":"src/existing.rs","expected_version":hash("before"),"edits":[{"old_text":"before","new_text":"after"}]},
+            {"path":"src/diagnostic.rs","action":"create","expected_version":"","content":"diagnostic"}
+        ]});
+        let rejected = d.path().join(format!("{}.json", uuid::Uuid::new_v4()));
+        let error = apply(&w, &args, &rejected).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "version_conflict: src/diagnostic.rs current_version=absent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("src/existing.rs")).unwrap(),
+            "before"
+        );
+        assert!(!d.path().join("src/diagnostic.rs").exists());
+        assert!(
+            !rejected.exists(),
+            "preflight rejection must not prepare a journal"
+        );
+
+        args["files"][1]["expected_version"] = json!("absent");
+        let journal = d.path().join(format!("{}.json", uuid::Uuid::new_v4()));
+        let created = apply(&w, &args, &journal).unwrap();
+        assert_eq!(created["state"], "completed");
+        assert_eq!(
+            created["change_set"]["files"][1]["before_version"],
+            "absent"
+        );
+        assert_eq!(
+            created["change_set"]["files"][1]["after_version"],
+            hash("diagnostic")
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("src/diagnostic.rs")).unwrap(),
+            "diagnostic"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("src/existing.rs")).unwrap(),
+            "after"
+        );
+    }
+    #[test]
+    fn create_never_overwrites_an_existing_file() {
+        let (d, w) = fixture();
+        std::fs::write(d.path().join("existing.rs"), "local work").unwrap();
+        for expected in ["absent".to_owned(), hash("local work")] {
+            let args = json!({"files":[{"path":"existing.rs","action":"create","expected_version":expected,"content":"replacement"}]});
+            let journal = d.path().join(format!("{}.json", uuid::Uuid::new_v4()));
+            let error = apply(&w, &args, &journal).unwrap_err().to_string();
+            assert!(
+                error.contains("version_conflict") || error.contains("create requires absent file")
+            );
+            assert_eq!(
+                std::fs::read_to_string(d.path().join("existing.rs")).unwrap(),
+                "local work"
+            );
+            assert!(!journal.exists());
+        }
+    }
+    #[test]
     fn budget_and_traversal() {
         let (d, w) = fixture();
         std::fs::write(d.path().join("a"), "a\nb\nc\n").unwrap();

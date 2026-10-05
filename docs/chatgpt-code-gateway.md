@@ -160,8 +160,21 @@ to 8 MiB; binary files produce an explicit error. Reads normally return at most
 than silently skipped. File versions are SHA-256 hashes of exact bytes. Search
 pages observe live files, so repeat the query after edits.
 
-Edits require `expected_version`; creating a file requires `"absent"`. Exact old
-text must match once; overlapping replacements are rejected. Every file is
+Edits and deletes require `expected_version` equal to the current file SHA-256.
+Creating a file requires the literal `"absent"`, plus the complete `content` and
+`action: "create"`; omit `edits` and `patch` for creation. An empty string, `null`,
+or an omitted version is not the missing-file marker. For example:
+
+```json
+{"workspace_id":"existing-workspace","idempotency_key":"create-diagnostic-v1","files":[{"path":"src/diagnostic.rs","action":"create","expected_version":"absent","content":"pub fn diagnostic() {}\n"}]}
+```
+
+All files preflight before any write, so a create-version conflict leaves the
+entire batch unchanged. A corrected payload needs a new stable idempotency key;
+an uncertain identical request reuses its original key and operation. Creating
+an already-existing path never overwrites it, even if its SHA-256 is supplied.
+
+Exact old text must match once; overlapping replacements are rejected. Every file is
 preflighted before writes. Individual file replacement uses a same-directory
 temporary file and rename, preserves permissions, and uses directory capabilities
 to prevent symlink/path traversal outside the workspace. New files can create

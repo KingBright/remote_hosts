@@ -308,6 +308,24 @@ fn catalog_schema_rejects_nested_unknown_fields_types_and_bounds() {
 }
 
 #[test]
+fn catalog_explains_the_create_version_contract() {
+    let catalog = remote_hosts_code::tools::catalog();
+    let tool = catalog
+        .iter()
+        .find(|t| t.name == "code_apply_edits")
+        .unwrap();
+    let description = tool.description.as_deref().unwrap();
+    assert!(description.contains("expected_version=\"absent\""));
+    assert!(description.contains("full content only"));
+    let version =
+        &tool.input_schema["properties"]["files"]["items"]["properties"]["expected_version"];
+    let help = version["description"].as_str().unwrap();
+    assert!(help.contains("absent for create"));
+    assert!(help.contains("SHA-256 for edit/delete"));
+    assert!(help.contains("empty string is not a missing-file marker"));
+}
+
+#[test]
 fn search_window_preserves_utf8_and_reports_byte_offset() {
     let (dir, ws) = workspace();
     std::fs::write(
