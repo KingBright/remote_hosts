@@ -2,11 +2,11 @@
 
 > 唯一事实源：`docs/product/backlog.json`。本页由 `scripts/product-backlog.py --render` 生成。
 
-更新日期：2026-09-22。共 56 项。
+更新日期：2026-10-05。共 58 项。
 
 已验证候选不等于线上修复；部分修复不能关闭整项。关闭必须附本项验收证据。
 
-状态汇总：未修复 11；部分修复 24；候选已验证 13；外部阻塞 1；已验收关闭 7。
+状态汇总：未修复 12；部分修复 24；候选已验证 14；外部阻塞 1；已验收关闭 7。
 
 ## 版本规划
 
@@ -38,6 +38,8 @@
 
 **0.10.19**：原生桌面 OAuth 接入及发布客户端传输诊断；本轮评估见 DESKTOP-REVIEW-2026-09-22.md，现场状态留在 private ops。
 
+**0.10.22**：打通真实 Gemini Spark 授权和工具调用，保持原生桌面、ChatGPT 与四台 Agent 的兼容边界；现场回执留在 private ops。
+
 ## 问题索引
 
 | ID | 优先级 | 状态 | 目标版本 | 问题 |
@@ -50,7 +52,7 @@
 | RH-006 | P1 | 候选已验证 | 0.3.0 | 上传全程占工作区写锁 |
 | RH-007 | P0 | 部分修复 | 0.4.0 | 双向且跨进程的持久化断点续传 |
 | RH-008 | P0 | 未修复 | 0.3.1 | 原生file_upload偶发file source lookup failed |
-| RH-009 | P1 | 部分修复 | 0.10.20 | 传输重试状态机与错误结果永久done |
+| RH-009 | P1 | 候选已验证 | 0.10.20 | 传输重试状态机与错误结果永久done |
 | RH-010 | P1 | 部分修复 | 0.4.1 | 短期文件URL到期后重新授权恢复 |
 | RH-011 | P1 | 部分修复 | 0.4.0 | 独立文件任务取消及清理证明 |
 | RH-012 | P1 | 部分修复 | 0.3.3 | 等待资源的任务占满同类执行名额 |
@@ -94,10 +96,12 @@
 | RH-047 | P0 | 部分修复 | 0.4.2 | 发布等待器缺少构建任务身份核对，启动确认被误当作交付进展 |
 | RH-051 | P1 | 未修复 | 0.8.0 | 终端进程与持久状态失配会长期阻塞升级排空 |
 | RH-052 | P1 | 未修复 | 0.8.0 | 升级就绪把短时全lane网络故障误判成候选失败 |
-| RH-053 | P0 | 未修复 | 0.10.20 | 设备时钟偏差使诊断回执阻断全部轮询 |
+| RH-053 | P0 | 未修复 | 0.10.x | 设备时钟偏差使诊断回执阻断全部轮询 |
 | RH-054 | P1 | 已验收关闭 | 0.10.19 | 原生桌面 OAuth loopback 回调未开放 |
 | RH-055 | P1 | 未修复 | next-ssh-runtime | 旧 SSH PowerShell 多行命令可能空输出退出而未执行 |
 | RH-056 | P1 | 未修复 | 0.10.x | 高负载下终端完成状态滞后与控制请求延迟 |
+| RH-057 | P1 | 未修复 | 0.10.x | OAuth 过期、重复提交和限流缺少清楚的页面反馈 |
+| RH-058 | P1 | 部分修复 | 0.10.x | 发布调用入口可能误用可变工作树中的旧协调器 |
 
 ## 逐项验收
 
@@ -215,15 +219,15 @@
 
 ### RH-009 · 传输重试状态机与错误结果永久done
 
-**P1 / 部分修复 / 0.10.20**
+**P1 / 候选已验证 / 0.10.20**
 
 现象与范围：可恢复传输错误当前也作为done结果；同一幂等键只返回旧失败，不能刷新授权继续。
 
-当前处理：0.10.19 现场再次证明 transfer_resume 能在同一 operation 上续传并校验 SHA。但 release_client.Client.tool 对 paused/awaiting_source 抛出 OperationIncomplete，fleet-upgrade 的 verified_import/export 尚未接住该边界，仍需人工观察并恢复原操作。保留 partial；下一轮打通有界恢复与仅验收入口。 验收器已支持已知瞬时连接故障最多两次原操作恢复，并拒绝把任意错误视作校验通过；该范围不关闭发布协调器的缺口。
+当前处理：Python 发布协调器原操作接续断层已修复，默认 Client.tool 仍抛 OperationIncomplete；显式传输恢复保留原 operation、SHA 和绑定 transfer_revision 的幂等键，300秒及默认最多两次resume，异常/确认丢失/确定失败/outcome_unknown停止而不重发上传下载。新增 acceptance-only 原传输入口借用已有授权，绕过登录、分发和部署。固定隔离验收36项协调器测试与10项真实Rust协议测试通过，含HTTP403源失效、明确同源刷新、新进程续传、夹具Gateway进程终止后检查点恢复及借用授权CLI异常脱敏；独立交付分支完整Python门禁328项中327通过、1项一次性launchd探针未启用而跳过。候选已验证，正式已安装fleet的故障/重启验收仍未运行，不等同线上关闭；无正式服务或凭据变更。
 
 验收：临时故障恢复同一任务；确定失败不可盲重放；发布后丢回执只补回执。
 
-证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`docs/releases/0.4.0/verification-q1.json`、`docs/releases/0.4.0/deployment.json`、`docs/releases/0.4.0/workflow-acceptance-q1.json`、`docs/releases/0.4.1/verification.json`、`docs/releases/0.4.1/deployment.json`、`docs/releases/0.4.1/incidents.json`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`
+证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`docs/releases/0.4.0/verification-q1.json`、`docs/releases/0.4.0/deployment.json`、`docs/releases/0.4.0/workflow-acceptance-q1.json`、`docs/releases/0.4.1/verification.json`、`docs/releases/0.4.1/deployment.json`、`docs/releases/0.4.1/incidents.json`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`、`scripts/release_client.py`、`scripts/fleet-upgrade.py`、`scripts/tests/test_fleet_transfer_recovery.py`、`scripts/check-transfer-recovery.py`、`scripts/tests/test_fleet_transfer_acceptance.py`、`crates/remote-hosts-code/src/durable_transfer_tests.rs`、`docs/transfer-recovery-acceptance.md`
 
 依赖：无
 
@@ -591,11 +595,11 @@
 
 现象与范围：ChatGPT工具目录可能仍缓存旧描述；包版本不能表达所有功能/限制。
 
-当前处理：0.10.19 Gateway 和原生 Codex 客户端均实测列出 24 项工具；版本、wire protocol、tool schema、Skill revision 分层报告。旧会话仍需刷新，其他宿主当前实际暴露程度不能从服务端自报推断。原生桌面 OAuth 回调接入由 RH-054 单独记录。
+当前处理：原生 Codex 已实测列出 24 工具；0.10.22 Gemini Spark 已完成真实授权、同步 24 工具并实际调用 devices_list，返回四台设备在线。版本、wire protocol、tool schema、Skill revision 仍分层报告。宿主对 compact/structuredContent 与 full 的消费差异、刷新和附件契约仍需独立回归，不能由服务端目录推断。原生桌面 OAuth 回调接入由 RH-054 记录。
 
 验收：新Gateway旧Agent与新Agent旧Gateway行为明确；无静默忽略lane导致错调度。
 
-证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`crates/remote-hosts-code/src/gateway.rs`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`、`docs/releases/0.7.1/native-acceptance.json`、`docs/releases/0.7.1/RELEASE.md`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`
+证据或实现位置：`crates/remote-hosts-code/src/agent.rs`、`crates/remote-hosts-code/src/gateway.rs`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`、`docs/releases/0.7.1/native-acceptance.json`、`docs/releases/0.7.1/RELEASE.md`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`、`docs/gemini-spark-mcp.md`
 
 依赖：无
 
@@ -843,7 +847,7 @@
 
 ### RH-053 · 设备时钟偏差使诊断回执阻断全部轮询
 
-**P0 / 未修复 / 0.10.20**
+**P0 / 未修复 / 0.10.x**
 
 现象与范围：receipt_delivery.reported_at 比 Gateway 快约 93 秒时，Status.valid 的 now()+90 校验让全部 poll 返回 400。设备仍可进行 HTTPS/SSH 访问，用户却看到代码 Agent 离线。
 
@@ -896,5 +900,33 @@
 验收：在可控 CPU/IO/SQLite 竞争下量化控制调用 P95、终端完成回执延迟及回执新鲜度。；本地完成或超时应在有界时间内可观察；状态滞后须明确标注，不得自动重放命令。
 
 证据或实现位置：`docs/product/DESKTOP-REVIEW-2026-09-22.md`
+
+依赖：无
+
+### RH-057 · OAuth 过期、重复提交和限流缺少清楚的页面反馈
+
+**P1 / 未修复 / 0.10.x**
+
+现象与范围：多次授权尝试期间出现 429，旧会话还可能在 Google 回调处过期。页面未清楚区分等待、失败与已发放授权码，易诱发继续点击。
+
+当前处理：0.10.22 已修复可确认的完整跳转链 CSP 问题，单次授权自动返回并完成 Spark 调用。重复提交防护、Retry-After/错误页面和过期后的新会话入口尚未验收。
+
+验收：真实浏览器覆盖 approve 303、Google callback 302、最终 Gemini 返回，且普通/native 客户端 CSP 保持原边界。；重复点击只产生一次授权提交；429 明确等待时间；过期会话明确引导重新发起，不重用已消费的回调。
+
+证据或实现位置：`docs/gemini-spark-mcp.md`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`
+
+依赖：无
+
+### RH-058 · 发布调用入口可能误用可变工作树中的旧协调器
+
+**P1 / 部分修复 / 0.10.x**
+
+现象与范围：固定源码已有进程 FD 上限修复，但调用了可变工作树中的旧 release-code.py，验证和 macOS 构建通过后 Linux linker 报 ProcessFdQuotaExceeded。长 PTY heredoc 的不完整输入也增加了启动状态不确定性。
+
+当前处理：保留原失败回执，通过状态/进程观察证明后续不完整输入未启动，校验上传小 runner 并仅以单行启动冻结协调器；进程软上限从 256 提到 4096 后三端构建与打包通过。没有修改系统上限、绕过测试或更换冻结源码。
+
+验收：正常发布入口强制绑定冻结协调器身份，并在回执记录该身份、资源上限和可复用 build slot。；不确定启动只观察原报告/进程；已知失败保留原回执；回归覆盖旧入口和不完整输入，不能重复执行未确认结束的构建。
+
+证据或实现位置：`docs/gemini-spark-mcp.md`、`docs/product/DESKTOP-REVIEW-2026-09-22.md`
 
 依赖：无

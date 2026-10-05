@@ -13,6 +13,7 @@ import pathlib
 import re
 import shlex
 import subprocess
+import sys
 import tarfile
 import time
 
@@ -98,31 +99,69 @@ def exported_size(exported, bundle):
     return value if isinstance(value,int) and value>=0 else bundle.stat().st_size
 
 
-def verified_export(client, exported, bundle, bundle_sha, version):
-    value=exported
-    for attempt in range(1,6):
-        if value.get('state')=='completed':
-            if value.get('sha256')!=bundle_sha or not value.get('artifact_id') or not value.get('download_url'):
-                raise RuntimeError('bundle export completed without verified artifact identity')
-            return value
-        ident=value.get('operation_id')
-        if not ident: raise RuntimeError('bundle export missing operation identity')
-        if value.get('state')=='already_finished' and value.get('next_action')=='operation_get':
-            value=client.tool('operation_get',{'operation_id':ident});continue
-        if value.get('state') in ('paused','awaiting_source') and value.get('next_action')=='transfer_resume':
-            client.tool('transfer_resume',{'operation_id':ident,'idempotency_key':'fleet-'+version+'-bundle-export-resume-'+str(attempt)})
-            value=client.tool('operation_get',{'operation_id':ident});continue
-        raise RuntimeError('bundle export not recoverable: '+str(value.get('state')))
-    raise RuntimeError('bundle export did not complete after bounded resume attempts')
+def recover_transfer(client, value, resume_key, *, file=None, deadline=None, max_resumes=2):
+    """Continue one original file operation; this never submits an upload/download.
+
+    A lost resume acknowledgement stops with the original exception/handle.
+    New resume generations use the device's revision, not a timeout or a new run.
+    """
+    if type(max_resumes) is not int or not 0 <= max_resumes <= 5:
+        raise ValueError('invalid transfer resume budget')
+    end=time.monotonic()+300 if deadline is None else deadline
+    ident=value.get('operation_id')
+    if not ident: raise RuntimeError('bundle transfer missing operation identity')
+    resumes=0
+    while True:
+        if value.get('operation_id')!=ident:
+            raise RuntimeError('bundle transfer recovery changed operation identity: '+ident)
+        if (value.get('state') in ('unknown','outcome_unknown') or value.get('outcome')=='outcome_unknown'
+                or value.get('receipt',{}).get('execution_state')=='outcome_unknown'):
+            raise RuntimeError('bundle transfer outcome uncertain; observe original: '+ident)
+        if value.get('error'):
+            raise RuntimeError('bundle transfer failed; observe original: '+ident)
+        if value.get('state')=='completed': return value
+        if time.monotonic()>=end:
+            raise RuntimeError('bundle transfer recovery timeout; observe original: '+ident)
+        if value.get('pending') or value.get('next_action')=='operation_get':
+            name='operation_get';args={'operation_id':ident,'wait_ms':5000}
+        elif (value.get('state') in ('paused','awaiting_source')
+                and value.get('next_action')=='transfer_resume' and value.get('resumable') is not False):
+            if value['state']=='awaiting_source' and file is None:
+                raise RuntimeError('bundle transfer needs refreshed source authorization; observe original: '+ident)
+            if resumes>=max_resumes:
+                raise RuntimeError('bundle transfer resume limit reached; observe original: '+ident)
+            revision=value.get('transfer_revision')
+            if revision is not None and (type(revision) is not int or revision<0):
+                raise RuntimeError('bundle transfer revision invalid; observe original: '+ident)
+            # Legacy results have no revision; retain their bounded attempt identity.
+            generation=revision if revision is not None else 'legacy-'+str(resumes+1)
+            args={'operation_id':ident,'idempotency_key':resume_key+'-'+rr.identity([ident,generation])[:16]}
+            if file is not None: args['file']=dict(file)
+            name='transfer_resume';resumes+=1
+        else:
+            raise RuntimeError('bundle transfer not recoverable: '+str(value.get('state'))+'; observe original: '+ident)
+        try:
+            value=client.tool(name,args,deadline=end,allow_incomplete=True)
+        except Exception as error:
+            error.add_note('bundle transfer interrupted; observe original: '+ident+'; no producing request replayed')
+            raise
 
 
-def verified_import(client, imported, exported, bundle, bundle_sha, version, ident):
-    if imported.get('state')=='completed' and imported.get('sha256')==bundle_sha:return imported
-    if imported.get('state') in ('paused','awaiting_source') and imported.get('next_action')=='transfer_resume':
-        resumed=client.tool('transfer_resume',{'operation_id':imported['operation_id'],
-            'idempotency_key':'fleet-'+version+'-bundle-resume-'+ident,
-            'file':{'file_id':exported['artifact_id'],'download_url':exported['download_url'],'file_name':bundle.name}})
-        if resumed.get('state')=='completed' and resumed.get('sha256')==bundle_sha:return resumed
+def verified_export(client, exported, bundle, bundle_sha, version, *, deadline=None, max_resumes=2):
+    value=recover_transfer(client,exported,'fleet-'+version+'-bundle-export-resume',
+                           deadline=deadline,max_resumes=max_resumes)
+    if value.get('sha256')!=bundle_sha or not value.get('artifact_id') or not value.get('download_url'):
+        raise RuntimeError('bundle export completed without verified artifact identity')
+    return value
+
+
+def verified_import(client, imported, exported, bundle, bundle_sha, version, ident, *, deadline=None, max_resumes=2):
+    if imported.get('state')=='completed' and imported.get('sha256')!=bundle_sha:
+        raise RuntimeError('bundle import not verified: '+ident)
+    value=recover_transfer(client,imported,'fleet-'+version+'-bundle-resume-'+ident,
+        file={'file_id':exported['artifact_id'],'download_url':exported['download_url'],'file_name':bundle.name},
+        deadline=deadline,max_resumes=max_resumes)
+    if value.get('sha256')==bundle_sha:return value
     raise RuntimeError('bundle import not verified: '+ident)
 
 
@@ -284,10 +323,102 @@ def launch_command(device,destination,manifest,version):
             ' -Sha256 '+sha+' -Version '+version+' -Result '+ps_quote(destination+'\\upgrade-result.json'))
 
 
+def validate_transfer_acceptance(spec):
+    """Only an explicit original transfer and borrowed grant may enter here."""
+    if not isinstance(spec, dict) or spec.get('schema_version') != 1:
+        raise ValueError('invalid transfer acceptance specification')
+    if spec.get('kind') not in ('export', 'import'):
+        raise ValueError('transfer acceptance requires export or import')
+    for field in ('operation_id', 'resume_key'):
+        if not isinstance(spec.get(field), str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', spec[field]):
+            raise ValueError('invalid transfer acceptance identity')
+    if not isinstance(spec.get('sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', spec['sha256']):
+        raise ValueError('transfer acceptance requires original SHA-256')
+    if not isinstance(spec.get('origin'), str):
+        raise ValueError('transfer acceptance requires explicit origin')
+    seconds=spec.get('deadline_seconds',300)
+    budget=spec.get('max_resumes',2)
+    if type(seconds) is not int or not 1 <= seconds <= 300:
+        raise ValueError('invalid transfer acceptance deadline')
+    if type(budget) is not int or not 0 <= budget <= 5:
+        raise ValueError('invalid transfer acceptance resume budget')
+    source=spec.get('file')
+    if source is not None:
+        if spec['kind'] != 'import' or not isinstance(source,dict):
+            raise ValueError('source refresh requires original import')
+        if set(source) != {'file_id','download_url','file_name'} or not all(isinstance(x,str) and x for x in source.values()):
+            raise ValueError('source refresh requires explicit original file identity')
+    return seconds,budget
+
+
+def accept_existing_transfer(client, spec, report):
+    """Observe/resume one existing operation; never distribute or deploy bytes.
+
+    The caller supplies its existing authorized client. Source refresh is explicit
+    and the existing server verifies unchanged file identity. Reports omit URLs,
+    bearer tokens, credentials and arbitrary exception text.
+    """
+    seconds,budget=validate_transfer_acceptance(spec)
+    if client.origin != spec['origin']:
+        raise ValueError('transfer acceptance origin changed')
+    ident=spec['operation_id']
+    state={'schema_version':1,'mode':'existing_transfer_acceptance','operation_id':ident,
+           'kind':spec['kind'],'sha256':spec['sha256'],'state':'observing',
+           'producer_submitted':False,'deployment_requested':False,'new_oauth_grant':False}
+    rr.atomic_json(report,state)
+    try:
+        deadline=time.monotonic()+seconds
+        value=client.tool('operation_get',{'operation_id':ident},deadline=deadline,allow_incomplete=True)
+        if value.get('operation_id') != ident:
+            raise RuntimeError('transfer acceptance changed original operation identity')
+        value=recover_transfer(client,value,spec['resume_key'],file=spec.get('file'),
+                               deadline=deadline,max_resumes=budget)
+        if value.get('sha256') != spec['sha256']:
+            raise RuntimeError('transfer acceptance SHA-256 mismatch')
+        if spec['kind']=='export' and (not value.get('artifact_id') or not value.get('download_url')):
+            raise RuntimeError('transfer acceptance export artifact unconfirmed')
+        state.update(state='accepted',transfer_revision=value.get('transfer_revision'),size=value.get('size'),
+                     acceptance_scope='original_transfer_only')
+        rr.atomic_json(report,state)
+        return state
+    except Exception as error:
+        state.update(state='needs_recovery',error_type=type(error).__name__,
+                     next_action='observe the same original operation; do not replay producer or deploy')
+        rr.atomic_json(report,state)
+        raise
+
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--version',required=True);p.add_argument('--package',type=pathlib.Path,required=True);p.add_argument('--config',type=pathlib.Path,required=True);p.add_argument('--report-dir',type=pathlib.Path,required=True)
+    p=argparse.ArgumentParser();p.add_argument('--version');p.add_argument('--package',type=pathlib.Path);p.add_argument('--config',type=pathlib.Path);p.add_argument('--report-dir',type=pathlib.Path,required=True)
     p.add_argument('--acceptance-script',type=pathlib.Path,help='Explicit verified validator update; keep the immutable package unchanged and record both identities')
+    p.add_argument('--acceptance-only',type=pathlib.Path,metavar='ORIGINAL_TRANSFER_JSON',
+                   help='Observe/resume only the specified existing transfer; no login, producer, upgrade or fleet deployment')
+    p.add_argument('--access-token-stdin',action='store_true',help='Borrow an already authorized bearer from stdin; never register, approve, refresh or revoke its grant')
     args=p.parse_args()
+    if args.acceptance_only:
+        if any((args.version,args.package,args.config,args.acceptance_script)) or not args.access_token_stdin:
+            p.error('acceptance-only requires --access-token-stdin and excludes deployment inputs')
+        if args.acceptance_only.stat().st_size > 65536:
+            p.error('transfer acceptance input exceeds 64 KiB')
+        spec=json.loads(args.acceptance_only.read_text())
+        validate_transfer_acceptance(spec)
+        access=sys.stdin.read(4097).strip()
+        if not access or len(access)>4096 or not re.fullmatch(r'[A-Za-z0-9._~+/=-]+',access):
+            p.error('explicit borrowed access token required on stdin')
+        client=Client(spec['origin'],access=access)
+        try:
+            result=accept_existing_transfer(client,spec,args.report_dir/'transfer-acceptance.json')
+            print(json.dumps(result))
+        except Exception as error:
+            # Preserve the cause for in-process callers, but never print a
+            # transport exception/capability URL at this borrowed-token CLI.
+            raise SystemExit('transfer acceptance needs recovery; error_type='+type(error).__name__+
+                             '; observe original operation='+spec['operation_id']) from None
+        finally:
+            client.close()  # refresh is None: borrowed grant is never revoked.
+        return
+    if args.access_token_stdin or not all((args.version,args.package,args.config)):
+        p.error('deployment requires --version, --package and --config')
     package=args.package.resolve();directory=args.report_dir.resolve();directory.mkdir(parents=True,exist_ok=True);config=json.loads(args.config.read_text());manifest=verify_package(package,args.version);bundle,bundle_sha=ensure_bundle(package,manifest)
     if args.acceptance_script:config['acceptance_script']=str(args.acceptance_script.resolve(strict=True))
     state={'state':'running','phase':'gateway','version':args.version,'manifest_sha256':rr.digest(package/'manifest.json'),'bundle_sha256':bundle_sha,'agents':{}}
@@ -316,7 +447,7 @@ def main():
         relative=str(bundle.relative_to(pathlib.Path(controller_root)))
         cws=open_workspace(client,controller['device_id'],controller_root,'fleet-'+args.version+'-controller')
         export_attempt=rr.identity([args.version,str(directory)])[:12]
-        exported=client.tool('file_download',{'workspace_id':cws,'path':relative,'expected_version':bundle_sha,'max_bytes':268435456,'idempotency_key':'fleet-'+args.version+'-bundle-export-'+export_attempt})
+        exported=client.tool('file_download',{'workspace_id':cws,'path':relative,'expected_version':bundle_sha,'max_bytes':268435456,'idempotency_key':'fleet-'+args.version+'-bundle-export-'+export_attempt},allow_incomplete=True)
         exported=verified_export(client,exported,bundle,bundle_sha,args.version)
         state['source_artifact']={'operation_id':exported['operation_id'],'sha256':bundle_sha,'size':exported_size(exported,bundle)};save()
         ordered,deferred=rollout_targets(devices,controller_id)
@@ -328,7 +459,7 @@ def main():
             if device['converged']: continue
             ws=open_workspace(client,ident,root_path(device),'fleet-'+args.version+'-'+ident)
             remote_bundle='.remote-hosts-release-staging-'+args.version+'/'+bundle.name
-            imported=client.tool('file_upload',{'workspace_id':ws,'path':remote_bundle,'expected_version':'absent','sha256':bundle_sha,'max_bytes':268435456,'idempotency_key':'fleet-'+args.version+'-bundle-import-'+ident,'file':{'file_id':exported['artifact_id'],'download_url':exported['download_url'],'file_name':bundle.name}})
+            imported=client.tool('file_upload',{'workspace_id':ws,'path':remote_bundle,'expected_version':'absent','sha256':bundle_sha,'max_bytes':268435456,'idempotency_key':'fleet-'+args.version+'-bundle-import-'+ident,'file':{'file_id':exported['artifact_id'],'download_url':exported['download_url'],'file_name':bundle.name}},allow_incomplete=True)
             imported=verified_import(client,imported,exported,bundle,bundle_sha,args.version,ident)
             h=home(device);destination=(h+'/.local/share/remote-hosts-code/releases/'+args.version) if platform(device)!='windows' else (h+'\\.local\\share\\remote-hosts-code\\releases\\'+args.version)
             client.terminal(ws,extract_command(device,remote_bundle,destination,bundle_sha),'fleet-'+args.version+'-extract-'+ident,120)

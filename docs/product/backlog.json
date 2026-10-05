@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "project": "remote_hosts",
-  "updated_at": "2026-09-22",
+  "updated_at": "2026-10-05",
   "source_of_truth": "docs/product/backlog.json",
   "status_policy": {
     "open": "未实现或尚未定位",
@@ -269,12 +269,12 @@
     {
       "id": "RH-009",
       "priority": "P1",
-      "status": "partial",
+      "status": "candidate_verified",
       "target_version": "0.10.20",
       "title": "传输重试状态机与错误结果永久done",
       "discovery": "code_review",
       "problem": "可恢复传输错误当前也作为done结果；同一幂等键只返回旧失败，不能刷新授权继续。",
-      "current_resolution": "0.10.19 现场再次证明 transfer_resume 能在同一 operation 上续传并校验 SHA。但 release_client.Client.tool 对 paused/awaiting_source 抛出 OperationIncomplete，fleet-upgrade 的 verified_import/export 尚未接住该边界，仍需人工观察并恢复原操作。保留 partial；下一轮打通有界恢复与仅验收入口。 验收器已支持已知瞬时连接故障最多两次原操作恢复，并拒绝把任意错误视作校验通过；该范围不关闭发布协调器的缺口。",
+      "current_resolution": "Python 发布协调器原操作接续断层已修复，默认 Client.tool 仍抛 OperationIncomplete；显式传输恢复保留原 operation、SHA 和绑定 transfer_revision 的幂等键，300秒及默认最多两次resume，异常/确认丢失/确定失败/outcome_unknown停止而不重发上传下载。新增 acceptance-only 原传输入口借用已有授权，绕过登录、分发和部署。固定隔离验收36项协调器测试与10项真实Rust协议测试通过，含HTTP403源失效、明确同源刷新、新进程续传、夹具Gateway进程终止后检查点恢复及借用授权CLI异常脱敏；独立交付分支完整Python门禁328项中327通过、1项一次性launchd探针未启用而跳过。候选已验证，正式已安装fleet的故障/重启验收仍未运行，不等同线上关闭；无正式服务或凭据变更。",
       "acceptance": [
         "临时故障恢复同一任务；确定失败不可盲重放；发布后丢回执只补回执。"
       ],
@@ -286,12 +286,19 @@
         "docs/releases/0.4.1/verification.json",
         "docs/releases/0.4.1/deployment.json",
         "docs/releases/0.4.1/incidents.json",
-        "docs/product/DESKTOP-REVIEW-2026-09-22.md"
+        "docs/product/DESKTOP-REVIEW-2026-09-22.md",
+        "scripts/release_client.py",
+        "scripts/fleet-upgrade.py",
+        "scripts/tests/test_fleet_transfer_recovery.py",
+        "scripts/check-transfer-recovery.py",
+        "scripts/tests/test_fleet_transfer_acceptance.py",
+        "crates/remote-hosts-code/src/durable_transfer_tests.rs",
+        "docs/transfer-recovery-acceptance.md"
       ],
       "depends_on": [],
       "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
       "introduced_or_observed": "0.2.0 or 0.3.0 candidate",
-      "last_reviewed": "2026-09-22",
+      "last_reviewed": "2026-10-05",
       "closure_evidence": []
     },
     {

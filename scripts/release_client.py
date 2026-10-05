@@ -303,17 +303,27 @@ class Client:
             value = json.loads(response['content'][0]['text'])
         return value
 
-    def tool(self, name, args, *, deadline=None):
+    def tool(self, name, args, *, deadline=None, allow_incomplete=False):
+        # Only the explicit transfer coordinator may consume a suspended result.
+        # Default callers still get OperationIncomplete, never false success.
+        if allow_incomplete and name not in ('file_upload', 'file_download', 'transfer_resume', 'operation_get'):
+            raise ValueError('incomplete_capture_requires_transfer_or_observation')
         end = deadline if deadline is not None else time.monotonic() + 900
         value = self.raw(name, args)
+        original = value.get('operation_id')
         while value.get('pending'):
+            if not original:
+                raise RuntimeError('observation_missing_operation_identity')
             if time.monotonic() > end:
-                raise RuntimeError('observation_timeout:' + value['operation_id'])
-            value = self.raw('operation_get', {'operation_id': value['operation_id'], 'wait_ms': 5000})
+                raise RuntimeError('observation_timeout:' + original)
+            value = self.raw('operation_get', {'operation_id': original, 'wait_ms': 5000})
+            if value.get('operation_id') != original:
+                raise RuntimeError('observation_identity_changed:' + original)
         if 'error' in value:
             raise RuntimeError(name + ':' + str(value.get('error_code', value['error'])) + '; operation=' + str(value.get('operation_id')))
         if value.get('state') in ('paused', 'awaiting_source'):
-            raise OperationIncomplete(value)
+            if not allow_incomplete:
+                raise OperationIncomplete(value)
         return value
 
     def terminal(self, ws, command, key, timeout=60):
