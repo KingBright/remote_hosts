@@ -50,22 +50,31 @@ pub(crate) fn ensure_storage_capacity(path: &Path, requested: u64) -> Result<u64
     Ok(available)
 }
 pub(crate) async fn source_authorization_status(g: &Gateway, id: &str) -> Result<Value> {
-    let row: Option<(i64,)> =
-        sqlx::query_as("SELECT expires FROM kv WHERE kind='file_source' AND key=?")
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT expires,value FROM kv WHERE kind='file_source' AND key=?")
             .bind(id)
             .fetch_optional(&g.store.pool)
             .await?;
     let control = crate::transfer_control::control(g, id).await?;
     let at = now();
+    // The existing authorized source record supplies only its origin here.
+    // Never return the signed path/query, even for an expired source.
+    let endpoint = row.as_ref().and_then(|(_, value)| {
+        let source: Value = serde_json::from_str(value).ok()?;
+        let url = source_url(source["download_url"].as_str()?, &g.config.public_url).ok()?;
+        Some(json!({"host":url.host_str()?,"port":url.port_or_known_default()?,"scheme":"https"}))
+    });
     let (state, expires_at) = match row {
-        Some((expires,)) if expires > at => ("available", Some(expires)),
-        Some((expires,)) => ("expired", Some(expires)),
+        Some((expires, _)) if expires > at => ("available", Some(expires)),
+        Some((expires, _)) => ("expired", Some(expires)),
         None => ("required", None),
     };
-    Ok(json!({"protocol":1,"state":state,"expires_at":expires_at,
+    Ok(
+        json!({"protocol":1,"state":state,"expires_at":expires_at,"source_endpoint":endpoint,
         "error_code":if state=="available" {Value::Null} else {json!("source_authorization_required")},
         "refresh_supported":true,"transfer_revision":control.revision,
-        "next_action":if state=="available" {"observe_original_operation"} else {"transfer_resume_with_refreshed_file_authorization"}}))
+        "next_action":if state=="available" {"observe_original_operation"} else {"transfer_resume_with_refreshed_file_authorization"}}),
+    )
 }
 pub(crate) fn valid_hash(value: &str) -> bool {
     value.len() == 64
@@ -143,6 +152,70 @@ fn public_ip(ip: IpAddr) -> bool {
         }
     }
 }
+/// Structured, URL-free pre-HTTP failures. These are not TCP/TLS failures.
+#[derive(Debug)]
+pub(crate) struct SourceClientFault {
+    pub code: &'static str,
+    host: String,
+    os_error: Option<i32>,
+}
+impl SourceClientFault {
+    fn new(u: &reqwest::Url, code: &'static str) -> Self {
+        Self {
+            code,
+            host: u.host_str().unwrap_or_default().to_owned(),
+            os_error: None,
+        }
+    }
+    fn dns(u: &reqwest::Url, error: &std::io::Error) -> Self {
+        let code = if error.kind() == std::io::ErrorKind::PermissionDenied {
+            "source_network_access_denied"
+        } else {
+            "source_dns_lookup_failed"
+        };
+        Self {
+            os_error: error.raw_os_error(),
+            ..Self::new(u, code)
+        }
+    }
+    pub fn diagnostic(&self) -> Value {
+        json!({"code":self.code,"side":"device","stage":"source_client_initialization",
+            "source_host":self.host,"os_error":self.os_error,
+            "failure_boundary":match self.code {
+                "source_network_access_denied"=>"device_network_permission",
+                "source_address_policy_rejected"=>"source_address_policy",
+                "source_client_initialization_failed"=>"device_client_initialization",
+                _=>"source_dns"
+            },"http_request_started":false,"authorization_failure_observed":false})
+    }
+}
+impl std::fmt::Display for SourceClientFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.code)
+    }
+}
+impl std::error::Error for SourceClientFault {}
+
+fn source_client_with_addresses(
+    u: &reqwest::Url,
+    addresses: &[SocketAddr],
+) -> Result<reqwest::Client> {
+    if addresses.is_empty() {
+        return Err(SourceClientFault::new(u, "source_dns_no_addresses").into());
+    }
+    if addresses.iter().any(|a| !public_ip(a.ip())) {
+        return Err(SourceClientFault::new(u, "source_address_policy_rejected").into());
+    }
+    let host = u.host_str().context("missing source host")?;
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(IDLE)
+        .resolve_to_addrs(host, addresses)
+        .build()
+        .map_err(|_| SourceClientFault::new(u, "source_client_initialization_failed").into())
+}
 pub(crate) async fn source_client(u: &reqwest::Url) -> Result<reqwest::Client> {
     let host = u.host_str().context("missing source host")?;
     let addresses: Vec<SocketAddr> = tokio::time::timeout(
@@ -150,20 +223,10 @@ pub(crate) async fn source_client(u: &reqwest::Url) -> Result<reqwest::Client> {
         tokio::net::lookup_host((host, u.port_or_known_default().unwrap_or(443))),
     )
     .await
-    .map_err(|_| anyhow!("file source DNS lookup timed out"))?
-    .map_err(|_| anyhow!("file source DNS lookup failed"))?
+    .map_err(|_| SourceClientFault::new(u, "source_dns_timeout"))?
+    .map_err(|error| SourceClientFault::dns(u, &error))?
     .collect();
-    ensure!(
-        !addresses.is_empty() && addresses.iter().all(|a| public_ip(a.ip())),
-        "file source resolves to a non-public address"
-    );
-    Ok(reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(15))
-        .read_timeout(IDLE)
-        .resolve_to_addrs(host, &addresses)
-        .build()?)
+    source_client_with_addresses(u, &addresses)
 }
 pub(crate) fn root(ws: &Workspace) -> Result<Dir> {
     Ok(Dir::open_ambient_dir(
@@ -973,6 +1036,56 @@ async fn serve_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_diagnostics_distinguish_dns_permission_and_address_policy_without_urls() {
+        let u = source_url(
+            "https://files.oaiusercontent.com/private-path?signature=secret",
+            "https://gateway.example",
+        )
+        .unwrap();
+        for (kind, code) in [
+            (std::io::ErrorKind::NotFound, "source_dns_lookup_failed"),
+            (
+                std::io::ErrorKind::PermissionDenied,
+                "source_network_access_denied",
+            ),
+        ] {
+            let error =
+                SourceClientFault::dns(&u, &std::io::Error::new(kind, "sensitive OS error"));
+            assert_eq!(error.code, code);
+            let text = error.diagnostic().to_string();
+            assert!(text.contains("files.oaiusercontent.com"));
+            for private in ["private-path", "signature", "secret", "sensitive OS error"] {
+                assert!(!text.contains(private));
+                assert!(!error.to_string().contains(private));
+            }
+        }
+        for (addresses, code) in [
+            (vec![], "source_dns_no_addresses"),
+            (
+                vec!["127.0.0.1:443".parse().unwrap()],
+                "source_address_policy_rejected",
+            ),
+            (
+                vec![
+                    "1.1.1.1:443".parse().unwrap(),
+                    "198.18.0.1:443".parse().unwrap(),
+                ],
+                "source_address_policy_rejected",
+            ),
+        ] {
+            let error = source_client_with_addresses(&u, &addresses).err().unwrap();
+            assert_eq!(
+                error.downcast_ref::<SourceClientFault>().unwrap().code,
+                code
+            );
+        }
+        assert!(source_client_with_addresses(&u, &["1.1.1.1:443".parse().unwrap()]).is_ok());
+        assert_eq!(
+            SourceClientFault::new(&u, "source_dns_timeout").diagnostic()["http_request_started"],
+            false
+        );
+    }
     #[test]
     fn source_allowlist_and_private_addresses() {
         let own = "https://mcp.example:8443";

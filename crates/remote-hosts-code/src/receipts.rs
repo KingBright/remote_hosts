@@ -93,7 +93,7 @@ pub fn decision(
     } else if pending || matches!(execution, "running" | "not_started_or_unknown") {
         Some("observe_original")
     } else if transfer_paused {
-        Some("transfer_resume")
+        Some(value["next_action"].as_str().unwrap_or("transfer_resume"))
     } else if incomplete || (terminal.is_object() && !evidence_complete) {
         Some("read_original_output")
     } else if error || terminal["exit_code"].as_i64().is_some_and(|n| n != 0) {

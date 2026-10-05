@@ -102,6 +102,15 @@ class TransferRecoveryTests(unittest.TestCase):
             self.assertEqual(self.imported(complete()), complete())
         raw.assert_not_called()
 
+    def test_source_diagnosis_never_resumes_or_refreshes_authorization(self):
+        value = dict(paused(), next_action='diagnose_original_source',
+                     diagnostic={'code':'source_address_policy_rejected'},
+                     source_authorization={'state':'available'})
+        with mock.patch.object(self.client, 'raw') as raw:
+            with self.assertRaises(RuntimeError): self.export(value)
+            with self.assertRaises(RuntimeError): self.imported(value)
+        raw.assert_not_called()
+
     def test_checksum_or_export_artifact_identity_mismatch_never_passes(self):
         with mock.patch.object(self.client, 'raw') as raw:
             for result in (complete(sha256='b'*64), complete(artifact_id='')):

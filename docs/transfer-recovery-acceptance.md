@@ -23,6 +23,12 @@ These are fixture receipts. They do not establish installed fleet acceptance.
 No production configuration, credentials, enrollment or service manager is used.
 On failure inspect the same report and its owned child before a new isolated run.
 
+The fixed cases also check source DNS/permission/address-policy classification,
+hostname-only diagnostics and current source authorization on paused imports.
+See [file source diagnostics](transfer-source-diagnostics.md). A
+`diagnose_original_source` result stops the coordinator until the reported
+condition changes; it does not authorize an automatic resume or source refresh.
+
 ## Existing original transfer only
 
 `fleet-upgrade.py --acceptance-only ORIGINAL_TRANSFER_JSON --report-dir DIR

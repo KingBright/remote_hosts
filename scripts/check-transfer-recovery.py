@@ -21,6 +21,9 @@ import source_snapshot
 
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 CASES=[
+    ('lib','transfers::tests::source_diagnostics_distinguish_dns_permission_and_address_policy_without_urls','DNS/permission/address policy classification and URL redaction'),
+    ('transfers_040','source_diagnostics_address_rejection_preserves_original_operation_and_target','real DNS address policy rejection before source HTTP; original operation retained'),
+    ('transfers_040','source_diagnostics_paused_observation_tracks_source_expiry_without_replay','paused source availability/expiry/missing state and owner/scope rejection'),
     ('lib','durable_transfer::tests::expired_source_keeps_checkpoint_for_explicit_authorization_refresh','real HTTP403 retains checkpoint'),
     ('lib','durable_transfer::tests::expired_source_refresh_resumes_same_checkpoint_in_a_new_process','real HTTP403 then refreshed same-source tail in a new OS process'),
     ('lib','durable_transfer::tests::inbound_checkpoint_survives_a_real_process_kill_and_resumes_only_the_tail','owned transfer process killed after durable checkpoint; same prefix and tail'),

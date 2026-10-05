@@ -233,7 +233,7 @@ pub(crate) async fn run(
             p.phase("cancelling");
             // Drop of the network future does not mean the disk writer finished.
             // Each writer is flushed at its cancellation boundary below.
-            if let Err(e) = cleanup(config, job, &j, &guard.client, true).await {
+            if cleanup(config, job, &j, &guard.client, true).await.is_err() {
                 return suspended(
                     config,
                     store,
@@ -241,12 +241,31 @@ pub(crate) async fn run(
                     p,
                     "paused",
                     "cancel_cleanup_pending",
-                    Some(e.to_string()),
+                    None,
                 )
                 .await;
             }
             json!({"operation_id":job.id,"state":"cancelled","cancelled":true,"cleanup_complete":true,
                 "destination_changed":false,"source_unchanged":true,"transfer_revision":j.revision})
+        }
+        Err(error)
+            if error
+                .downcast_ref::<transfers::SourceClientFault>()
+                .is_some() =>
+        {
+            let fault = error
+                .downcast_ref::<transfers::SourceClientFault>()
+                .unwrap();
+            return suspended(
+                config,
+                store,
+                &mut j,
+                p,
+                "paused",
+                fault.code,
+                Some(fault.diagnostic()),
+            )
+            .await;
         }
         Err(error) if error.downcast_ref::<Fault>().is_some() => {
             let f = error.downcast_ref::<Fault>().unwrap();
@@ -288,7 +307,7 @@ async fn suspended(
     p: &Progress,
     state: &str,
     code: &str,
-    _detail: Option<String>,
+    detail: Option<Value>,
 ) -> Result<Value> {
     // Preserve a publishing marker across pause; it enables crash reconciliation.
     let publication_pending = j.phase == "publishing";
@@ -303,10 +322,17 @@ async fn suspended(
     } else {
         "paused"
     });
-    let value = json!({"operation_id":j.operation_id,"state":state,"resumable":true,"pending":false,
+    let mut value = json!({"operation_id":j.operation_id,"state":state,"resumable":true,"pending":false,
         "diagnostic":{"code":code},"next_action":"transfer_resume","transfer_revision":j.revision,
         "confirmed_bytes":j.offset,"total_bytes":j.total,"expires_at":j.expires_at,"cleanup_complete":false,
         "publication_pending":publication_pending,"progress":p.snapshot()});
+    if let Some(diagnostic) = detail {
+        value["failure_boundary"] = diagnostic["failure_boundary"].clone();
+        value["diagnostic"] = diagnostic;
+        value["next_action"] = json!("diagnose_original_source");
+        value["retry_policy"] =
+            json!("resume_original_only_after_connection_and_source_authorization_confirmed");
+    }
     // If this bounded status transmission is interrupted, the gateway's expired
     // dispatch lease retrieves the same paused journal; no file work is redone.
     let client = http()?;
@@ -462,9 +488,7 @@ async fn inbound(
     }
     let source = small_json(response).await?;
     let u = transfers::source_url(files::text(&source, "download_url")?, &config.gateway_url)?;
-    let client = transfers::source_client(&u)
-        .await
-        .map_err(|_| paused("source_dns_or_connection"))?;
+    let client = transfers::source_client(&u).await?;
     let path = j.data_path(config);
     let offset = j.offset;
     let prefix = j.prefix_sha256.clone();

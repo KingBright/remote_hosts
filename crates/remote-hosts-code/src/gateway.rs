@@ -1015,6 +1015,10 @@ impl Gateway {
         if let Some(result) = result {
             let mut result: Value = serde_json::from_str(&result)?;
             crate::transfers::decorate(self, &job, &mut result).await?;
+            if job.tool == "file_upload" && crate::durable_transfer::is_suspended(&result) {
+                result["source_authorization"] =
+                    crate::transfers::source_authorization_status(self, id).await?;
+            }
             if let Some(o) = result.as_object_mut() {
                 o.insert("operation_id".into(), json!(id));
                 o.insert("device_id".into(), json!(job.device_id));

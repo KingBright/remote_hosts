@@ -4,6 +4,7 @@ include!("support/gateway_process_040.rs");
 include!("support/recovery_041.rs");
 include!("support/collaboration_050.rs");
 include!("support/scale_070.rs");
+include!("support/source_diagnostics.rs");
 use axum::{
     Router,
     body::{Body, to_bytes},
