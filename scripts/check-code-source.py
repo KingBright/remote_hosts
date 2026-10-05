@@ -59,6 +59,21 @@ def inputs(root):
         if path.is_file():
             paths.add(path)
     paths.update((root/'scripts/tests').rglob('*.py'))
+    # Android is part of mainline input identity. Keep generated SDK/build state,
+    # signing material and the debug-only generated CA outside source snapshots.
+    android = root/'android'
+    if android.is_symlink():
+        raise ValueError('unsupported linked verification subtree: android')
+    for directory, children, files in os.walk(android, followlinks=False):
+        children[:] = sorted(n for n in children if n not in
+                             ('build', '.gradle', '.kotlin', '.idea', '.git'))
+        if any((pathlib.Path(directory)/n).is_symlink() for n in children):
+            raise ValueError('linked Android directory cannot be omitted from verification')
+        for name in files:
+            if name in ('local.properties', 'fixture_ca.pem') or pathlib.Path(name).suffix.lower() in (
+                    '.jks', '.keystore', '.p12', '.pfx', '.key', '.apk', '.aab'):
+                continue
+            paths.add(pathlib.Path(directory)/name)
     result = {}
     for path in sorted(paths):
         name = str(path.relative_to(root))

@@ -92,6 +92,21 @@ class SnapshotTests(unittest.TestCase):
         proof=self.capture()
         for file in ('target/debug/private.bin','dist/old.bin','.git/config','agent.json'):
             self.assertNotIn(file,proof['source_inputs']);self.assertFalse((self.dest/file).exists())
+
+    def test_android_sources_are_bound_but_sdk_signing_and_fixture_outputs_are_not(self):
+        source = self.root/'android/app/src/main/java/Agent.kt'
+        source.parent.mkdir(parents=True); source.write_text('// Android source')
+        private = ('android/local.properties', 'android/build/private.json',
+                   'android/.gradle/cache.bin', 'android/release.jks',
+                   'android/app/src/debug/res/raw/fixture_ca.pem', 'android/release.apk')
+        for name in private:
+            path=self.root/name; path.parent.mkdir(parents=True,exist_ok=True); path.write_text('excluded')
+        proof=self.capture()
+        self.assertIn('android/app/src/main/java/Agent.kt',proof['source_inputs'])
+        for name in private:
+            self.assertNotIn(name,proof['source_inputs']);self.assertFalse((self.dest/name).exists())
+        (self.dest/'android/app/src/main/java/Agent.kt').write_text('// next iteration')
+        with self.assertRaises(ValueError): snapshot.check(self.dest,checker.inputs)
     def test_tests_can_run_on_copy_while_original_tree_changes(self):
         import sys
         self.capture()
