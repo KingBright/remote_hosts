@@ -1,9 +1,9 @@
 {
-  "adapter_tools_sha256": "3178659ff6cab98fec845ab3d0b34f8890798f8a3d5c76d2595e1683091798ba",
+  "adapter_tools_sha256": "42da70ae12b5bfa1bb6c6e97c6d06852492f7277ab45e8f6a459930b6d2c2d68",
   "boundary": "Adapter-sent catalog is not proof of final host exposure. No final host report means unknown.",
   "protocol": 1,
-  "server_tools_sha256": "3178659ff6cab98fec845ab3d0b34f8890798f8a3d5c76d2595e1683091798ba",
-  "skill_revision": "792ee869ef68ad7253c69f6a0170ea5423dd87e7cab1b364e850fd1fcbb1c536",
+  "server_tools_sha256": "42da70ae12b5bfa1bb6c6e97c6d06852492f7277ab45e8f6a459930b6d2c2d68",
+  "skill_revision": "5875f702cd705f891a9ce178640ff499aa59dc8a671139100ea3d3cecd9e9e02",
   "tools": [
     {
       "annotations": {
@@ -440,7 +440,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Apply version-checked precise replacements or a unified patch. All files preflight before changes; each file is atomic, and every batch returns a durable change_set_id with before/after versions. Partial or uncertain batches can be inspected and continued with change_resume. Never guess when a version or unique match conflicts. Reuse the same idempotency_key only for an uncertain identical submission. Return compact diffs.",
+      "description": "Apply version-checked precise replacements or a unified patch. For action=create, use expected_version=\"absent\" and full content only; an empty version is a conflict. For edit/delete, use the current file SHA-256. All files preflight before changes; each file is atomic, and every batch returns a durable change_set_id with before/after versions. Partial or uncertain batches can be inspected and continued with change_resume. Never guess when a version or unique match conflicts. Reuse the same idempotency_key only for an uncertain identical submission. Return compact diffs.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -480,6 +480,7 @@
                   "type": "array"
                 },
                 "expected_version": {
+                  "description": "Required CAS version: literal absent for create; current file SHA-256 for edit/delete. An empty string is not a missing-file marker.",
                   "type": "string"
                 },
                 "patch": {
@@ -766,10 +767,18 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Start a command in the bound workspace. Default pty=false uses real pipes with stdin EOF and combined stdout/stderr; use pty=true only for interactive input. Shell has local-user authority outside code roots. Write-capable action. By default waits up to 1000 ms so short commands can return exit/output in one call; long commands return the same durable terminal_id. wait_ms may be 0..2000 and never stops the command. Follow the returned cursor; never replay uncertain execution.",
+      "description": "Start a command in the bound workspace. Default pty=false uses real pipes with stdin EOF and combined stdout/stderr; use pty=true only for interactive input. Shell has local-user authority outside code roots. Write-capable action. By default waits up to 1000 ms so short commands can return exit/output in one call; long commands return the same durable terminal_id. wait_ms may be 0..2000 and never stops the command. Follow the returned cursor; never replay uncertain execution. action=maintenance_task uses fixed argv and the shared ordinary-user maintenance core: prepare requires maintenance_action and a canonical maintenance_request_id, run requires the same ID and plan_sha256, verify uses the same ID. Command/PTY fields are forbidden for maintenance; privileged requests remain unavailable. No root grant.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "action": {
+            "default": "shell",
+            "enum": [
+              "shell",
+              "maintenance_task"
+            ],
+            "type": "string"
+          },
           "cols": {
             "maximum": 500,
             "minimum": 20,
@@ -779,6 +788,27 @@
             "type": "string"
           },
           "idempotency_key": {
+            "type": "string"
+          },
+          "maintenance_action": {
+            "enum": [
+              "inspect_remoteplay_mesh",
+              "repair_remoteplay_mesh_ownership"
+            ],
+            "type": "string"
+          },
+          "maintenance_request_id": {
+            "type": "string"
+          },
+          "maintenance_step": {
+            "enum": [
+              "prepare",
+              "run",
+              "verify"
+            ],
+            "type": "string"
+          },
+          "plan_sha256": {
             "type": "string"
           },
           "pty": {
@@ -819,8 +849,7 @@
         },
         "required": [
           "workspace_id",
-          "idempotency_key",
-          "command"
+          "idempotency_key"
         ],
         "type": "object"
       },
@@ -1203,10 +1232,19 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Read bounded workspace transfer/terminal facts, recent durable change-set summaries, state counts and runtime identity. active_only narrows terminal/transfer facts; terminal_cursor and transfer_after continue independent live pages. Cursors bind the workspace and filters; restart pages for a fresh view after state changes. after_event replays durable workspace transitions from the returned scoped event cursor; expired cursors require a fresh snapshot. Reports whether explicit workspace_gc is available. No command text or credentials. Device-wide counts are labelled. Not chat-memory or build-verification evidence.",
+      "description": "Read bounded workspace transfer/terminal facts, recent durable change-set summaries, state counts and runtime identity. active_only narrows terminal/transfer facts; terminal_cursor and transfer_after continue independent live pages. Cursors bind the workspace and filters; restart pages for a fresh view after state changes. after_event replays durable workspace transitions from the returned scoped event cursor; expired cursors require a fresh snapshot. Reports whether explicit workspace_gc is available. No command text or credentials. Device-wide counts are labelled. Not chat-memory or build-verification evidence. action=maintenance_describe requires maintenance_action; maintenance_receipt requires the original canonical maintenance_request_id. Both read without creating a journal, target files or write lock; snapshot paging fields cannot be mixed with maintenance. Requires the selected agent to advertise optional maintenance capability.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "action": {
+            "default": "snapshot",
+            "enum": [
+              "snapshot",
+              "maintenance_describe",
+              "maintenance_receipt"
+            ],
+            "type": "string"
+          },
           "active_only": {
             "type": "boolean"
           },
@@ -1220,6 +1258,16 @@
             "maximum": 50,
             "minimum": 1,
             "type": "integer"
+          },
+          "maintenance_action": {
+            "enum": [
+              "inspect_remoteplay_mesh",
+              "repair_remoteplay_mesh_ownership"
+            ],
+            "type": "string"
+          },
+          "maintenance_request_id": {
+            "type": "string"
           },
           "response_mode": {
             "default": "compact",
@@ -1472,5 +1520,5 @@
     "host_tools": "x-rh-host-tools",
     "request_id": "x-rh-request-id"
   },
-  "version": "0.10.24"
+  "version": "0.10.25"
 }
