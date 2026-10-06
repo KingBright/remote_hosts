@@ -267,6 +267,38 @@ pub(crate) async fn run(
             )
             .await;
         }
+        Err(error) if error.downcast_ref::<transfers::SourceHttpFault>().is_some() => {
+            let fault = error.downcast_ref::<transfers::SourceHttpFault>().unwrap();
+            return suspended(
+                config,
+                store,
+                &mut j,
+                p,
+                "awaiting_source",
+                "source_http_authorization_rejected",
+                Some(fault.diagnostic()),
+            )
+            .await;
+        }
+        Err(error)
+            if error
+                .downcast_ref::<transfers::DestinationPermissionFault>()
+                .is_some() =>
+        {
+            let fault = error
+                .downcast_ref::<transfers::DestinationPermissionFault>()
+                .unwrap();
+            return suspended(
+                config,
+                store,
+                &mut j,
+                p,
+                "paused",
+                "destination_file_permission_denied",
+                Some(fault.diagnostic()),
+            )
+            .await;
+        }
         Err(error) if error.downcast_ref::<Fault>().is_some() => {
             let f = error.downcast_ref::<Fault>().unwrap();
             return suspended(config, store, &mut j, p, f.state, f.code, None).await;
@@ -328,10 +360,21 @@ async fn suspended(
         "publication_pending":publication_pending,"progress":p.snapshot()});
     if let Some(diagnostic) = detail {
         value["failure_boundary"] = diagnostic["failure_boundary"].clone();
-        value["diagnostic"] = diagnostic;
-        value["next_action"] = json!("diagnose_original_source");
-        value["retry_policy"] =
-            json!("resume_original_only_after_connection_and_source_authorization_confirmed");
+        value["diagnostic"] = diagnostic.clone();
+        if diagnostic["side"] == "destination" {
+            value["next_action"] = json!(if diagnostic["destination_changed"].is_null() {
+                "inspect_destination_before_resuming_original"
+            } else {
+                "fix_destination_permissions_then_resume_original"
+            });
+            value["retry_policy"] =
+                json!("resume_original_only_after_destination_permissions_and_state_confirmed");
+            value["destination_changed"] = diagnostic["destination_changed"].clone();
+        } else {
+            value["next_action"] = json!("diagnose_original_source");
+            value["retry_policy"] =
+                json!("resume_original_only_after_connection_and_source_authorization_confirmed");
+        }
     }
     // If this bounded status transmission is interrupted, the gateway's expired
     // dispatch lease retrieves the same paused journal; no file work is redone.
@@ -596,7 +639,10 @@ async fn fetch(
             }
         };
         let status = response.status().as_u16();
-        if matches!(status, 401 | 403 | 404 | 410) {
+        if matches!(status, 401 | 403) {
+            return Err(transfers::SourceHttpFault::new(url, status).into());
+        }
+        if matches!(status, 404 | 410) {
             return Err(needs_source());
         }
         if status >= 500 || matches!(status, 408 | 429) {
@@ -753,8 +799,14 @@ async fn publish(
         let path = j.path.clone();
         let expected = sha.clone();
         let matches = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let root = transfers::root(&copy)?;
-            Ok(transfers::existing(&root, std::path::Path::new(&path))? == expected)
+            let root = transfers::root(&copy).map_err(|error| {
+                transfers::classify_destination_error(error, "destination_inspection", None)
+            })?;
+            let existing =
+                transfers::existing(&root, std::path::Path::new(&path)).map_err(|error| {
+                    transfers::classify_destination_error(error, "destination_inspection", None)
+                })?;
+            Ok(existing == expected)
         })
         .await??;
         if matches {
@@ -766,17 +818,23 @@ async fn publish(
     p.phase("waiting_resource");
     let write = guard.wait(scopes.acquire(&ws.root)).await?;
     guard.check().await?;
-    let canonical = ws.root.canonicalize()?;
+    let canonical = ws.root.canonicalize().map_err(|error| {
+        transfers::classify_destination_error(error.into(), "destination_staging", Some(false))
+    })?;
     ensure!(
         canonical == ws.root && config.roots.iter().any(|r| canonical.starts_with(r)),
         "workspace authorization changed"
     );
     clean_publication(config, j)?;
-    let (stage, mut output) = transfers::Staged::new(ws, &job.arguments)?;
+    let (stage, mut output) = transfers::Staged::new(ws, &job.arguments).map_err(|error| {
+        transfers::classify_destination_error(error, "destination_staging", Some(false))
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = output.metadata()?;
+        let meta = output.metadata().map_err(|error| {
+            transfers::classify_destination_error(error.into(), "destination_staging", Some(false))
+        })?;
         j.publication_identity = Some((meta.dev(), meta.ino()));
     }
     j.publication_temp = Some(stage.temporary.clone());
@@ -796,9 +854,13 @@ async fn publish(
             actual == expected,
             "checkpoint content changed before publication"
         );
-        output.sync_all()?;
+        output.sync_all().map_err(|error| {
+            transfers::classify_destination_error(error.into(), "destination_staging", Some(false))
+        })?;
         drop(output);
-        stage.publish()
+        stage.publish().map_err(|error| {
+            transfers::classify_destination_error(error, "destination_publication", None)
+        })
     })
     .await??;
     Ok(completed_upload(job, j, &sha, false))

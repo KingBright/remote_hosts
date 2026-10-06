@@ -186,7 +186,8 @@ impl SourceClientFault {
                 "source_address_policy_rejected"=>"source_address_policy",
                 "source_client_initialization_failed"=>"device_client_initialization",
                 _=>"source_dns"
-            },"http_request_started":false,"authorization_failure_observed":false})
+            },"http_request_started":false,"authorization_failure_observed":false,
+            "destination_changed":false})
     }
 }
 impl std::fmt::Display for SourceClientFault {
@@ -195,6 +196,86 @@ impl std::fmt::Display for SourceClientFault {
     }
 }
 impl std::error::Error for SourceClientFault {}
+
+/// A response from the external file origin confirms that source HTTP began.
+#[derive(Debug)]
+pub(crate) struct SourceHttpFault {
+    host: String,
+    pub status: u16,
+}
+impl SourceHttpFault {
+    pub(crate) fn new(url: &reqwest::Url, status: u16) -> Self {
+        Self {
+            host: url.host_str().unwrap_or_default().to_owned(),
+            status,
+        }
+    }
+    pub(crate) fn diagnostic(&self) -> Value {
+        json!({"code":"source_http_authorization_rejected","side":"source",
+            "stage":"source_http_response","source_host":self.host,"http_status":self.status,
+            "failure_boundary":"source_http_authorization","http_request_started":true,
+            "authorization_failure_observed":true,"destination_changed":false})
+    }
+}
+impl std::fmt::Display for SourceHttpFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source_http_authorization_rejected")
+    }
+}
+impl std::error::Error for SourceHttpFault {}
+
+/// A destination permission failure. Unknown means publication may have committed.
+#[derive(Debug)]
+pub(crate) struct DestinationPermissionFault {
+    stage: &'static str,
+    os_error: Option<i32>,
+    destination_changed: Option<bool>,
+}
+impl DestinationPermissionFault {
+    fn new(stage: &'static str, os_error: Option<i32>, destination_changed: Option<bool>) -> Self {
+        Self {
+            stage,
+            os_error,
+            destination_changed,
+        }
+    }
+    pub(crate) fn diagnostic(&self) -> Value {
+        json!({"code":"destination_file_permission_denied","side":"destination",
+            "stage":self.stage,"os_error":self.os_error,
+            "failure_boundary":"destination_file_permission","http_request_started":true,
+            "authorization_failure_observed":false,"destination_changed":self.destination_changed})
+    }
+}
+impl std::fmt::Display for DestinationPermissionFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("destination_file_permission_denied")
+    }
+}
+impl std::error::Error for DestinationPermissionFault {}
+
+/// Convert only an actual PermissionDenied I/O cause; leave other errors intact.
+pub(crate) fn classify_destination_error(
+    error: anyhow::Error,
+    stage: &'static str,
+    destination_changed: Option<bool>,
+) -> anyhow::Error {
+    let os_error = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .filter(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+            .and_then(std::io::Error::raw_os_error)
+    });
+    let denied = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    });
+    if denied {
+        DestinationPermissionFault::new(stage, os_error, destination_changed).into()
+    } else {
+        error
+    }
+}
 
 fn source_client_with_addresses(
     u: &reqwest::Url,
@@ -251,7 +332,9 @@ pub(crate) fn digest_reader(
         ensure!(size <= max, "file exceeds max_bytes");
         digest.update(&buf[..n]);
         if let Some(output) = output.as_mut() {
-            output.write_all(&buf[..n])?;
+            output.write_all(&buf[..n]).map_err(|error| {
+                classify_destination_error(error.into(), "destination_staging", Some(false))
+            })?;
         }
     }
     Ok((size, format!("{:x}", digest.finalize())))
@@ -1036,6 +1119,79 @@ async fn serve_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_and_destination_faults_report_boundaries_without_paths_or_secrets() {
+        let u = source_url(
+            "https://files.oaiusercontent.com/private-path?signature=secret-token",
+            "https://gateway.example",
+        )
+        .unwrap();
+        let source = SourceHttpFault::new(&u, 403);
+        let source_json = source.diagnostic();
+        assert_eq!(source_json["failure_boundary"], "source_http_authorization");
+        assert_eq!(source_json["http_request_started"], true);
+        assert_eq!(source_json["http_status"], 403);
+        assert_eq!(source_json["destination_changed"], false);
+        assert_eq!(source.to_string(), "source_http_authorization_rejected");
+
+        let denied = classify_destination_error(
+            anyhow!(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private destination path",
+            )),
+            "destination_staging",
+            Some(false),
+        );
+        let destination = denied.downcast_ref::<DestinationPermissionFault>().unwrap();
+        let destination_json = destination.diagnostic();
+        assert_eq!(
+            destination_json["failure_boundary"],
+            "destination_file_permission"
+        );
+        assert_eq!(destination_json["side"], "destination");
+        assert_eq!(destination_json["destination_changed"], false);
+        assert_eq!(denied.to_string(), "destination_file_permission_denied");
+
+        let publication = classify_destination_error(
+            anyhow!(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private destination path",
+            )),
+            "destination_publication",
+            None,
+        );
+        assert_eq!(
+            publication
+                .downcast_ref::<DestinationPermissionFault>()
+                .unwrap()
+                .diagnostic()["destination_changed"],
+            Value::Null
+        );
+
+        let unrelated = classify_destination_error(
+            anyhow!(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")),
+            "destination_staging",
+            Some(false),
+        );
+        assert!(
+            unrelated
+                .downcast_ref::<DestinationPermissionFault>()
+                .is_none()
+        );
+
+        for diagnostic in [source_json, destination_json] {
+            let text = diagnostic.to_string();
+            for private in [
+                "private-path",
+                "signature",
+                "secret-token",
+                "private destination path",
+            ] {
+                assert!(!text.contains(private));
+            }
+        }
+    }
+
     #[test]
     fn source_diagnostics_distinguish_dns_permission_and_address_policy_without_urls() {
         let u = source_url(
