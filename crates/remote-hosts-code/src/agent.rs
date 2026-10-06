@@ -254,6 +254,13 @@ impl Agent {
             canonical == ws.root && self.config.roots.iter().any(|r| canonical.starts_with(r)),
             "workspace root moved or authorization revoked"
         );
+        crate::maintenance_tasks::require_capability(
+            &job.tool,
+            v,
+            Some(std::env::consts::OS),
+            crate::maintenance_tasks::current(self.config.allow_exec).as_ref(),
+            self.config.allow_exec,
+        )?;
         progress.phase("waiting_resource");
         let _write = if matches!(
             job.tool.as_str(),
@@ -299,10 +306,24 @@ impl Agent {
                 .await
             }
             "workspace_context" => {
-                crate::workspace_context::read(&self.store, &self.config, &ws, v).await
+                if crate::maintenance_tasks::requested(&job.tool, v) {
+                    crate::maintenance_tasks::read(&self.config, &ws, &job.owner, v)
+                } else {
+                    crate::workspace_context::read(&self.store, &self.config, &ws, v).await
+                }
             }
             "workspace_gc" => crate::storage_gc::run(&self.config, &self.store, &ws, v).await,
-            "terminal_exec" => self.terminals.start(&self.config, &ws, v, &job.id).await,
+            "terminal_exec" => {
+                if crate::maintenance_tasks::requested(&job.tool, v) {
+                    let launch =
+                        crate::maintenance_tasks::launch(&self.config, &ws, &job.owner, v)?;
+                    self.terminals
+                        .start_maintenance(&self.config, &ws, v, &job.id, launch)
+                        .await
+                } else {
+                    self.terminals.start(&self.config, &ws, v, &job.id).await
+                }
+            }
             "terminal_read" => self.terminals.read(&ws, v).await,
             "terminal_input" => self.terminals.input(&ws, v).await,
             "terminal_cancel" => self.terminals.cancel(&ws, v).await,
@@ -425,6 +446,7 @@ impl Agent {
             allow_write: self.config.allow_write,
             allow_exec: self.config.allow_exec,
             transfer_limits: Some(crate::capabilities::TransferLimits::current()),
+            maintenance_tasks: crate::maintenance_tasks::current(self.config.allow_exec),
         };
         // A launchd process marker is not readiness. Only successful authenticated
         // poll round-trips populate the per-lane timestamps for this exact session.

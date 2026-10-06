@@ -87,6 +87,8 @@ pub struct DeviceHello {
     pub allow_exec: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_limits: Option<crate::capabilities::TransferLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_tasks: Option<crate::maintenance_tasks::Capability>,
 }
 /// Optional extensions keep old serial agents compatible with the new gateway.
 #[derive(Deserialize)]
@@ -140,6 +142,11 @@ impl PollRequest {
                 .transfer_limits
                 .as_ref()
                 .is_none_or(crate::capabilities::TransferLimits::valid)
+            && self
+                .hello
+                .maintenance_tasks
+                .as_ref()
+                .is_none_or(crate::maintenance_tasks::Capability::valid)
             && self.lanes.as_ref().is_none_or(|v| v.len() <= 5)
             && self
                 .runtime_features
@@ -667,6 +674,15 @@ impl Gateway {
                 "device_draining: observe original updater; new execution not queued"
             );
             let online = self.store.get::<Online>("online", device).await?;
+            crate::maintenance_tasks::require_capability(
+                name,
+                &args,
+                online.as_ref().map(|o| o.hello.platform.as_str()),
+                online
+                    .as_ref()
+                    .and_then(|o| o.hello.maintenance_tasks.as_ref()),
+                online.as_ref().is_some_and(|o| o.hello.allow_exec),
+            )?;
             for (tool, feature) in [
                 ("files_sync", "files_sync_v1"),
                 ("change_resume", "change_set_resume_v1"),

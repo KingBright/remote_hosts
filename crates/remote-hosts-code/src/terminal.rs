@@ -169,12 +169,38 @@ impl Terminals {
     ) -> Result<Value> {
         let command = files::text(v, "command")?;
         ensure!(command.len() <= 65536, "command too large");
+        self.start_process(config, ws, v, id, command, None).await
+    }
+    pub(crate) async fn start_maintenance(
+        &self,
+        config: &AgentConfig,
+        ws: &Workspace,
+        v: &Value,
+        id: &str,
+        launch: crate::maintenance_tasks::FixedLaunch,
+    ) -> Result<Value> {
+        self.start_process(config, ws, v, id, "maintenance_task", Some(launch))
+            .await
+    }
+    async fn start_process(
+        &self,
+        config: &AgentConfig,
+        ws: &Workspace,
+        v: &Value,
+        id: &str,
+        command: &str,
+        fixed: Option<crate::maintenance_tasks::FixedLaunch>,
+    ) -> Result<Value> {
         let timeout = files::number(v, "timeout_seconds", 600, 1, 7200)?;
         // Default to a short bounded wait so fast commands usually finish in the
         // initiating tool call even when an older host schema cannot send wait_ms.
         // Long commands still return the same durable terminal handle.
         let wait_ms = files::number(v, "wait_ms", 1000, 0, 2000)?;
         let interactive = v.get("pty").and_then(Value::as_bool).unwrap_or(false);
+        ensure!(
+            fixed.is_none() || !interactive,
+            "maintenance_requires_real_pipes"
+        );
         let rows = files::number(v, "rows", 40, 5, 200)? as u16;
         let cols = files::number(v, "cols", 120, 20, 500)? as u16;
         uuid::Uuid::parse_str(id).context("invalid terminal id")?;
@@ -207,7 +233,13 @@ impl Terminals {
                 &self.dir.join(format!("{id}.log")),
                 self.secret.clone(),
             )?));
-            let process = spawn(config, ws, command, interactive, rows, cols)?;
+            let process = if let Some(launch) = fixed {
+                let mut cmd = std::process::Command::new(launch.executable);
+                cmd.args(launch.args);
+                spawn_pipes(ws, cmd)?
+            } else {
+                spawn(config, ws, command, interactive, rows, cols)?
+            };
             Ok((capture, process))
         })();
         let mut status = status;
@@ -671,43 +703,47 @@ fn spawn(
             io_control: Some(io_control),
         })
     } else {
-        // A single kernel pipe preserves the observed stdout/stderr write order.
-        // It is intentionally a combined stream, not falsely labeled stdout-only.
-        let (reader, writer) = std::io::pipe()?;
         let mut cmd = std::process::Command::new(&config.shell);
-        cmd.args(shell_args(&config.shell, command, false))
-            .current_dir(&ws.root)
-            .stdin(std::process::Stdio::null())
-            .stdout(writer.try_clone()?)
-            .stderr(writer)
-            .env("TERM", "dumb")
-            .env("NO_COLOR", "1")
-            .env("CLICOLOR", "0")
-            .env("PAGER", "cat")
-            .env("GIT_PAGER", "cat");
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // Native pipes must not allocate a console when the Agent has none.
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let child = cmd.spawn()?;
-        drop(cmd); // Close the parent's pipe writers, or EOF would never arrive.
-        Ok(Spawned {
-            child: Box::new(child),
-            reader: Box::new(reader),
-            input: None,
-            master: None,
-            #[cfg(unix)]
-            io_control: None,
-        })
+        cmd.args(shell_args(&config.shell, command, false));
+        spawn_pipes(ws, cmd)
     }
 }
+fn spawn_pipes(ws: &Workspace, mut cmd: std::process::Command) -> Result<Spawned> {
+    // A single kernel pipe preserves the observed stdout/stderr write order.
+    // It is intentionally a combined stream, not falsely labeled stdout-only.
+    let (reader, writer) = std::io::pipe()?;
+    cmd.current_dir(&ws.root)
+        .stdin(std::process::Stdio::null())
+        .stdout(writer.try_clone()?)
+        .stderr(writer)
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("PAGER", "cat")
+        .env("GIT_PAGER", "cat");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Native pipes must not allocate a console when the Agent has none.
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let child = cmd.spawn()?;
+    drop(cmd); // Close the parent's pipe writers, or EOF would never arrive.
+    Ok(Spawned {
+        child: Box::new(child),
+        reader: Box::new(reader),
+        input: None,
+        master: None,
+        #[cfg(unix)]
+        io_control: None,
+    })
+}
+
 fn kill_group(pid: Option<u32>) -> Result<()> {
     #[cfg(unix)]
     if let Some(pid) = pid {
@@ -808,6 +844,79 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fixed_process_uses_existing_pipe_pid_and_exit_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            gateway_url: "https://fixture.invalid".into(),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            device_token: "fixture-unused".into(),
+            state_dir: temp.path().join("state"),
+            roots: vec![temp.path().to_owned()],
+            allow_write: false,
+            allow_exec: true,
+            shell: "/nonexistent-shell".into(),
+        };
+        let ws = Workspace {
+            id: "fixture".into(),
+            device_id: config.device_id.clone(),
+            root: temp.path().to_owned(),
+        };
+        let store = Store::open(&config.state_dir).await.unwrap();
+        let terminals = Terminals::new(
+            store,
+            config.state_dir.join("terminals"),
+            config.device_token.clone(),
+        )
+        .await
+        .unwrap();
+        for exit in [0, 2] {
+            let id = uuid::Uuid::new_v4().to_string();
+            // This fixed fixture process has no maintenance or production target access.
+            let launch = crate::maintenance_tasks::FixedLaunch { executable: "/bin/sh".into(),
+                args: vec!["-c".into(), format!("if [ -t 1 ]; then exit 9; fi; printf 'out\\n'; printf 'err\\n' >&2; exit {exit}").into()] };
+            terminals
+                .start_maintenance(
+                    &config,
+                    &ws,
+                    &json!({"timeout_seconds":30,"wait_ms":0}),
+                    &id,
+                    launch,
+                )
+                .await
+                .unwrap();
+            let value = tokio::time::timeout(Duration::from_secs(45), async {
+                loop {
+                    let value = terminals
+                        .read(&ws, &json!({"terminal_id":id,"max_bytes":4096}))
+                        .await
+                        .unwrap();
+                    if value["terminal"]["output_complete"] == true
+                        && !matches!(
+                            value["terminal"]["state"].as_str(),
+                            Some("starting" | "running")
+                        )
+                    {
+                        break value;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fixed process did not close its pipe");
+            assert_eq!(value["terminal"]["state"], "exited", "{value}");
+            assert_eq!(value["terminal"]["exit_code"], exit);
+            assert_eq!(value["terminal"]["pty"], false);
+            assert!(
+                value["terminal"]["process_id"]
+                    .as_u64()
+                    .is_some_and(|pid| pid > 1)
+            );
+            assert_eq!(value["output"], "out\nerr\n");
+        }
+    }
 
     #[test]
     fn dsr_responder_handles_split_and_repeated_queries() {

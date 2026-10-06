@@ -28,7 +28,8 @@ pub fn validate(name: &str, arguments: &Value) -> Result<()> {
         .iter()
         .find(|t| t.name == name)
         .context("unknown tool")?;
-    validate_node(&tool.input_schema, arguments, "$")
+    validate_node(&tool.input_schema, arguments, "$")?;
+    crate::maintenance_tasks::validate(name, arguments)
 }
 
 fn validate_node(schema: &Map<String, Value>, value: &Value, path: &str) -> Result<()> {
@@ -219,9 +220,9 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "terminal_exec",
-        "Start a command in the bound workspace. Default pty=false uses real pipes with stdin EOF and combined stdout/stderr; use pty=true only for interactive input. Shell has local-user authority outside code roots. Write-capable action. By default waits up to 1000 ms so short commands can return exit/output in one call; long commands return the same durable terminal_id. wait_ms may be 0..2000 and never stops the command. Follow the returned cursor; never replay uncertain execution.",
-        json!({"workspace_id":string(),"idempotency_key":string(),"command":string(),"pty":{"type":"boolean"},"timeout_seconds":integer(1,7200),"cols":integer(20,500),"rows":integer(5,200),"wait_ms":{"type":"integer","minimum":0,"maximum":2000,"default":1000}}),
-        vec!["workspace_id", "idempotency_key", "command"],
+        "Start a command in the bound workspace. Default pty=false uses real pipes with stdin EOF and combined stdout/stderr; use pty=true only for interactive input. Shell has local-user authority outside code roots. Write-capable action. By default waits up to 1000 ms so short commands can return exit/output in one call; long commands return the same durable terminal_id. wait_ms may be 0..2000 and never stops the command. Follow the returned cursor; never replay uncertain execution. action=maintenance_task uses fixed argv and the shared ordinary-user maintenance core: prepare requires maintenance_action and a canonical maintenance_request_id, run requires the same ID and plan_sha256, verify uses the same ID. Command/PTY fields are forbidden for maintenance; privileged requests remain unavailable. No root grant.",
+        json!({"workspace_id":string(),"idempotency_key":string(),"action":{"type":"string","enum":["shell","maintenance_task"],"default":"shell"},"command":string(),"pty":{"type":"boolean"},"timeout_seconds":integer(1,7200),"cols":integer(20,500),"rows":integer(5,200),"wait_ms":{"type":"integer","minimum":0,"maximum":2000,"default":1000},"maintenance_step":{"type":"string","enum":["prepare","run","verify"]},"maintenance_request_id":string(),"maintenance_action":{"type":"string","enum":["inspect_remoteplay_mesh","repair_remoteplay_mesh_ownership"]},"plan_sha256":string()}),
+        vec!["workspace_id", "idempotency_key"],
     );
     add(
         "terminal_read",
@@ -261,8 +262,8 @@ fn build_catalog() -> Vec<Tool> {
     );
     add(
         "workspace_context",
-        "Read bounded workspace transfer/terminal facts, recent durable change-set summaries, state counts and runtime identity. active_only narrows terminal/transfer facts; terminal_cursor and transfer_after continue independent live pages. Cursors bind the workspace and filters; restart pages for a fresh view after state changes. after_event replays durable workspace transitions from the returned scoped event cursor; expired cursors require a fresh snapshot. Reports whether explicit workspace_gc is available. No command text or credentials. Device-wide counts are labelled. Not chat-memory or build-verification evidence.",
-        json!({"workspace_id":string(),"cursor":string(),"limit":integer(1,50),"transfer_after":string(),"terminal_cursor":string(),"active_only":{"type":"boolean"},"after_event":string()}),
+        "Read bounded workspace transfer/terminal facts, recent durable change-set summaries, state counts and runtime identity. active_only narrows terminal/transfer facts; terminal_cursor and transfer_after continue independent live pages. Cursors bind the workspace and filters; restart pages for a fresh view after state changes. after_event replays durable workspace transitions from the returned scoped event cursor; expired cursors require a fresh snapshot. Reports whether explicit workspace_gc is available. No command text or credentials. Device-wide counts are labelled. Not chat-memory or build-verification evidence. action=maintenance_describe requires maintenance_action; maintenance_receipt requires the original canonical maintenance_request_id. Both read without creating a journal, target files or write lock; snapshot paging fields cannot be mixed with maintenance. Requires the selected agent to advertise optional maintenance capability.",
+        json!({"workspace_id":string(),"action":{"type":"string","enum":["snapshot","maintenance_describe","maintenance_receipt"],"default":"snapshot"},"cursor":string(),"limit":integer(1,50),"transfer_after":string(),"terminal_cursor":string(),"active_only":{"type":"boolean"},"after_event":string(),"maintenance_action":{"type":"string","enum":["inspect_remoteplay_mesh","repair_remoteplay_mesh_ownership"]},"maintenance_request_id":string()}),
         vec!["workspace_id"],
     );
     add(

@@ -22,6 +22,7 @@ mod history_retention;
 mod job_dispatch;
 mod job_receipts;
 mod maintenance;
+pub mod maintenance_tasks;
 mod observations;
 mod progress;
 mod readiness;

@@ -257,8 +257,12 @@ fn response(record: &Record) -> Result<Value> {
 }
 fn load(store: &Store, id: &str, identity: &Identity) -> Result<Record> {
     let r: Record = store.load_json(id)?.context("task_not_found")?;
+    validate_record(r, id, identity)
+}
+fn validate_record(r: Record, id: &str, identity: &Identity) -> Result<Record> {
     r.plan.identity.validate()?;
     valid_id(&r.plan.request_id)?;
+    valid_id(&r.plan.device_id)?;
     ensure!(
         r.plan.protocol == TASK_PROTOCOL
             && r.plan.request_id == id
@@ -383,17 +387,24 @@ fn verify(store: &Store, identity: &Identity, id: &str) -> Result<Value> {
         "acceptance_scope":"fixed file metadata only; no service execution/signature/loaded-state or administrator authorization proof"}),
     )
 }
-// Reuse Store's private, atomic, fsynced records. The separate user-owned directory is not a root grant.
-fn locked_store(path: &Path, uid: u32) -> Result<(Store, File)> {
+// Validation opens no journal, creates no directory and acquires no lock.
+fn existing_store(path: &Path, uid: u32) -> Result<Option<Store>> {
     ensure!(path.is_absolute(), "task_store_requires_absolute_path");
+    ensure!(
+        path.components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_))),
+        "unsafe_task_store_component"
+    );
     let mut part = PathBuf::from("/");
     for c in path.components() {
-        match c {
-            Component::RootDir => (),
-            Component::Normal(n) => part.push(n),
-            _ => anyhow::bail!("unsafe_task_store_component"),
+        if let Component::Normal(n) = c {
+            part.push(n);
         }
-        let m = fs::symlink_metadata(&part)?;
+        let m = match fs::symlink_metadata(&part) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         let sticky_root = m.uid() == 0 && m.mode() & 0o1000 != 0;
         ensure!(
             m.is_dir()
@@ -408,6 +419,38 @@ fn locked_store(path: &Path, uid: u32) -> Result<(Store, File)> {
         m.uid() == uid && m.mode() & 0o077 == 0,
         "task_store_must_be_caller_owned_private_directory"
     );
+    Ok(Some(Store {
+        dir: path.into(),
+        owner: uid,
+    }))
+}
+/// Only execution may create a private journal directory, under an existing private parent.
+/// Existing permissions are validated, never changed.
+pub fn create_private_store(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let identity = Identity::current()?;
+    identity.validate()?;
+    if existing_store(path, identity.uid)?.is_some() {
+        return Ok(());
+    }
+    let parent = path.parent().context("task_store_parent_missing")?;
+    ensure!(
+        existing_store(parent, identity.uid)?.is_some(),
+        "task_store_parent_missing"
+    );
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(e) => return Err(e.into()),
+    }
+    ensure!(
+        existing_store(path, identity.uid)?.is_some(),
+        "task_store_missing"
+    );
+    Ok(())
+}
+fn locked_store(path: &Path, uid: u32) -> Result<(Store, File)> {
+    let store = existing_store(path, uid)?.context("task_store_missing")?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -422,27 +465,82 @@ fn locked_store(path: &Path, uid: u32) -> Result<(Store, File)> {
         "untrusted_task_lock"
     );
     fs2::FileExt::try_lock_exclusive(&lock).context("task_store_busy_observe_original")?;
-    Ok((
-        Store {
-            dir: path.into(),
-            owner: uid,
-        },
-        lock,
-    ))
+    Ok((store, lock))
+}
+/// A missing journal/receipt is a read result. No directory, record or task.lock is created.
+pub fn read_status(path: &Path, request_id: &str, device_id: &str) -> Result<Option<Value>> {
+    read_status_inner(path, request_id, Some(device_id), &Identity::current()?)
+}
+fn read_status_inner(
+    path: &Path,
+    id: &str,
+    device: Option<&str>,
+    identity: &Identity,
+) -> Result<Option<Value>> {
+    identity.validate()?;
+    valid_id(id)?;
+    if let Some(d) = device {
+        valid_id(d)?;
+    }
+    let Some(store) = existing_store(path, identity.uid)? else {
+        return Ok(None);
+    };
+    let Some(record) = store.load_json::<Record>(id)? else {
+        return Ok(None);
+    };
+    let record = validate_record(record, id, identity)?;
+    ensure!(
+        device.is_none_or(|d| record.plan.device_id == d),
+        "task_device_binding_mismatch"
+    );
+    Ok(Some(response(&record)?))
+}
+pub fn ordinary_tasks_supported() -> bool {
+    Identity::current().is_ok_and(|i| i.validate().is_ok())
 }
 pub fn run_cli(command: Command) -> Result<Value> {
+    run_impl(command, None)
+}
+/// The device binding is supplied by the authenticated Agent, never by MCP arguments.
+pub fn run_bound_cli(command: Command, device: &str) -> Result<Value> {
+    valid_id(device)?;
+    run_impl(command, Some(device))
+}
+fn run_impl(command: Command, device: Option<&str>) -> Result<Value> {
     if let Command::Describe { action } = command {
         return Ok(describe(action));
     }
     let identity = Identity::current()?;
+    identity.validate()?;
+    if let Command::Status {
+        state_dir,
+        request_id,
+    } = &command
+    {
+        return read_status_inner(state_dir, request_id, device, &identity)?
+            .context("task_not_found");
+    }
     let path = match &command {
         Command::Prepare { state_dir, .. }
         | Command::Run { state_dir, .. }
-        | Command::Status { state_dir, .. }
         | Command::Verify { state_dir, .. } => state_dir,
         _ => unreachable!(),
     };
     let (store, _lock) = locked_store(path, identity.uid)?;
+    if let Some(device) = device {
+        match &command {
+            Command::Prepare { device_id, .. } => {
+                ensure!(device_id == device, "task_device_binding_mismatch")
+            }
+            Command::Run { request_id, .. } | Command::Verify { request_id, .. } => {
+                ensure!(
+                    load(&store, request_id, &identity)?.plan.device_id == device,
+                    "task_device_binding_mismatch"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
     match command {
         Command::Prepare {
             request_id,
@@ -462,7 +560,6 @@ pub fn run_cli(command: Command) -> Result<Value> {
             plan_sha256,
             ..
         } => execute(&store, &identity, &request_id, &plan_sha256, unix_time()),
-        Command::Status { request_id, .. } => response(&load(&store, &request_id, &identity)?),
         Command::Verify { request_id, .. } => verify(&store, &identity, &request_id),
         _ => unreachable!(),
     }
@@ -665,5 +762,90 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn status_missing_store_or_record_has_zero_creations() {
+        let (_t, store, identity, id, device) = fixture();
+        let missing = store.dir.join("missing").join("nested");
+        assert!(
+            read_status_inner(&missing, &id, Some(&device), &identity)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.dir.join("missing").exists());
+        assert!(
+            read_status_inner(&store.dir, &id, Some(&device), &identity)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read_dir(&store.dir).unwrap().count(), 0);
+    }
+    #[test]
+    fn status_reads_without_a_lock_and_does_not_touch_targets_or_records() {
+        let (_t, store, identity, id, device) = fixture();
+        let planned = intent(
+            &store,
+            &identity,
+            &id,
+            &device,
+            Action::InspectRemoteplayMesh,
+        );
+        let before = fs::read(store.dir.join(format!("{id}.json"))).unwrap();
+        // Even with targets gone, Status reads only the saved receipt.
+        fs::remove_dir_all(Path::new(&identity.home).join("Library")).unwrap();
+        assert_eq!(
+            read_status_inner(&store.dir, &id, Some(&device), &identity).unwrap(),
+            Some(planned.clone())
+        );
+        assert!(!store.dir.join("task.lock").exists());
+        let (_s, lock) = locked_store(&store.dir, identity.uid).unwrap();
+        assert_eq!(
+            read_status_inner(&store.dir, &id, Some(&device), &identity).unwrap(),
+            Some(planned)
+        );
+        assert_eq!(
+            fs::read(store.dir.join(format!("{id}.json"))).unwrap(),
+            before
+        );
+        drop(lock);
+    }
+    #[test]
+    fn status_rejects_wrong_device_tampering_and_unsupported_identity() {
+        let (_t, store, identity, id, device) = fixture();
+        intent(
+            &store,
+            &identity,
+            &id,
+            &device,
+            Action::InspectRemoteplayMesh,
+        );
+        assert!(
+            read_status_inner(
+                &store.dir,
+                &id,
+                Some(&uuid::Uuid::new_v4().to_string()),
+                &identity
+            )
+            .is_err()
+        );
+        let mut unsupported = identity.clone();
+        unsupported.uid = 0;
+        assert!(read_status_inner(&store.dir, &id, Some(&device), &unsupported).is_err());
+        unsupported = identity.clone();
+        unsupported.platform = "linux".into();
+        assert!(read_status_inner(&store.dir, &id, Some(&device), &unsupported).is_err());
+        let mut record: Record = store.load_json(&id).unwrap().unwrap();
+        record.plan_sha256 = "0".repeat(64);
+        store.save_json(&id, &record).unwrap();
+        assert!(read_status_inner(&store.dir, &id, Some(&device), &identity).is_err());
+        assert!(!store.dir.join("task.lock").exists());
+    }
+    #[test]
+    fn status_rejects_a_symlink_journal_without_creating_a_lock() {
+        let (_t, store, identity, id, device) = fixture();
+        let alias = store.dir.parent().unwrap().join("journal-alias");
+        symlink(&store.dir, &alias).unwrap();
+        assert!(read_status_inner(&alias, &id, Some(&device), &identity).is_err());
+        assert!(!store.dir.join("task.lock").exists());
     }
 }

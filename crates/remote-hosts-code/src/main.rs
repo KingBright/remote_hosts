@@ -19,6 +19,12 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    MaintenanceTask {
+        #[command(flatten)]
+        args: remote_hosts_code::maintenance_tasks::ChildArgs,
+    },
     /// Serve OAuth, MCP and device relay behind a TLS reverse proxy.
     Gateway {
         #[arg(long)]
@@ -162,6 +168,27 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     match command {
+        #[cfg(target_os = "macos")]
+        Command::MaintenanceTask { args } => {
+            let value = remote_hosts_code::maintenance_tasks::run_child(args);
+            let (value, failed) = match value {
+                Ok(value) => {
+                    let failed = value["state"] == "failed"
+                        || value["state"] == "awaiting_platform_authorization"
+                        || value["recovery_required"] == true;
+                    (value, failed)
+                }
+                Err(error) => (
+                    serde_json::json!({"ok":false,"error":format!("{error:#}"),
+                    "system_changes_confirmed":false,"next_action":"Observe the original operation and maintenance receipt; do not replay with a new request ID."}),
+                    true,
+                ),
+            };
+            println!("{}", serde_json::to_string(&value)?);
+            if failed {
+                std::process::exit(2);
+            }
+        }
         Command::Gateway { config } => {
             let c: GatewayConfig = read_config(&config)?;
             let bind: SocketAddr = c.bind.parse()?;

@@ -66,7 +66,17 @@ impl Fixture {
         }
     }
     async fn job(&self, device: usize, state: &str, terminal: Option<Value>) -> String {
-        let id = uuid::Uuid::new_v4().to_string();
+        self.job_with_id(&uuid::Uuid::new_v4().to_string(), device, state, terminal)
+            .await
+    }
+    async fn job_with_id(
+        &self,
+        id: &str,
+        device: usize,
+        state: &str,
+        terminal: Option<Value>,
+    ) -> String {
+        let id = id.to_owned();
         let ws = format!(
             "{}:{}",
             self.g.config.devices[device].id,
@@ -834,6 +844,261 @@ async fn task_survives_gateway_restart_and_never_reexecutes() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn task_context_finished_terminals_do_not_claim_next_execution() {
+    let f = Fixture::new().await;
+    let mut failed = terminal("exited", now() - 10);
+    failed["exit_code"] = json!(1);
+    let old = f
+        .job_with_id(
+            "00000000-0000-4000-8000-000000000001",
+            0,
+            "done",
+            Some(failed),
+        )
+        .await;
+    let newer = f
+        .job_with_id(
+            "00000000-0000-4000-8000-000000000002",
+            1,
+            "done",
+            Some(terminal("exited", now())),
+        )
+        .await;
+    f.link("finished-history", &old).await;
+    f.link("finished-history", &newer).await;
+    let value =
+        f.g.dispatch(&f.p, "task_context", json!({"task_id":"finished-history"}))
+            .await
+            .unwrap();
+    assert!(value["next_operation_id"].is_null());
+    assert_eq!(value["next_action"], "no_active_work_in_page");
+    assert_eq!(value["scope_complete"], true);
+    assert_eq!(value["automatic_replay"], false);
+    assert_eq!(value["operations"][0]["operation_id"], old);
+    assert_eq!(value["operations"][0]["state"], "process_failed");
+    assert_eq!(value["operations"][0]["process"]["exit_code"], 1);
+    assert_eq!(
+        value["operations"][0]["receipt"]["next_action"],
+        "inspect_original_receipt"
+    );
+    assert_eq!(value["operations"][1]["operation_id"], newer);
+    assert_eq!(value["operations"][1]["process"]["exit_code"], 0);
+    assert_eq!(value["summary"]["active_in_page"], 0);
+    assert_eq!(value["summary"]["uncertain_in_page"], 0);
+    assert_eq!(f.count().await, 2);
+}
+
+#[tokio::test]
+async fn task_context_finished_output_gap_preserves_review_without_execution_hint() {
+    let f = Fixture::new().await;
+    let id = f.job(0, "done", Some(terminal("exited", now()))).await;
+    let mut observation: Value =
+        f.g.store
+            .get("terminal_observation", &id)
+            .await
+            .unwrap()
+            .unwrap();
+    observation["output_truncated_before"] = json!(true);
+    f.g.store
+        .put("terminal_observation", &id, &observation, now() + 100)
+        .await
+        .unwrap();
+    f.link("output-review", &id).await;
+    let value =
+        f.g.dispatch(&f.p, "task_context", json!({"task_id":"output-review"}))
+            .await
+            .unwrap();
+    assert!(value["next_operation_id"].is_null());
+    assert_eq!(value["next_action"], "no_active_work_in_page");
+    assert_eq!(value["operations"][0]["state"], "output_incomplete");
+    assert_eq!(value["operations"][0]["active"], false);
+    assert_eq!(value["operations"][0]["uncertain"], false);
+    assert_eq!(value["operations"][0]["process"]["exit_code"], 0);
+    assert_eq!(
+        value["operations"][0]["receipt"]["evidence_complete"],
+        false
+    );
+    assert_eq!(
+        value["operations"][0]["receipt"]["next_action"],
+        "read_original_output"
+    );
+    assert_eq!(
+        value["operations"][0]["verification"]["state"],
+        "not_attached"
+    );
+    assert!(value["last_verified_source"].is_null());
+    assert_eq!(f.count().await, 1);
+}
+
+#[tokio::test]
+async fn task_context_live_or_uncertain_work_precedes_paused_transfer_and_history() {
+    for stale in [false, true] {
+        let f = Fixture::new().await;
+        let paused = f
+            .job_with_id("00000000-0000-4000-8000-000000000001", 0, "paused", None)
+            .await;
+        sqlx::query(
+            "UPDATE jobs SET request=json_set(request,'$.tool','file_upload'),result=? WHERE id=?",
+        )
+        .bind(json!({"state":"paused","resumable":true}).to_string())
+        .bind(&paused)
+        .execute(&f.g.store.pool)
+        .await
+        .unwrap();
+        let mut failed = terminal("exited", now());
+        failed["exit_code"] = json!(1);
+        let old = f
+            .job_with_id(
+                "00000000-0000-4000-8000-000000000002",
+                0,
+                "done",
+                Some(failed),
+            )
+            .await;
+        let live = f
+            .job_with_id(
+                "00000000-0000-4000-8000-000000000003",
+                1,
+                "done",
+                Some(terminal("running", now())),
+            )
+            .await;
+        if stale {
+            let mut observation: Value =
+                f.g.store
+                    .get("terminal_observation", &live)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            observation["reported_at"] = json!(now() - 60);
+            f.g.store
+                .put("terminal_observation", &live, &observation, now() + 100)
+                .await
+                .unwrap();
+        }
+        for id in [&paused, &old, &live] {
+            f.link("priority", id).await;
+        }
+        let value =
+            f.g.dispatch(&f.p, "task_context", json!({"task_id":"priority"}))
+                .await
+                .unwrap();
+        assert_eq!(value["next_operation_id"], live);
+        assert_eq!(value["next_action"], "observe_existing_operation");
+        assert_eq!(value["operations"][0]["state"], "paused");
+        assert_eq!(value["operations"][1]["state"], "process_failed");
+        assert_eq!(value["operations"][2]["uncertain"], stale);
+        assert_eq!(value["automatic_replay"], false);
+        assert_eq!(f.count().await, 3);
+    }
+}
+
+#[tokio::test]
+async fn task_context_unrelated_success_does_not_hide_awaiting_source_transfer() {
+    let f = Fixture::new().await;
+    let paused = f
+        .job_with_id(
+            "00000000-0000-4000-8000-000000000001",
+            0,
+            "awaiting_source",
+            None,
+        )
+        .await;
+    sqlx::query(
+        "UPDATE jobs SET request=json_set(request,'$.tool','file_upload'),result=? WHERE id=?",
+    )
+    .bind(
+        json!({"state":"awaiting_source","resumable":true,"next_action":"transfer_resume"})
+            .to_string(),
+    )
+    .bind(&paused)
+    .execute(&f.g.store.pool)
+    .await
+    .unwrap();
+    let done = f
+        .job_with_id(
+            "00000000-0000-4000-8000-000000000002",
+            1,
+            "done",
+            Some(terminal("exited", now())),
+        )
+        .await;
+    f.link("independent-work", &paused).await;
+    f.link("independent-work", &done).await;
+    let value =
+        f.g.dispatch(&f.p, "task_context", json!({"task_id":"independent-work"}))
+            .await
+            .unwrap();
+    assert_eq!(value["next_operation_id"], paused);
+    assert_eq!(value["operations"][0]["state"], "awaiting_source");
+    assert_eq!(
+        value["operations"][0]["receipt"]["next_action"],
+        "transfer_resume"
+    );
+    assert_eq!(value["automatic_replay"], false);
+    assert_eq!(f.count().await, 2);
+}
+
+#[tokio::test]
+async fn task_context_finished_history_preserves_pagination_restart_and_cursor() {
+    let f = Fixture::new().await;
+    let mut failed = terminal("exited", now());
+    failed["exit_code"] = json!(1);
+    let old = f
+        .job_with_id(
+            "00000000-0000-4000-8000-000000000001",
+            0,
+            "done",
+            Some(failed),
+        )
+        .await;
+    let done = f
+        .job_with_id(
+            "00000000-0000-4000-8000-000000000002",
+            1,
+            "done",
+            Some(terminal("exited", now())),
+        )
+        .await;
+    f.link("paged-history", &old).await;
+    f.link("paged-history", &done).await;
+    let first =
+        f.g.dispatch(
+            &f.p,
+            "task_context",
+            json!({"task_id":"paged-history","limit":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["scope_complete"], false);
+    assert_eq!(first["next_page"], old);
+    assert_eq!(first["next_action"], "continue_task_page");
+    assert!(first["next_operation_id"].is_null());
+    assert_eq!(first["operations"][0]["state"], "process_failed");
+    let g = Gateway::new((*f.g.config).clone()).await.unwrap();
+    let second = g
+        .dispatch(
+            &f.p,
+            "task_context",
+            json!({"task_id":"paged-history","limit":1,"after_operation":old}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["has_more"], false);
+    assert_eq!(second["scope_complete"], false);
+    assert_eq!(second["next_action"], "no_active_work_in_page");
+    assert!(second["next_operation_id"].is_null());
+    assert_eq!(second["operations"][0]["operation_id"], done);
+    let unchanged = g.dispatch(&f.p, "task_context", json!({"task_id":"paged-history","limit":1,"after_operation":old,"cursor":second["cursor"]})).await.unwrap();
+    assert_eq!(unchanged["changed"], false);
+    assert_eq!(unchanged["scope_complete"], false);
+    assert!(unchanged["operations"].as_array().unwrap().is_empty());
+    assert!(unchanged["next_operation_id"].is_null());
+    assert_eq!(f.count().await, 2);
 }
 
 #[tokio::test]

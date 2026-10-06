@@ -41,6 +41,9 @@ tree-sitter-typescript = "0.23.2"
 uuid.workspace = true
 url = "2.5.8"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+remote-hosts-admin = { path = "../remote-hosts-admin" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
 

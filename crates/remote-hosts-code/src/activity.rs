@@ -185,10 +185,16 @@ pub(crate) async fn task(g: &Gateway, p: &Principal, args: &Value) -> Result<Val
     }
     let active = items.iter().filter(|v| v["active"] == true).count();
     let uncertain = items.iter().filter(|v| v["uncertain"] == true).count();
+    // Execution uncertainty and live work take priority over paused transfers.
+    // Finished terminal receipt/output review stays in history; a later success
+    // does not establish that an unrelated earlier failure has been resolved.
     let next = items
         .iter()
-        .find(|v| {
-            v["uncertain"] == true || v["active"] == true || !v["receipt"]["next_action"].is_null()
+        .find(|v| v["uncertain"] == true || v["active"] == true)
+        .or_else(|| {
+            items
+                .iter()
+                .find(|v| matches!(v["state"].as_str(), Some("paused" | "awaiting_source")))
         })
         .map(|v| v["operation_id"].clone());
     let identity = hash(serde_json::to_vec(
