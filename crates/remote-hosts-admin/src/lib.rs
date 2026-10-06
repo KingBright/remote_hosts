@@ -8,4 +8,6 @@ pub mod executor;
 pub mod filesystem;
 pub mod protocol;
 #[cfg(unix)]
+pub mod tasks;
+#[cfg(unix)]
 pub mod transport;

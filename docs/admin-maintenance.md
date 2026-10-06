@@ -141,3 +141,38 @@ cargo build --release --manifest-path target/admin-helper-preparation/snapshot/C
 - Linux kernel: https://docs.kernel.org/userspace-api/no_new_privs.html
 - Tokio UnixStream peer credentials: https://docs.rs/tokio/latest/tokio/net/struct.UnixStream.html#method.peer_cred
 - Apple launchd system services: https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html
+
+## 普通权限维护任务候选入口（未部署）
+
+`remote-hosts-admin task` 是同一 Rust 组件的普通用户入口，不连接管理员 socket，不调用 sudo、launchctl 或 shell，不读策略、配置或凭据，也不新增 MCP 工具或调度器。现有 root helper 协议和 `remove_legacy_remoteplay` 动作保持原范围；本次没有安装、启用或扩展任何 root grant。线上 Agent 的 `terminal:exec` 和升级回执仍不能证明管理员权限。
+
+仅支持两个封闭任务：
+
+- `inspect-remoteplay-mesh`：观察固定 launch plist 和两份 NativeMesh 配置的文件身份，成功表示元数据检查完成。
+- `repair-remoteplay-mesh-ownership`：记录特权需求，run 始终返回 `awaiting_platform_authorization` 和退出码 2，不执行修复。真正的固定范围为停用/卸载 `system/com.remoteplay.mesh`，将两份 root-owned 配置的 owner 修复为经认证账户 UID，保留 group/mode。该特权执行器尚未实现。
+
+目标由系统账户 home 推导，不能请求任意路径：`/Library/LaunchDaemons/com.remoteplay.mesh.plist`，以及 `<home>/Library/Application Support/RemotePlay/NativeMesh/{mesh.conf,mesh.secret}`。目录逐层以 O_NOFOLLOW 固定，文件用 fstatat/AT_SYMLINK_NOFOLLOW 取 device、inode、UID/GID、mode、link count、size、mtime/ctime；不打开文件或计算内容摘要，拒绝符号链接、硬链接和其他账户文件。root-owned 0600 不被修改。计划摘要绑定原始元数据，执行只读检查时若身份变化则失败；verify 再观察并报告 unchanged/targets_changed，不执行或证明管理员修复。尚未观察服务的加载状态、进程/可执行身份或签名，未来特权执行前必须补齐这些检查。
+
+CLI 的 UID/GID/home 来自当前进程及系统账户，不接受参数覆盖。device-id 是调用者声明并绑定到回执的 UUID，**不是**从 Gateway 独立认证得到的设备证据；当前实现不得据此签发 root grant。普通任务目录只属于当前 UID，0700，无符号链接祖先；同一 UID 的进程具有同等信任，回执不是不可篡改审计。记录复用既有私有原子 JSON/fsync Store 和文件锁，不能与 root 回执目录混用。
+
+```text
+<candidate> task describe --action repair-remoteplay-mesh-ownership
+<candidate> task prepare --state-dir <已存在的绝对路径0700目录> --request-id <固定UUID> --device-id <当前设备UUID> --action inspect-remoteplay-mesh
+<candidate> task run --state-dir <同目录> --request-id <同UUID> --plan-sha256 <prepare摘要>
+<candidate> task status --state-dir <同目录> --request-id <同UUID>
+<candidate> task verify --state-dir <同目录> --request-id <同UUID>
+```
+
+prepare 固定身份、动作、目标快照与五分钟有效期。同 UUID 同意图返回原记录，改动作或设备则冲突；run 的重复请求返回原结果，不重复检查。开始前 fsync running；中断留下 running 时需要观察/核验原 UUID，不能换 UUID 或 device-id 自动重试。verify 不自动解除不确定状态。task describe 是纯观察；prepare/run 写普通用户任务回执，应在 SSH 通道声明真实 mutating scope。
+
+真实管理员执行还缺：平台认可的独立安装/持久访问确认、本机管理员认证、root 所有策略与授权动作、服务及可执行身份检查、每步 inode/owner/group/mode 复核和真实恢复验收。本入口不访问 `com.apple.Terminal`，不授权通过另一通道执行已经被拒绝的动作。聊天密码、自动认证重试或 sudoers 变更都不是恢复步骤。
+
+固定验证命令（只验证源码候选，不能当作上线/提权验收）：
+
+```text
+python3 scripts/check-maintenance-tasks.py --evidence-dir <新的绝对证据目录> --device-id <当前设备UUID> --dependency-lock <已确认候选Cargo.lock> --accept-lock-sha256 <该锁文件SHA256>
+```
+
+脚本复用 helper 快照与 leased Cargo target，离线运行 fmt/test/clippy/build，并以真实普通 UID 验证候选 CLI 的元数据检查、重复请求和特权请求阻断。完整证据保存在 report.json 和日志中。它不运行 serve/apply/install，不读配置内容，不修改服务或目标文件。
+
+验证驱动显式绑定已确认候选锁的 SHA，使用 offline/locked 和原 leased Cargo target；这不等于已验证根工作区锁。每个 Cargo 串行运行，记录自建进程组、阶段、退出码和日志摘要，每 30 秒输出进展。测试阶段最多 1200 秒，完整驱动最多 2400 秒；超时只清理本驱动拥有的进程组并保留失败回执，不自动重试。

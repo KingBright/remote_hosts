@@ -84,6 +84,9 @@ impl Store {
         Ok(self.dir.join(format!("{id}.json")))
     }
     pub fn load(&self, id: &str) -> Result<Option<Record>> {
+        self.load_json(id)
+    }
+    pub fn load_json<T: serde::de::DeserializeOwned>(&self, id: &str) -> Result<Option<T>> {
         let path = self.path(id)?;
         match private_read(&path, self.owner) {
             Ok(data) => Ok(Some(serde_json::from_slice(&data)?)),
@@ -97,7 +100,14 @@ impl Store {
         }
     }
     pub fn save(&self, record: &Record) -> Result<()> {
-        atomic_json(&self.path(&record.plan.request_id)?, record)
+        self.save_json(&record.plan.request_id, record)
+    }
+    pub fn save_json<T: serde::Serialize>(&self, id: &str, record: &T) -> Result<()> {
+        ensure!(
+            serde_json::to_vec(record)?.len() as u64 <= MAX_RECORD,
+            "receipt_too_large"
+        );
+        atomic_json(&self.path(id)?, record)
     }
     pub fn revoked(&self) -> Result<bool> {
         match private_read(&self.dir.join("revoked.json"), self.owner) {
@@ -127,7 +137,7 @@ impl Store {
 }
 
 /// Pin each directory with O_NOFOLLOW; /etc and home symlinks are never silently followed.
-fn parent_fd(path: &Path) -> Result<(File, String)> {
+pub(crate) fn parent_fd(path: &Path) -> Result<(File, String)> {
     ensure!(path.is_absolute(), "artifact_path_not_absolute");
     let filename = path
         .file_name()
