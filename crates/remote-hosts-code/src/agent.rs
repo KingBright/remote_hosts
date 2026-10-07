@@ -315,8 +315,13 @@ impl Agent {
             "workspace_gc" => crate::storage_gc::run(&self.config, &self.store, &ws, v).await,
             "terminal_exec" => {
                 if crate::maintenance_tasks::requested(&job.tool, v) {
-                    let launch =
-                        crate::maintenance_tasks::launch(&self.config, &ws, &job.owner, v)?;
+                    let launch = crate::maintenance_tasks::launch(
+                        &self.config,
+                        &ws,
+                        &job.owner,
+                        v,
+                        &job.id,
+                    )?;
                     self.terminals
                         .start_maintenance(&self.config, &ws, v, &job.id, launch)
                         .await

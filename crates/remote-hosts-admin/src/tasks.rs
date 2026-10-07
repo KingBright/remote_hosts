@@ -22,6 +22,7 @@ use std::{
 pub const TASK_PROTOCOL: u32 = 1;
 pub const SERVICE: &str = "system/com.remoteplay.mesh";
 const PLIST: &str = "/Library/LaunchDaemons/com.remoteplay.mesh.plist";
+const APPROVAL_TTL: u64 = 120;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +50,26 @@ pub enum Command {
     },
     /// Execute the saved metadata check once; privileged action remains blocked.
     Run {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        plan_sha256: String,
+    },
+    /// Record one explicit, short-lived gateway approval; no privileged action is launched.
+    Approve {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        plan_sha256: String,
+        #[arg(long)]
+        approval_operation_id: String,
+    },
+    /// Cancel before execution; a running task stays on its original recovery handle.
+    Cancel {
         #[arg(long)]
         state_dir: PathBuf,
         #[arg(long)]
@@ -211,6 +232,8 @@ pub struct Plan {
     pub protocol: u32,
     pub request_id: String,
     pub device_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_sha256: String,
     pub identity: Identity,
     pub action: Action,
     pub created_at: u64,
@@ -221,10 +244,25 @@ pub struct Plan {
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Prepared,
+    AwaitingApproval,
+    Approved,
     Running,
     Succeeded,
     Failed,
+    Cancelled,
     AwaitingPlatformAuthorization,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Approval {
+    pub approval_operation_id: String,
+    pub plan_sha256: String,
+    pub context_sha256: String,
+    pub action: Action,
+    pub uid: u32,
+    pub approved_at: u64,
+    pub expires_at: u64,
+    pub consumed_at: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -232,6 +270,10 @@ pub struct Record {
     pub plan: Plan,
     pub plan_sha256: String,
     pub state: State,
+    #[serde(default)]
+    pub approval: Option<Approval>,
+    #[serde(default)]
+    pub cancelled_at: Option<u64>,
     pub result: Option<Snapshot>,
     pub error_code: Option<String>,
     pub events: Vec<String>,
@@ -248,21 +290,70 @@ fn response(record: &Record) -> Result<Value> {
             "Observe and verify the original request; no automatic replay or new request ID."
         );
     }
+    if record.state == State::AwaitingApproval {
+        v["next_action"] = json!(
+            "Review this fixed action and plan digest, then issue one explicit approval bound to this request, owner, workspace and device."
+        );
+    }
+    if record.state == State::Approved {
+        v["next_action"] = json!(
+            "Run once before the approval expires; this records the approval and still does not execute privileged work."
+        );
+    }
+    if record.state == State::Cancelled {
+        v["next_action"] = json!("This request is terminally cancelled and will not be replayed.");
+    }
     if record.state == State::AwaitingPlatformAuthorization {
         v["next_action"] = json!(
-            "Separate platform installation/access confirmation and authenticated privileged executor are required; do not retry authentication through this CLI."
+            "Separate platform installation/access confirmation and authenticated privileged executor are required; no privileged execution was attempted."
         );
     }
     Ok(v)
 }
-fn load(store: &Store, id: &str, identity: &Identity) -> Result<Record> {
-    let r: Record = store.load_json(id)?.context("task_not_found")?;
-    validate_record(r, id, identity)
+fn valid_sha256(value: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid_sha256"
+    );
+    Ok(())
 }
-fn validate_record(r: Record, id: &str, identity: &Identity) -> Result<Record> {
+#[cfg(test)]
+fn load(store: &Store, id: &str, identity: &Identity) -> Result<Record> {
+    load_bound(store, id, identity, None)
+}
+fn load_bound(
+    store: &Store,
+    id: &str,
+    identity: &Identity,
+    context_sha256: Option<&str>,
+) -> Result<Record> {
+    let r: Record = store.load_json(id)?.context("task_not_found")?;
+    validate_record_bound(r, id, identity, context_sha256)
+}
+fn validate_record_bound(
+    r: Record,
+    id: &str,
+    identity: &Identity,
+    context_sha256: Option<&str>,
+) -> Result<Record> {
     r.plan.identity.validate()?;
     valid_id(&r.plan.request_id)?;
     valid_id(&r.plan.device_id)?;
+    if let Some(context) = context_sha256 {
+        valid_sha256(context)?;
+        ensure!(
+            r.plan.context_sha256.is_empty() || r.plan.context_sha256 == context,
+            "task_context_binding_mismatch"
+        );
+    } else {
+        ensure!(
+            r.plan.context_sha256.is_empty(),
+            "task_context_binding_required"
+        );
+    }
     ensure!(
         r.plan.protocol == TASK_PROTOCOL
             && r.plan.request_id == id
@@ -270,8 +361,32 @@ fn validate_record(r: Record, id: &str, identity: &Identity) -> Result<Record> {
             && digest(&r.plan)? == r.plan_sha256,
         "task_binding_or_digest_mismatch"
     );
+    if let Some(approval) = &r.approval {
+        valid_id(&approval.approval_operation_id)?;
+        valid_sha256(&approval.plan_sha256)?;
+        valid_sha256(&approval.context_sha256)?;
+        ensure!(
+            context_sha256 == Some(approval.context_sha256.as_str())
+                && approval.plan_sha256 == r.plan_sha256
+                && approval.action == r.plan.action
+                && approval.action == Action::RepairRemoteplayMeshOwnership
+                && approval.uid == identity.uid
+                && approval.approved_at >= r.plan.created_at
+                && approval.expires_at > approval.approved_at
+                && approval.expires_at <= r.plan.expires_at
+                && approval
+                    .consumed_at
+                    .is_none_or(|at| at >= approval.approved_at),
+            "task_approval_binding_mismatch"
+        );
+    }
+    ensure!(
+        r.state != State::Approved || r.approval.is_some(),
+        "task_approval_missing"
+    );
     Ok(r)
 }
+#[cfg(test)]
 fn prepare(
     store: &Store,
     identity: &Identity,
@@ -280,11 +395,22 @@ fn prepare(
     action: Action,
     now: u64,
 ) -> Result<Value> {
+    prepare_bound(store, identity, id, device, action, None, now)
+}
+fn prepare_bound(
+    store: &Store,
+    identity: &Identity,
+    id: &str,
+    device: &str,
+    action: Action,
+    context_sha256: Option<&str>,
+    now: u64,
+) -> Result<Value> {
     identity.validate()?;
     valid_id(id)?;
     valid_id(device)?;
     if let Some(old) = store.load_json::<Record>(id)? {
-        let r = load(store, id, identity)?;
+        let r = load_bound(store, id, identity, context_sha256)?;
         ensure!(
             old.plan.device_id == device && old.plan.action == action,
             "task_idempotency_binding_conflict"
@@ -308,10 +434,14 @@ fn prepare(
             );
         }
     }
+    if let Some(context) = context_sha256 {
+        valid_sha256(context)?;
+    }
     let plan = Plan {
         protocol: TASK_PROTOCOL,
         request_id: id.into(),
         device_id: device.into(),
+        context_sha256: context_sha256.unwrap_or_default().into(),
         identity: identity.clone(),
         action,
         created_at: now,
@@ -322,6 +452,8 @@ fn prepare(
         plan_sha256: digest(&plan)?,
         plan,
         state: State::Prepared,
+        approval: None,
+        cancelled_at: None,
         result: None,
         error_code: None,
         events: vec!["intent_prepared".into()],
@@ -330,23 +462,60 @@ fn prepare(
     store.save_json(id, &r)?;
     response(&r)
 }
+#[cfg(test)]
 fn execute(store: &Store, identity: &Identity, id: &str, hash: &str, now: u64) -> Result<Value> {
-    let mut r = load(store, id, identity)?;
+    execute_bound(store, identity, id, hash, None, now)
+}
+fn execute_bound(
+    store: &Store,
+    identity: &Identity,
+    id: &str,
+    hash: &str,
+    context_sha256: Option<&str>,
+    now: u64,
+) -> Result<Value> {
+    let mut r = load_bound(store, id, identity, context_sha256)?;
     ensure!(r.plan_sha256 == hash, "task_plan_digest_mismatch");
-    if r.state != State::Prepared {
-        return response(&r);
-    }
-    if r.plan.action == Action::RepairRemoteplayMeshOwnership {
-        r.state = State::AwaitingPlatformAuthorization;
-        r.error_code = Some("platform_confirmation_and_privileged_executor_required".into());
-        r.events.push("privileged_execution_not_attempted".into());
-        r.updated_at = now;
-        store.save_json(id, &r)?;
+    if !matches!(r.state, State::Prepared | State::Approved) {
         return response(&r);
     }
     ensure!(
         now >= r.plan.created_at && now < r.plan.expires_at,
         "task_expired_or_clock_moved_backwards"
+    );
+    if r.plan.action == Action::RepairRemoteplayMeshOwnership {
+        if r.state == State::Prepared {
+            r.state = State::AwaitingApproval;
+            r.error_code = Some("explicit_single_approval_required".into());
+            r.events.push("awaiting_explicit_approval".into());
+        } else {
+            let context = context_sha256.context("gateway_bound_approval_required")?;
+            let approval = r.approval.as_mut().context("task_approval_missing")?;
+            ensure!(
+                approval.context_sha256 == context
+                    && approval.plan_sha256 == r.plan_sha256
+                    && approval.action == r.plan.action
+                    && approval.uid == identity.uid
+                    && approval.consumed_at.is_none(),
+                "task_approval_binding_mismatch_or_consumed"
+            );
+            ensure!(
+                now >= approval.approved_at && now < approval.expires_at,
+                "task_approval_expired_or_clock_moved_backwards"
+            );
+            approval.consumed_at = Some(now);
+            r.state = State::AwaitingPlatformAuthorization;
+            r.error_code = Some("platform_confirmation_and_privileged_executor_required".into());
+            r.events.push("explicit_approval_consumed".into());
+            r.events.push("privileged_execution_not_attempted".into());
+        }
+        r.updated_at = now;
+        store.save_json(id, &r)?;
+        return response(&r);
+    }
+    ensure!(
+        r.plan.action == Action::InspectRemoteplayMesh,
+        "task_action_unavailable"
     );
     r.state = State::Running;
     r.events.push("metadata_check_started".into());
@@ -373,8 +542,111 @@ fn execute(store: &Store, identity: &Identity, id: &str, hash: &str, now: u64) -
     store.save_json(id, &r)?;
     response(&r)
 }
+fn approve(
+    store: &Store,
+    identity: &Identity,
+    id: &str,
+    hash: &str,
+    approval_operation_id: &str,
+    context_sha256: Option<&str>,
+    now: u64,
+) -> Result<Value> {
+    valid_id(id)?;
+    valid_id(approval_operation_id)?;
+    valid_sha256(hash)?;
+    let context = context_sha256.context("gateway_bound_approval_required")?;
+    valid_sha256(context)?;
+    let mut r = load_bound(store, id, identity, Some(context))?;
+    ensure!(r.plan_sha256 == hash, "task_plan_digest_mismatch");
+    ensure!(
+        r.plan.action == Action::RepairRemoteplayMeshOwnership,
+        "approval_not_required_for_action"
+    );
+    if let Some(existing) = &r.approval {
+        ensure!(
+            existing.approval_operation_id == approval_operation_id
+                && existing.plan_sha256 == hash
+                && existing.context_sha256 == context
+                && existing.action == r.plan.action
+                && existing.uid == identity.uid,
+            "task_approval_already_recorded"
+        );
+        return response(&r);
+    }
+    ensure!(
+        matches!(r.state, State::Prepared | State::AwaitingApproval),
+        "task_not_awaiting_approval"
+    );
+    ensure!(
+        now >= r.plan.created_at && now < r.plan.expires_at,
+        "task_expired_or_clock_moved_backwards"
+    );
+    let expires_at = now
+        .checked_add(APPROVAL_TTL)
+        .context("clock_overflow")?
+        .min(r.plan.expires_at);
+    ensure!(expires_at > now, "task_expired_or_clock_moved_backwards");
+    r.approval = Some(Approval {
+        approval_operation_id: approval_operation_id.into(),
+        plan_sha256: hash.into(),
+        context_sha256: context.into(),
+        action: r.plan.action,
+        uid: identity.uid,
+        approved_at: now,
+        expires_at,
+        consumed_at: None,
+    });
+    r.state = State::Approved;
+    r.error_code = None;
+    r.events.push("explicit_approval_recorded".into());
+    r.updated_at = now;
+    store.save_json(id, &r)?;
+    response(&r)
+}
+fn cancel(
+    store: &Store,
+    identity: &Identity,
+    id: &str,
+    hash: &str,
+    context_sha256: Option<&str>,
+    now: u64,
+) -> Result<Value> {
+    valid_sha256(hash)?;
+    let mut r = load_bound(store, id, identity, context_sha256)?;
+    ensure!(r.plan_sha256 == hash, "task_plan_digest_mismatch");
+    let result = match r.state {
+        State::Prepared
+        | State::AwaitingApproval
+        | State::Approved
+        | State::AwaitingPlatformAuthorization => {
+            r.state = State::Cancelled;
+            r.cancelled_at = Some(now);
+            r.error_code = None;
+            r.events
+                .push("request_cancelled_before_privileged_execution".into());
+            r.updated_at = now;
+            store.save_json(id, &r)?;
+            "cancelled"
+        }
+        State::Cancelled => "already_cancelled",
+        State::Running => "original_running_no_replay",
+        State::Succeeded | State::Failed => "already_terminal",
+    };
+    let mut value = response(&r)?;
+    value["cancel_result"] = json!(result);
+    Ok(value)
+}
+#[cfg(test)]
 fn verify(store: &Store, identity: &Identity, id: &str) -> Result<Value> {
-    let r = load(store, id, identity)?;
+    verify_bound(store, identity, id, None)
+}
+fn verify_bound(
+    store: &Store,
+    identity: &Identity,
+    id: &str,
+    context_sha256: Option<&str>,
+) -> Result<Value> {
+    let r = load_bound(store, id, identity, context_sha256)?;
     let fresh = inspect(identity)?;
     let comparison = match &r.result {
         Some(old) if old == &fresh => "unchanged",
@@ -471,10 +743,34 @@ fn locked_store(path: &Path, uid: u32) -> Result<(Store, File)> {
 pub fn read_status(path: &Path, request_id: &str, device_id: &str) -> Result<Option<Value>> {
     read_status_inner(path, request_id, Some(device_id), &Identity::current()?)
 }
+pub fn read_status_bound(
+    path: &Path,
+    request_id: &str,
+    device_id: &str,
+    context_sha256: &str,
+) -> Result<Option<Value>> {
+    valid_sha256(context_sha256)?;
+    read_status_scoped(
+        path,
+        request_id,
+        Some(device_id),
+        Some(context_sha256),
+        &Identity::current()?,
+    )
+}
 fn read_status_inner(
     path: &Path,
     id: &str,
     device: Option<&str>,
+    identity: &Identity,
+) -> Result<Option<Value>> {
+    read_status_scoped(path, id, device, None, identity)
+}
+fn read_status_scoped(
+    path: &Path,
+    id: &str,
+    device: Option<&str>,
+    context_sha256: Option<&str>,
     identity: &Identity,
 ) -> Result<Option<Value>> {
     identity.validate()?;
@@ -488,7 +784,7 @@ fn read_status_inner(
     let Some(record) = store.load_json::<Record>(id)? else {
         return Ok(None);
     };
-    let record = validate_record(record, id, identity)?;
+    let record = validate_record_bound(record, id, identity, context_sha256)?;
     ensure!(
         device.is_none_or(|d| record.plan.device_id == d),
         "task_device_binding_mismatch"
@@ -499,14 +795,15 @@ pub fn ordinary_tasks_supported() -> bool {
     Identity::current().is_ok_and(|i| i.validate().is_ok())
 }
 pub fn run_cli(command: Command) -> Result<Value> {
-    run_impl(command, None)
+    run_impl(command, None, None)
 }
-/// The device binding is supplied by the authenticated Agent, never by MCP arguments.
-pub fn run_bound_cli(command: Command, device: &str) -> Result<Value> {
+/// Device and owner/workspace context come from the authenticated Agent, never MCP fields.
+pub fn run_bound_cli(command: Command, device: &str, context_sha256: &str) -> Result<Value> {
     valid_id(device)?;
-    run_impl(command, Some(device))
+    valid_sha256(context_sha256)?;
+    run_impl(command, Some(device), Some(context_sha256))
 }
-fn run_impl(command: Command, device: Option<&str>) -> Result<Value> {
+fn run_impl(command: Command, device: Option<&str>, context_sha256: Option<&str>) -> Result<Value> {
     if let Command::Describe { action } = command {
         return Ok(describe(action));
     }
@@ -517,12 +814,14 @@ fn run_impl(command: Command, device: Option<&str>) -> Result<Value> {
         request_id,
     } = &command
     {
-        return read_status_inner(state_dir, request_id, device, &identity)?
+        return read_status_scoped(state_dir, request_id, device, context_sha256, &identity)?
             .context("task_not_found");
     }
     let path = match &command {
         Command::Prepare { state_dir, .. }
         | Command::Run { state_dir, .. }
+        | Command::Approve { state_dir, .. }
+        | Command::Cancel { state_dir, .. }
         | Command::Verify { state_dir, .. } => state_dir,
         _ => unreachable!(),
     };
@@ -532,9 +831,15 @@ fn run_impl(command: Command, device: Option<&str>) -> Result<Value> {
             Command::Prepare { device_id, .. } => {
                 ensure!(device_id == device, "task_device_binding_mismatch")
             }
-            Command::Run { request_id, .. } | Command::Verify { request_id, .. } => {
+            Command::Run { request_id, .. }
+            | Command::Approve { request_id, .. }
+            | Command::Cancel { request_id, .. }
+            | Command::Verify { request_id, .. } => {
                 ensure!(
-                    load(&store, request_id, &identity)?.plan.device_id == device,
+                    load_bound(&store, request_id, &identity, context_sha256)?
+                        .plan
+                        .device_id
+                        == device,
                     "task_device_binding_mismatch"
                 );
             }
@@ -547,20 +852,56 @@ fn run_impl(command: Command, device: Option<&str>) -> Result<Value> {
             device_id,
             action,
             ..
-        } => prepare(
+        } => prepare_bound(
             &store,
             &identity,
             &request_id,
             &device_id,
             action,
+            context_sha256,
             unix_time(),
         ),
         Command::Run {
             request_id,
             plan_sha256,
             ..
-        } => execute(&store, &identity, &request_id, &plan_sha256, unix_time()),
-        Command::Verify { request_id, .. } => verify(&store, &identity, &request_id),
+        } => execute_bound(
+            &store,
+            &identity,
+            &request_id,
+            &plan_sha256,
+            context_sha256,
+            unix_time(),
+        ),
+        Command::Approve {
+            request_id,
+            plan_sha256,
+            approval_operation_id,
+            ..
+        } => approve(
+            &store,
+            &identity,
+            &request_id,
+            &plan_sha256,
+            &approval_operation_id,
+            context_sha256,
+            unix_time(),
+        ),
+        Command::Cancel {
+            request_id,
+            plan_sha256,
+            ..
+        } => cancel(
+            &store,
+            &identity,
+            &request_id,
+            &plan_sha256,
+            context_sha256,
+            unix_time(),
+        ),
+        Command::Verify { request_id, .. } => {
+            verify_bound(&store, &identity, &request_id, context_sha256)
+        }
         _ => unreachable!(),
     }
 }
@@ -644,10 +985,228 @@ mod tests {
         let before = inspect(&i).unwrap();
         let hash = a["plan_sha256"].as_str().unwrap();
         let r = execute(&s, &i, &id, hash, 1001).unwrap();
-        assert_eq!(r["state"], "awaiting_platform_authorization");
+        assert_eq!(r["state"], "awaiting_approval");
         assert_eq!(r["system_changes_confirmed"], false);
         assert_eq!(before, inspect(&i).unwrap());
         assert_eq!(r, execute(&s, &i, &id, hash, 1002).unwrap());
+    }
+    #[test]
+    fn approval_is_single_use_and_bound_to_request_plan_context_and_caller() {
+        let (_t, s, i, id, d) = fixture();
+        let context = "a".repeat(64);
+        let planned = prepare_bound(
+            &s,
+            &i,
+            &id,
+            &d,
+            Action::RepairRemoteplayMeshOwnership,
+            Some(&context),
+            1000,
+        )
+        .unwrap();
+        let hash = planned["plan_sha256"].as_str().unwrap();
+        let waiting = execute_bound(&s, &i, &id, hash, Some(&context), 1001).unwrap();
+        assert_eq!(waiting["state"], "awaiting_approval");
+        let approval_operation_id = uuid::Uuid::new_v4().to_string();
+        let approved = approve(
+            &s,
+            &i,
+            &id,
+            hash,
+            &approval_operation_id,
+            Some(&context),
+            1002,
+        )
+        .unwrap();
+        assert_eq!(approved["state"], "approved");
+        assert_eq!(
+            approved["administrator_authorization"],
+            "not_checked_not_granted"
+        );
+        assert_eq!(approved["system_changes_confirmed"], false);
+        assert_eq!(
+            approved["device_identity_evidence"],
+            "caller_declared_not_gateway_authenticated"
+        );
+        assert_eq!(
+            approved,
+            approve(
+                &s,
+                &i,
+                &id,
+                hash,
+                &approval_operation_id,
+                Some(&context),
+                1003,
+            )
+            .unwrap()
+        );
+        assert!(
+            approve(
+                &s,
+                &i,
+                &id,
+                hash,
+                &uuid::Uuid::new_v4().to_string(),
+                Some(&context),
+                1003,
+            )
+            .is_err()
+        );
+
+        let result = execute_bound(&s, &i, &id, hash, Some(&context), 1004).unwrap();
+        assert_eq!(result["state"], "awaiting_platform_authorization");
+        assert_eq!(
+            result["administrator_authorization"],
+            "not_checked_not_granted"
+        );
+        assert_eq!(result["system_changes_confirmed"], false);
+        assert_eq!(
+            result["device_identity_evidence"],
+            "caller_declared_not_gateway_authenticated"
+        );
+        assert_eq!(
+            result["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| *event == "privileged_execution_not_attempted")
+                .count(),
+            1
+        );
+        assert_eq!(result["approval"]["consumed_at"], 1004);
+        assert_eq!(
+            result,
+            execute_bound(&s, &i, &id, hash, Some(&context), 1005).unwrap()
+        );
+    }
+    #[test]
+    fn approval_rejects_context_digest_mismatch_and_expired_single_use_evidence() {
+        let (_t, s, i, id, d) = fixture();
+        let context = "c".repeat(64);
+        let wrong_context = "d".repeat(64);
+        let planned = prepare_bound(
+            &s,
+            &i,
+            &id,
+            &d,
+            Action::RepairRemoteplayMeshOwnership,
+            Some(&context),
+            1000,
+        )
+        .unwrap();
+        let hash = planned["plan_sha256"].as_str().unwrap();
+        let approval_operation_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            approve(
+                &s,
+                &i,
+                &id,
+                hash,
+                &approval_operation_id,
+                Some(&wrong_context),
+                1001,
+            )
+            .is_err()
+        );
+        assert!(
+            approve(
+                &s,
+                &i,
+                &id,
+                &"0".repeat(64),
+                &approval_operation_id,
+                Some(&context),
+                1001,
+            )
+            .is_err()
+        );
+        let approved = approve(
+            &s,
+            &i,
+            &id,
+            hash,
+            &approval_operation_id,
+            Some(&context),
+            1001,
+        )
+        .unwrap();
+        let expires_at = approved["approval"]["expires_at"].as_u64().unwrap();
+        assert!(execute_bound(&s, &i, &id, hash, Some(&context), expires_at).is_err());
+        assert_eq!(
+            load_bound(&s, &id, &i, Some(&context)).unwrap().state,
+            State::Approved
+        );
+    }
+    #[test]
+    fn cancel_is_durable_idempotent_and_never_changes_a_running_record() {
+        let (_t, s, i, id, d) = fixture();
+        let context = "e".repeat(64);
+        let planned = prepare_bound(
+            &s,
+            &i,
+            &id,
+            &d,
+            Action::RepairRemoteplayMeshOwnership,
+            Some(&context),
+            1000,
+        )
+        .unwrap();
+        let hash = planned["plan_sha256"].as_str().unwrap();
+        let cancelled = cancel(&s, &i, &id, hash, Some(&context), 1001).unwrap();
+        assert_eq!(cancelled["state"], "cancelled");
+        assert_eq!(cancelled["cancel_result"], "cancelled");
+        assert_eq!(cancelled["cancelled_at"], 1001);
+        assert_eq!(
+            cancel(&s, &i, &id, hash, Some(&context), 1002).unwrap()["cancel_result"],
+            "already_cancelled"
+        );
+        assert_eq!(
+            execute_bound(&s, &i, &id, hash, Some(&context), 1003).unwrap()["state"],
+            "cancelled"
+        );
+
+        let running_id = uuid::Uuid::new_v4().to_string();
+        let running = prepare_bound(
+            &s,
+            &i,
+            &running_id,
+            &d,
+            Action::InspectRemoteplayMesh,
+            Some(&context),
+            1000,
+        )
+        .unwrap();
+        let running_hash = running["plan_sha256"].as_str().unwrap();
+        let mut record: Record = s.load_json(&running_id).unwrap().unwrap();
+        record.state = State::Running;
+        s.save_json(&running_id, &record).unwrap();
+        let before = fs::read(s.dir.join(format!("{running_id}.json"))).unwrap();
+        let observed = cancel(&s, &i, &running_id, running_hash, Some(&context), 1004).unwrap();
+        assert_eq!(observed["state"], "running");
+        assert_eq!(observed["cancel_result"], "original_running_no_replay");
+        assert_eq!(
+            fs::read(s.dir.join(format!("{running_id}.json"))).unwrap(),
+            before
+        );
+    }
+    #[test]
+    fn legacy_record_fields_default_without_changing_plan_digest() {
+        let (_t, s, i, id, d) = fixture();
+        intent(&s, &i, &id, &d, Action::InspectRemoteplayMesh);
+        let record: Record = s.load_json(&id).unwrap().unwrap();
+        let mut legacy = serde_json::to_value(record).unwrap();
+        legacy.as_object_mut().unwrap().remove("approval");
+        legacy.as_object_mut().unwrap().remove("cancelled_at");
+        legacy["plan"]
+            .as_object_mut()
+            .unwrap()
+            .remove("context_sha256");
+        s.save_json(&id, &legacy).unwrap();
+        let restored = load(&s, &id, &i).unwrap();
+        assert_eq!(restored.state, State::Prepared);
+        assert_eq!(restored.approval, None);
+        assert_eq!(restored.cancelled_at, None);
     }
     #[test]
     fn changed_inode_rejects_saved_plan() {

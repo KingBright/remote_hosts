@@ -77,7 +77,7 @@ fn step(v: &Value) -> Result<&str> {
         .as_str()
         .context("maintenance_step_required")?;
     ensure!(
-        matches!(s, "prepare" | "run" | "verify"),
+        matches!(s, "prepare" | "run" | "approve" | "cancel" | "verify"),
         "maintenance_step_unavailable"
     );
     Ok(s)
@@ -98,6 +98,7 @@ pub fn validate(tool: &str, v: &Value) -> Result<()> {
         "maintenance_request_id",
         "maintenance_step",
         "plan_sha256",
+        "approval_operation_id",
     ];
     match tool {
         "terminal_exec" if v["action"] == "maintenance_task" => {
@@ -106,10 +107,10 @@ pub fn validate(tool: &str, v: &Value) -> Result<()> {
             match step(v)? {
                 "prepare" => {
                     action(v)?;
-                    reject(&["plan_sha256"])?;
+                    reject(&["plan_sha256", "approval_operation_id"])?;
                 }
-                "run" => {
-                    reject(&["maintenance_action"])?;
+                "run" | "approve" | "cancel" => {
+                    reject(&["maintenance_action", "approval_operation_id"])?;
                     let digest = v["plan_sha256"].as_str().context("plan_sha256_required")?;
                     ensure!(
                         digest.len() == 64
@@ -119,7 +120,9 @@ pub fn validate(tool: &str, v: &Value) -> Result<()> {
                         "invalid_plan_sha256"
                     );
                 }
-                "verify" => reject(&["maintenance_action", "plan_sha256"])?,
+                "verify" => {
+                    reject(&["maintenance_action", "plan_sha256", "approval_operation_id"])?
+                }
                 _ => unreachable!(),
             }
         }
@@ -141,10 +144,10 @@ pub fn validate(tool: &str, v: &Value) -> Result<()> {
             ])?;
             if v["action"] == "maintenance_describe" {
                 action(v)?;
-                reject(&["maintenance_request_id"])?;
+                reject(&["maintenance_request_id", "approval_operation_id"])?;
             } else {
                 request_id(v)?;
-                reject(&["maintenance_action"])?;
+                reject(&["maintenance_action", "approval_operation_id"])?;
             }
         }
         "workspace_context" => reject(&maintenance_fields)?,
@@ -184,7 +187,7 @@ pub fn require_capability(
     Ok(())
 }
 /// Authenticated owner/device/workspace are inputs from the Job and Agent, never MCP fields.
-pub fn journal_dir(state: &Path, owner: &str, workspace: &str, device: &str) -> Result<PathBuf> {
+fn namespace_hash(owner: &str, workspace: &str, device: &str) -> Result<String> {
     canonical_uuid(device)?;
     let (ws_device, ws_id) = workspace
         .split_once(':')
@@ -195,9 +198,18 @@ pub fn journal_dir(state: &Path, owner: &str, workspace: &str, device: &str) -> 
         !owner.is_empty() && owner.len() <= 256 && !owner.chars().any(char::is_control),
         "maintenance_owner_invalid"
     );
+    Ok(crate::hash(serde_json::to_vec(&[
+        owner, workspace, device,
+    ])?))
+}
+pub fn binding_sha256(owner: &str, workspace: &str, device: &str) -> Result<String> {
+    namespace_hash(owner, workspace, device)
+}
+pub fn journal_dir(state: &Path, owner: &str, workspace: &str, device: &str) -> Result<PathBuf> {
     ensure!(state.is_absolute(), "maintenance_state_root_invalid");
-    let namespace = crate::hash(serde_json::to_vec(&[owner, workspace, device])?);
-    Ok(state.join("maintenance_tasks").join(namespace))
+    Ok(state
+        .join("maintenance_tasks")
+        .join(namespace_hash(owner, workspace, device)?))
 }
 #[cfg(target_os = "macos")]
 fn core_action(v: &Value) -> Result<remote_hosts_admin::tasks::Action> {
@@ -230,14 +242,21 @@ pub(crate) fn read(
     #[cfg(target_os = "macos")]
     {
         if v["action"] == "maintenance_describe" {
+            let mut descriptor = remote_hosts_admin::tasks::describe(core_action(v)?);
+            descriptor["device_identity_evidence"] = json!("gateway_authenticated_agent_bound");
             return Ok(
                 json!({"maintenance_protocol":PROTOCOL,"journal_read_only":true,
-                "descriptor":remote_hosts_admin::tasks::describe(core_action(v)?)}),
+                "descriptor":descriptor}),
             );
         }
-        let receipt =
-            remote_hosts_admin::tasks::read_status(&path, request_id(v)?, &config.device_id)?
-                .map(bound);
+        let context = binding_sha256(owner, &ws.id, &config.device_id)?;
+        let receipt = remote_hosts_admin::tasks::read_status_bound(
+            &path,
+            request_id(v)?,
+            &config.device_id,
+            &context,
+        )?
+        .map(bound);
         Ok(
             json!({"maintenance_protocol":PROTOCOL,"journal_read_only":true,"found":receipt.is_some(),
             "maintenance_request_id":request_id(v)?,"receipt":receipt}),
@@ -258,6 +277,7 @@ pub(crate) fn launch(
     ws: &crate::files::Workspace,
     owner: &str,
     v: &Value,
+    approval_operation_id: &str,
 ) -> Result<FixedLaunch> {
     validate("terminal_exec", v)?;
     ensure!(requested("terminal_exec", v), "maintenance_action_required");
@@ -268,11 +288,13 @@ pub(crate) fn launch(
         current(config.allow_exec).as_ref(),
         config.allow_exec,
     )?;
+    let context = binding_sha256(owner, &ws.id, &config.device_id)?;
     journal_dir(&config.state_dir, owner, &ws.id, &config.device_id)?;
     ensure!(
         ws.device_id == config.device_id,
         "maintenance_workspace_device_mismatch"
     );
+    let current_step = step(v)?;
     let mut args: Vec<std::ffi::OsString> = vec![
         "maintenance-task".into(),
         "--state-root".into(),
@@ -282,21 +304,30 @@ pub(crate) fn launch(
         ws.id.clone().into(),
         "--device-id".into(),
         config.device_id.clone().into(),
+        "--context-sha256".into(),
+        context.into(),
         "--step".into(),
-        step(v)?.into(),
+        current_step.into(),
         "--request-id".into(),
         request_id(v)?.into(),
     ];
-    if step(v)? == "prepare" {
+    if current_step == "prepare" {
         args.extend(["--maintenance-action".into(), action(v)?.into()]);
     }
-    if step(v)? == "run" {
+    if matches!(current_step, "run" | "approve" | "cancel") {
         args.extend([
             "--plan-sha256".into(),
             v["plan_sha256"]
                 .as_str()
                 .context("plan_sha256_required")?
                 .into(),
+        ]);
+    }
+    if current_step == "approve" {
+        canonical_uuid(approval_operation_id)?;
+        args.extend([
+            "--approval-operation-id".into(),
+            approval_operation_id.into(),
         ]);
     }
     Ok(FixedLaunch {
@@ -317,6 +348,8 @@ pub struct ChildArgs {
     #[arg(long)]
     pub device_id: String,
     #[arg(long)]
+    pub context_sha256: String,
+    #[arg(long)]
     pub step: String,
     #[arg(long)]
     pub request_id: String,
@@ -324,6 +357,8 @@ pub struct ChildArgs {
     pub maintenance_action: Option<String>,
     #[arg(long)]
     pub plan_sha256: Option<String>,
+    #[arg(long)]
+    pub approval_operation_id: Option<String>,
 }
 #[cfg(target_os = "macos")]
 pub fn run_child(args: ChildArgs) -> Result<Value> {
@@ -366,15 +401,28 @@ pub fn run_child(args: ChildArgs) -> Result<Value> {
             request_id: args.request_id,
             plan_sha256: args.plan_sha256.context("plan_sha256_required")?,
         },
+        "approve" => Command::Approve {
+            state_dir,
+            request_id: args.request_id,
+            plan_sha256: args.plan_sha256.context("plan_sha256_required")?,
+            approval_operation_id: args
+                .approval_operation_id
+                .as_deref()
+                .context("approval_operation_id_required")?
+                .to_owned(),
+        },
+        "cancel" => Command::Cancel {
+            state_dir,
+            request_id: args.request_id,
+            plan_sha256: args.plan_sha256.context("plan_sha256_required")?,
+        },
         "verify" => Command::Verify {
             state_dir,
             request_id: args.request_id,
         },
         _ => unreachable!(),
     };
-    let mut value = tasks::run_bound_cli(command, &args.device_id)?;
-    value["device_identity_evidence"] = json!("fixed_child_device_bound");
-    Ok(value)
+    tasks::run_bound_cli(command, &args.device_id, &args.context_sha256)
 }
 
 #[cfg(test)]
@@ -442,6 +490,34 @@ mod tests {
         run["plan_sha256"] = json!("A".repeat(64));
         assert!(crate::tools::validate("terminal_exec", &run).is_err());
     }
+    #[test]
+    fn approval_and_cancel_steps_require_a_plan_but_never_accept_gateway_evidence_from_mcp() {
+        let mut approve = args();
+        approve["maintenance_step"] = json!("approve");
+        approve
+            .as_object_mut()
+            .unwrap()
+            .remove("maintenance_action");
+        approve["plan_sha256"] = json!("a".repeat(64));
+        crate::tools::validate("terminal_exec", &approve).unwrap();
+        approve["approval_operation_id"] = json!(uuid::Uuid::new_v4().to_string());
+        assert!(crate::tools::validate("terminal_exec", &approve).is_err());
+
+        let mut cancel = args();
+        cancel["maintenance_step"] = json!("cancel");
+        cancel.as_object_mut().unwrap().remove("maintenance_action");
+        cancel["plan_sha256"] = json!("b".repeat(64));
+        crate::tools::validate("terminal_exec", &cancel).unwrap();
+        cancel.as_object_mut().unwrap().remove("plan_sha256");
+        assert!(crate::tools::validate("terminal_exec", &cancel).is_err());
+
+        let mut verify = args();
+        verify["maintenance_step"] = json!("verify");
+        verify.as_object_mut().unwrap().remove("maintenance_action");
+        verify["approval_operation_id"] = json!("caller-chosen");
+        assert!(crate::tools::validate("terminal_exec", &verify).is_err());
+    }
+
     #[test]
     fn read_actions_reject_mixed_snapshot_and_execution_fields() {
         let describe = json!({"workspace_id":"fixture","action":"maintenance_describe","maintenance_action":"inspect_remoteplay_mesh"});
@@ -563,11 +639,44 @@ mod tests {
             allow_exec: true,
             shell: "/nonexistent-shell".into(),
         };
-        let fixed = launch(&config, &ws, "owner; unexecuted", &args()).unwrap();
+        let approval_operation_id = uuid::Uuid::new_v4().to_string();
+        let fixed = launch(
+            &config,
+            &ws,
+            "owner; unexecuted",
+            &args(),
+            &approval_operation_id,
+        )
+        .unwrap();
         assert_eq!(fixed.executable, std::env::current_exe().unwrap());
         assert_eq!(fixed.args[0], "maintenance-task");
         assert!(fixed.args.iter().any(|a| a == "--owner=owner; unexecuted"));
+        assert!(fixed.args.iter().any(|a| a == "--context-sha256"));
         assert!(!fixed.args.iter().any(|a| a == "-c" || a == "sudo"));
+
+        let mut approve = args();
+        approve["maintenance_step"] = json!("approve");
+        approve
+            .as_object_mut()
+            .unwrap()
+            .remove("maintenance_action");
+        approve["plan_sha256"] = json!("a".repeat(64));
+        let approved = launch(
+            &config,
+            &ws,
+            "owner; unexecuted",
+            &approve,
+            &approval_operation_id,
+        )
+        .unwrap();
+        assert!(
+            approved
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--approval-operation-id"
+                    && pair[1].to_string_lossy() == approval_operation_id)
+        );
+        assert!(!approved.args.iter().any(|a| a == "sudo"));
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

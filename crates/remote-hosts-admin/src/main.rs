@@ -59,6 +59,7 @@ mod unix_cli {
                 let value = tasks::run_cli(command)?;
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 if value["state"] == "failed"
+                    || value["state"] == "awaiting_approval"
                     || value["state"] == "awaiting_platform_authorization"
                     || value["recovery_required"] == true
                 {

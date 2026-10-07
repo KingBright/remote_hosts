@@ -1,7 +1,11 @@
 //! Synthetic gateway/device tests; no production credentials, root executor or target-file access.
 use remote_hosts_code::{
-    DeviceRegistration, GatewayConfig, auth::Principal, gateway::Gateway, hash,
-    maintenance_tasks::journal_dir, now, random,
+    DeviceRegistration, GatewayConfig,
+    auth::Principal,
+    gateway::Gateway,
+    hash,
+    maintenance_tasks::{binding_sha256, journal_dir},
+    now, random,
 };
 use serde_json::{Value, json};
 
@@ -191,11 +195,13 @@ async fn agent_maintenance_queries_are_readonly_and_owner_scoped() {
         &agent.config.device_id,
     )
     .unwrap();
+    let context_sha256 = binding_sha256("first", ws, &agent.config.device_id).unwrap();
     let saved = seed_receipt(
         &agent.config.state_dir,
         &path,
         &request,
         &agent.config.device_id,
+        &context_sha256,
         false,
     );
     let bytes = std::fs::read(path.join(format!("{request}.json"))).unwrap();
@@ -232,6 +238,7 @@ fn seed_receipt(
     path: &std::path::Path,
     request: &str,
     device: &str,
+    context_sha256: &str,
     repair: bool,
 ) -> String {
     use remote_hosts_admin::{
@@ -247,18 +254,20 @@ fn seed_receipt(
     tasks::create_private_store(path.parent().unwrap()).unwrap();
     tasks::create_private_store(path).unwrap();
     let identity = Identity::current().unwrap();
+    let timestamp = u64::try_from(now()).unwrap();
     let plan = Plan {
         protocol: 1,
         request_id: request.into(),
         device_id: device.into(),
+        context_sha256: context_sha256.into(),
         identity: identity.clone(),
         action: if repair {
             Action::RepairRemoteplayMeshOwnership
         } else {
             Action::InspectRemoteplayMesh
         },
-        created_at: 1,
-        expires_at: 2,
+        created_at: timestamp.saturating_sub(1),
+        expires_at: timestamp.saturating_add(3600),
         snapshot: Snapshot {
             service_label: "synthetic-no-target-access".into(),
             service_plist: None,
@@ -271,14 +280,25 @@ fn seed_receipt(
         plan,
         plan_sha256: hash.clone(),
         state: if repair {
-            State::Prepared
+            State::Approved
         } else {
             State::Succeeded
         },
+        approval: repair.then(|| remote_hosts_admin::tasks::Approval {
+            approval_operation_id: uuid::Uuid::new_v4().to_string(),
+            plan_sha256: hash.clone(),
+            context_sha256: context_sha256.into(),
+            action: Action::RepairRemoteplayMeshOwnership,
+            uid: identity.uid,
+            approved_at: timestamp.saturating_sub(1),
+            expires_at: timestamp.saturating_add(120),
+            consumed_at: None,
+        }),
+        cancelled_at: None,
         result: None,
         error_code: None,
         events: vec!["synthetic".into()],
-        updated_at: 1,
+        updated_at: timestamp,
     };
     Store {
         dir: path.into(),
@@ -299,7 +319,8 @@ async fn hidden_child_replays_receipt_or_blocks_privilege_with_real_exit_codes()
     let path = journal_dir(&state, "fixture", &ws, &device).unwrap();
     for repair in [false, true] {
         let request = uuid::Uuid::new_v4().to_string();
-        let plan_hash = seed_receipt(&state, &path, &request, &device, repair);
+        let context_sha256 = binding_sha256("fixture", &ws, &device).unwrap();
+        let plan_hash = seed_receipt(&state, &path, &request, &device, &context_sha256, repair);
         let run = || {
             let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_remote-hosts-code"));
             command
@@ -312,6 +333,8 @@ async fn hidden_child_replays_receipt_or_blocks_privilege_with_real_exit_codes()
                     &ws,
                     "--device-id",
                     &device,
+                    "--context-sha256",
+                    &context_sha256,
                     "--step",
                     "run",
                     "--request-id",
@@ -336,6 +359,11 @@ async fn hidden_child_replays_receipt_or_blocks_privilege_with_real_exit_codes()
         let b: Value = serde_json::from_slice(&second.stdout).unwrap();
         assert_eq!(a, b);
         assert_eq!(a["system_changes_confirmed"], false);
+        assert_eq!(a["administrator_authorization"], "not_checked_not_granted");
+        assert_eq!(
+            a["device_identity_evidence"],
+            "caller_declared_not_gateway_authenticated"
+        );
         if repair {
             assert_eq!(a["state"], "awaiting_platform_authorization");
             assert_eq!(
