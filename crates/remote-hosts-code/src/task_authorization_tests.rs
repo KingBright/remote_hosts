@@ -195,6 +195,91 @@ async fn form(
             .unwrap();
     response.status()
 }
+
+#[tokio::test]
+async fn owner_can_revoke_after_device_enrollment_or_scopes_change() {
+    for remove_device in [false, true] {
+        let mut f = fixture().await;
+        let previous = grant(&f, 0, true, &["code:read", "code:write", "terminal:exec"]).await;
+        let config = std::sync::Arc::make_mut(&mut f.g.config);
+        if remove_device {
+            config.devices.clear();
+        } else {
+            config.devices[0].scopes = vec!["code:read".into()];
+        }
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("task_id", "overnight"),
+                ("expected_version", "1"),
+                ("action", "revoke"),
+                ("devices", "unregistered"),
+                ("scopes", "root"),
+                ("csrf", csrf(&f.cookie).as_str()),
+                ("password", f.password.as_str()),
+            ])
+            .finish();
+        let response =
+            f.g.router()
+                .unwrap()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/status/task-authorization")
+                        .header("host", "fixture.example")
+                        .header("origin", "https://fixture.example")
+                        .header("cookie", format!("rh_status={}", f.cookie))
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let revoked: Grant =
+            f.g.store
+                .get(KIND, &key("owner", "overnight"))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!revoked.enabled);
+        assert_eq!(revoked.version, 2);
+        assert_eq!(revoked.devices, previous.devices);
+        assert_eq!(revoked.scopes, previous.scopes);
+        assert_eq!(count(&f).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn queued_resume_requires_existing_undispatched_timing_evidence() {
+    let f = fixture().await;
+    grant(&f, 0, true, &["code:read", "terminal:exec"]).await;
+    let pending = call(&f, "terminal_exec", terminal(&f, 1, "missing-timing")).await;
+    let id = pending["operation_id"].as_str().unwrap();
+    grant(&f, 1, true, &["code:read", "terminal:exec"]).await;
+    // Simulate a corrupted/missing receipt in this isolated fixture only.
+    sqlx::query("DELETE FROM operation_timing WHERE id=?")
+        .bind(id)
+        .execute(&f.g.store.pool)
+        .await
+        .unwrap();
+    let denied = call(
+        &f,
+        "task_resume",
+        json!({"operation_id":id,"task_id":"overnight","authorization_version":2}),
+    )
+    .await;
+    assert!(denied.get("error").is_some());
+    let binding: Binding = f.g.store.get(BINDING, id).await.unwrap().unwrap();
+    assert_eq!(binding.version, 1);
+    assert_eq!(count(&f).await, 1);
+    assert!(
+        crate::job_dispatch::claim(&f.g.store, &selection(&f), now())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn owner_route_requires_password_session_origin_csrf_and_cas() {
     let mut f = fixture().await;

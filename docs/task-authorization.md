@@ -60,3 +60,80 @@ existing signed release workflow, Gateway first. A rollout must explicitly name
 the target Gateway/Agents, new catalog/Skill identities, original build receipt,
 maintenance lease and runtime acceptance. It does not require changing roots,
 local allow flags, OAuth scopes, credentials, sudoers, VPN or DNS.
+
+## Defaults and upgrade scope
+
+Deployment creates no grant. The form initially leaves device IDs empty and
+prefills the three existing scopes; these are proposed values, not active
+permission. The owner must select enrolled devices and submit authenticated
+approval. No-grant legacy calls retain the existing account/device/local policy.
+An owner-created grant makes subsequent enqueued calls with that exact task_id
+require its current version. Unlabelled calls remain the existing API authority;
+a TaskGrant is not a replacement for account-wide revocation or a command/path
+sandbox. Observation and existing control APIs keep their existing authorization.
+
+The new MCP catalog entry is task_resume (25th tool). The trusted browser entry
+is GET/POST /status/task-authorization; login remains POST /status/login via
+/status. A valid existing status session can load the form, but every grant write
+requires the owner to enter the existing password directly. There are no new
+credentials, OAuth scopes, device enrollments, local allow flags, roots, sudoers,
+VPN/DNS rules or platform approval exemptions. Persistent grant/version/history,
+operation bindings, deferred intent and recovery audit are new private records
+in the existing Gateway store. They persist until explicit owner cleanup.
+
+Revocation preserves the prior devices/scopes and works even after enrollment
+or device scopes change. A missing timing record is not proof of no dispatch;
+task_resume refuses such a queued operation.
+
+## Deployment and rollback boundary
+
+Use one new immutable version and the existing verified release bundle:
+release-code.py on the existing leased Mac Studio target, then fleet-upgrade.py
+with the established private deployment configuration. The narrow authenticated
+/admin/gateway-upgrade path upgrades the Gateway first. Existing signed Agent
+updaters keep their maintenance leases, hashes and host signing checks; controller
+cutover stays last. Android requires its separate signed APK workflow.
+
+The Gateway updater backs up the binary and SQLite state, checks candidate hash,
+version and config, stops only its configured service, then rechecks policy before
+replacement. It starts the candidate and requires bounded health plus executable
+identity. Ordinary compatible rollback restores the previous binary and preserves
+the live database, including owner changes made during the attempt.
+
+Once task grants or task-bound operations exist, replacement and rollback binaries
+must declare task_authorization_protocol=1. This is checked again after stopping
+the policy writer. It prevents a rollback to 0.10.25 from dispatching a task-blocked
+queue without checking the grant. If a new runtime creates policy and then fails
+health while its predecessor lacks support, automatic rollback is blocked and
+the service stays stopped; the receipt names that recovery state. Recover with
+a verified compatible binary. Do not clear policy, weaken authentication or
+restore an old database to force rollback.
+
+## Live owner-offline acceptance (pending deployment)
+
+1. Verify deployed Gateway protocol 1, 25-tool catalog and candidate Skill identity,
+   plus selected Agent/runtime convergence. Host exposure must report task_resume;
+   a server catalog alone does not establish that the conversation has it.
+2. Choose one unique acceptance task_id and the existing enrolled test device.
+   The owner opens /status, signs in directly, then opens
+   /status/task-authorization?task_id=<id>. Choose only the needed existing scopes
+   and authorize version 1. Verify operations_started=false.
+3. The owner logs out/closes that browser. Through the already-authorized connector,
+   use task_id/version 1 to create a small isolated project under existing roots,
+   apply a version-checked test file, run a bounded content check and local Git
+   commit, and read back the file, commit and original terminal receipts.
+4. Require file versions, original operation IDs, exit 0, complete captured output
+   and commit identity. OAuth refresh/connection and the active assistant remain
+   platform prerequisites; this feature does not schedule or wake the assistant.
+5. The owner revokes to version 2. Submit one harmless marker command for that task;
+   require durable task-policy rejection, not_started and no operation. Reauthorize
+   to version 3, then task_resume that exact original request. Require unchanged
+   command/idempotency identity and one execution. Repeat resume only to observe
+   the same operation; marker count and operation count must remain one.
+6. Clean up only the acceptance project while its grant remains valid, then have
+   the owner revoke it. Read grant history and receipts without exposing deferred
+   command arguments. Do not change production flags/scopes to manufacture tests.
+
+The isolated suite covers queued races, missing evidence, account/device/local
+denials, platform/source refusals and rollback faults. Those tests are not live
+fleet, human owner consent, client tool refresh or target-platform evidence.

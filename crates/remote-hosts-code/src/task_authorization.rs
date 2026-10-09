@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Sqlite, Transaction};
 
+pub(crate) const PROTOCOL: u32 = 1;
 const KIND: &str = "task_authorization";
 const BINDING: &str = "operation_task_authorization";
 
@@ -182,8 +183,8 @@ pub(crate) async fn resume_queued(g: &Gateway, p: &Principal, args: &Value) -> R
         .as_u64()
         .context("invalid_arguments: authorization_version")?;
     let mut tx = g.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    let (raw, state, result, dispatched): (String, String, Option<String>, Option<i64>) =
-        sqlx::query_as("SELECT j.request,j.state,j.result,t.dispatched_ms FROM jobs j LEFT JOIN operation_timing t ON t.id=j.id WHERE j.id=?")
+    let (raw, state, result, dispatched, timing): (String, String, Option<String>, Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT j.request,j.state,j.result,t.dispatched_ms,t.id FROM jobs j LEFT JOIN operation_timing t ON t.id=j.id WHERE j.id=?")
             .bind(id).fetch_optional(&mut *tx).await?.context("operation_unavailable")?;
     let job: crate::gateway::Job = serde_json::from_str(&raw)?;
     ensure!(job.owner == p.owner, "operation owner mismatch");
@@ -204,7 +205,7 @@ pub(crate) async fn resume_queued(g: &Gateway, p: &Principal, args: &Value) -> R
         return g.result(p, id).await;
     }
     ensure!(
-        state == "queued" && result.is_none() && dispatched.is_none(),
+        state == "queued" && result.is_none() && dispatched.is_none() && timing.is_some(),
         "task_resume_not_eligible"
     );
     ensure!(
@@ -375,18 +376,19 @@ async fn update(
     devices.dedup();
     scopes.sort();
     scopes.dedup();
-    if devices.is_empty()
-        || devices.len() > 50
-        || scopes.is_empty()
-        || scopes
-            .iter()
-            .any(|s| !crate::SCOPES.split_whitespace().any(|v| v == s))
-        || devices.iter().any(|id| {
-            !g.config
-                .devices
+    if form.action == "authorize"
+        && (devices.is_empty()
+            || devices.len() > 50
+            || scopes.is_empty()
+            || scopes
                 .iter()
-                .any(|d| d.id == *id && scopes.iter().all(|s| d.scopes.contains(s)))
-        })
+                .any(|s| !crate::SCOPES.split_whitespace().any(|v| v == s))
+            || devices.iter().any(|id| {
+                !g.config
+                    .devices
+                    .iter()
+                    .any(|d| d.id == *id && scopes.iter().all(|s| d.scopes.contains(s)))
+            }))
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -405,6 +407,9 @@ async fn update(
             "enabled":v.enabled,"devices":v.devices,"scopes":v.scopes,"operations_started":false}),
         )
         .into_response(),
+        Err(e) if e.to_string() == "task_authorization_missing" => {
+            StatusCode::NOT_FOUND.into_response()
+        }
         Err(e) if e.to_string() == "task_authorization_version_conflict" => {
             StatusCode::CONFLICT.into_response()
         }
@@ -435,6 +440,14 @@ async fn save(
         previous.as_ref().map_or(0, |v| v.version) == expected,
         "task_authorization_version_conflict"
     );
+    // Revocation must remain possible after enrollment or scopes change. It
+    // disables the existing grant, without accepting new devices or scopes.
+    let (devices, scopes) = if enabled {
+        (devices, scopes)
+    } else {
+        let old = previous.as_ref().context("task_authorization_missing")?;
+        (old.devices.clone(), old.scopes.clone())
+    };
     let grant = Grant {
         owner: g.config.owner.clone(),
         task_id: task.into(),

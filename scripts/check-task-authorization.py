@@ -25,6 +25,7 @@ OWNED = [
     "crates/remote-hosts-code/src/job_dispatch.rs",
     "crates/remote-hosts-code/src/tools.rs",
     "crates/remote-hosts-code/src/lib.rs",
+    "crates/remote-hosts-code/src/capabilities.rs",
 ]
 
 def stage(argv, checkout, target, report, name, state, limit):
@@ -110,6 +111,11 @@ def main():
                        str(evidence/"adapter-contract.json")],
                       checkout,target,report,"contract_export",state,300)
             if args.acceptance:
+                stage([sys.executable,"-m","unittest","discover","-s","scripts/tests",
+                       "-p","test_task_authorization_upgrade.py","-v"],
+                      checkout,target,report,"upgrade_policy_guard",state,60)
+                stage([*selected,"release_manifest","--","--nocapture"],
+                      checkout,target,report,"release_manifest",state,120)
                 stage([*selected,"contract","--","--nocapture"],
                       checkout,target,report,"catalog_contract",state,120)
                 stage(["cargo","test","--offline","--locked","-p","remote-hosts-code",

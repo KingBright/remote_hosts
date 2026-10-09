@@ -5,6 +5,7 @@ Deployment identity is supplied explicitly. DNS, reverse-proxy configuration and
 provider-specific routing belong to the private ops layer and are not mutated here.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -41,6 +42,35 @@ def atomic_copy(source, destination):
             temp.unlink(missing_ok=True)
 
 
+def task_authorization_required(database):
+    """Inspect only policy presence, never grant contents or credentials."""
+    database = pathlib.Path(database).resolve()
+    if not database.exists():
+        return False
+    with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=2)) as connection:
+        return connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM kv WHERE kind IN "
+            "('task_authorization','operation_task_authorization'))"
+        ).fetchone()[0] == 1
+
+
+def task_authorization_supported(binary):
+    try:
+        manifest = json.loads(subprocess.check_output(
+            [str(binary), 'release-manifest'], text=True,
+            stderr=subprocess.DEVNULL, timeout=10,
+        ))
+        return type(manifest.get('task_authorization_protocol')) is int and manifest['task_authorization_protocol'] == 1
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return False
+
+
+def require_task_authorization_support(database, binary, stage):
+    if task_authorization_required(database) and not task_authorization_supported(binary):
+        raise RuntimeError('task_authorization_policy_required:' + stage +
+                           '; refusing a binary without task authorization protocol 1')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--candidate', required=True, type=pathlib.Path)
@@ -70,6 +100,8 @@ def main():
     state_dir = pathlib.Path(gateway_config['state_dir']).resolve()
     record = {'state': 'preflight', 'version': args.version, 'candidate_sha256': args.sha256}
     changed = False
+    stopped = False
+    database = state_dir / 'state.sqlite'
     backup = backup_root / ('before-' + args.version + '-' + time.strftime('%Y%m%dT%H%M%S'))
 
     try:
@@ -82,20 +114,26 @@ def main():
             [str(args.candidate), 'check', '--config', str(config)],
             stdout=subprocess.DEVNULL,
         )
+        require_task_authorization_support(database, args.candidate, 'preflight')
         backup.mkdir(parents=True, exist_ok=False)
         shutil.copy2(binary, backup / binary.name)
-        database = state_dir / 'state.sqlite'
         if database.exists():
-            with sqlite3.connect(str(database)) as src:
-                with sqlite3.connect(str(backup / 'state.sqlite')) as dst:
+            with contextlib.closing(sqlite3.connect(str(database))) as src:
+                with contextlib.closing(sqlite3.connect(str(backup / 'state.sqlite'))) as dst:
                     src.backup(dst)
             record['database_backup'] = str(backup / 'state.sqlite')
         record['backup'] = str(backup)
         record['previous_sha256'] = checksum(backup / binary.name)
 
+        # Stop the sole policy writer before the decisive check. A grant added
+        # after preflight must not race a downgrade or be ignored by rollback.
+        subprocess.check_call(['systemctl', 'stop', args.service_name], timeout=30)
+        stopped = True
+        require_task_authorization_support(database, args.candidate, 'cutover')
         atomic_copy(args.candidate, binary)
         changed = True
-        subprocess.check_call(['systemctl', 'restart', args.service_name])
+        subprocess.check_call(['systemctl', 'start', args.service_name], timeout=30)
+        stopped = False
         authority = urllib.parse.urlsplit(gateway_config['public_url']).netloc
         deadline = time.monotonic() + 30
         health = None
@@ -130,11 +168,26 @@ def main():
         record.update(state='failed', error=str(error))
         if changed:
             try:
+                subprocess.check_call(['systemctl', 'stop', args.service_name], timeout=30)
+                stopped = True
+                require_task_authorization_support(database, backup / binary.name, 'rollback')
                 atomic_copy(backup / binary.name, binary)
-                subprocess.check_call(['systemctl', 'restart', args.service_name])
+                subprocess.check_call(['systemctl', 'start', args.service_name], timeout=30)
+                stopped = False
                 record['rollback'] = 'restored_previous_binary; live database preserved'
             except Exception as rollback_error:
-                record['rollback'] = 'failed: ' + str(rollback_error)
+                if str(rollback_error).startswith('task_authorization_policy_required:'):
+                    record['rollback'] = 'blocked_task_authorization_policy; service stopped; live database preserved'
+                else:
+                    record['rollback'] = 'failed: ' + str(rollback_error)
+        elif stopped:
+            try:
+                subprocess.check_call(['systemctl', 'start', args.service_name], timeout=30)
+                stopped = False
+                record['rollback'] = 'unchanged_binary_restarted; live database preserved'
+            except Exception as restart_error:
+                record['rollback'] = 'unchanged_binary_restart_failed: ' + str(restart_error)
+        record['service_stopped'] = stopped
 
     args.result.parent.mkdir(parents=True, exist_ok=True)
     args.result.write_text(json.dumps(record, indent=2) + '\n')

@@ -275,6 +275,10 @@ pub(crate) fn gateway_manifest(known: Option<&str>) -> Value {
         ("capabilities_protocol", json!(2)),
         ("schema_diagnostics_protocol", json!(2)),
         ("admin_status_protocol", json!(1)),
+        (
+            "task_authorization_protocol",
+            json!(crate::task_authorization::PROTOCOL),
+        ),
         ("request_receipt_protocol", json!(2)),
         ("resource_dispatch_protocol", json!(1)),
         ("transfer_protocol", json!(2)),
@@ -368,6 +372,7 @@ mod release_manifest_tests {
         let manifest = release_manifest();
         assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(manifest["tool_count"], tools::catalog().len());
+        assert_eq!(manifest["task_authorization_protocol"], 1);
         assert_eq!(manifest["tool_schema_revision"], tool_schema_revision());
         assert_eq!(manifest["tools_sha256"], tool_schema_revision());
         assert_eq!(manifest["terminal_observation_protocol"], 2);
