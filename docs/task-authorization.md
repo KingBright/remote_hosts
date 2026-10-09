@@ -2,16 +2,27 @@
 
 ## Source and deployed-runtime status
 
-The current source implements task authorization protocol 2. The deployed
-immutable 0.10.26 Gateway advertises protocol 1 and 25 MCP tools; its existing
-bundle, updater and production state were not changed by this source work.
-Protocol 2 must receive a new immutable release version and normal signed
-release/runtime acceptance before production use. Do not replace the existing
-0.10.26 artifacts with a build from this changed source.
+The NAS Gateway runs the independent 0.10.27 release with task authorization
+protocol 2, wire protocol 2 and 25 MCP tools. Runtime acceptance on 2026-10-09
+verified the installed and running executable SHA-256, UID 18787, local health,
+owner-route authentication and existing-authority read/terminal/transfer receipts.
+The 0.10.26 published bundle remains byte-identical. Only the Linux Gateway was
+built and deployed; Agents retain their existing wire-compatible versions.
 
-The conversation currently has an older tool schema: `task_resume` is absent
-and its enqueue tools do not accept `authorization_version`. The Gateway's
-advertised catalog does not establish host-side availability. There is no
+The binary is bound to commit `b55e061a1d88a9975125cbacc6761c1b321600c3` and the
+declared working-tree snapshot
+`0b1556c3ff430a9aca27946a832cda271a52e186eb1da0bd400566b53c4b9b6b`.
+The initial package's Skill revision used the hash of one file; acceptance caught
+that mismatch before service changes. A separate corrected package uses the
+ordered nine-file embedded Skill revision; original artifacts and the rejection
+receipt are retained. Its binary and updater bytes did not change or rebuild.
+The accepted NAS package is in `releases/0.10.27/verified-02`; runtime evidence is
+`task-auth-release-0.10.27/gateway-01/runtime-acceptance.json` in the task evidence
+workspace. No production grant, OAuth change or other-product action occurred.
+
+The conversation currently exposes 24 Remote Hosts tools against the Gateway's
+25-tool catalog: `task_resume` is absent and its enqueue tools do not accept
+`authorization_version`. The Gateway's advertised catalog does not establish host-side availability. There is no
 supported connector action exposed here to refresh that schema. For a custom
 MCP connection, use ChatGPT Plugins, select the existing connection, choose
 Refresh, verify the metadata, then start a new conversation and inspect the
@@ -65,8 +76,10 @@ account/operation authorization.
 A protocol-1 grant without an expiry is not silently promoted. It reports
 `expiry_required` and bound undispatched work waits for direct owner renewal
 to a new version. Existing unbound jobs and receipt recovery keep their original
-semantics. The source protocol-2 form provides automatic expiry; the deployed
-protocol-1 form cannot provide it.
+semantics. The deployed protocol-2 form provides automatic expiry. The 0.10.27
+updater blocks migration while an effective unbounded legacy grant exists, so
+cutover cannot silently invalidate the owner's current approval. The production
+preflight found no grant, binding or history rows; no effective grant changed.
 
 After direct owner renewal, `task_resume` requires the exact task ID, new
 owner-issued version and one original request or operation ID. A durable
@@ -91,9 +104,11 @@ rows require at least protocol 2 even if expired, revoked or orphaned. Unknown
 future versions and malformed metadata fail closed. Candidate manifests must
 declare a recognized integer protocol supporting the persisted minimum.
 
-The gate runs before service changes, again after stopping the policy writer,
-and before rollback. A new expiry policy cannot be ignored by a protocol-1
-predecessor. If compatible rollback is unavailable, the configured service stays
+The capability gate runs before service changes, again after stopping the policy
+writer, and before rollback. An additional migration gate checks effective legacy
+grants before replacement and after stopping that writer. If it blocks cutover,
+the unchanged previous binary restarts; no grant is rewritten or erased. A new
+expiry policy cannot be ignored by a protocol-1 predecessor. If compatible rollback is unavailable, the configured service stays
 stopped and the live database is retained; use a verified compatible binary.
 Do not clear policy or restore an older database to force downgrade. This source
 change does not modify or supersede immutable previously packaged updaters.
@@ -102,11 +117,13 @@ change does not modify or supersede immutable previously packaged updaters.
 
 The former proposal for three scopes plus manual revocation after one hour is
 withdrawn. No production grant was created. Manual revocation is not automatic
-expiry, and the previous 0.10.26 acceptance used existing account authority,
-not a human-issued TaskGrant.
+expiry, and both the previous 0.10.26 acceptance and the 0.10.27 runtime acceptance
+used existing account authority rather than a human-issued TaskGrant.
 
-After a separately verified protocol-2 release and host schema refresh, propose
-one unique task ID, one existing test device, only `code:read` and five minutes.
+Protocol-2 release/runtime acceptance is complete. After the host schema is
+updated, the inactive proposal is task `taskgrant-expiry-live-0.10.27-01`, enrolled
+device `ba3bf113-2390-466e-88bc-40d5b4f02884` (MacBook-M2-Max), only `code:read`
+and five minutes. It requests no terminal or write scope.
 The owner must directly accept the actual read scope and issue the version.
 Use one harmless read in an existing permitted workspace, close the owner
 browser, observe its original receipt, then check that a new labelled read after
@@ -128,6 +145,13 @@ dependencies and one build job. Record declared source-input hashes before and
 after compilation/testing, Cargo's generated executable, its checksum, test
 count and sealed logs. A cached test executable without exact input provenance
 does not establish current-source acceptance; zero selected tests are rejected.
+
+The 0.10.27 frozen snapshot passed 17 TaskGrant library tests, 16 Python updater
+tests, eight dispatcher tests and one release-manifest test (42 total), plus
+format, Clippy and component check gates. It reused the registered target and
+lease, built one Linux production executable and left more than 107 GiB free.
+The updater tests include active-legacy preflight rejection, a grant appearing
+before cutover, and valid protocol-2 approval metadata.
 
 The isolated suite covers expiry boundaries, expiry between initial check and
 queue binding, post-enqueue expiry, legacy grants, owner/task/device/scope
