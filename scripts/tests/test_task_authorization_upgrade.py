@@ -36,12 +36,12 @@ class UpgradePolicyTests(unittest.TestCase):
                                           "public_url": "https://fixture.invalid"}))
         self.result = self.root / "result.json"
 
-    def policy(self, kind="task_authorization"):
+    def policy(self, kind="task_authorization", value=None):
         with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("INSERT INTO kv VALUES(?,?,?,?)",
-                               (kind, "fixture", '{"enabled":false}', 2**63-1))
+                               (kind, "fixture", json.dumps(value or {"enabled": False}), 2**63-1))
 
-    def invoke(self, check_call, manifest=None):
+    def invoke(self, check_call, manifest=None, previous_manifest=None):
         argv = ["upgrade-code-gateway.py", "--candidate", str(self.candidate),
                 "--sha256", UPGRADE.checksum(self.candidate), "--version", "0.10.99",
                 "--result", str(self.result), "--binary-path", str(self.binary),
@@ -50,7 +50,8 @@ class UpgradePolicyTests(unittest.TestCase):
             if command[-1] == "--version":
                 return "remote-hosts-code 0.10.99"
             self.assertEqual(command[-1], "release-manifest")
-            return json.dumps(manifest or {})
+            return json.dumps((manifest or {}) if command[0] == str(self.candidate)
+                              else (previous_manifest if previous_manifest is not None else (manifest or {})))
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch.object(UPGRADE.os, "getuid", return_value=0), \
                 mock.patch.object(UPGRADE.os, "umask"), \
@@ -90,7 +91,7 @@ class UpgradePolicyTests(unittest.TestCase):
 
     def test_absent_malformed_boolean_or_unknown_protocol_is_not_support(self):
         for value in ('{}', '[]', 'null', 'broken', '{"task_authorization_protocol":true}',
-                      '{"task_authorization_protocol":2}'):
+                      '{"task_authorization_protocol":3}'):
             with self.subTest(value=value), mock.patch.object(
                     UPGRADE.subprocess, "check_output", return_value=value):
                 self.assertFalse(UPGRADE.task_authorization_supported(self.binary))
@@ -150,6 +151,61 @@ class UpgradePolicyTests(unittest.TestCase):
         self.assertEqual(self.binary.read_bytes(), b"previous")
         self.assertTrue(UPGRADE.task_authorization_required(self.database))
         self.assertFalse(result["service_stopped"])
+
+
+    def test_expiry_policy_requires_protocol_two_even_after_expiry_or_revocation(self):
+        for kind in ("task_authorization", "operation_task_authorization"):
+            for value in ({"protocol": 2, "enabled": False}, {"expires_at": 1, "enabled": True}):
+                with self.subTest(kind=kind, value=value):
+                    with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
+                        connection.execute("DELETE FROM kv")
+                    self.policy(kind, value)
+                    self.assertEqual(UPGRADE.task_authorization_required_protocol(self.database), 2)
+                    before = self.database.read_bytes()
+                    with mock.patch.object(UPGRADE.subprocess, "check_output",
+                                           return_value='{"task_authorization_protocol":1}'):
+                        with self.assertRaisesRegex(RuntimeError, "protocol 2"):
+                            UPGRADE.require_task_authorization_support(self.database, self.binary, "rollback")
+                    with mock.patch.object(UPGRADE.subprocess, "check_output",
+                                           return_value='{"task_authorization_protocol":2}'):
+                        UPGRADE.require_task_authorization_support(self.database, self.binary, "cutover")
+                    self.assertEqual(self.database.read_bytes(), before)
+
+    def test_unknown_future_policy_and_malformed_metadata_fail_closed(self):
+        self.policy(value={"protocol": 3})
+        with mock.patch.object(UPGRADE.subprocess, "check_output",
+                               return_value='{"task_authorization_protocol":2}'):
+            with self.assertRaisesRegex(RuntimeError, "protocol 3"):
+                UPGRADE.require_task_authorization_support(self.database, self.binary, "cutover")
+        with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("UPDATE kv SET value='broken'")
+        with self.assertRaisesRegex(RuntimeError, "metadata_invalid"):
+            UPGRADE.task_authorization_required_protocol(self.database)
+
+    def test_invalid_policy_metadata_never_permits_downgrade(self):
+        for value in ([], None, {"protocol": "2"}, {"protocol": True},
+                      {"protocol": 0}, {"expires_at": "1"}, {"expires_at": True}):
+            with self.subTest(value=value):
+                with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
+                    connection.execute("DELETE FROM kv")
+                    connection.execute("INSERT INTO kv VALUES(?,?,?,?)",
+                                       ("task_authorization", "fixture", json.dumps(value), 2**63-1))
+                with self.assertRaisesRegex(RuntimeError, "metadata_invalid"):
+                    UPGRADE.task_authorization_required_protocol(self.database)
+
+    def test_new_expiry_policy_blocks_rollback_to_protocol_one(self):
+        calls = []
+        def control(command, **kwargs):
+            calls.append(command)
+            if command[:2] == ["systemctl", "start"]:
+                self.policy(value={"protocol": 2, "expires_at": 1})
+        result = self.invoke(control, {"task_authorization_protocol": 2},
+                             previous_manifest={"task_authorization_protocol": 1})
+        self.assertEqual(result["rollback"],
+                         "blocked_task_authorization_policy; service stopped; live database preserved")
+        self.assertTrue(result["service_stopped"])
+        self.assertEqual(self.binary.read_bytes(), b"candidate")
+        self.assertEqual(UPGRADE.task_authorization_required_protocol(self.database), 2)
 
 
 if __name__ == "__main__":

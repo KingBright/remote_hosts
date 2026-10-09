@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Sqlite, Transaction};
 
-pub(crate) const PROTOCOL: u32 = 1;
+pub(crate) const PROTOCOL: u32 = 2;
 const KIND: &str = "task_authorization";
 const BINDING: &str = "operation_task_authorization";
 
@@ -25,6 +25,10 @@ struct Grant {
     devices: Vec<String>,
     scopes: Vec<String>,
     updated_at: i64,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    protocol: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Binding {
@@ -34,11 +38,16 @@ pub(crate) struct Binding {
     pub version: u64,
     pub device_id: String,
     pub scope: String,
+    #[serde(default)]
+    pub protocol: u32,
 }
 fn key(owner: &str, task: &str) -> String {
     hash(serde_json::to_vec(&(owner, task)).expect("string pair"))
 }
 fn check(grant: Option<&Grant>, binding: &Binding) -> Result<()> {
+    check_at(grant, binding, now())
+}
+fn check_at(grant: Option<&Grant>, binding: &Binding, at: i64) -> Result<()> {
     let grant = grant.context("task_authorization_missing")?;
     ensure!(
         grant.owner == binding.owner && grant.task_id == binding.task_id,
@@ -49,6 +58,14 @@ fn check(grant: Option<&Grant>, binding: &Binding) -> Result<()> {
         grant.version == binding.version,
         "task_authorization_version_changed"
     );
+    ensure!(
+        grant.protocol == PROTOCOL && binding.protocol == PROTOCOL,
+        "task_authorization_expiry_required"
+    );
+    let expires_at = grant
+        .expires_at
+        .context("task_authorization_expiry_required")?;
+    ensure!(expires_at > at, "task_authorization_expired");
     ensure!(
         grant.devices.contains(&binding.device_id),
         "task_device_denied"
@@ -87,6 +104,7 @@ pub(crate) async fn requested(
         version,
         device_id: device.into(),
         scope: tools::scope(tool).context("unknown tool")?.into(),
+        protocol: PROTOCOL,
     };
     check(grant.as_ref(), &binding)?;
     Ok(Some(binding))
@@ -128,7 +146,8 @@ pub(crate) async fn view(g: &Gateway, p: &Principal, task: &str) -> Result<Value
     Ok(grant.map_or(
         json!({"state":"correlation_only","grants_authority":false}),
         |v| {
-            json!({"state":if v.enabled {"authorized"}else{"revoked"},"version":v.version,
+            json!({"state":if !v.enabled {"revoked"} else if v.protocol != PROTOCOL || v.expires_at.is_none() {"expiry_required"} else if v.expires_at.is_some_and(|at| at <= now()) {"expired"} else {"authorized"},"version":v.version,
+            "expires_at":v.expires_at,"protocol":v.protocol,
             "task_id":v.task_id,"devices":v.devices,"scopes":v.scopes,"updated_at":v.updated_at,
             "authority":"intersection_with_current_account_device_and_local_policy",
             "terminal_authority":"local_user; not confined by code roots"})
@@ -156,6 +175,8 @@ pub(crate) fn authorization_rejection(code: &str) -> bool {
             | "task_authorization_version_required"
             | "task_authorization_version_changed"
             | "task_authorization_revoked"
+            | "task_authorization_expired"
+            | "task_authorization_expiry_required"
             | "task_scope_denied"
             | "task_device_denied"
     )
@@ -225,6 +246,7 @@ pub(crate) async fn resume_queued(g: &Gateway, p: &Principal, args: &Value) -> R
         "device_scope_denied"
     );
     binding.version = version;
+    binding.protocol = PROTOCOL;
     check_in_transaction(&mut tx, &binding).await?;
     sqlx::query("UPDATE kv SET value=? WHERE kind=? AND key=?")
         .bind(serde_json::to_string(&binding)?)
@@ -267,6 +289,7 @@ struct UpdateForm {
     scopes: String,
     csrf: String,
     password: String,
+    expires_in_minutes: Option<u16>,
 }
 fn csrf(token: &str) -> String {
     hash(format!("task-authorization:{token}"))
@@ -304,7 +327,7 @@ async fn page(
     let scopes = grant
         .as_ref()
         .map(|v| v.scopes.join(" "))
-        .unwrap_or_else(|| "code:read code:write terminal:exec".into());
+        .unwrap_or_else(|| "code:read".into());
     let inventory = g
         .config
         .devices
@@ -315,13 +338,14 @@ async fn page(
     let html = format!(
         r#"<!doctype html><html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Task authorization</title><h1>Task authorization</h1>
-<p>Approve a persistent task using the existing Gateway owner password. Each request still requires its current account and device scopes and local allow flags. Terminal access has local-user authority outside code roots. This does not approve platform prompts or administrator actions.</p>
-<p>Updating or revoking increments the version. Already dispatched work may continue. Queued work requires an explicit resume using the new version. No operation runs from this form.</p>
+<p>Approve a time-limited task using the existing Gateway owner password. Each request still requires its current account and device scopes and local allow flags. Terminal access has local-user authority outside code roots. This does not approve platform prompts or administrator actions.</p>
+<p>Expiry blocks new and undispatched work; existing receipts stay readable. This form does not confine commands to a workspace. Updating or revoking increments the version. Already dispatched work may continue. Queued work requires an explicit resume using the new version. No operation runs from this form.</p>
 <ul>{inventory}</ul><form method=post action=/status/task-authorization>
 <input type=hidden name=csrf value="{csrf}"><input type=hidden name=expected_version value="{version}">
 <label>Task ID <input name=task_id required value="{task}"></label><br>
 <label>Device IDs, separated by spaces <input name=devices required value="{devices}"></label><br>
 <label>Scopes, separated by spaces <input name=scopes required value="{scopes}"></label><br>
+<label>Lifetime in minutes (1–1440) <input type=number name=expires_in_minutes min=1 max=1440 value=60 required></label><br>
 <label>Existing owner password <input type=password name=password required autocomplete=current-password></label><br>
 <button name=action value=authorize>Authorize or update this task</button>
 <button name=action value=revoke>Revoke this task</button></form></html>"#,
@@ -377,7 +401,10 @@ async fn update(
     scopes.sort();
     scopes.dedup();
     if form.action == "authorize"
-        && (devices.is_empty()
+        && (!form
+            .expires_in_minutes
+            .is_some_and(|v| (1..=1440).contains(&v))
+            || devices.is_empty()
             || devices.len() > 50
             || scopes.is_empty()
             || scopes
@@ -399,12 +426,13 @@ async fn update(
         form.action == "authorize",
         devices,
         scopes,
+        form.expires_in_minutes,
     )
     .await
     {
         Ok(v) => axum::Json(
             json!({"task_id":v.task_id,"authorization_version":v.version,
-            "enabled":v.enabled,"devices":v.devices,"scopes":v.scopes,"operations_started":false}),
+            "enabled":v.enabled,"devices":v.devices,"scopes":v.scopes,"expires_at":v.expires_at,"protocol":v.protocol,"operations_started":false}),
         )
         .into_response(),
         Err(e) if e.to_string() == "task_authorization_missing" => {
@@ -423,6 +451,7 @@ async fn save(
     enabled: bool,
     devices: Vec<String>,
     scopes: Vec<String>,
+    expires_in_minutes: Option<u16>,
 ) -> Result<Grant> {
     let k = key(&g.config.owner, task);
     let mut tx = g.store.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -448,6 +477,18 @@ async fn save(
         let old = previous.as_ref().context("task_authorization_missing")?;
         (old.devices.clone(), old.scopes.clone())
     };
+    let issued_at = now();
+    let expires_at = if enabled {
+        let minutes = expires_in_minutes.context("task_authorization_expiry_required")?;
+        ensure!((1..=1440).contains(&minutes), "invalid task lifetime");
+        Some(
+            issued_at
+                .checked_add(i64::from(minutes) * 60)
+                .context("task_authorization_expiry_overflow")?,
+        )
+    } else {
+        previous.as_ref().and_then(|v| v.expires_at)
+    };
     let grant = Grant {
         owner: g.config.owner.clone(),
         task_id: task.into(),
@@ -457,7 +498,9 @@ async fn save(
         enabled,
         devices,
         scopes,
-        updated_at: now(),
+        updated_at: issued_at,
+        expires_at,
+        protocol: PROTOCOL,
     };
     sqlx::query(
         "INSERT INTO kv VALUES(?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value",

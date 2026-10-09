@@ -108,6 +108,7 @@ async fn grant(f: &Fixture, expected: u64, enabled: bool, scopes: &[&str]) -> Gr
         enabled,
         vec![f.device.clone()],
         scopes.iter().map(|v| (*v).into()).collect(),
+        Some(60),
     )
     .await
     .unwrap()
@@ -175,6 +176,7 @@ async fn form(
             ("scopes", scopes),
             ("csrf", token),
             ("password", password),
+            ("expires_in_minutes", "60"),
         ])
         .finish();
     let mut builder = Request::builder()
@@ -245,6 +247,8 @@ async fn owner_can_revoke_after_device_enrollment_or_scopes_change() {
         assert_eq!(revoked.version, 2);
         assert_eq!(revoked.devices, previous.devices);
         assert_eq!(revoked.scopes, previous.scopes);
+        assert_eq!(revoked.expires_at, previous.expires_at);
+        assert_eq!(revoked.protocol, PROTOCOL);
         assert_eq!(count(&f).await, 0);
     }
 }
@@ -534,6 +538,7 @@ async fn legacy_label_is_not_a_grant_and_intersections_remain_required() {
         version: 1,
         device_id: f.device.clone(),
         scope: "code:read".into(),
+        protocol: PROTOCOL,
     };
     let stored: Grant =
         f.g.store
@@ -765,7 +770,8 @@ async fn concurrent_grant_updates_cas_and_preserve_history() {
             1,
             false,
             devices.clone(),
-            vec!["code:read".into()]
+            vec!["code:read".into()],
+            None,
         ),
         save(
             &f.g,
@@ -773,7 +779,8 @@ async fn concurrent_grant_updates_cas_and_preserve_history() {
             1,
             true,
             devices,
-            vec!["code:read".into()]
+            vec!["code:read".into()],
+            Some(60),
         )
     );
     assert_ne!(a.is_ok(), b.is_ok());
@@ -844,4 +851,309 @@ fn denial_classes_keep_platform_and_task_authority_separate() {
         "agent_execute",
     );
     assert_eq!(forged["error_code"], "version_conflict");
+}
+
+#[tokio::test]
+async fn expiry_boundary_owner_task_device_and_scope_are_enforced() {
+    let f = fixture().await;
+    let grant = grant(&f, 0, true, &["code:read"]).await;
+    assert_eq!(grant.protocol, PROTOCOL);
+    assert_eq!(grant.expires_at, Some(grant.updated_at + 3600));
+    let binding = Binding {
+        key: key("owner", "overnight"),
+        owner: "owner".into(),
+        task_id: "overnight".into(),
+        version: 1,
+        device_id: f.device.clone(),
+        scope: "code:read".into(),
+        protocol: PROTOCOL,
+    };
+    let end = grant.expires_at.unwrap();
+    assert!(check_at(Some(&grant), &binding, end - 1).is_ok());
+    assert_eq!(
+        check_at(Some(&grant), &binding, end)
+            .unwrap_err()
+            .to_string(),
+        "task_authorization_expired"
+    );
+    assert!(check_at(Some(&grant), &binding, end + 1).is_err());
+    for changed in [
+        Binding {
+            owner: "other".into(),
+            ..binding.clone()
+        },
+        Binding {
+            task_id: "other".into(),
+            ..binding.clone()
+        },
+        Binding {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            ..binding.clone()
+        },
+        Binding {
+            scope: "terminal:exec".into(),
+            ..binding.clone()
+        },
+    ] {
+        assert!(check_at(Some(&grant), &changed, end - 1).is_err());
+    }
+    let mut old = grant.clone();
+    old.expires_at = None;
+    assert_eq!(
+        check_at(Some(&old), &binding, end - 1)
+            .unwrap_err()
+            .to_string(),
+        "task_authorization_expiry_required"
+    );
+    old.expires_at = Some(end);
+    old.protocol = 1;
+    assert!(check_at(Some(&old), &binding, end - 1).is_err());
+    old = grant.clone();
+    old.enabled = false;
+    assert_eq!(
+        check_at(Some(&old), &binding, end - 1)
+            .unwrap_err()
+            .to_string(),
+        "task_authorization_revoked"
+    );
+}
+
+async fn expire_fixture(f: &Fixture) {
+    let mut value: Grant =
+        f.g.store
+            .get(KIND, &key("owner", "overnight"))
+            .await
+            .unwrap()
+            .unwrap();
+    value.expires_at = Some(now());
+    f.g.store
+        .put(KIND, &key("owner", "overnight"), &value, i64::MAX)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn expired_request_reauthorization_executes_original_marker_once() {
+    let f = fixture().await;
+    grant(&f, 0, true, &["code:read", "terminal:exec"]).await;
+    let root = f._dir.path().join("project");
+    let workspace = run(
+        &f,
+        "workspace_open",
+        json!({"device_id":f.device,
+        "root":root,"idempotency_key":"expiry-workspace",
+        "task_id":"overnight","authorization_version":1}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    expire_fixture(&f).await;
+    let original = json!({"workspace_id":ws,"command":"printf x >> expiry-marker",
+        "idempotency_key":"expiry-original","task_id":"overnight",
+        "authorization_version":1,"wait_ms":0});
+    let request = request_id();
+    let denied = receipts::invoke(&f.g, &f.p, "terminal_exec", original.clone(), &request)
+        .await
+        .unwrap();
+    assert_eq!(denied["error_code"], "task_authorization_expired");
+    assert_eq!(denied["execution_state"], "not_started");
+    assert!(denied["operation_id"].is_null());
+    assert_eq!(count(&f).await, 1);
+    assert_eq!(
+        view(&f.g, &f.p, "overnight").await.unwrap()["state"],
+        "expired"
+    );
+    grant(&f, 1, true, &["code:read", "terminal:exec"]).await;
+    let resume = json!({"request_id":request,"task_id":"overnight","authorization_version":2});
+    let (a, b) = tokio::join!(
+        call(&f, "task_resume", resume.clone()),
+        call(&f, "task_resume", resume.clone())
+    );
+    let out = if a["operation_id"].is_string() { a } else { b };
+    let id = out["operation_id"].as_str().unwrap();
+    assert_eq!(count(&f).await, 2);
+    let (claimed, raw) = crate::job_dispatch::claim(&f.g.store, &selection(&f), now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed, id);
+    let job: Job = serde_json::from_str(&raw).unwrap();
+    assert_eq!(job.arguments["command"], original["command"]);
+    assert_eq!(job.arguments["idempotency_key"], "expiry-original");
+    let started = f.agent.execute(&job).await.unwrap();
+    crate::job_receipts::commit(&f.g.store, &f.device, id, &started)
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        if std::fs::read_to_string(root.join("expiry-marker")).is_ok_and(|v| v == "x") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("expiry-marker")).unwrap(),
+        "x"
+    );
+    let duplicate = call(&f, "task_resume", resume).await;
+    assert_eq!(duplicate["operation_id"], id);
+    assert_eq!(count(&f).await, 2);
+    assert_eq!(
+        std::fs::read_to_string(root.join("expiry-marker")).unwrap(),
+        "x"
+    );
+}
+
+#[tokio::test]
+async fn expiry_between_initial_check_and_queue_binding_fails_closed() {
+    let f = fixture().await;
+    grant(&f, 0, true, &["code:read", "terminal:exec"]).await;
+    let arguments = terminal(&f, 1, "expiry-transaction");
+    let binding = requested(&f.g, &f.p, "terminal_exec", &arguments, &f.device)
+        .await
+        .unwrap()
+        .unwrap();
+    expire_fixture(&f).await;
+    let mut tx = f.g.store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        bind(&mut tx, &id, &binding).await.unwrap_err().to_string(),
+        "task_authorization_expired"
+    );
+    tx.rollback().await.unwrap();
+    assert!(
+        f.g.store
+            .get::<Binding>(BINDING, &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(count(&f).await, 0);
+}
+
+#[tokio::test]
+async fn expiry_after_enqueue_blocks_claim_without_blocking_independent_work() {
+    let f = fixture().await;
+    grant(&f, 0, true, &["code:read", "terminal:exec"]).await;
+    let pending = call(&f, "terminal_exec", terminal(&f, 1, "expiry-queued")).await;
+    let id = pending["operation_id"].as_str().unwrap();
+    expire_fixture(&f).await;
+    assert!(
+        crate::job_dispatch::claim(&f.g.store, &selection(&f), now())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(blocked(&f.g, &f.p, id).await.unwrap());
+    let independent = call(
+        &f,
+        "terminal_exec",
+        json!({
+        "workspace_id":format!("{}:{}",f.device,uuid::Uuid::new_v4()),
+        "command":"printf independent","idempotency_key":"expiry-independent"}),
+    )
+    .await;
+    let (claimed, _) = crate::job_dispatch::claim(&f.g.store, &selection(&f), now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed, independent["operation_id"]);
+    // Owner renewal is synthetic and isolated; the queued operation keeps its ID.
+    grant(&f, 1, true, &["code:read", "terminal:exec"]).await;
+    let resumed = call(
+        &f,
+        "task_resume",
+        json!({
+        "operation_id":id,"task_id":"overnight","authorization_version":2}),
+    )
+    .await;
+    assert_eq!(resumed["operation_id"], id);
+    assert_eq!(count(&f).await, 2);
+    let (claimed, _) = crate::job_dispatch::claim(&f.g.store, &selection(&f), now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed, id);
+}
+
+#[tokio::test]
+async fn owner_form_requires_bounded_server_lifetime() {
+    let f = fixture().await;
+    for minutes in [None, Some("0"), Some("1441"), Some("-1"), Some("true")] {
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.extend_pairs([
+            ("task_id", "overnight"),
+            ("expected_version", "0"),
+            ("action", "authorize"),
+            ("devices", f.device.as_str()),
+            ("scopes", "code:read"),
+            ("csrf", csrf(&f.cookie).as_str()),
+            ("password", f.password.as_str()),
+        ]);
+        if let Some(v) = minutes {
+            form.append_pair("expires_in_minutes", v);
+        }
+        let response =
+            f.g.router()
+                .unwrap()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/status/task-authorization")
+                        .header("host", "fixture.example")
+                        .header("origin", "https://fixture.example")
+                        .header("cookie", format!("rh_status={}", f.cookie))
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(form.finish()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        assert!(matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ));
+        assert!(
+            f.g.store
+                .get::<Grant>(KIND, &key("owner", "overnight"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(count(&f).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn legacy_unbounded_grant_is_not_silently_promoted_and_receipts_remain_readable() {
+    let f = fixture().await;
+    let issued = grant(&f, 0, true, &["code:read", "terminal:exec"]).await;
+    let pending = call(&f, "terminal_exec", terminal(&f, 1, "legacy-boundary")).await;
+    let id = pending["operation_id"].as_str().unwrap();
+    let mut legacy = serde_json::to_value(issued).unwrap();
+    legacy.as_object_mut().unwrap().remove("expires_at");
+    legacy.as_object_mut().unwrap().remove("protocol");
+    f.g.store
+        .put(KIND, &key("owner", "overnight"), &legacy, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        view(&f.g, &f.p, "overnight").await.unwrap()["state"],
+        "expiry_required"
+    );
+    let denied = call(&f, "terminal_exec", terminal(&f, 1, "legacy-new")).await;
+    assert_eq!(denied["error_code"], "task_authorization_expiry_required");
+    assert_eq!(count(&f).await, 1);
+    let observed = call(
+        &f,
+        "operation_get",
+        json!({
+        "operation_id":id,"task_id":"overnight","wait_ms":0}),
+    )
+    .await;
+    assert_eq!(observed["operation_id"], id);
+    assert!(
+        crate::job_dispatch::claim(&f.g.store, &selection(&f), now())
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

@@ -372,7 +372,7 @@ mod release_manifest_tests {
         let manifest = release_manifest();
         assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(manifest["tool_count"], tools::catalog().len());
-        assert_eq!(manifest["task_authorization_protocol"], 1);
+        assert_eq!(manifest["task_authorization_protocol"], 2);
         assert_eq!(manifest["tool_schema_revision"], tool_schema_revision());
         assert_eq!(manifest["tools_sha256"], tool_schema_revision());
         assert_eq!(manifest["terminal_observation_protocol"], 2);

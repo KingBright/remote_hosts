@@ -28,6 +28,11 @@ AND (jobs.state='dispatched' OR NOT EXISTS (
     AND NOT EXISTS (
         SELECT 1 FROM kv g WHERE g.kind='task_authorization' AND g.key=json_extract(b.value,'$.key')
         AND g.expires>unixepoch() AND json_extract(g.value,'$.enabled')=1
+        AND json_extract(g.value,'$.protocol')=2 AND json_extract(b.value,'$.protocol')=2
+        AND json_type(g.value,'$.expires_at')='integer'
+        AND json_extract(g.value,'$.expires_at')>unixepoch()
+        AND json_extract(b.value,'$.device_id')=jobs.device
+        AND json_extract(b.value,'$.owner')=json_extract(request,'$.owner')
         AND json_extract(g.value,'$.owner')=json_extract(b.value,'$.owner')
         AND json_extract(g.value,'$.task_id')=json_extract(b.value,'$.task_id')
         AND json_extract(g.value,'$.version')=json_extract(b.value,'$.version')

@@ -7,6 +7,8 @@ pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &
         "task_authorization_version_required",
         "task_authorization_version_changed",
         "task_authorization_revoked",
+        "task_authorization_expired",
+        "task_authorization_expiry_required",
         "task_scope_denied",
         "task_device_denied",
     ]
@@ -185,6 +187,8 @@ pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &
         | "task_authorization_version_required"
         | "task_authorization_version_changed"
         | "task_authorization_revoked"
+        | "task_authorization_expired"
+        | "task_authorization_expiry_required"
         | "task_scope_denied"
         | "task_device_denied" => "explicit_resume_only_after_authorization_changes",
         "account_scope_denied"
@@ -214,6 +218,8 @@ pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &
         | "task_authorization_version_required"
         | "task_authorization_version_changed"
         | "task_authorization_revoked"
+        | "task_authorization_expired"
+        | "task_authorization_expiry_required"
         | "task_scope_denied"
         | "task_device_denied" => "review_owner_task_authorization",
         "account_scope_denied" => "check_current_account_scopes",

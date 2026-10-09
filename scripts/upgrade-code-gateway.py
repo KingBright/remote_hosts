@@ -42,33 +42,51 @@ def atomic_copy(source, destination):
             temp.unlink(missing_ok=True)
 
 
-def task_authorization_required(database):
-    """Inspect only policy presence, never grant contents or credentials."""
+def task_authorization_required_protocol(database):
+    """Read only aggregate policy capability metadata, never private row contents."""
     database = pathlib.Path(database).resolve()
     if not database.exists():
-        return False
+        return 0
     with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=2)) as connection:
-        return connection.execute(
-            "SELECT EXISTS(SELECT 1 FROM kv WHERE kind IN "
-            "('task_authorization','operation_task_authorization'))"
-        ).fetchone()[0] == 1
+        count, minimum, invalid = connection.execute(
+            "SELECT COUNT(*), COALESCE(MAX(CASE WHEN json_valid(value) THEN "
+            "MAX(COALESCE(CASE WHEN json_type(value,'$.protocol')='integer' "
+            "THEN json_extract(value,'$.protocol') END,1), "
+            "CASE WHEN json_type(value,'$.expires_at') IS NOT NULL THEN 2 ELSE 1 END) "
+            "ELSE 0 END),0), COALESCE(SUM(CASE WHEN NOT json_valid(value) THEN 1 " +
+            "WHEN json_type(value)!='object' THEN 1 " +
+            "WHEN json_type(value,'$.protocol') IS NOT NULL AND " +
+            "(json_type(value,'$.protocol')!='integer' OR json_extract(value,'$.protocol')<1) THEN 1 " +
+            "WHEN json_type(value,'$.expires_at') IS NOT NULL AND " +
+            "json_type(value,'$.expires_at') NOT IN ('integer','null') THEN 1 ELSE 0 END),0) "
+            "FROM kv WHERE kind IN ('task_authorization','operation_task_authorization')"
+        ).fetchone()
+    if invalid:
+        raise RuntimeError('task_authorization_policy_metadata_invalid')
+    return max(1, minimum) if count else 0
 
 
-def task_authorization_supported(binary):
+def task_authorization_required(database):
+    return task_authorization_required_protocol(database) > 0
+
+
+def task_authorization_supported(binary, minimum=1):
     try:
         manifest = json.loads(subprocess.check_output(
             [str(binary), 'release-manifest'], text=True,
             stderr=subprocess.DEVNULL, timeout=10,
         ))
-        return type(manifest.get('task_authorization_protocol')) is int and manifest['task_authorization_protocol'] == 1
+        protocol = manifest.get('task_authorization_protocol')
+        return type(protocol) is int and protocol in (1, 2) and protocol >= minimum
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return False
 
 
 def require_task_authorization_support(database, binary, stage):
-    if task_authorization_required(database) and not task_authorization_supported(binary):
+    minimum = task_authorization_required_protocol(database)
+    if minimum and not task_authorization_supported(binary, minimum):
         raise RuntimeError('task_authorization_policy_required:' + stage +
-                           '; refusing a binary without task authorization protocol 1')
+                           '; refusing a binary without task authorization protocol ' + str(minimum))
 
 
 def main():
