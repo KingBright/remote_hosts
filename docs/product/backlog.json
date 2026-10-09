@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "project": "remote_hosts",
-  "updated_at": "2026-10-05",
+  "updated_at": "2026-10-09",
   "source_of_truth": "docs/product/backlog.json",
   "status_policy": {
     "open": "未实现或尚未定位",
@@ -19,8 +19,17 @@
     "rule": "公共 backlog 记录产品问题和 repository/release facts；真实 release targets、installed/running/accepted 状态和现场 receipts 属于 private deployment/runtime system。",
     "last_packaged_release": "0.10.22",
     "last_packaged_validation": "Frozen snapshot 962de77e1adebe279bb00dbef30efeef93edfeec52c338bc523230d1097df42e: 762 passed, 0 failed (473 Rust, 289 Python), 2 Rust ignored, 3 Python skipped; fmt, strict Clippy, workspace check and all three platform release builds passed.",
-    "current_main_state": "0.10.22 runtime source at d863a96; subsequent live-acceptance documentation does not change the frozen package.",
-    "current_source_validation": "The 0.10.22 frozen verification passed 762 tests. Native Codex four-device acceptance remains valid for 0.10.19 Agents. Spark live authorization, 24-tool synchronization and real devices_list and a bounded README code_read with an independently matched SHA-256 passed against Gateway 0.10.22. Gemini attachment compatibility and the expanded four-device failure matrix remain unverified."
+    "current_main_state": "0.10.27 Gateway source at b55e061; terminal observation recovery changes are release-Python only. Installed/running state is tracked separately.",
+    "current_source_validation": "Frozen 0.10.27 Linux Gateway component verification passed 42 tests plus fmt, strict Clippy and component check. Controller terminal-continuation verification is recorded in docs/iterations/2026-10-09-terminal-continuation/verification.json; this does not replace the earlier full-platform package verification.",
+    "last_component_packaged_release": {
+      "version": "0.10.27",
+      "component": "remote-hosts-code Gateway",
+      "platform": "Linux x86_64 musl only",
+      "source_commit": "b55e061a1d88a9975125cbacc6761c1b321600c3",
+      "snapshot_id": "0b1556c3ff430a9aca27946a832cda271a52e186eb1da0bd400566b53c4b9b6b",
+      "passed_tests": 42,
+      "bundle_sha256": "7929e68ace1265f89ab92e70cdf0f6eeecec0dc8324cea949f343566f26f0e60"
+    }
   },
   "milestones": [
     {
@@ -471,7 +480,7 @@
       "title": "短命令与观察操作的多层轮询",
       "discovery": "observed_in_conversation",
       "problem": "exec可能pending，read又pending，额外往返；code_read也多次需要operation_get。",
-      "current_resolution": "已上线最多20项批量operation_get、5秒有界等待和状态指纹，旧单ID保持兼容。线上只读验证顺序、原结果、重复ID拒绝与不变游标通过；仍非完整事件回放或统一终端观察，精确预算等后续见RH-045。",
+      "current_resolution": "已上线最多20项批量operation_get、5秒有界等待和状态指纹，旧单ID保持兼容。线上只读验证顺序、原结果、重复ID拒绝与不变游标通过；仍非完整事件回放或统一终端观察，精确预算等后续见RH-045。 2026-10-09 发布 Python 客户端修复预算省略丢失 terminal 元数据后的接续断层：新增 observe_terminal 只观察原 operation，身份缺失仅做一次有界查询，已知身份从原日志精确字节游标恢复，最终页必须有完整持久回执。15项固定回归与38项原生通道/路由回归通过；断连不自动重启或切换传输。仅控制器候选，未重新部署生产；完整事件回放、故障矩阵和其余观察范围仍未关闭。 最终完整Python门禁444项：442通过、1项既有公共仓库实例边界检查失败、1项可选launchd探针跳过；四个失败涉及文件与本轮基线HEAD一致，完整门禁不能标为通过。",
       "acceptance": [
         "短命令尽量一次返回退出码与首屏；长任务不重派发；同终端增量输出不漏不重复。"
       ],
@@ -482,12 +491,16 @@
         "docs/releases/0.3.1/deployment.json",
         "docs/releases/0.3.2/RELEASE.md",
         "docs/releases/0.3.2/deployment.json",
-        "docs/releases/0.3.2/verification-final.json"
+        "docs/releases/0.3.2/verification-final.json",
+        "scripts/release_client.py",
+        "scripts/tests/test_terminal_observation_recovery.py",
+        "docs/native-release-client.md",
+        "docs/iterations/2026-10-09-terminal-continuation/verification.json"
       ],
       "depends_on": [],
       "owner": "Remote Hosts 维护者（用户 / ChatGPT / Codex）",
       "introduced_or_observed": "0.2.0 or 0.3.0 candidate",
-      "last_reviewed": "2026-09-10",
+      "last_reviewed": "2026-10-09",
       "closure_evidence": []
     },
     {

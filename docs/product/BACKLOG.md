@@ -2,7 +2,7 @@
 
 > 唯一事实源：`docs/product/backlog.json`。本页由 `scripts/product-backlog.py --render` 生成。
 
-更新日期：2026-10-05。共 58 项。
+更新日期：2026-10-09。共 58 项。
 
 已验证候选不等于线上修复；部分修复不能关闭整项。关闭必须附本项验收证据。
 
@@ -321,11 +321,11 @@
 
 现象与范围：exec可能pending，read又pending，额外往返；code_read也多次需要operation_get。
 
-当前处理：已上线最多20项批量operation_get、5秒有界等待和状态指纹，旧单ID保持兼容。线上只读验证顺序、原结果、重复ID拒绝与不变游标通过；仍非完整事件回放或统一终端观察，精确预算等后续见RH-045。
+当前处理：已上线最多20项批量operation_get、5秒有界等待和状态指纹，旧单ID保持兼容。线上只读验证顺序、原结果、重复ID拒绝与不变游标通过；仍非完整事件回放或统一终端观察，精确预算等后续见RH-045。 2026-10-09 发布 Python 客户端修复预算省略丢失 terminal 元数据后的接续断层：新增 observe_terminal 只观察原 operation，身份缺失仅做一次有界查询，已知身份从原日志精确字节游标恢复，最终页必须有完整持久回执。15项固定回归与38项原生通道/路由回归通过；断连不自动重启或切换传输。仅控制器候选，未重新部署生产；完整事件回放、故障矩阵和其余观察范围仍未关闭。 最终完整Python门禁444项：442通过、1项既有公共仓库实例边界检查失败、1项可选launchd探针跳过；四个失败涉及文件与本轮基线HEAD一致，完整门禁不能标为通过。
 
 验收：短命令尽量一次返回退出码与首屏；长任务不重派发；同终端增量输出不漏不重复。
 
-证据或实现位置：`crates/remote-hosts-code/src/gateway.rs`、`crates/remote-hosts-code/src/tools.rs`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`
+证据或实现位置：`crates/remote-hosts-code/src/gateway.rs`、`crates/remote-hosts-code/src/tools.rs`、`docs/releases/0.3.1/verification.json`、`docs/releases/0.3.1/deployment.json`、`docs/releases/0.3.2/RELEASE.md`、`docs/releases/0.3.2/deployment.json`、`docs/releases/0.3.2/verification-final.json`、`scripts/release_client.py`、`scripts/tests/test_terminal_observation_recovery.py`、`docs/native-release-client.md`、`docs/iterations/2026-10-09-terminal-continuation/verification.json`
 
 依赖：无
 

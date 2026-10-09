@@ -25,7 +25,9 @@
 
 版本目录位于 `docs/releases/`。新的公共 release evidence 只应保存固定输入、测试门禁、artifact manifest/SHA 和不绑定具体实例的发布说明。早期版本目录中还保留了一批真实部署 acceptance/deployment/targets 记录，它们属于历史 **legacy evidence**，不是当前推荐的数据模型，也不能作为实时状态事实源；后续应在保留审计链的前提下迁往私有 ops/archive。
 
-当前最近一次不可变 packaged release 为 **0.9.0**。该固定源码 pipeline 通过 **372 项测试：239 Rust + 133 Python，0 失败**，并完成 macOS ARM64 与 Linux x86_64-musl release 构建；package manifest SHA-256 为 `8e40977a4fc83d6999c89bcccf70bae160b5aca58cf89f5f82b4302ba4b9f5e2`。这些都是 release facts；当前 `main` 还可以包含尚未重新打包的后续源码改动，也不描述任何一套实例当前 installed/running/accepted 状态。
+固定 package、版本和验证的产品事实源是 `product/backlog.json` 的 `release_policy`；其中整套平台包与独立组件包分别记录。控制器 Git 修订与已安装 binary 版本分开判断，实时 installed/running/accepted 状态来自私有 runtime。
+
+- [2026-10-09 原 terminal 回执接续实验](iterations/2026-10-09-terminal-continuation/README.md)：实验假设、实际版本/环境、RED 与最终指标、关键原始片段、校验值、复现命令和已知门禁阻塞；机器可读结果使用同目录 `verification.json`。
 
 ## 文档纪律
 

@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-09",
+  "scope": "release-Python controller terminal evidence continuation; no Rust rebuild or production deployment",
+  "base_commit": "87a5d3cf898d72495a5024fb4c89f5d8812d860b",
+  "source_sha256": {
+    "scripts/release_client.py": "3144db787ab01df03ce77071751f3741b34063bbecb4bd0e5bc838ca3afc31c2",
+    "scripts/tests/test_terminal_observation_recovery.py": "3b685055e039623d80f1dce27ed28bc4418d68a37044a9e297721e62f4b2ad06"
+  },
+  "red": {
+    "tests": 12,
+    "failures": 1,
+    "errors": 11,
+    "old_client_sha256": "9b63139cf30a5239b3f2d87931408f6ce1f9b2f5fb68723a67192a2fe325a2c2",
+    "log_sha256": "4cca122bc832eac3b128605e8d4bb3dede7943e63d560c2c9994c81a196be8ef",
+    "test_source_sha256": "6857e3791ef871da06318c2bcc2bb16a5e56e9fc2d8111d126c864f54f53f05b",
+    "process_exit_code": 1,
+    "test_seconds": 0.667
+  },
+  "legacy_compatibility_red": {
+    "tests": 15,
+    "failures": 1,
+    "errors": 1,
+    "log_sha256": "2bb1291216deb588ca961fb0d5022d5c949359ec1533ae44fae9536435ac46f8",
+    "client_sha256": "2ce254f0e4b79e06e959ed47042784def5ce88a35c4bcfe14d19f24711d257d1",
+    "test_source_sha256": "3b685055e039623d80f1dce27ed28bc4418d68a37044a9e297721e62f4b2ad06",
+    "process_exit_code": 1,
+    "test_seconds": 0.412
+  },
+  "related_final": {
+    "passed": 53,
+    "new_terminal_continuation_tests": 15,
+    "native_transport_and_routing_tests": 38,
+    "failures": 0
+  },
+  "full_python_gate": {
+    "tests_run": 444,
+    "passed": 442,
+    "failures": 1,
+    "errors": 0,
+    "skipped": 1,
+    "gate_passed": false,
+    "elapsed_seconds": 56.363,
+    "log_sha256": "6ce69546f61e2d4790a9445b4f10a1fe1abfaf0b096edd91c617e12eb6d5c7f6",
+    "python_inputs_unchanged": true,
+    "remaining_failure": "test_active_public_surfaces_have_no_known_instance_identity (test_public_repository_boundaries.PublicRepositoryBoundaryTests.test_active_public_surfaces_have_no_known_instance_identity)",
+    "baseline_files_unchanged_at_base_commit": {
+      "scripts/gateway_release.py": "b231d91532be3ce337e7b8515a8324ac2431b9ff9fa5027c5f10cb404eb93561",
+      "scripts/gateway_release_stage.py": "958cffd6fef4eb866684edfea9d239aee8df33aa8868be99552fc42fc58d13b1",
+      "scripts/gateway_release_oauth.py": "4cefc500e46979b1f0753a07250f9f8f1259368bf7235944223a7537e50cb4ad",
+      "scripts/tests/test_gateway_release_ssh_failures.py": "31fe3e94a74e74d1c48436711d65c8709c8a285c62313bff0dfedfdaba4e7476"
+    },
+    "skipped_test": "test_exited_counter_job_is_not_restarted; disposable launchd probe requires explicit opt-in",
+    "process_exit_code": 1,
+    "test_seconds": 54.242,
+    "python_input_manifest_sha256": "f32ac949b1a62f2bafee27fa8027674286a09222d830359572db618d90170d66"
+  },
+  "coverage": [
+    "original operation identity before/during recovery",
+    "single bounded identity probe for metadata-free budget omission",
+    "exact UTF-8 byte history after tail previews",
+    "still-running history capture",
+    "protocol-2 durable final receipt",
+    "new Client observes without terminal_exec",
+    "native disconnect never falls back or recreates session",
+    "protocol-1 terminal alias compatibility without weakening explicit/protocol-2 identity"
+  ],
+  "limits": [
+    "The aggregate gate remains blocked by the pre-existing public repository identity guard.",
+    "Live production transport fault injection was not performed; native disconnect coverage uses an isolated mock and existing stdio fixtures.",
+    "Retained original deployment output was recovered using read-only public tools; this does not rerun installation or establish Agent fleet convergence."
+  ],
+  "runtime_version_source": "private deployment/runtime acceptance, separate from controller Git revision",
+  "environment": {
+    "system": "Darwin",
+    "release": "25.5.0",
+    "machine": "arm64",
+    "python": "3.14.3"
+  },
+  "experiment_entry": "README.md"
+}

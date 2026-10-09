@@ -327,24 +327,73 @@ class Client:
         return value
 
     def terminal(self, ws, command, key, timeout=60):
-        """Follow one operation. Full history reads are only an evidence fallback."""
+        """Submit once, then follow only the original operation."""
         end = time.monotonic() + timeout + 60
         value = self.tool('terminal_exec', {'workspace_id': ws, 'command': command, 'idempotency_key': key, 'timeout_seconds': timeout, 'wait_ms': 1000, 'response_mode': 'full'}, deadline=end)
+        return self._terminal_output(ws, value, end, value.get('operation_id'))
+
+    def observe_terminal(self, ws, operation_id, timeout=60):
+        """Recover retained terminal evidence without submitting a command."""
+        if not operation_id:
+            raise ValueError('observation_missing_operation_identity')
+        end = time.monotonic() + timeout + 60
+        value = self.tool('operation_get', {'operation_id': operation_id, 'wait_ms': 5000, 'max_bytes': 65536, 'response_mode': 'full'}, deadline=end)
+        return self._terminal_output(ws, value, end, operation_id)
+
+    def _terminal_output(self, ws, value, end, operation):
+        # Protocol-1 terminal responses historically used terminal_id as the
+        # operation alias and could omit receipt metadata. Keep that existing
+        # contract only for a submitted legacy response, never protocol 2 or
+        # an explicit observe_terminal handle.
+        protocol = value.get('receipt', {}).get('protocol', 1)
+        legacy_alias = (not operation and bool(value.get('terminal_id'))
+                        and type(protocol) is int and protocol == 1)
+        if legacy_alias:
+            operation = value['terminal_id']
+
+        def check_operation(observed):
+            if not operation:
+                raise RuntimeError('observation_missing_operation_identity')
+            seen = observed.get('operation_id')
+            observed_protocol = observed.get('receipt', {}).get('protocol', 1)
+            if (seen is None and legacy_alias
+                    and type(observed_protocol) is int and observed_protocol == 1):
+                return
+            if seen != operation:
+                raise RuntimeError('observation_identity_changed:' + operation)
+
+        check_operation(value)
         ident = value.get('terminal_id') or value.get('terminal', {}).get('id')
-        operation = value.get('operation_id') or ident
+        if not ident and value.get('result_omitted'):
+            # A budget placeholder can omit all terminal metadata. Probe the
+            # SAME operation once at the public ceiling; never guess an ID.
+            value = self.tool('operation_get', {'operation_id': operation, 'wait_ms': 5000, 'max_bytes': 131072, 'response_mode': 'full'}, deadline=end)
+            check_operation(value)
+            ident = value.get('terminal_id') or value.get('terminal', {}).get('id')
         if not ident:
             raise RuntimeError('terminal_identity_unconfirmed:' + str(operation))
-        status = value.get('terminal', {})
+
+        def check_terminal(observed):
+            status = observed.get('terminal', {})
+            if (observed.get('terminal_id', ident) != ident
+                    or status.get('id', ident) != ident):
+                raise RuntimeError('terminal_identity_changed:' + ident)
+            return status
+
+        status = check_terminal(value)
         while status.get('exit_code') is None or status.get('output_complete') is not True:
+            # Retain the proven terminal identity when a later budget
+            # placeholder loses status. Full history supplies its current state.
+            if not status and value.get('result_omitted'):
+                break
             if time.monotonic() > end:
                 raise RuntimeError('terminal_observation_timeout:' + ident)
             value = self.tool('operation_get', {'operation_id': operation, 'wait_ms': 5000, 'max_bytes': 65536}, deadline=end)
-            status = value.get('terminal', {})
-            if status.get('id', ident) != ident:
-                raise RuntimeError('terminal_identity_changed:' + ident)
+            check_operation(value)
+            status = check_terminal(value)
         if status.get('output_truncated') or status.get('output_error'):
             raise RuntimeError('terminal_evidence_incomplete:' + ident)
-        if status['exit_code'] != 0 or status.get('state', 'exited') != 'exited':
+        if status and (status.get('exit_code') != 0 or status.get('state', 'exited') != 'exited'):
             raise RuntimeError('terminal_failed:' + ident)
         if (value.get('receipt', {}).get('evidence_complete') is True
                 and evidence_is_durable(value.get('receipt', {}))
@@ -372,14 +421,27 @@ class Client:
                 raise RuntimeError('terminal_output_timeout:' + ident)
             page = self.tool('terminal_read', {'workspace_id': ws, 'terminal_id': ident, 'cursor': cursor, 'max_bytes': 65536, 'output_mode': 'full'}, deadline=end)
             status, text, next_cursor = page['terminal'], page.get('output', ''), page['cursor']
-            if (status.get('id', ident) != ident or page.get('raw_cursor_start', cursor) != cursor
+            if (page.get('terminal_id', ident) != ident or status.get('id', ident) != ident
+                    or page.get('raw_cursor_start', cursor) != cursor
                     or next_cursor < cursor or next_cursor - cursor != len(text.encode('utf-8'))
                     or status.get('output_truncated') or status.get('output_error')):
                 raise RuntimeError('terminal_evidence_incomplete:' + ident)
             parts.append(text)
             if not page.get('has_more'):
+                if status.get('state') in ('starting', 'running'):
+                    # The omitted snapshot may have hidden a still-running
+                    # process. Wait on its original operation, then continue
+                    # the same log at the exact byte cursor.
+                    value = self.tool('operation_get', {'operation_id': operation, 'wait_ms': 5000, 'max_bytes': 65536}, deadline=end)
+                    check_operation(value)
+                    check_terminal(value)
+                    cursor = next_cursor
+                    continue
                 if (status.get('output_complete') is not True or status.get('exit_code') != 0
-                        or status.get('state', 'exited') != 'exited'):
+                        or status.get('state', 'exited') != 'exited'
+                        or (page.get('receipt', {}).get('evidence_complete') is not True
+                            and not (legacy_alias and page.get('receipt', {}) == {}))
+                        or not evidence_is_durable(page.get('receipt', {}))):
                     raise RuntimeError('terminal_final_evidence_unconfirmed:' + ident)
                 return ''.join(parts)
             if next_cursor == cursor:
