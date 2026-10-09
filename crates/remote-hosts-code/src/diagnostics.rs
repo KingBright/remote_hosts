@@ -2,7 +2,61 @@
 use crate::now;
 use serde_json::{Value, json};
 pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &str) -> Value {
-    let (code, recovery, outcome) = if message.contains("device_draining") {
+    let task_rejection = [
+        "task_authorization_missing",
+        "task_authorization_version_required",
+        "task_authorization_version_changed",
+        "task_authorization_revoked",
+        "task_scope_denied",
+        "task_device_denied",
+    ]
+    .into_iter()
+    .find(|code| message == *code);
+    let (code, recovery, outcome) = if let Some(code) = task_rejection {
+        (
+            code,
+            "establish_owner_task_authorization_then_resume_original",
+            "not_executed",
+        )
+    } else if message.starts_with("insufficient_scope") {
+        (
+            "account_scope_denied",
+            "check_current_account_scopes",
+            "not_executed",
+        )
+    } else if message.starts_with("device_scope_denied") {
+        (
+            "device_scope_denied",
+            "check_selected_device_scopes",
+            "not_executed",
+        )
+    } else if message == "device file writes disabled" {
+        (
+            "local_write_disabled",
+            "request_owner_local_policy_review",
+            "not_executed",
+        )
+    } else if message == "device terminal execution disabled" {
+        (
+            "local_exec_disabled",
+            "request_owner_local_policy_review",
+            "not_executed",
+        )
+    } else if message.starts_with("platform_authorization_required")
+        || message == "authorization_required"
+    {
+        (
+            "platform_authorization_required",
+            "complete_platform_authorization_directly",
+            "not_executed_or_partial",
+        )
+    } else if message.starts_with("source_address_policy_rejected") {
+        (
+            "source_address_policy_rejected",
+            "inspect_original_source_policy_without_bypass",
+            "not_executed_or_paused",
+        )
+    } else if message.contains("device_draining") {
         (
             "device_draining",
             "observe_original_updater",
@@ -127,6 +181,18 @@ pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &
         _ => "unknown",
     };
     let retry_policy = match code {
+        "task_authorization_missing"
+        | "task_authorization_version_required"
+        | "task_authorization_version_changed"
+        | "task_authorization_revoked"
+        | "task_scope_denied"
+        | "task_device_denied" => "explicit_resume_only_after_authorization_changes",
+        "account_scope_denied"
+        | "device_scope_denied"
+        | "local_write_disabled"
+        | "local_exec_disabled"
+        | "platform_authorization_required"
+        | "source_address_policy_rejected" => "do_not_replay_or_expand_authority",
         "invalid_arguments" => "retry_only_after_correcting_arguments",
         "device_offline" | "device_feature_unavailable" | "storage_capacity_insufficient" => {
             "retry_only_after_reported_condition_changes"
@@ -144,6 +210,17 @@ pub(crate) fn error(tool: &str, message: &str, operation: Option<&str>, stage: &
         "storage_capacity_insufficient" => "free_storage_or_reduce_request",
         "invalid_arguments" => "correct_arguments",
         "access_denied" => "check_account_and_device_permissions",
+        "task_authorization_missing"
+        | "task_authorization_version_required"
+        | "task_authorization_version_changed"
+        | "task_authorization_revoked"
+        | "task_scope_denied"
+        | "task_device_denied" => "review_owner_task_authorization",
+        "account_scope_denied" => "check_current_account_scopes",
+        "device_scope_denied" => "check_selected_device_scopes",
+        "local_write_disabled" | "local_exec_disabled" => "request_owner_local_policy_review",
+        "platform_authorization_required" => "complete_platform_authorization_directly",
+        "source_address_policy_rejected" => "inspect_original_source_policy_without_bypass",
         _ => "none_until_observation_or_recovery_guidance_requires_it",
     };
     json!({"error":"tool_failed","error_code":code,"message":code,

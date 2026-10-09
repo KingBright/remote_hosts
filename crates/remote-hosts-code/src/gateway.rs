@@ -311,6 +311,7 @@ impl Gateway {
             .with_state(self.clone());
         Ok(Router::new()
             .merge(status)
+            .merge(crate::task_authorization::routes(self.clone()))
             .merge(mcp)
             .merge(admin)
             .merge(self.auth.routes())
@@ -381,9 +382,9 @@ impl Gateway {
         tools::validate(name, &args)?;
         if let Some(object) = args.as_object_mut() {
             object.remove("response_mode");
-            if name != "task_context" {
-                object.remove("task_id");
-            }
+        }
+        if name == "task_resume" {
+            return crate::task_authorization::resume(self, p, &args).await;
         }
         if matches!(name, "transfer_cancel" | "transfer_resume") {
             return crate::transfer_control::apply(self, p, name, &args).await;
@@ -572,7 +573,9 @@ impl Gateway {
                 .split_once(':')
                 .context("invalid workspace id")?
                 .0
-        };
+        }
+        .to_owned();
+        let device = device.as_str();
         let registration = self
             .config
             .devices
@@ -581,8 +584,14 @@ impl Gateway {
             .context("unknown device")?;
         ensure!(
             registration.scopes.iter().any(|s| s == scope),
-            "device does not permit {scope}"
+            "device_scope_denied: {scope}"
         );
+        let task_binding =
+            crate::task_authorization::requested(self, p, name, &args, device).await?;
+        if let Some(object) = args.as_object_mut() {
+            object.remove("task_id");
+            object.remove("authorization_version");
+        }
         let signals = self.signals.get(device).context("unknown device")?;
         let key = if scope == "code:read" && name != "workspace_open" && name != "file_download" {
             random()
@@ -724,6 +733,9 @@ impl Gateway {
                 "device_offline: reconnect the selected device; do not fail over"
             );
             let mut transaction = self.store.pool.begin_with("BEGIN IMMEDIATE").await?;
+            if let Some(binding) = &task_binding {
+                crate::task_authorization::check_in_transaction(&mut transaction, binding).await?;
+            }
             if let Some(semantic) = &semantic {
                 let inserted =
                     sqlx::query("INSERT OR IGNORE INTO semantic_guards VALUES(?,?,'active',?)")
@@ -779,6 +791,9 @@ impl Gateway {
                 transaction.commit().await?;
                 (selected_id, false)
             } else {
+                if let Some(binding) = &task_binding {
+                    crate::task_authorization::bind(&mut transaction, &id, binding).await?;
+                }
                 // All dispatch prerequisites share the job's commit. A failure
                 // cannot publish a job without timing, recovery or source data.
                 if let Some(semantic) = &semantic {
@@ -1216,7 +1231,7 @@ async fn admin_status(
 struct StatusLogin {
     password: String,
 }
-fn status_cookie(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn status_cookie(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::COOKIE)?
         .to_str()
@@ -1224,7 +1239,7 @@ fn status_cookie(headers: &HeaderMap) -> Option<&str> {
         .split(';')
         .find_map(|part| part.trim().strip_prefix("rh_status="))
 }
-async fn status_session_valid(g: &Gateway, headers: &HeaderMap) -> bool {
+pub(crate) async fn status_session_valid(g: &Gateway, headers: &HeaderMap) -> bool {
     let Some(token) = status_cookie(headers) else {
         return false;
     };
@@ -1237,7 +1252,7 @@ async fn status_session_valid(g: &Gateway, headers: &HeaderMap) -> bool {
             .flatten()
             == Some(true)
 }
-fn status_html_escape(value: &str) -> String {
+pub(crate) fn status_html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1583,10 +1598,20 @@ async fn poll(
         }
     }
     let deadline = Instant::now() + poll_wait;
+    let current_scopes = serde_json::to_string(
+        &g.config
+            .devices
+            .iter()
+            .find(|d| d.id == device)
+            .expect("authenticated device")
+            .scopes,
+    )
+    .expect("scope strings");
     let selection = crate::job_dispatch::Selection {
         device: &device,
         session: &online.hello.session,
         active: &active_json,
+        scopes: &current_scopes,
         lanes: &lanes_json,
         defer_writes,
         write_workspaces: &filtered_workspaces,

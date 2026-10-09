@@ -8,7 +8,9 @@ pub fn scope(name: &str) -> Option<&'static str> {
     match name {
         "devices_list" | "fleet_status" | "workspace_open" | "code_list" | "code_search"
         | "code_read" | "code_symbols" | "code_diff" | "operation_get" | "terminal_read"
-        | "file_download" | "workspace_context" | "task_context" => Some("code:read"),
+        | "file_download" | "workspace_context" | "task_context" | "task_resume" => {
+            Some("code:read")
+        }
         "code_apply_edits" | "change_resume" | "workspace_gc" | "files_sync" | "file_upload"
         | "transfer_cancel" | "transfer_resume" | "outcome_resolve" => Some("code:write"),
         "terminal_exec" | "terminal_input" | "terminal_cancel" => Some("terminal:exec"),
@@ -130,10 +132,11 @@ fn build_catalog() -> Vec<Tool> {
     let mut add = |name: &str, description: &str, mut properties: Value, required: Vec<&str>| {
         properties["response_mode"] = json!({"type":"string","enum":["full","compact"],"default":"compact","description":"MCP envelope view; compact is the default. full restores diagnostic metadata."});
         if name != "task_context" {
+            properties["authorization_version"] = json!({"type":"integer","minimum":1,"maximum":9223372036854775807u64,"description":"Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions."});
             properties["task_id"] = json!({"type":"string","description":"Optional correlation label for one authorized cross-device task; it never authorizes or replays work."});
         }
-        let read =
-            scope(name) == Some("code:read") && !matches!(name, "workspace_open" | "file_download");
+        let read = scope(name) == Some("code:read")
+            && !matches!(name, "workspace_open" | "file_download" | "task_resume");
         let value = json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"outputSchema":{"type":"object","additionalProperties":true},"annotations":{"readOnlyHint":read,"destructiveHint":!read&&name!="workspace_open","idempotentHint":true,"openWorldHint":name.starts_with("terminal_")}});
         // Catalog is composed entirely from static, server-controlled JSON.
         if let Ok(tool) = serde_json::from_value(value) {
@@ -145,6 +148,13 @@ fn build_catalog() -> Vec<Tool> {
         "Restore one authorized cross-device task: linked operations, workspaces, execution states, evidence boundaries and the next existing handle. Read-only; never resumes or replays work. Follow next_page when has_more=true. No evidence of a task is not proof of a host rejection.",
         json!({"task_id":string(),"limit":integer(1,100),"after_operation":string(),"cursor":string()}),
         vec!["task_id"],
+    );
+    add(
+        "task_resume",
+        "Explicitly resume an owner-bound task-policy rejection after its authorization version changes. Supply exactly one original request_id or operation_id. Only durable not-started requests and never-dispatched queued jobs are eligible. Keeps the original arguments, CAS versions and idempotency identity. Never resumes unknown, running, completed, platform-denied, or source-policy-rejected work.",
+        json!({"task_id":string(),"authorization_version":integer(1,9223372036854775807u64),
+            "request_id":string(),"operation_id":string()}),
+        vec!["task_id", "authorization_version"],
     );
     add(
         "devices_list",

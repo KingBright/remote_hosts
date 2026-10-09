@@ -1,9 +1,9 @@
 {
-  "adapter_tools_sha256": "42da70ae12b5bfa1bb6c6e97c6d06852492f7277ab45e8f6a459930b6d2c2d68",
+  "adapter_tools_sha256": "6515d87730bbdc7f67ac3dcc4d56c2346e7eca122b2c28b5f831f37fea1b88c0",
   "boundary": "Adapter-sent catalog is not proof of final host exposure. No final host report means unknown.",
   "protocol": 1,
-  "server_tools_sha256": "42da70ae12b5bfa1bb6c6e97c6d06852492f7277ab45e8f6a459930b6d2c2d68",
-  "skill_revision": "5875f702cd705f891a9ce178640ff499aa59dc8a671139100ea3d3cecd9e9e02",
+  "server_tools_sha256": "6515d87730bbdc7f67ac3dcc4d56c2346e7eca122b2c28b5f831f37fea1b88c0",
+  "skill_revision": "6aa3bdbdd86135c9db72bcf2ab8bb8f9017af48fc5c701de898866a7ed1afdc1",
   "tools": [
     {
       "annotations": {
@@ -53,6 +53,55 @@
     },
     {
       "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Explicitly resume an owner-bound task-policy rejection after its authorization version changes. Supply exactly one original request_id or operation_id. Only durable not-started requests and never-dispatched queued jobs are eligible. Keeps the original arguments, CAS versions and idempotency identity. Never resumes unknown, running, completed, platform-denied, or source-policy-rejected work.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "response_mode": {
+            "default": "compact",
+            "description": "MCP envelope view; compact is the default. full restores diagnostic metadata.",
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Optional correlation label for one authorized cross-device task; it never authorizes or replays work.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "authorization_version"
+        ],
+        "type": "object"
+      },
+      "name": "task_resume",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false,
@@ -62,6 +111,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "known_tools_sha256": {
             "type": "string"
           },
@@ -99,6 +154,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "desired_version": {
             "type": "string"
           },
@@ -136,6 +197,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "device_id": {
             "type": "string"
           },
@@ -183,6 +250,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "cursor": {
             "type": "string"
           },
@@ -236,6 +309,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "context_lines": {
             "maximum": 5,
             "minimum": 0,
@@ -308,6 +387,12 @@
         "properties": {
           "allow_partial": {
             "type": "boolean"
+          },
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
           },
           "max_bytes": {
             "maximum": 65536,
@@ -391,6 +476,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "limit": {
             "maximum": 300,
             "minimum": 1,
@@ -444,6 +535,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "files": {
             "items": {
               "additionalProperties": false,
@@ -544,6 +641,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "idempotency_key": {
             "type": "string"
           },
@@ -595,6 +698,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "change_set_id": {
             "type": "string"
           },
@@ -648,6 +757,12 @@
               "apply"
             ],
             "type": "string"
+          },
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
           },
           "idempotency_key": {
             "type": "string"
@@ -706,6 +821,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "cursor": {
             "maximum": 100000000,
             "minimum": 0,
@@ -767,7 +888,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Start a command in the bound workspace. Default pty=false uses real pipes with stdin EOF and combined stdout/stderr; use pty=true only for interactive input. Shell has local-user authority outside code roots. Write-capable action. By default waits up to 1000 ms so short commands can return exit/output in one call; long commands return the same durable terminal_id. wait_ms may be 0..2000 and never stops the command. Follow the returned cursor; never replay uncertain execution. action=maintenance_task uses fixed argv and the shared ordinary-user maintenance core: prepare requires maintenance_action and a canonical maintenance_request_id, run requires the same ID and plan_sha256, verify uses the same ID. Command/PTY fields are forbidden for maintenance; privileged requests remain unavailable. No root grant.",
+      "description": "Start a command in the bound workspace. Default pty=false uses real pipes with stdin EOF and combined stdout/stderr; use pty=true only for interactive input. Shell has local-user authority outside code roots. Write-capable action. By default waits up to 1000 ms so short commands can return exit/output in one call; long commands return the same durable terminal_id. wait_ms may be 0..2000 and never stops the command. Follow the returned cursor; never replay uncertain execution. action=maintenance_task uses fixed argv and the shared ordinary-user maintenance core: prepare requires maintenance_action and a canonical maintenance_request_id; run requires the same ID and plan_sha256; approve records one short-lived approval bound to that plan and authenticated owner/workspace/device; cancel requires the same ID and plan_sha256; verify uses the same ID. A running or unknown request must be recovered through its original operation. Command/PTY fields are forbidden for maintenance; privileged execution remains unavailable. No root grant.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -778,6 +899,12 @@
               "maintenance_task"
             ],
             "type": "string"
+          },
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
           },
           "cols": {
             "maximum": 500,
@@ -804,6 +931,8 @@
             "enum": [
               "prepare",
               "run",
+              "approve",
+              "cancel",
               "verify"
             ],
             "type": "string"
@@ -870,6 +999,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "cursor": {
             "maximum": 100000000,
             "minimum": 0,
@@ -930,6 +1065,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "idempotency_key": {
             "type": "string"
           },
@@ -981,6 +1122,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "idempotency_key": {
             "type": "string"
           },
@@ -1028,6 +1175,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "cursor": {
             "type": "string"
           },
@@ -1100,6 +1253,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "expected_version": {
             "type": "string"
           },
@@ -1181,6 +1340,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "expected_version": {
             "type": "string"
           },
@@ -1251,6 +1416,12 @@
           "after_event": {
             "type": "string"
           },
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "cursor": {
             "type": "string"
           },
@@ -1314,6 +1485,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "idempotency_key": {
             "type": "string"
           },
@@ -1362,6 +1539,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "file": {
             "additionalProperties": false,
             "properties": {
@@ -1427,6 +1610,12 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "authorization_version": {
+            "description": "Current owner-established task grant version. Restricts existing authority; never grants account, device, local-user, or platform permissions.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
           "bundle_path": {
             "type": "string"
           },

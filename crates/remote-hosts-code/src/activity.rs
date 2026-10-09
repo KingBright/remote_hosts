@@ -173,6 +173,33 @@ pub(crate) async fn task(g: &Gateway, p: &Principal, args: &Value) -> Result<Val
             rows.get(id).context("operation_unavailable")?,
         )?);
     }
+    let authorization = crate::task_authorization::view(g, p, task).await?;
+    let rejected: Vec<(String, String)> = sqlx::query_as("SELECT r.key,r.value FROM kv r JOIN kv d ON d.kind='task_deferred' AND d.key=r.key WHERE r.kind='request_receipt' AND json_extract(r.value,'$.owner')=? AND json_extract(r.value,'$.task_id')=? AND json_extract(r.value,'$.operation_id') IS NULL ORDER BY json_extract(r.value,'$.updated_at') DESC LIMIT 20")
+        .bind(&p.owner).bind(task).fetch_all(&g.store.pool).await?;
+    let rejected_requests = rejected
+        .into_iter()
+        .map(|(id, raw)| {
+            let v: Value = serde_json::from_str(&raw)?;
+            Ok(
+                json!({"request_id":id,"tool":v["tool"],"error_code":v["error_code"],
+            "execution_state":v["execution_state"],"state":v["state"],
+            "resume_only_when_not_started":true}),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for item in &mut items {
+        if item["transport_state"] == "queued" {
+            let id = item["operation_id"]
+                .as_str()
+                .context("operation_unavailable")?;
+            item["authorization_blocked"] =
+                json!(crate::task_authorization::blocked(g, p, id).await?);
+        }
+    }
+    let authorization_blocked = items
+        .iter()
+        .filter(|v| v["authorization_blocked"] == true)
+        .count();
     let mut devices = BTreeSet::new();
     let mut workspaces = BTreeSet::new();
     for item in &items {
@@ -190,7 +217,9 @@ pub(crate) async fn task(g: &Gateway, p: &Principal, args: &Value) -> Result<Val
     // does not establish that an unrelated earlier failure has been resolved.
     let next = items
         .iter()
-        .find(|v| v["uncertain"] == true || v["active"] == true)
+        .find(|v| {
+            v["authorization_blocked"] != true && (v["uncertain"] == true || v["active"] == true)
+        })
         .or_else(|| {
             items
                 .iter()
@@ -198,18 +227,18 @@ pub(crate) async fn task(g: &Gateway, p: &Principal, args: &Value) -> Result<Val
         })
         .map(|v| v["operation_id"].clone());
     let identity = hash(serde_json::to_vec(
-        &json!({"task":task,"owner":p.owner,"page":after,"items":items.iter().map(|v|
+        &json!({"task":task,"owner":p.owner,"page":after,"authorization":authorization,"rejected":rejected_requests,"items":items.iter().map(|v|
         json!({"id":v["operation_id"],"state":v["state"],"event":v["last_confirmed_event"]["stage"],"progress":v["last_progress_at"],"stale":v["stale"],"receipt":v["receipt"],"verification":v["verification"]})).collect::<Vec<_>>()}),
     )?);
     let changed = args.get("cursor").and_then(Value::as_str) != Some(identity.as_str());
     Ok(
         json!({"protocol":1,"task_id":task,"scope":"authorized operations linked to this owner and task",
-        "observed_at":now(),"changed":changed,"cursor":identity,
+        "observed_at":now(),"changed":changed,"cursor":identity,"authorization":authorization,"rejected_requests":rejected_requests,
         "operations":if changed{items}else{Vec::<Value>::new()},"devices":devices,"workspaces":workspaces,
-        "summary":{"linked_operations":count,"page_operations":ids.len(),"active_in_page":active,"uncertain_in_page":uncertain},
+        "summary":{"linked_operations":count,"page_operations":ids.len(),"active_in_page":active,"uncertain_in_page":uncertain,"authorization_blocked":authorization_blocked},
         "has_more":more,"scope_complete":!more&&after.is_none(),
         "next_page":if more{ids.last().cloned()}else{None},
-        "next_action":if more{"continue_task_page"}else if next.is_some(){"observe_existing_operation"}else if count==0{"not_observed_or_expired"}else{"no_active_work_in_page"},
+        "next_action":if more{"continue_task_page"}else if next.is_some(){"observe_existing_operation"}else if authorization_blocked>0 || !rejected_requests.is_empty(){"review_task_authorization_then_resume_original"}else if count==0{"not_observed_or_expired"}else{"no_active_work_in_page"},
         "next_operation_id":next,"automatic_replay":false,
         "last_verified_source":null,"verification_note":"Only attached verification receipts prove source/test identity; terminal exit alone does not.",
         "retention_seconds":receipts::RETENTION,"retention_policy":"until_explicit_owner_cleanup"}),

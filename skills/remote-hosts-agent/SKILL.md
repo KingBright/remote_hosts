@@ -15,6 +15,36 @@ and reuse the returned workspace and operation identities. The SSH inventory's
 host IDs are not Code Gateway device IDs. Never silently substitute one for the
 other or fail over an offline device to a different machine.
 
+## Owner-approved continued tasks
+
+A managed task may have a persistent, versioned owner grant. Read its
+task_context authorization and attach task_id plus authorization_version to
+execution calls. The grant only restricts current account/device scopes and
+Agent local flags; it never creates credentials or platform/admin permission.
+A task label alone is correlation, not approval. Keep work within the user's
+already approved scope when the owner is offline; no owner browser login is
+needed again merely to execute an unchanged approved task.
+
+Only the owner establishes or changes a grant through the Gateway's
+/status/task-authorization form using the existing owner password. Do not read,
+enter or transmit that password for the owner. Refer to
+[task authorization](../../docs/task-authorization.md) for the exact scope.
+
+After an owner changes a grant version, use task_resume only for a durable
+task-policy rejection with execution_state=not_started and no operation, or a
+queued operation with no dispatch timestamp. Preserve the original request or
+operation, arguments, file versions and idempotency key. Concurrent resume
+attempts do not authorize duplicates. A recovery claim with no confirmed result
+is unknown and must be observed.
+
+Never use task_resume for platform prompts, local allow-flag denials, generic
+access_denied, source-address policy rejection, credentials/terminal input,
+running/completed work or unknown outcomes. Do not change task labels, omit a
+managed task's binding, choose another device or route, or acquire broader
+scopes to evade a denial. Continue independent authorized work and report the
+specific blocked boundary. This feature neither creates Codex conversations nor
+keeps an external assistant scheduled; those platform controls remain separate.
+
 ## Core Rules
 
 1. Prefer `remote_hosts_*` MCP tools over shelling out to `ssh`, editing the SQLite database, or inventing host state.

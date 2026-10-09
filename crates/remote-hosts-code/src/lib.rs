@@ -32,6 +32,7 @@ mod resumable;
 mod scheduler;
 mod storage_gc;
 pub mod store;
+mod task_authorization;
 pub mod terminal;
 #[cfg(unix)]
 mod terminal_io;

@@ -14,11 +14,27 @@ use sqlx::{Row, Sqlite, query::Query, sqlite::SqliteArguments};
 // no runtime SQL concatenation or unchecked SQL-safety assertion is needed.
 macro_rules! candidate_sql {
     () => { r#"SELECT id FROM (
-    SELECT id,device,request,updated FROM jobs WHERE device=? AND state='queued'
+    SELECT id,device,request,updated,state FROM jobs WHERE device=? AND state='queued'
     UNION ALL
-    SELECT id,device,request,updated FROM jobs WHERE device=? AND state='dispatched' AND updated<?
+    SELECT id,device,request,updated,state FROM jobs WHERE device=? AND state='dispatched' AND updated<?
 ) jobs
 WHERE id NOT IN (SELECT value FROM json_each(?))
+AND (jobs.state='dispatched' OR
+    (CASE WHEN json_extract(request,'$.tool') IN ('code_apply_edits','change_resume','workspace_gc','files_sync','file_upload','transfer_cancel','transfer_resume','outcome_resolve') THEN 'code:write'
+    WHEN json_extract(request,'$.tool') IN ('terminal_exec','terminal_input','terminal_cancel') THEN 'terminal:exec'
+    ELSE 'code:read' END) IN (SELECT value FROM json_each(?)))
+AND (jobs.state='dispatched' OR NOT EXISTS (
+    SELECT 1 FROM kv b WHERE b.kind='operation_task_authorization' AND b.key=jobs.id
+    AND NOT EXISTS (
+        SELECT 1 FROM kv g WHERE g.kind='task_authorization' AND g.key=json_extract(b.value,'$.key')
+        AND g.expires>unixepoch() AND json_extract(g.value,'$.enabled')=1
+        AND json_extract(g.value,'$.owner')=json_extract(b.value,'$.owner')
+        AND json_extract(g.value,'$.task_id')=json_extract(b.value,'$.task_id')
+        AND json_extract(g.value,'$.version')=json_extract(b.value,'$.version')
+        AND EXISTS(SELECT 1 FROM json_each(g.value,'$.devices') WHERE value=jobs.device)
+        AND EXISTS(SELECT 1 FROM json_each(g.value,'$.scopes') WHERE value=json_extract(b.value,'$.scope'))
+    )
+))
 AND (json_extract(request,'$.tool') IN ('code_read','code_list','code_search','code_symbols','code_diff','workspace_context','terminal_read','terminal_cancel')
     OR EXISTS(SELECT 1 FROM kv c WHERE c.kind='transfer_control' AND c.key=jobs.id AND json_extract(c.value,'$.cancel_requested')=1)
     OR NOT EXISTS(SELECT 1 FROM kv WHERE kind='device_drain' AND key=jobs.device AND expires>unixepoch()))
@@ -45,6 +61,7 @@ pub(crate) struct Selection<'a> {
     pub device: &'a str,
     pub session: &'a str,
     pub active: &'a str,
+    pub scopes: &'a str,
     pub lanes: &'a str,
     pub defer_writes: bool,
     pub write_workspaces: &'a str,
@@ -61,6 +78,7 @@ impl Selection<'_> {
             .bind(self.device)
             .bind(at - 30)
             .bind(self.active)
+            .bind(self.scopes)
             .bind(self.lanes)
             .bind(self.defer_writes)
             .bind(self.write_workspaces)
@@ -176,6 +194,7 @@ mod tests {
             device: "device",
             session: "session",
             active: "[]",
+            scopes: r#"["code:read","code:write","terminal:exec"]"#,
             lanes: r#"["read","write","terminal","control","transfer"]"#,
             defer_writes: false,
             write_workspaces: "[]",
@@ -322,6 +341,29 @@ mod tests {
             id
         );
     }
+    #[tokio::test]
+    async fn revoked_device_scope_does_not_dispatch_queued_execution() {
+        let (_d, s) = fixture().await;
+        let id = add(&s, "terminal_exec").await;
+        let mut limited = selection();
+        limited.scopes = r#"["code:read"]"#;
+        assert!(claim(&s, &limited, crate::now()).await.unwrap().is_none());
+        let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE id=?")
+            .bind(&id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "queued");
+        assert_eq!(
+            claim(&s, &selection(), crate::now())
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            id
+        );
+    }
+
     #[tokio::test]
     async fn active_handles_and_busy_terminal_inputs_are_not_claimed() {
         let (_d, s) = fixture().await;
