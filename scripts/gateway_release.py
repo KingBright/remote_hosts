@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gateway-only 0.10.26 publication through the existing owner Bearer API."""
+"""Gateway-only 0.10.26 publication through the owner API and direct human login."""
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -19,6 +19,7 @@ import time
 import gateway_release_stage as staging
 import release_receipts as rr
 from release_client import Client
+from gateway_release_oauth import BrowserOAuth, BrowserOAuthError
 
 VERSION = "0.10.26"
 ORIGIN = "https://mcp.hackerlife.fun"
@@ -46,14 +47,16 @@ def require(condition, code):
 
 def auth_requirement():
     return {
-        "state": "owner_bearer_required",
+        "state": "owner_session_required",
+        "available_modes": ["oauth-browser", "borrow-existing-bearer"],
+        "browser_flow_approved_in_this_task": True,
         "status_login_usable": False,
         "existing_session": "Borrow an already authorized owner Bearer directly in the operator Terminal; never send it to the model.",
         "resource": ORIGIN + "/mcp",
         "scopes": SCOPES,
         "automatic_registration_or_authorization": False,
         "new_authorization_if_no_existing_bearer": {
-            "approval_required": True,
+            "approval_required": False,
             "type": "OAuth authorization_code with PKCE S256; existing registered client preferred",
             "resource": ORIGIN + "/mcp",
             "scopes": SCOPES,
@@ -64,7 +67,7 @@ def auth_requirement():
             "refresh_issuance_can_be_disabled_by_current_protocol": False,
             "persistent_client_or_refresh_storage_by_this_entry": False,
             "client_registration_if_no_reusable_registered_client": {
-                "approval_required": True,
+                "approval_required": False,
                 "type": "OAuth public client registration, token_endpoint_auth_method=none; no client secret",
                 "server_registration_expiry": "none; stored with i64::MAX expiry",
                 "created": False,
@@ -258,6 +261,13 @@ class GatewayRelease:
         for key, expected in self.identity["runtime"].items():
             require(type(value.get(key)) is type(expected) and value.get(key) == expected,
                     "gateway_runtime_identity_mismatch")
+        route_status, route_headers, _ = self.client.call(
+            "/status/task-authorization?task_id=01a1184e-4ede-76a2-aad4-3141c7b4c03c")
+        require(route_status == 200 or (route_status == 303
+                and route_headers.get("Location") == "/status"),
+                "task_authorization_route_not_confirmed")
+        self.save(task_authorization_route={"available": True, "http_status": route_status,
+                  "login_required": route_status == 303, "grant_created": False})
         return {key: value[key] for key in
                 (*self.identity["runtime"], "file_transfer")}
 
@@ -381,14 +391,17 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--execute", action="store_true")
     mode.add_argument("--observe", action="store_true")
-    parser.add_argument("--borrow-existing-bearer", action="store_true",
+    auth_mode = parser.add_mutually_exclusive_group()
+    auth_mode.add_argument("--oauth-browser", action="store_true",
+                          help="Use the approved read/write PKCE grant; owner logs in directly in the default browser")
+    auth_mode.add_argument("--borrow-existing-bearer", action="store_true",
                         help="Owner enters an already authorized Bearer at a hidden Terminal prompt; no OAuth or password-file login")
     args = parser.parse_args()
     os.umask(0o077)
     client, ssh = None, None
     try:
         identity = verify_release(args.build_report)
-        if not (args.execute or args.observe) or not args.borrow_existing_bearer:
+        if not (args.execute or args.observe) or not (args.borrow_existing_bearer or args.oauth_browser):
             result = {"state": "authentication_required", "version": VERSION,
                       "local_verified": identity, "authentication": auth_requirement(),
                       "deployed": False, "agent_actions": 0}
@@ -398,8 +411,12 @@ def main():
             print(json.dumps(result, ensure_ascii=False))
             return 2
         with journal_lock(args.report_dir) as journal:
-            token = borrowed_bearer()
-            client = Client(ORIGIN, access=token, transport="legacy")
+            require(sys.stdin.isatty() and sys.stderr.isatty(), "owner_terminal_required")
+            client = Client(ORIGIN, access=None, transport="legacy")
+            token = (BrowserOAuth(client, args.report_dir).authenticate() if args.oauth_browser
+                     else borrowed_bearer())
+            client.access = token
+            client.refresh = None
             token = None
             # Check existing application authority before asking for SSH import authority.
             ssh = OwnerSSH()
@@ -411,14 +428,14 @@ def main():
             return 0 if result["state"] == "healthy" else 2
     except Exception as error:
         print(json.dumps({"state": "blocked", "error_type": type(error).__name__,
-                          "error_code": error.code if isinstance(error, PublishError) else "publication_not_confirmed",
+                          "error_code": error.code if isinstance(error, (PublishError, BrowserOAuthError)) else "publication_not_confirmed",
                           "deployed": False}, ensure_ascii=False))
         return 2
     finally:
         if ssh is not None:
             ssh.close()
         if client is not None:
-            client.close()  # borrowed access has no refresh family owned by this entry
+            client.close()  # no retained refresh token; access remains only in this process
             client.access = None
 
 

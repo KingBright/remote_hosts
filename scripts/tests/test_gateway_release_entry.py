@@ -123,6 +123,12 @@ class FakeGateway:
                     value["version"] = release.VERSION if owner.installed == owner.identity["plan"]["candidate_sha256"] else owner.current_version
                     value.update(owner.health_change)
                     return self.response(value)
+                if self.path.startswith("/status/task-authorization?"):
+                    self.send_response(303)
+                    self.send_header("Location", "/status")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if self.path == "/admin/status":
                     if not self.permitted():
                         return self.response({"error": "unauthorized"}, 401)
@@ -183,7 +189,8 @@ class FakeGateway:
                 if parsed.scheme != "https" or parsed.netloc != "fixture.invalid":
                     raise AssertionError("test request escaped synthetic origin")
                 mapped = urllib.request.Request(
-                    "http://127.0.0.1:" + str(owner.server.server_port) + parsed.path,
+                    "http://127.0.0.1:" + str(owner.server.server_port) + parsed.path
+                    + (("?" + parsed.query) if parsed.query else ""),
                     data=request.data, headers=dict(request.headers), method=request.get_method())
                 # This isolated adapter translates only synthetic HTTPS to loopback HTTP.
                 # Production Client HTTPS/TLS policy is unchanged; no test keys are needed.
@@ -238,7 +245,8 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn(self.gateway.token, self.journal.read_text())
         self.assertEqual(set(self.gateway.requests),
                          {("GET", "/admin/status"), ("POST", "/mcp"),
-                          ("POST", "/admin/gateway-upgrade"), ("GET", "/healthz")})
+                          ("POST", "/admin/gateway-upgrade"), ("GET", "/healthz"),
+                      ("GET", "/status/task-authorization?task_id=01a1184e-4ede-76a2-aad4-3141c7b4c03c")})
 
     def test_status_cookie_value_cannot_replace_bearer_and_no_import_occurs(self):
         client = self.gateway.client("a" * 64)
@@ -391,6 +399,31 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(result["state"], "authentication_required")
         self.assertEqual(result["agent_actions"], 0)
         self.assertEqual(self.gateway.posts, 0)
+
+    def test_oauth_flag_without_execution_remains_local_plan(self):
+        report_dir = self.root / "oauth-plan"
+        with mock.patch.object(sys, "argv", ["gateway_release.py", "--report-dir",
+                str(report_dir), "--oauth-browser"]), \
+                mock.patch.object(release, "verify_release", return_value=self.identity), \
+                mock.patch.object(release, "BrowserOAuth") as oauth_flow, \
+                mock.patch.object(release, "Client") as client, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(release.main(), 2)
+        client.assert_not_called()
+        oauth_flow.assert_not_called()
+        self.assertEqual(self.gateway.posts, 0)
+
+    def test_noninteractive_oauth_execution_stops_before_client_creation(self):
+        report_dir = self.root / "noninteractive"
+        with mock.patch.object(sys, "argv", ["gateway_release.py", "--report-dir",
+                str(report_dir), "--execute", "--oauth-browser"]), \
+                mock.patch.object(release, "verify_release", return_value=self.identity), \
+                mock.patch.object(release.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(release, "Client") as client, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(release.main(), 2)
+        client.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())["error_code"], "owner_terminal_required")
 
     def test_no_new_oauth_claims_shorter_expiry_than_server_protocol(self):
         auth = release.auth_requirement()["new_authorization_if_no_existing_bearer"]
