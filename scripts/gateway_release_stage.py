@@ -155,35 +155,46 @@ def discover_nas():
     return identity
 
 
-def identify():
-    require(os.geteuid() == 0, "existing_management_account_required")
+def systemctl_main_pid():
+    # systemd 219 supports property output but not the later --value option.
     try:
         result = subprocess.run(
-            ["systemctl", "show", SERVICE, "--property=MainPID", "--value"],
+            ["systemctl", "show", SERVICE, "--property=MainPID"],
             capture_output=True, timeout=10, check=False)
-        pid = int(result.stdout.decode("ascii").strip()) if result.returncode == 0 else None
+        if result.returncode != 0:
+            return None
+        rows = result.stdout.decode("ascii").strip().splitlines()
+        values = [line[len("MainPID="):] for line in rows if line.startswith("MainPID=")]
+        if len(values) != 1 or not values[0].isdecimal():
+            return None
+        return int(values[0])
     except (OSError, subprocess.SubprocessError, ValueError):
-        pid = None
+        return None
+
+
+def identify():
+    require(os.geteuid() == 0, "existing_management_account_required")
+    pid = systemctl_main_pid()
     if pid is None:
         return discover_nas()
     require(pid > 1, "gateway_not_running")
     identity = checked_identity(pid)
     identity["discovery"] = "systemd_main_pid"
+    if identity["root"] == NAS_ROOT:
+        require(owns_gateway_listener(pid), "gateway_listener_identity_mismatch")
+        identity["public_health"] = nas_public_identity(identity)
     return identity
 
 
 def publication_controller():
     runner = shutil.which("systemd-run")
-    try:
-        result = subprocess.run(
-            ["systemctl", "show", SERVICE, "--property=MainPID", "--value"],
-            capture_output=True, timeout=10, check=False)
-        service_ready = result.returncode == 0 and int(result.stdout.decode("ascii").strip()) > 1
-    except (OSError, subprocess.SubprocessError, ValueError):
-        service_ready = False
+    pid = systemctl_main_pid()
+    service_ready = pid is not None and pid > 1
     return {"systemd_run_available": bool(runner), "service_control_verified": service_ready,
             "ready": bool(runner) and service_ready,
             "error_code": None if runner and service_ready else "gateway_publication_controller_unavailable"}
+
+
 def release_paths(identity):
     root = identity["root"]
     releases = root / "releases"
@@ -282,6 +293,47 @@ def inspect_bundle(path, plan):
         return manifest
 
 
+def stage_completion(release, plan, *, write=False):
+    operation = plan.get("stage_operation_id")
+    if operation is not None:
+        require(isinstance(operation, str) and 1 <= len(operation) <= 128
+                and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._"
+                        for c in operation), "invalid_stage_operation_identity")
+    path = release / "bundle-stage-complete.json"
+    if os.path.lexists(path):
+        value = small_json(path)
+        require(set(value) == {"state", "version", "bundle_sha256", "bundle_bytes", "operation_id"}
+                and value["state"] == "staged" and value["version"] == VERSION
+                and value["bundle_sha256"] == plan["bundle_sha256"]
+                and value["bundle_bytes"] == plan["bundle_bytes"]
+                and isinstance(value["operation_id"], str)
+                and (operation is None or value["operation_id"] == operation),
+                "stage_completion_identity_conflict")
+        return value
+    if not write or operation is None:
+        return None
+    value = {"state": "staged", "version": VERSION, "bundle_sha256": plan["bundle_sha256"],
+             "bundle_bytes": plan["bundle_bytes"], "operation_id": operation}
+    fd, name = tempfile.mkstemp(prefix=".bundle-stage-complete-", dir=release)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Atomic, exclusive completion: no published marker is replaced.
+        os.link(temporary, path)
+        directory_fd = os.open(release, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return value
+
+
 def probe(plan):
     validate_plan(plan)
     try:
@@ -318,6 +370,9 @@ def probe(plan):
         value["bundle_staged"] = True
         value["bundle_sha256"] = plan["bundle_sha256"]
         value["bundle_bytes"] = plan["bundle_bytes"]
+    completion = stage_completion(release, plan)
+    require(completion is None or value["bundle_staged"], "completion_without_verified_bundle")
+    value["stage_completion"] = completion
     marker_path = release / "self-upgrade-request.json"
     result_path = release / "self-upgrade-result.json"
     if os.path.lexists(marker_path):
@@ -343,7 +398,8 @@ def stage(plan, stream):
     require(not before["marker_present"] and not before["result_present"],
             "existing_upgrade_requires_observation")
     if before["bundle_staged"]:
-        return before
+        stage_completion(Path(before["bundle_path"]).parent, plan, write=True)
+        return probe(plan)
     identity = identify()
     release, bundle = release_paths(identity)
     require(shutil.disk_usage(identity["root"]).free >= RESERVE + MAX_EXPANDED
@@ -385,6 +441,7 @@ def stage(plan, stream):
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+        stage_completion(release, plan, write=True)
         return probe(plan)
     finally:
         if partial is not None:

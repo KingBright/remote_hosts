@@ -185,7 +185,7 @@ class OwnerSSH:
                     and rr.digest(bundle) == plan["bundle_sha256"], "bundle_changed_before_import")
             payload += Path(bundle).read_bytes()
         value = subprocess.run(args, input=payload, capture_output=True,
-                               timeout=90, check=False)
+                               timeout=600 if action == "stage" else 90, check=False)
         require(len(value.stdout) <= 65536, "staging_receipt_budget")
         # stderr may contain private transport detail; never persist or print it.
         if value.returncode != 0:

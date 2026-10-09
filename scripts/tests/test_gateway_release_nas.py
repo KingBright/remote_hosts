@@ -114,6 +114,29 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertFalse(stage.publication_controller()["ready"])
 
 
+    def test_systemd219_property_format_is_supported_without_value(self):
+        with mock.patch.object(stage.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, b"MainPID=123\n", b"")) as run:
+            self.assertEqual(stage.systemctl_main_pid(), 123)
+        self.assertNotIn("--value", run.call_args.args[0])
+
+    def test_ambiguous_or_malformed_mainpid_is_not_accepted(self):
+        for output in (b"123", b"MainPID=12\nMainPID=13", b"MainPID=private"):
+            with mock.patch.object(stage.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0, output, b"private")):
+                self.assertIsNone(stage.systemctl_main_pid())
+
+    def test_completion_is_atomic_and_original_identity_is_preserved(self):
+        plan = dict(PackageFixture(self.root).identity()["plan"], stage_operation_id="owned-stage-01")
+        directory = self.root / "receipt"
+        directory.mkdir()
+        first = stage.stage_completion(directory, plan, write=True)
+        self.assertEqual(stage.stage_completion(directory, plan), first)
+        self.assertEqual(list(directory.glob(".bundle-stage-complete-*")), [])
+        with self.assertRaises(stage.StageError):
+            stage.stage_completion(directory, dict(plan, stage_operation_id="other-operation"), write=True)
+
+
 class PreOAuthTests(unittest.TestCase):
     def test_controller_failure_stops_before_oauth_and_persists_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
