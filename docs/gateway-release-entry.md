@@ -1,8 +1,9 @@
 # Gateway-only 0.10.26 release entry
 
-This entry publishes only Gateway 0.10.26 at https://mcp.hackerlife.fun using
-the original frozen bundle and owner API. It runs outside that release; it does
-not rebuild it or upgrade Agents.
+This entry validates only Gateway 0.10.26 at https://mcp.hackerlife.fun against
+the original frozen bundle. It runs outside that release and does not rebuild it
+or upgrade Agents. The NAS deployment below used the explicitly selected existing
+administrator SSH maintenance path; the owner API remains unavailable there.
 
 ## Direct owner login
 
@@ -89,8 +90,9 @@ create another grant. A separately available already-authorized session can use
 
 Success requires the running Linux SHA, version, wire protocol, global tool
 count/hash, Skill revision, TaskGrant protocol and file-transfer health to match
-the manifest. The read-only TaskGrant route must exist or redirect to its login
-guard; no TaskGrant is created. Scoped OAuth tools/list checks write authority
+the manifest. The read-only TaskGrant route must exist, redirect to its login guard, or return
+the exact known 401 owner-login HTML. An unrelated 401 response fails acceptance;
+no TaskGrant is created. Scoped OAuth tools/list checks write authority
 without broadening the grant to expose every tool.
 
 Immutable updater backup/cutover/rollback checks remain authoritative. A rollback
@@ -106,8 +108,8 @@ binary/health checks succeed.
 
 ## Verified NAS checkpoint (2026-10-09)
 
-Existing NAS SSH authentication succeeds without a password. Gateway 0.10.25
-runs as PID 12270 from the canonical Entware directory, supervised by the existing
+Existing NAS SSH authentication succeeds without a password. At the initial
+checkpoint Gateway 0.10.25 ran as PID 12270 from the canonical Entware directory, supervised by the existing
 systemd 219 unit (not an Entware init script). At the first checkpoint the 0.10.26
 release directory did not exist. Original transfer
 `64b45061-9e0d-4b94-bd6a-31a1c709b120` completed with 31,956,930 bytes and SHA
@@ -139,14 +141,14 @@ mode 0400, while the release parent remains root-owned 0700. No ownership, mode,
 unit, account, config or authentication change was made. The owner API publication
 gate remains blocked; it was not called to discover these failures.
 
-### Concrete compatible publication proposal (not executed)
+### Selected compatible publication path
 
 The repository already supplies `gateway_upgrade_ssh` in `scripts/fleet-upgrade.py`.
 It runs the packaged `upgrade-code-gateway.py` once as the existing root SSH
 administrator, directly controlling the existing systemd unit. That updater uses
 the supported MainPID property format and does not require systemd-run. Reuse
-this maintenance path for NAS, after explicitly selecting this publication-mode
-change; do not pretend the unsupported owner self-upgrade API succeeded.
+this maintenance path for NAS, after the owner's explicit publication-mode selection and approval recorded
+below; do not claim the unsupported owner self-upgrade API succeeded.
 
 Reuse the verified persistent bundle without another transfer. Extract only
 verified regular members, preserve the candidate's packaged executable mode,
@@ -166,10 +168,50 @@ outcomes observe the original maintenance receipt, never rerun the updater.
 
 This proposal adds no daemon, privilege grant, polkit/sudo rule, PATH shim or
 systemd installation. It changes the selected publication channel to the existing
-administrator SSH flow. No switch, new OAuth login or server authentication
-modification is performed while that channel selection remains pending. The
+administrator SSH flow. The owner selected this channel and explicitly approved this single upgrade.
+No new OAuth login or server authentication modification was performed. The
 0.10.26 owner self-upgrade API still needs a separately reviewed future platform
 solution; bootstrapping this release does not fix that API.
+
+### Actual deployment and acceptance (2026-10-09)
+
+The owner's direct confirmation, **批准本次升级**, authorized the original frozen
+0.10.26 Gateway-only updater with existing root SSH, service stop/start and binary
+replacement, while retaining backups, permissions and authentication. The original
+operation `5a5c1653-3c3a-468c-99ee-e2e10f2dab82` completed; semantic identity
+`nas-gw-0.10.26-deploy-01`. The one-shot worker PID 9040 ran the original packaged
+updater once, with exit code 0 and result `upgraded`. Unknown results were observed,
+never replayed.
+
+Final read-only acceptance operation `4c24dbb9-0ea7-438c-a4ac-65a3dcb184e2`
+confirmed the existing service active/running, Gateway PID 9333, unchanged UID
+18787, and the exact installed Linux SHA
+`2c9d259c73f436384b9e3c2d562f5e7d4c5a88515be69df567383a0480943523`.
+Loopback health returned 200 with version 0.10.26, wire protocol 2, 25 tools,
+matching manifest schema/Skill hashes, file transfer enabled and TaskGrant protocol
+1. The TaskGrant route returned the exact expected 401 owner-login guard without
+creating a grant. Release parent root 0700, config UID/GID 18787 mode 0400, existing
+unit and privilege-drop launcher hashes remained unchanged.
+
+The original binary and consistent database backups remain at
+`/volume1/@entware-opt/remote-hosts-code/releases/before-0.10.26-20261009T193852`.
+The binary matches the pre-upgrade SHA; `state.sqlite` is 279,674,880 bytes.
+NAS free space remains over 4 GiB. No backup or live policy database was removed
+or restored. No Agents, OAuth settings, accounts, credentials or network settings
+were changed.
+
+Authenticated public MCP resumed and independently reported Gateway 0.10.26,
+25 tools and schema SHA
+`6515d87730bbdc7f67ac3dcc4d56c2346e7eca122b2c28b5f831f37fea1b88c0`,
+with Gateway convergence true. A separate anonymous Mac HTTPS probe returned 403
+for both health and the TaskGrant route; its cause is not established. Public
+anonymous HTTP acceptance remains unconfirmed; this is not evidence that the
+authenticated MCP deployment failed.
+
+The durable sanitized receipt is
+`/Users/jinliang/Workspace/Codex/2026-10-08/task/task-auth-release-0.10.26/recovery-01/gateway-entry-implementation/nas-deploy-01/acceptance.json`.
+It binds original execution, retained backups, exact local acceptance, public MCP
+evidence and the separate 403 limitation.
 
 ## Future in-system iteration acceptance
 
@@ -180,3 +222,21 @@ rollback; observation of unknown outcomes without replay; and continuation of
 independent work. Durable release artifacts must be distinct from expiring transfer
 blobs, and supported deployment controllers must be checked before OAuth. The
 system must never grant itself higher privilege or bypass authentication.
+
+## Long-term authorization and cross-task evidence requirement
+
+The owner requested revocable, scoped long-term authorization and reliable
+cross-task transmission of its evidence, to avoid repeating confirmation for the
+same already-authorized action. The parent task subsequently confirmed that the
+long-term rule card was saved as revision 3. This records the reported rule state;
+the revocable scoped authorization and cross-task evidence mechanism remains a
+product requirement until its implementation and enforcement are verified.
+
+Acceptance must preserve the human confirmation, principal, device/resource,
+allowed actions, version/artifact and operation limits, lifetime, revocation
+state and source task; dependent tasks must receive verifiable evidence before
+acting. State inquiries are not new authorization. Reuse valid in-scope evidence,
+while keeping platform-mandated confirmation and expansion of security scope
+separate. Never infer approval from elapsed time, another task's request, or an
+unknown operation, and never replay an uncertain maintenance execution. Current
+upgrade completion is independent of this future mechanism.

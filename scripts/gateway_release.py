@@ -295,13 +295,15 @@ class GatewayRelease:
         for key, expected in self.identity["runtime"].items():
             require(type(value.get(key)) is type(expected) and value.get(key) == expected,
                     "gateway_runtime_identity_mismatch")
-        route_status, route_headers, _ = self.client.call(
+        route_status, route_headers, route_body = self.client.call(
             "/status/task-authorization?task_id=01a1184e-4ede-76a2-aad4-3141c7b4c03c")
-        require(route_status == 200 or (route_status == 303
+        owner_guard = (route_status == 401 and route_body ==
+                       b"<a href=\'/status\'>Sign in as the Gateway owner</a>")
+        require(route_status == 200 or owner_guard or (route_status == 303
                 and route_headers.get("Location") == "/status"),
                 "task_authorization_route_not_confirmed")
         self.save(task_authorization_route={"available": True, "http_status": route_status,
-                  "login_required": route_status == 303, "grant_created": False})
+                  "login_required": route_status in (303, 401), "grant_created": False})
         return {key: value[key] for key in
                 (*self.identity["runtime"], "file_transfer")}
 

@@ -355,6 +355,26 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.gateway.posts, 1)
         self.assertNotIn("stage", self.gateway.ssh_actions)
 
+    def test_real_owner_status_guard_401_confirms_route_without_new_login(self):
+        health = dict(self.identity["runtime"], file_transfer=True)
+        with mock.patch.object(self.client, "call", side_effect=[
+                (200, {}, encode(health)),
+                (401, {}, b"<a href='/status'>Sign in as the Gateway owner</a>")]):
+            self.coordinator().health()
+        saved = json.loads(self.journal.read_text())
+        self.assertTrue(saved["task_authorization_route"]["login_required"])
+        self.assertFalse(saved["task_authorization_route"]["grant_created"])
+        self.assertEqual(self.gateway.posts, 0)
+
+    def test_unrelated_401_is_not_accepted_as_task_authorization_route(self):
+        health = dict(self.identity["runtime"], file_transfer=True)
+        with mock.patch.object(self.client, "call", side_effect=[
+                (200, {}, encode(health)), (401, {}, b"unrelated proxy rejection")]), \
+                self.assertRaises(release.PublishError) as caught:
+            self.coordinator().health()
+        self.assertEqual(caught.exception.code, "task_authorization_route_not_confirmed")
+        self.assertEqual(self.gateway.posts, 0)
+
     def test_changed_semantic_identity_cannot_reuse_journal(self):
         first = self.coordinator()
         other = dict(self.identity, plan=dict(self.identity["plan"], bundle_sha256="0" * 64))
