@@ -9,14 +9,15 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.parse
 import urllib.request
 
 VERSION = "0.10.26"
 SERVICE = "remote-hosts-code-gateway.service"
 APPROVED_ROOT = Path("/opt/remote-hosts-code")
-NAS_ROOT = Path("/volume1/@entware-opt/remote-hosts-code")
+NAS_ROOT = None  # Bound to the explicit deployment plan before any remote probe.
 PROC_ROOT = Path("/proc")
-PUBLIC_HOST = "mcp.hackerlife.fun"
+PUBLIC_HOST = "mcp.example.com"
 PUBLIC_ORIGIN = "https://" + PUBLIC_HOST
 BINARY_IDENTITIES = {
     "0.10.25": "947d03f345d3668d372bdfa404d70e3bbcaa50de450164517c67c6f6439e9f20",
@@ -56,9 +57,38 @@ def regular(path):
     require(not path.is_symlink() and path.is_file(), "not_regular_file")
 
 
+def configure_target(plan):
+    global NAS_ROOT, PUBLIC_HOST, PUBLIC_ORIGIN
+    origin, value = plan.get("origin"), plan.get("installation_root")
+    require(isinstance(origin, str) and isinstance(value, str),
+            "deployment_target_required")
+    require(1 <= len(origin) <= 2048
+            and not any(ord(c) <= 32 or ord(c) == 127 or c == "\\" for c in origin),
+            "invalid_gateway_origin")
+    try:
+        uri = urllib.parse.urlsplit(origin)
+        port = uri.port
+    except ValueError:
+        raise StageError("invalid_gateway_origin") from None
+    require(uri.scheme == "https" and bool(uri.hostname) and uri.username is None
+            and uri.password is None and not uri.path and not uri.query and not uri.fragment
+            and (port is None or 1 <= port <= 65535)
+            and urllib.parse.urlunsplit(uri) == origin, "invalid_gateway_origin")
+    require(len(value) <= 4096
+            and not any(ord(c) < 32 or ord(c) == 127 for c in value),
+            "invalid_installation_root")
+    root = Path(value)
+    require(root.is_absolute() and root != Path("/") and ".." not in root.parts
+            and "." not in value.split("/") and str(root) == value,
+            "invalid_installation_root")
+    NAS_ROOT, PUBLIC_ORIGIN, PUBLIC_HOST = root, origin, uri.netloc
+
+
 def approved_root(root):
-    # Entware's /opt alias is never traversed for writes; use the verified real root.
-    return root == NAS_ROOT or root == APPROVED_ROOT or APPROVED_ROOT in root.parents
+    # Explicit deployments are bound to one exact existing root; aliases are never followed.
+    if NAS_ROOT is not None:
+        return root == NAS_ROOT
+    return root == APPROVED_ROOT or APPROVED_ROOT in root.parents
 
 
 def checked_identity(pid):
@@ -457,6 +487,8 @@ def main():
         request = json.loads(raw)
         require(set(request) == {"action", "plan"}
                 and request["action"] in ("probe", "stage"), "invalid_staging_action")
+        phase = "deployment_target_validation"
+        configure_target(request["plan"])
         phase = request["action"]
         result = stage(request["plan"], sys.stdin.buffer) if phase == "stage" else probe(request["plan"])
         print(json.dumps(result, sort_keys=True))

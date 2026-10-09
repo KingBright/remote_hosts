@@ -246,7 +246,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(set(self.gateway.requests),
                          {("GET", "/admin/status"), ("POST", "/mcp"),
                           ("POST", "/admin/gateway-upgrade"), ("GET", "/healthz"),
-                      ("GET", "/status/task-authorization?task_id=01a1184e-4ede-76a2-aad4-3141c7b4c03c")})
+                      ("GET", "/status/task-authorization?task_id=gateway-release-route-check")})
 
     def test_status_cookie_value_cannot_replace_bearer_and_no_import_occurs(self):
         client = self.gateway.client("a" * 64)
@@ -446,7 +446,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())["error_code"], "owner_terminal_required")
 
     def test_no_new_oauth_claims_shorter_expiry_than_server_protocol(self):
-        auth = release.auth_requirement()["new_authorization_if_no_existing_bearer"]
+        plan = release.auth_requirement()
+        self.assertFalse(plan["browser_flow_approved_in_this_task"])
+        self.assertFalse(plan["ssh"]["existing_ssh_key_or_agent_reuse_authorized"])
+        auth = plan["new_authorization_if_no_existing_bearer"]
+        self.assertTrue(auth["approval_required"])
+        self.assertTrue(auth["client_registration_if_no_reusable_registered_client"]["approval_required"])
         self.assertEqual(auth["scopes"], ["code:read", "code:write"])
         self.assertEqual(auth["access_seconds"], 3600)
         self.assertEqual(auth["refresh_seconds"], 2592000)

@@ -147,7 +147,9 @@ class PreOAuthTests(unittest.TestCase):
             ssh.last_outcome = {"exit_code": 0, "category": "connected"}
             ssh.request.return_value = {"publication_controller": {"ready": False}}
             with mock.patch.object(release.sys, "argv", ["gateway_release.py", "--report-dir",
-                 str(report), "--execute", "--oauth-browser"]), \
+                 str(report), "--execute", "--oauth-browser", "--origin", release.ORIGIN,
+                 "--ssh-account", "owner@gateway.example",
+                 "--installation-root", "/srv/remote-hosts-code"]), \
                  mock.patch.object(release.sys.stdin, "isatty", return_value=True), \
                  mock.patch.object(release.sys.stderr, "isatty", return_value=True), \
                  mock.patch.object(release, "verify_release", return_value=identity), \
@@ -158,7 +160,8 @@ class PreOAuthTests(unittest.TestCase):
                 self.assertEqual(release.main(), 2)
             client.assert_not_called()
             oauth.assert_not_called()
-            ssh.request.assert_called_once_with("probe", identity["plan"])
+            ssh.request.assert_called_once_with("probe", dict(identity["plan"],
+                origin=release.ORIGIN, installation_root="/srv/remote-hosts-code"))
             self.assertTrue((report / "gateway-preflight.json").is_file())
             failure = json.loads(output.getvalue())
             self.assertEqual(failure["error_code"], "gateway_publication_controller_unavailable")

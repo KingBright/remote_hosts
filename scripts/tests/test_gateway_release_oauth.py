@@ -19,6 +19,7 @@ import release_receipts as rr
 
 class FakeClient:
     def __init__(self):
+        self.origin = oauth.ORIGIN
         self.calls = []
         self.register_fail = False
         self.exchange_fail = False
@@ -56,7 +57,8 @@ class FakeClient:
 
 class FakeCallback:
     last = None
-    def __init__(self, state, port=0):
+    def __init__(self, state, port=0, *, origin=oauth.ORIGIN):
+        self.origin = origin
         self.state, self.port = state, port or 54321
         self.closed = False
         FakeCallback.last = self
@@ -169,15 +171,15 @@ class OAuthTests(unittest.TestCase):
 
 class CallbackTests(unittest.TestCase):
     def test_callback_rejects_wrong_identity_and_serves_code_free_redirect(self):
-        callback = oauth.Callback("synthetic-state")
+        callback = oauth.Callback("synthetic-state", origin="https://other.example")
         self.addCleanup(callback.close)
         code = []
         worker = threading.Thread(target=lambda: code.append(callback.wait(seconds=10)))
         worker.start()
         conn = HTTPConnection("127.0.0.1", callback.server.server_port, timeout=3)
-        base = {"code": "synthetic-code", "state": "synthetic-state", "iss": oauth.ORIGIN}
+        base = {"code": "synthetic-code", "state": "synthetic-state", "iss": "https://other.example"}
         with contextlib.redirect_stderr(io.StringIO()):
-            for altered in (dict(base, state="wrong"), dict(base, iss="https://wrong.invalid")):
+            for altered in (dict(base, state="wrong"), dict(base, iss=oauth.ORIGIN)):
                 conn.request("GET", "/callback?" + urllib.parse.urlencode(altered))
                 response = conn.getresponse()
                 self.assertEqual(response.status, 400)

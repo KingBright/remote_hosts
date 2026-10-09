@@ -66,7 +66,7 @@
     "protocol-1 terminal alias compatibility without weakening explicit/protocol-2 identity"
   ],
   "limits": [
-    "The aggregate gate remains blocked by the pre-existing public repository identity guard.",
+    "The initial aggregate gate failed the pre-existing public repository identity guard; public_boundary_followup records its later repair and final successful gate.",
     "Live production transport fault injection was not performed; native disconnect coverage uses an isolated mock and existing stdio fixtures.",
     "Retained original deployment output was recovered using read-only public tools; this does not rerun installation or establish Agent fleet convergence."
   ],
@@ -77,5 +77,135 @@
     "machine": "arm64",
     "python": "3.14.3"
   },
-  "experiment_entry": "README.md"
+  "experiment_entry": "README.md",
+  "public_boundary_followup": {
+    "base_commit": "780026a3e80f95f404b553dd7ffd67663039aca7",
+    "classification": "committed public-source instance identity, not untracked/worktree pollution",
+    "failed_test": "test_public_repository_boundaries.PublicRepositoryBoundaryTests.test_active_public_surfaces_have_no_known_instance_identity",
+    "original_affected_files": 4,
+    "original_marker_violations": 7,
+    "guard_unchanged_sha256": "021ab75d521eb0557d0ce752eba5c2d586ddde8e08b37bdd3bad67acfa912ce5",
+    "new_protection_tests": 7,
+    "boundary_red": {
+      "exit_code": 1,
+      "elapsed_seconds": 0.414,
+      "log_bytes": 2755,
+      "log_sha256": "8528e277d1ccb82e04f93571d3f62e5a5055adf856000438d34de7c58be1b7d2",
+      "head": "780026a3e80f95f404b553dd7ffd67663039aca7"
+    },
+    "configuration_red": {
+      "exit_code": 1,
+      "elapsed_seconds": 0.961,
+      "log_bytes": 18994,
+      "log_sha256": "e5b41e691b02b59ca2c65e5f8f73d967d4ec5b22b9848f8b0ec01925e16d7a42"
+    },
+    "first_regression": {
+      "tests_run": 74,
+      "failures": 1,
+      "errors": 0,
+      "skipped": 0,
+      "exit_code": 1,
+      "elapsed_seconds": 17.776,
+      "log_bytes": 13988,
+      "log_sha256": "2685e0f8b39649dd681ec434632c6f9964d1ccf0a39a8657a861edb34e7d3a06"
+    },
+    "final_python_gate": {
+      "profile": "release_python",
+      "process_exit_code": 0,
+      "gate_passed": true,
+      "tests_run": 451,
+      "test_seconds": 57.934,
+      "elapsed_seconds": 60.514,
+      "log_bytes": 77231,
+      "log_sha256": "d250f2fddf4a0d5b168bbdcc0421d1d7fc55601387bd49ff746d19ea3987ddfc",
+      "python_inputs_unchanged": true,
+      "python_input_manifest_sha256": "ed06437906889e284f280061d3488f07333583f614663ca12a44953211df0fc1",
+      "free_bytes_before": 109145436160,
+      "free_bytes_after": 109034065920,
+      "checks": [
+        "scope audit",
+        "git diff --check",
+        "selected JSON parse",
+        "canonical backlog consistency",
+        "changed Python compilation",
+        "all Python unittest with ResourceWarning errors"
+      ],
+      "repeat_reason": "Final review removed inherited per-task OAuth and SSH approval claims; one existing lifetime test gained explicit no-inherited-approval assertions.",
+      "passed": 450,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 1
+    },
+    "source_sha256": {
+      "scripts/gateway_release.py": "184ba90e911cdae9d864dcd026cc12a35b8c17e8055c4c48cb218937322216a6",
+      "scripts/gateway_release_oauth.py": "ae6415f9e8838d93529e48c87902a421135382981fd0da4ed67cb7f2b5622010",
+      "scripts/gateway_release_stage.py": "92be3bda13bb9d137104502727640486c316ce37759ad94d3ce02e4a0825efdb",
+      "scripts/tests/test_gateway_release_ssh_failures.py": "5dae97dd313878d88bfe69454ca65177863e51740b9cc973e76d161823045adb",
+      "scripts/tests/test_gateway_release_oauth.py": "f6ea1f7420554c16f306e54d0dd310a715a52e8d47a54a45ca870b7a4a891b35",
+      "scripts/tests/test_gateway_release_nas.py": "8e5edb9239433e3bfd8a3588f53ef0aec6bc098517a66c6191fd75dab06cd19f",
+      "scripts/tests/test_gateway_release_entry.py": "ab2c8cb512a1d60e483b6e195323157007bbf8ab465491a3c581bb5c216f0354"
+    },
+    "connection_public_metadata": {
+      "tracked_publication_manifest_candidates": [],
+      "candidate_count": 0,
+      "public_document_search_matches": 0,
+      "connection_type": "unconfirmed",
+      "app_permission_lookup": "found; returns permission only",
+      "gui_lookup": "blocked by symlinked writable root",
+      "publication_lookup_limit": "No connection type, connector ID, published revision or tool-catalog version available from allowed metadata."
+    },
+    "coverage": [
+      "explicit target before execution/observation authentication",
+      "strict origin/SSH/root/port inputs",
+      "one SSH target and port for connect/request/close",
+      "target-bound immutable journal identity",
+      "configured OAuth issuer/resource/callback",
+      "exact configured installation scope",
+      "staging target validation before process probe"
+    ],
+    "authorization_probe_status": "human-approved, unissued; no authorization_version exposed; expiry clock not started",
+    "production_side_effects": false,
+    "verification_limit": "Isolated fixtures, loopback and temporary directories; no production SSH/OAuth/publication or host catalog refresh",
+    "first_full_python_gate": {
+      "profile": "release_python",
+      "process_exit_code": 0,
+      "gate_passed": true,
+      "tests_run": 451,
+      "test_seconds": 54.627,
+      "elapsed_seconds": 56.209,
+      "log_bytes": 77233,
+      "log_sha256": "5dbbbade36a21862bac50334da2a57796907647f09b2de8828adec24ed84c137",
+      "python_inputs_unchanged": true,
+      "python_input_manifest_sha256": "c4abc7c493eecb727e7ee94dc79597dd711cd8e109af14f453e4f0946f79ec39",
+      "free_bytes_before": 109423284224,
+      "free_bytes_after": 109416718336,
+      "checks": [
+        "scope audit",
+        "git diff --check",
+        "selected JSON parse",
+        "canonical backlog consistency",
+        "changed Python compilation",
+        "all Python unittest with ResourceWarning errors"
+      ],
+      "passed": 450,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 1
+    },
+    "inherited_approval_red": {
+      "process_exit_code": 1,
+      "tests_run": 1,
+      "failures": 1,
+      "elapsed_seconds": 24.313,
+      "log_sha256": "669126a0b7dc594b0b3a7db5f45ce6ea6a5428a12edb4d7b19a6619031223f31",
+      "log_bytes": 966
+    },
+    "approval_correction": "Public local plans never inherit a prior task OAuth/client-registration/SSH approval; existing grant scopes and lifetimes remain unchanged.",
+    "current_exposed_host_schema": {
+      "available_remote_tools": 24,
+      "task_resume_available": false,
+      "authorization_version_argument_available": false,
+      "refresh_api_available": false
+    }
+  }
 }

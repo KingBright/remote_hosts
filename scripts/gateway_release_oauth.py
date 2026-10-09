@@ -15,7 +15,7 @@ import urllib.parse
 
 import release_receipts as rr
 
-ORIGIN = "https://mcp.hackerlife.fun"
+ORIGIN = "https://mcp.example.com"  # Reserved fixture/example origin.
 SCOPES = ("code:read", "code:write")
 
 
@@ -30,6 +30,22 @@ def require(condition, code):
         raise BrowserOAuthError(code)
 
 
+def checked_origin(value):
+    require(isinstance(value, str) and 1 <= len(value) <= 2048
+            and not re.search(r"[\x00-\x20\x7f\\]", value), "invalid_gateway_origin")
+    try:
+        uri = urllib.parse.urlsplit(value)
+        port = uri.port
+    except ValueError:
+        raise BrowserOAuthError("invalid_gateway_origin") from None
+    require(uri.scheme == "https" and bool(uri.hostname)
+            and uri.username is None and uri.password is None and not uri.path
+            and not uri.query and not uri.fragment
+            and (port is None or 1 <= port <= 65535)
+            and urllib.parse.urlunsplit(uri) == value, "invalid_gateway_origin")
+    return value
+
+
 def durable_json(path, value):
     rr.atomic_json(path, value)
     fd = os.open(Path(path).parent, os.O_RDONLY)
@@ -40,7 +56,8 @@ def durable_json(path, value):
 
 
 class Callback:
-    def __init__(self, state, port=0):
+    def __init__(self, state, port=0, *, origin=ORIGIN):
+        self.origin = checked_origin(origin)
         self.state = state
         self.code = None
         self.invalid_requests = 0
@@ -70,7 +87,7 @@ class Callback:
                 query = urllib.parse.parse_qs(parsed.query, strict_parsing=False)
                 valid = (parsed.path == "/callback" and set(query) == {"code", "state", "iss"}
                          and all(len(v) == 1 for v in query.values())
-                         and query["iss"][0] == ORIGIN
+                         and query["iss"][0] == owner.origin
                          and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", query["state"][0]))
                          and secrets.compare_digest(query["state"][0], owner.state)
                          and re.fullmatch(r"[A-Za-z0-9_-]{1,256}", query["code"][0]))
@@ -117,6 +134,7 @@ class Callback:
 class BrowserOAuth:
     def __init__(self, client, directory, *, opener=None):
         self.client = client
+        self.origin = checked_origin(client.origin)
         self.directory = Path(directory)
         self.record_path = self.directory / "oauth-public-client.json"
         self.progress_path = self.directory / "oauth-progress.json"
@@ -132,17 +150,17 @@ class BrowserOAuth:
 
     def progress(self, phase, **fields):
         durable_json(self.progress_path, {"phase": phase, "pid": os.getpid(),
-                     "updated_at": int(time.time()), "resource": ORIGIN + "/mcp",
+                     "updated_at": int(time.time()), "resource": self.origin + "/mcp",
                      "scopes": list(SCOPES), "credential_storage": False, **fields})
 
     def metadata(self):
         resource = self.client.parsed("/.well-known/oauth-protected-resource")
         metadata = self.client.parsed("/.well-known/oauth-authorization-server")
-        require(resource.get("resource") == ORIGIN + "/mcp"
-                and metadata.get("issuer") == ORIGIN
-                and metadata.get("authorization_endpoint") == ORIGIN + "/oauth/authorize"
-                and metadata.get("token_endpoint") == ORIGIN + "/oauth/token"
-                and metadata.get("registration_endpoint") == ORIGIN + "/oauth/register"
+        require(resource.get("resource") == self.origin + "/mcp"
+                and metadata.get("issuer") == self.origin
+                and metadata.get("authorization_endpoint") == self.origin + "/oauth/authorize"
+                and metadata.get("token_endpoint") == self.origin + "/oauth/token"
+                and metadata.get("registration_endpoint") == self.origin + "/oauth/register"
                 and "S256" in metadata.get("code_challenge_methods_supported", []),
                 "gateway_oauth_metadata_identity_mismatch")
 
@@ -152,7 +170,7 @@ class BrowserOAuth:
         require(not self.record_path.is_symlink()
                 and self.record_path.stat().st_size <= 8192, "unsafe_public_client_record")
         record = json.loads(self.record_path.read_text())
-        require(record.get("resource") == ORIGIN + "/mcp"
+        require(record.get("resource") == self.origin + "/mcp"
                 and record.get("scopes") == list(SCOPES), "public_client_identity_conflict")
         require(record.get("phase") == "registered", "observe_original_registration_do_not_repeat")
         require(bool(re.fullmatch(r"[A-Za-z0-9_-]{1,256}", record.get("client_id", ""))),
@@ -160,7 +178,7 @@ class BrowserOAuth:
         uri = urllib.parse.urlsplit(record["redirect_uri"])
         require(uri.scheme == "http" and uri.hostname == "127.0.0.1"
                 and uri.port and uri.path == "/callback" and not uri.query
-                and not uri.fragment and not uri.username and not uri.password,
+                and not uri.fragment and uri.username is None and uri.password is None,
                 "public_callback_identity_invalid")
         return record
 
@@ -168,7 +186,7 @@ class BrowserOAuth:
         if previous:
             require(previous["redirect_uri"] == callback.redirect_uri, "registered_callback_changed")
             return previous["client_id"]
-        record = {"phase": "registration_requesting", "resource": ORIGIN + "/mcp",
+        record = {"phase": "registration_requesting", "resource": self.origin + "/mcp",
                   "scopes": list(SCOPES), "redirect_uri": callback.redirect_uri,
                   "requested_at": int(time.time()), "registration_expiry": "none"}
         durable_json(self.record_path, record)
@@ -214,20 +232,20 @@ class BrowserOAuth:
         verifier = secrets.token_urlsafe(48)
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
         port = urllib.parse.urlsplit(previous["redirect_uri"]).port if previous else 0
-        callback = Callback(state, port)
+        callback = Callback(state, port, origin=self.origin)
         try:
             client_id = self.registered(callback, previous)
             query = urllib.parse.urlencode({"client_id": client_id,
                 "redirect_uri": callback.redirect_uri, "response_type": "code",
                 "code_challenge": challenge, "code_challenge_method": "S256",
-                "state": state, "resource": ORIGIN + "/mcp", "scope": " ".join(SCOPES)})
+                "state": state, "resource": self.origin + "/mcp", "scope": " ".join(SCOPES)})
             self.progress("waiting_owner_login", expires_at=int(time.time()) + 600,
                           client_id=client_id)
             print("授权范围已确认。请在自动打开的 Gateway 页面直接输入密码并点击“登录并授权”。", file=sys.stderr)
-            self.opener(ORIGIN + "/oauth/authorize?" + query)  # URL stays out of logs/receipts
+            self.opener(self.origin + "/oauth/authorize?" + query)  # URL stays out of logs/receipts
             self.progress("waiting_owner_login", expires_at=int(time.time()) + 600,
                           client_id=client_id, browser_launch_confirmed=True,
-                          authorization_origin=ORIGIN,
+                          authorization_origin=self.origin,
                           page_title_from_source="Remote Hosts 授权")
             code = callback.wait()
             self.progress("token_exchange_requested", client_id=client_id)
@@ -235,10 +253,10 @@ class BrowserOAuth:
                 status, _, body = self.client.call("/oauth/token", {
                     "grant_type": "authorization_code", "client_id": client_id,
                     "code": code, "code_verifier": verifier,
-                    "redirect_uri": callback.redirect_uri, "resource": ORIGIN + "/mcp"}, form=True)
+                    "redirect_uri": callback.redirect_uri, "resource": self.origin + "/mcp"}, form=True)
                 require(status == 200, "token_exchange_not_confirmed")
                 value = json.loads(body)
-                require(value.get("resource") == ORIGIN + "/mcp"
+                require(value.get("resource") == self.origin + "/mcp"
                         and value.get("token_type") == "Bearer"
                         and type(value.get("expires_in")) is int and value["expires_in"] == 3600
                         and value.get("scope", "").split() == list(SCOPES)

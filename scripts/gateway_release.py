@@ -19,12 +19,12 @@ import time
 import gateway_release_stage as staging
 import release_receipts as rr
 from release_client import Client
-from gateway_release_oauth import BrowserOAuth, BrowserOAuthError
+from gateway_release_oauth import BrowserOAuth, BrowserOAuthError, checked_origin
 from gateway_release_ssh_diagnostics import StderrCodes, classify
 
 VERSION = "0.10.26"
-ORIGIN = "https://mcp.hackerlife.fun"
-BUILD_REPORT = "/Users/jinliang/Workspace/Codex/2026-10-08/task/task-auth-release-0.10.26/recovery-01/build.json"
+ORIGIN = "https://mcp.example.com"  # Reserved example; execution requires an explicit target.
+BUILD_REPORT = "build.json"
 APPROVED = {
     "build_sha256": "a0706aaa562d0965c47a2349e2b5ce910821ddee6041595ff0cc5238a55262fb",
     "manifest_sha256": "4bb5e301c122b3f7276ba9426d239728fd9c7438126147efd00372becaf8fbf6",
@@ -46,20 +46,44 @@ def require(condition, code):
         raise PublishError(code)
 
 
-def auth_requirement():
+def ssh_target(account, port):
+    require(isinstance(account, str) and bool(re.fullmatch(
+        r"[A-Za-z0-9_][A-Za-z0-9_.-]*@[A-Za-z0-9][A-Za-z0-9.-]*", account)),
+        "invalid_ssh_target")
+    require(type(port) is int and 1 <= port <= 65535, "invalid_ssh_port")
+
+
+def deployment_target(origin, account, port, installation_root):
+    require(all(value is not None for value in (origin, account, installation_root)),
+            "deployment_target_required")
+    origin = checked_origin(origin)
+    ssh_target(account, port)
+    require(isinstance(installation_root, str) and len(installation_root) <= 4096
+            and not any(ord(c) < 32 or ord(c) == 127 for c in installation_root),
+            "invalid_installation_root")
+    root = Path(installation_root)
+    require(root.is_absolute() and root != Path("/") and ".." not in root.parts
+            and "." not in installation_root.split("/")
+            and str(root) == installation_root, "invalid_installation_root")
+    return {"origin": origin, "ssh_account": account, "ssh_port": port,
+            "installation_root": installation_root}
+
+
+def auth_requirement(target=None):
+    origin = target["origin"] if target else ORIGIN
     return {
         "state": "owner_session_required",
         "available_modes": ["oauth-browser", "borrow-existing-bearer"],
-        "browser_flow_approved_in_this_task": True,
+        "browser_flow_approved_in_this_task": False,
         "status_login_usable": False,
         "existing_session": "Borrow an already authorized owner Bearer directly in the operator Terminal; never send it to the model.",
-        "resource": ORIGIN + "/mcp",
+        "resource": origin + "/mcp",
         "scopes": SCOPES,
         "automatic_registration_or_authorization": False,
         "new_authorization_if_no_existing_bearer": {
-            "approval_required": False,
+            "approval_required": True,
             "type": "OAuth authorization_code with PKCE S256; existing registered client preferred",
-            "resource": ORIGIN + "/mcp",
+            "resource": origin + "/mcp",
             "scopes": SCOPES,
             "authorization_pending_seconds": 600,
             "code_seconds": 120,
@@ -68,7 +92,7 @@ def auth_requirement():
             "refresh_issuance_can_be_disabled_by_current_protocol": False,
             "persistent_client_or_refresh_storage_by_this_entry": False,
             "client_registration_if_no_reusable_registered_client": {
-                "approval_required": False,
+                "approval_required": True,
                 "type": "OAuth public client registration, token_endpoint_auth_method=none; no client secret",
                 "server_registration_expiry": "none; stored with i64::MAX expiry",
                 "created": False,
@@ -76,12 +100,13 @@ def auth_requirement():
             "limitation": "These scopes are owner resource scopes, not a Gateway-only token audience. This entry itself never dispatches Agent actions.",
         },
         "borrowed_session_lifetime": "Existing server expiry is unchanged; memory only for this bounded run, no refresh, revoke or credential-file write.",
-        "ssh": {"account": "root@hackerlife.fun", "port": 222,
+        "ssh": {"account": target["ssh_account"] if target else "YOUR_USER@example.com",
+                "port": target["ssh_port"] if target else 22,
                 "purpose": "Verified import and read-only receipt observation only",
                 "owner_authentication": "Existing NAS key or agent in BatchMode; no password prompt",
                 "idle_timeout_seconds": 600, "closed_on_exit": True,
                 "model_reads_private_key_password_or_token_contents": False,
-                "existing_ssh_key_or_agent_reuse_authorized": True},
+                "existing_ssh_key_or_agent_reuse_authorized": False},
     }
 
 
@@ -139,7 +164,9 @@ def journal_lock(directory):
 
 class OwnerSSH:
     """One explicitly owner-authenticated, short-lived SSH management transport."""
-    def __init__(self):
+    def __init__(self, account, port=22):
+        ssh_target(account, port)
+        self.account, self.port = account, port
         self.directory = None
         self.socket = None
         self.auth_process = None
@@ -151,11 +178,11 @@ class OwnerSSH:
         self.directory = tempfile.TemporaryDirectory(prefix="rh-gw-", dir="/tmp")
         os.chmod(self.directory.name, 0o700)
         self.socket = str(Path(self.directory.name) / "c")
-        args = ["ssh", "-p", "222", "-S", self.socket,
+        args = ["ssh", "-p", str(self.port), "-S", self.socket,
                 "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15",
                 "-o", "BatchMode=yes", "-o", "NumberOfPasswordPrompts=0",
                 "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
-                "-o", "ControlPersist=600", "-M", "-N", "-f", "root@hackerlife.fun"]
+                "-o", "ControlPersist=600", "-M", "-N", "-f", self.account]
         # Existing configuration, keys and agent authenticate in BatchMode. No prompt.
         try:
             self.auth_process = subprocess.Popen(args, stderr=subprocess.PIPE)
@@ -172,12 +199,12 @@ class OwnerSSH:
     def request(self, action, plan, bundle=None):
         require(self.socket is not None, "owner_ssh_not_connected")
         source = Path(staging.__file__).read_text()
-        args = ["ssh", "-F", "/dev/null", "-p", "222", "-S", self.socket,
+        args = ["ssh", "-F", "/dev/null", "-p", str(self.port), "-S", self.socket,
                 "-o", "ControlMaster=no", "-o", "ProxyCommand=false",
                 "-o", "StrictHostKeyChecking=yes", "-o", "IdentityFile=none",
                 "-o", "IdentityAgent=none", "-o", "PubkeyAuthentication=no",
                 "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
-                "-o", "BatchMode=yes", "root@hackerlife.fun",
+                "-o", "BatchMode=yes", self.account,
                 "python3 -c " + shlex.quote(source)]
         payload = (json.dumps({"action": action, "plan": plan}) + "\n").encode()
         if action == "stage":
@@ -217,8 +244,8 @@ class OwnerSSH:
                 self.auth_process.wait(timeout=2)
         if self.socket is not None:
             try:
-                subprocess.run(["ssh", "-F", "/dev/null", "-p", "222", "-S", self.socket,
-                                "-O", "exit", "root@hackerlife.fun"],
+                subprocess.run(["ssh", "-F", "/dev/null", "-p", str(self.port), "-S", self.socket,
+                                "-O", "exit", self.account],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                timeout=10, check=False)
             except (OSError, subprocess.SubprocessError):
@@ -233,13 +260,18 @@ class OwnerSSH:
 
 class GatewayRelease:
     def __init__(self, identity, client, ssh, journal, *, clock=time.monotonic,
-                 sleep=time.sleep, timeout=300, interval=2):
+                 sleep=time.sleep, timeout=300, interval=2, target=None):
         require(0 < timeout <= 600 and 0 < interval <= 10, "invalid_observation_budget")
         self.identity, self.client, self.ssh = identity, client, ssh
         self.journal = Path(journal)
         self.clock, self.sleep, self.timeout, self.interval = clock, sleep, timeout, interval
         self.plan = dict(identity["plan"])
-        semantic = {"origin": ORIGIN, "target": "gateway", "plan": dict(self.plan)}
+        self.origin = target["origin"] if target else ORIGIN
+        if target:
+            self.plan.update(origin=self.origin, installation_root=target["installation_root"])
+        semantic = {"origin": self.origin, "target": "gateway", "plan": dict(self.plan)}
+        if target:
+            semantic["deployment"] = dict(target)
         ident = rr.identity(semantic)
         if self.journal.exists():
             require(not self.journal.is_symlink(), "unsafe_journal_file")
@@ -296,7 +328,7 @@ class GatewayRelease:
             require(type(value.get(key)) is type(expected) and value.get(key) == expected,
                     "gateway_runtime_identity_mismatch")
         route_status, route_headers, route_body = self.client.call(
-            "/status/task-authorization?task_id=01a1184e-4ede-76a2-aad4-3141c7b4c03c")
+            "/status/task-authorization?task_id=gateway-release-route-check")
         owner_guard = (route_status == 401 and route_body ==
                        b"<a href=\'/status\'>Sign in as the Gateway owner</a>")
         require(route_status == 200 or owner_guard or (route_status == 303
@@ -424,12 +456,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-report", type=Path, default=Path(BUILD_REPORT))
     parser.add_argument("--report-dir", type=Path, required=True)
+    parser.add_argument("--origin", help="Exact HTTPS Gateway origin; no credentials or path")
+    parser.add_argument("--ssh-account", help="Existing management account in USER@HOST form")
+    parser.add_argument("--ssh-port", type=int, default=22)
+    parser.add_argument("--installation-root", help="Exact canonical existing Gateway directory")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--execute", action="store_true")
     mode.add_argument("--observe", action="store_true")
     auth_mode = parser.add_mutually_exclusive_group()
     auth_mode.add_argument("--oauth-browser", action="store_true",
-                          help="Use the approved read/write PKCE grant; owner logs in directly in the default browser")
+                          help="Use an explicitly owner-approved read/write PKCE grant; owner logs in directly in the default browser")
     auth_mode.add_argument("--borrow-existing-bearer", action="store_true",
                         help="Owner enters an already authorized Bearer at a hidden Terminal prompt; no OAuth or password-file login")
     args = parser.parse_args()
@@ -441,6 +477,7 @@ def main():
         if not (args.execute or args.observe) or not (args.borrow_existing_bearer or args.oauth_browser):
             result = {"state": "authentication_required", "version": VERSION,
                       "local_verified": identity, "authentication": auth_requirement(),
+                      "configuration_required": ["--origin", "--ssh-account", "--installation-root"],
                       "deployed": False, "agent_actions": 0}
             require(not args.report_dir.is_symlink(), "unsafe_journal_directory")
             args.report_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -450,9 +487,12 @@ def main():
         with journal_lock(args.report_dir) as journal:
             journal_owned = True
             require(sys.stdin.isatty() and sys.stderr.isatty(), "owner_terminal_required")
-            # Read-only NAS/key/service preflight precedes any new OAuth grant.
-            ssh = OwnerSSH()
-            release = GatewayRelease(identity, None, ssh, journal)
+            entry_phase = "deployment_target_validation"
+            target = deployment_target(args.origin, args.ssh_account, args.ssh_port,
+                                       args.installation_root)
+            # Read-only existing key/service preflight precedes any new OAuth grant.
+            ssh = OwnerSSH(target["ssh_account"], target["ssh_port"])
+            release = GatewayRelease(identity, None, ssh, journal, target=target)
             entry_phase = "existing_ssh_connection"
             ssh.connect()
             entry_phase = "gateway_identity_preflight"
@@ -462,7 +502,7 @@ def main():
                 require(preflight.get("publication_controller", {}).get("ready") is True,
                         "gateway_publication_controller_unavailable")
             entry_phase = "owner_oauth_authentication"
-            client = Client(ORIGIN, access=None, transport="legacy")
+            client = Client(target["origin"], access=None, transport="legacy")
             token = (BrowserOAuth(client, args.report_dir).authenticate() if args.oauth_browser
                      else borrowed_bearer())
             client.access = token
