@@ -1709,5 +1709,5 @@
     "host_tools": "x-rh-host-tools",
     "request_id": "x-rh-request-id"
   },
-  "version": "0.10.25"
+  "version": "0.10.26"
 }
