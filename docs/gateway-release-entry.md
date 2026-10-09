@@ -33,12 +33,25 @@ key, token or credential file. Registration and token exchange are submitted onc
 An interrupted/unknown exchange or existing session is observed rather than
 automatically repeating authorization.
 
-After API authority is checked, the same Terminal prompts for the existing
-`root@hackerlife.fun:222` SSH password. SSH performs verified bundle import and
-bounded public executable/updater observation. Strict known-host verification
-remains enabled; automatic disk-key and SSH-agent authentication are disabled.
-Its private control socket has a 600-second idle bound and is closed on exit.
-Upgrade execution always uses `POST /admin/gateway-upgrade`.
+Before OAuth, SSH reuses the owner's existing configuration, key or agent in
+BatchMode at the verified NAS endpoint `root@hackerlife.fun:222`; it never prompts
+for an NAS password. The bare `hackerlife.fun` alias instead selects MacStudio
+(port 2222, user jinliang), so the NAS port/user are explicit. Strict known-host
+verification remains enabled. The private control socket has a 600-second idle
+bound and closes on exit; slaves cannot silently reconnect or authenticate.
+
+The read-only preflight verifies the running executable and release location
+before creating an application session. On the verified Entware installation it
+uses the canonical `/volume1/@entware-opt/remote-hosts-code`, a unique live process,
+its working directory, owned TCP listener 18787, and loopback public health and
+OAuth resource identity with the required Host header. It never reads process
+arguments, environment, config, private keys or database contents. A failed
+systemctl lookup is not proof that the Gateway is absent.
+
+Publication also requires the existing API's systemd-run launcher and service
+control to be verified. An unavailable controller blocks before OAuth. Observation
+of an already attempted upgrade remains available. Upgrade execution always uses
+`POST /admin/gateway-upgrade`; SSH does not run the updater.
 
 A status-page **Open status** login issues only the 12-hour status cookie
 (Secure, HttpOnly, SameSite=Strict, Path=/status); it cannot authorize the
@@ -60,8 +73,8 @@ There is no credential argument or environment-variable input.
 
 The entry pins the build receipt, manifest, bundle and Linux candidate hashes;
 verifies original gates/provenance and all archived bytes; stages under the
-running Gateway executable's parent. Service identity remains
-`remote-hosts-code-gateway.service`. Staging retains at least 4 GiB plus expansion
+running Gateway executable's parent. The configured systemd identity is
+`remote-hosts-code-gateway.service`; verified NAS discovery is the guarded fallback. Staging retains at least 4 GiB plus expansion
 headroom. A matching staged bundle is reused; another version, artifact, symlink
 or unknown release state stops the entry.
 
@@ -89,3 +102,36 @@ Tests use temporary files, loopback fake HTTP and mocked SSH/service controls.
 Production HTTPS/TLS is unchanged. Local tests and plan verification are not live
 publication evidence. Claim deployment only after original updater and running
 binary/health checks succeed.
+
+## Verified NAS checkpoint (2026-10-09)
+
+Existing NAS SSH authentication succeeds without a password. Gateway 0.10.25
+runs as PID 12270 from the canonical Entware directory. The 0.10.26 release
+directory does not exist. Original transfer
+`64b45061-9e0d-4b94-bd6a-31a1c709b120` completed with 31,956,930 bytes and SHA
+`00da35fbbf1d0e768988320cd481544eb3ca5690463e4e90ee8f23209bdfc0cd`.
+Its temporary receiver blob has since been removed, confirmed by both the original
+operation and the exact file's absence. It is not a reusable staged release.
+No export or transfer is repeated to recover it. The immutable local bundle
+remains separately verifiable.
+
+The original owner worker exited with neither import nor upgrade POST attempted.
+Its exact exit cause is unavailable; do not infer a bad password. New failures
+persist phase, process exit code, fixed error category and attempt flags in a
+private receipt. Raw SSH stderr, Terminal input/history and credentials are never
+saved. Password and keyboard-interactive SSH authentication are disabled.
+
+The NAS SSH environment lacks systemd-run; the configured unit's MainPID query
+also fails. Controller readiness is therefore unconfirmed. This checkpoint is
+identity evidence, not a passed deployment preflight or deployment. Do not ask the
+owner to log in again until the controller and durable artifact staging gates pass.
+
+## Future in-system iteration acceptance
+
+Keep these gaps in the existing task and product acceptance, without a duplicate
+task or broad refactor: durable task phase and recovery; reuse of valid existing
+authorization; fixed verification and actual receipts; health checks and compatible
+rollback; observation of unknown outcomes without replay; and continuation of
+independent work. Durable release artifacts must be distinct from expiring transfer
+blobs, and supported deployment controllers must be checked before OAuth. The
+system must never grant itself higher privilege or bypass authentication.

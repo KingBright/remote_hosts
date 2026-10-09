@@ -9,10 +9,25 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.request
 
 VERSION = "0.10.26"
 SERVICE = "remote-hosts-code-gateway.service"
 APPROVED_ROOT = Path("/opt/remote-hosts-code")
+NAS_ROOT = Path("/volume1/@entware-opt/remote-hosts-code")
+PROC_ROOT = Path("/proc")
+PUBLIC_HOST = "mcp.hackerlife.fun"
+PUBLIC_ORIGIN = "https://" + PUBLIC_HOST
+BINARY_IDENTITIES = {
+    "0.10.25": "947d03f345d3668d372bdfa404d70e3bbcaa50de450164517c67c6f6439e9f20",
+    "0.10.26": "2c9d259c73f436384b9e3c2d562f5e7d4c5a88515be69df567383a0480943523",
+}
+RUNTIME_IDENTITIES = {
+    "0.10.25": {"tool_count": 24, "tools_sha256": "42da70ae12b5bfa1bb6c6e97c6d06852492f7277ab45e8f6a459930b6d2c2d68",
+                "skill_revision": "5875f702cd705f891a9ce178640ff499aa59dc8a671139100ea3d3cecd9e9e02"},
+    "0.10.26": {"tool_count": 25, "tools_sha256": "6515d87730bbdc7f67ac3dcc4d56c2346e7eca122b2c28b5f831f37fea1b88c0",
+                "skill_revision": "6aa3bdbdd86135c9db72bcf2ab8bb8f9017af48fc5c701de898866a7ed1afdc1"},
+}
 RESERVE = 4 * 1024**3
 MAX_BUNDLE = 64 * 1024**2
 MAX_EXPANDED = 256 * 1024**2
@@ -41,21 +56,18 @@ def regular(path):
     require(not path.is_symlink() and path.is_file(), "not_regular_file")
 
 
-def identify():
-    require(os.geteuid() == 0, "existing_management_account_required")
-    result = subprocess.run(
-        ["systemctl", "show", SERVICE, "--property=MainPID", "--value"],
-        capture_output=True, timeout=10, check=False)
-    require(result.returncode == 0, "gateway_service_identity_unavailable")
-    pid = int(result.stdout.decode("ascii").strip())
-    require(pid > 1, "gateway_not_running")
+def approved_root(root):
+    # Entware's /opt alias is never traversed for writes; use the verified real root.
+    return root == NAS_ROOT or root == APPROVED_ROOT or APPROVED_ROOT in root.parents
+
+
+def checked_identity(pid):
     value = os.readlink("/proc/" + str(pid) + "/exe")
     require(not value.endswith(" (deleted)"), "gateway_executable_deleted")
     binary = Path(value)
     require(binary.name == "remote-hosts-code", "unexpected_gateway_executable")
     root = binary.parent
-    require(root == APPROVED_ROOT or APPROVED_ROOT in root.parents,
-            "gateway_outside_existing_installation")
+    require(approved_root(root), "gateway_outside_existing_installation")
     for parent in [root] + list(root.parents):
         require(not parent.is_symlink(), "symlink_in_installation")
     regular(binary)
@@ -63,6 +75,115 @@ def identify():
             "installed_sha256": digest(binary)}
 
 
+def owns_gateway_listener(pid):
+    sockets = set()
+    try:
+        for fd in (PROC_ROOT / str(pid) / "fd").iterdir():
+            try:
+                value = os.readlink(str(fd))
+                if value.startswith("socket:[") and value.endswith("]"):
+                    sockets.add(value[8:-1])
+            except OSError:
+                continue
+        for name in ("tcp", "tcp6"):
+            for line in (PROC_ROOT / str(pid) / "net" / name).read_text().splitlines()[1:]:
+                row = line.split()
+                if len(row) > 9 and row[3] == "0A" and row[9] in sockets:
+                    if int(row[1].rsplit(":", 1)[1], 16) == 18787:
+                        return True
+    except OSError:
+        pass
+    return False
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def local_public_json(path):
+    request = urllib.request.Request("http://127.0.0.1:18787" + path,
+                                    headers={"Host": PUBLIC_HOST})
+    # Fixed loopback only, no redirects, inherited proxies or credential inputs.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(request, timeout=3) as response:
+        require(response.status == 200, "gateway_public_identity_unconfirmed")
+        data = response.read(65537)
+    require(len(data) <= 65536, "gateway_public_metadata_budget")
+    return json.loads(data)
+
+
+def nas_public_identity(identity):
+    metadata = local_public_json("/.well-known/oauth-protected-resource")
+    require(metadata.get("resource") == PUBLIC_ORIGIN + "/mcp"
+            and metadata.get("authorization_servers") == [PUBLIC_ORIGIN],
+            "gateway_resource_identity_mismatch")
+    health = local_public_json("/healthz")
+    version = health.get("version")
+    expected = RUNTIME_IDENTITIES.get(version)
+    require(expected is not None and health.get("wire_protocol") == 2
+            and health.get("file_transfer") is True
+            and all(health.get(key) == value for key, value in expected.items()),
+            "gateway_runtime_identity_mismatch")
+    require(identity["installed_sha256"] == BINARY_IDENTITIES[version],
+            "gateway_installed_identity_mismatch")
+    return {key: health[key] for key in
+            ("version", "wire_protocol", "tool_count", "tools_sha256", "skill_revision", "file_transfer")}
+
+
+def discover_nas():
+    matches = []
+    for entry in PROC_ROOT.iterdir():
+        if not entry.name.isdecimal() or int(entry.name) <= 1:
+            continue
+        try:
+            value = os.readlink(str(entry / "exe"))
+        except OSError:
+            continue
+        if value == str(NAS_ROOT / "remote-hosts-code") + " (deleted)":
+            raise StageError("gateway_executable_deleted")
+        if value == str(NAS_ROOT / "remote-hosts-code"):
+            matches.append(int(entry.name))
+    require(len(matches) <= 1, "gateway_service_identity_ambiguous")
+    require(bool(matches), "gateway_not_running")
+    identity = checked_identity(matches[0])
+    require(os.readlink("/proc/" + str(identity["pid"]) + "/cwd") == str(NAS_ROOT),
+            "gateway_working_directory_mismatch")
+    require(owns_gateway_listener(identity["pid"]), "gateway_listener_identity_mismatch")
+    identity["public_health"] = nas_public_identity(identity)
+    identity["discovery"] = "verified_entware_process_listener_resource"
+    return identity
+
+
+def identify():
+    require(os.geteuid() == 0, "existing_management_account_required")
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", SERVICE, "--property=MainPID", "--value"],
+            capture_output=True, timeout=10, check=False)
+        pid = int(result.stdout.decode("ascii").strip()) if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pid = None
+    if pid is None:
+        return discover_nas()
+    require(pid > 1, "gateway_not_running")
+    identity = checked_identity(pid)
+    identity["discovery"] = "systemd_main_pid"
+    return identity
+
+
+def publication_controller():
+    runner = shutil.which("systemd-run")
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", SERVICE, "--property=MainPID", "--value"],
+            capture_output=True, timeout=10, check=False)
+        service_ready = result.returncode == 0 and int(result.stdout.decode("ascii").strip()) > 1
+    except (OSError, subprocess.SubprocessError, ValueError):
+        service_ready = False
+    return {"systemd_run_available": bool(runner), "service_control_verified": service_ready,
+            "ready": bool(runner) and service_ready,
+            "error_code": None if runner and service_ready else "gateway_publication_controller_unavailable"}
 def release_paths(identity):
     root = identity["root"]
     releases = root / "releases"
@@ -168,10 +289,11 @@ def probe(plan):
     except StageError as error:
         # A policy-protected rollback may deliberately leave the service stopped.
         # Read only the release rooted in previously verified executable metadata.
-        require(error.code == "gateway_not_running" and isinstance(plan.get("gateway_root"), str),
-                "gateway_identity_unavailable")
+        if error.code != "gateway_not_running":
+            raise
+        require(isinstance(plan.get("gateway_root"), str), "gateway_identity_unavailable")
         root = Path(plan["gateway_root"])
-        require(root.is_absolute() and (root == APPROVED_ROOT or APPROVED_ROOT in root.parents)
+        require(root.is_absolute() and approved_root(root)
                 and ".." not in root.parts, "unverified_observation_root")
         for parent in [root] + list(root.parents):
             require(not parent.is_symlink(), "symlink_in_observation_root")
@@ -186,7 +308,11 @@ def probe(plan):
              "gateway_executable": str(identity["binary"]),
              "installed_sha256": identity["installed_sha256"],
              "bundle_path": str(bundle), "bundle_staged": False,
-             "marker_present": False, "result_present": False}
+             "marker_present": False, "result_present": False,
+             "gateway_root": str(identity["root"]),
+             "discovery": identity.get("discovery"),
+             "public_health": identity.get("public_health"),
+             "publication_controller": publication_controller()}
     if os.path.lexists(bundle):
         inspect_bundle(bundle, plan)
         value["bundle_staged"] = True

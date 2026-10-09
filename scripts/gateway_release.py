@@ -20,6 +20,7 @@ import gateway_release_stage as staging
 import release_receipts as rr
 from release_client import Client
 from gateway_release_oauth import BrowserOAuth, BrowserOAuthError
+from gateway_release_ssh_diagnostics import StderrCodes, classify
 
 VERSION = "0.10.26"
 ORIGIN = "https://mcp.hackerlife.fun"
@@ -77,9 +78,10 @@ def auth_requirement():
         "borrowed_session_lifetime": "Existing server expiry is unchanged; memory only for this bounded run, no refresh, revoke or credential-file write.",
         "ssh": {"account": "root@hackerlife.fun", "port": 222,
                 "purpose": "Verified import and read-only receipt observation only",
-                "owner_authentication": "Direct SSH prompt in owner's Terminal",
+                "owner_authentication": "Existing NAS key or agent in BatchMode; no password prompt",
                 "idle_timeout_seconds": 600, "closed_on_exit": True,
-                "automatic_disk_password_key_token_reads": False},
+                "model_reads_private_key_password_or_token_contents": False,
+                "existing_ssh_key_or_agent_reuse_authorized": True},
     }
 
 
@@ -140,22 +142,32 @@ class OwnerSSH:
     def __init__(self):
         self.directory = None
         self.socket = None
+        self.auth_process = None
+        self.stderr_codes = None
+        self.last_outcome = None
 
     def connect(self):
-        require(sys.stdin.isatty() and sys.stderr.isatty(), "owner_terminal_required")
+        # Passwordless read-only preflight may run without a Terminal; owner OAuth still requires one.
         self.directory = tempfile.TemporaryDirectory(prefix="rh-gw-", dir="/tmp")
         os.chmod(self.directory.name, 0o700)
         self.socket = str(Path(self.directory.name) / "c")
-        args = ["ssh", "-F", "/dev/null", "-p", "222", "-S", self.socket,
+        args = ["ssh", "-p", "222", "-S", self.socket,
                 "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15",
-                "-o", "IdentityFile=none", "-o", "IdentityAgent=none",
-                "-o", "PubkeyAuthentication=no", "-o", "BatchMode=no",
-                "-o", "NumberOfPasswordPrompts=1",
-                "-o", "PasswordAuthentication=yes", "-o", "KbdInteractiveAuthentication=yes",
+                "-o", "BatchMode=yes", "-o", "NumberOfPasswordPrompts=0",
+                "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
                 "-o", "ControlPersist=600", "-M", "-N", "-f", "root@hackerlife.fun"]
-        # SSH reads its password directly from /dev/tty; never capture that prompt.
-        require(subprocess.run(args, check=False).returncode == 0,
-                "owner_ssh_authentication_not_confirmed")
+        # Existing configuration, keys and agent authenticate in BatchMode. No prompt.
+        try:
+            self.auth_process = subprocess.Popen(args, stderr=subprocess.PIPE)
+            self.stderr_codes = StderrCodes(self.auth_process.stderr)
+            returncode = self.auth_process.wait()
+            self.last_outcome = self.stderr_codes.result(returncode)
+        except OSError as error:
+            self.last_outcome = {"exit_code": None, "category": "ssh_client_start_failed",
+                                 "error_type": type(error).__name__,
+                                 "raw_stderr_retained": False, "password_prompt_capture": False}
+            raise PublishError("owner_ssh_connection_not_confirmed") from None
+        require(returncode == 0, "owner_ssh_connection_not_confirmed")
 
     def request(self, action, plan, bundle=None):
         require(self.socket is not None, "owner_ssh_not_connected")
@@ -176,6 +188,19 @@ class OwnerSSH:
                                timeout=90, check=False)
         require(len(value.stdout) <= 65536, "staging_receipt_budget")
         # stderr may contain private transport detail; never persist or print it.
+        if value.returncode != 0:
+            self.last_outcome = classify(value.stderr, value.returncode)
+            try:
+                blocked = json.loads(value.stdout)
+                code = blocked.get("error_code") if isinstance(blocked, dict) else None
+            except (ValueError, TypeError):
+                code = None
+            known = {"existing_management_account_required", "gateway_service_identity_unavailable",
+                     "gateway_not_running", "gateway_executable_deleted", "unexpected_gateway_executable",
+                     "gateway_outside_existing_installation", "symlink_in_installation", "not_regular_file"}
+            if code in known:
+                self.last_outcome.update(category="gateway_preflight_failed", gateway_error_code=code)
+                raise PublishError(code)
         require(value.returncode == 0, "staging_or_observation_not_confirmed")
         result = json.loads(value.stdout)
         require(isinstance(result, dict) and result.get("state") != "blocked",
@@ -183,6 +208,13 @@ class OwnerSSH:
         return result
 
     def close(self):
+        if self.auth_process is not None and self.auth_process.poll() is None:
+            self.auth_process.terminate()
+            try:
+                self.auth_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.auth_process.kill()
+                self.auth_process.wait(timeout=2)
         if self.socket is not None:
             try:
                 subprocess.run(["ssh", "-F", "/dev/null", "-p", "222", "-S", self.socket,
@@ -192,6 +224,8 @@ class OwnerSSH:
             except (OSError, subprocess.SubprocessError):
                 pass  # ControlPersist bounds the transport if close is unconfirmed.
             self.socket = None
+        if self.stderr_codes is not None:
+            self.stderr_codes.thread.join(timeout=1)
         if self.directory is not None:
             self.directory.cleanup()
             self.directory = None
@@ -398,7 +432,8 @@ def main():
                         help="Owner enters an already authorized Bearer at a hidden Terminal prompt; no OAuth or password-file login")
     args = parser.parse_args()
     os.umask(0o077)
-    client, ssh = None, None
+    client, ssh, release = None, None, None
+    entry_phase, journal_owned = "local_verification", False
     try:
         identity = verify_release(args.build_report)
         if not (args.execute or args.observe) or not (args.borrow_existing_bearer or args.oauth_browser):
@@ -411,26 +446,51 @@ def main():
             print(json.dumps(result, ensure_ascii=False))
             return 2
         with journal_lock(args.report_dir) as journal:
+            journal_owned = True
             require(sys.stdin.isatty() and sys.stderr.isatty(), "owner_terminal_required")
+            # Read-only NAS/key/service preflight precedes any new OAuth grant.
+            ssh = OwnerSSH()
+            release = GatewayRelease(identity, None, ssh, journal)
+            entry_phase = "existing_ssh_connection"
+            ssh.connect()
+            entry_phase = "gateway_identity_preflight"
+            preflight = ssh.request("probe", release.plan)
+            rr.atomic_json(args.report_dir / "gateway-preflight.json", preflight)
+            if args.execute and not release.state["request_attempted"]:
+                require(preflight.get("publication_controller", {}).get("ready") is True,
+                        "gateway_publication_controller_unavailable")
+            entry_phase = "owner_oauth_authentication"
             client = Client(ORIGIN, access=None, transport="legacy")
             token = (BrowserOAuth(client, args.report_dir).authenticate() if args.oauth_browser
                      else borrowed_bearer())
             client.access = token
             client.refresh = None
             token = None
-            # Check existing application authority before asking for SSH import authority.
-            ssh = OwnerSSH()
-            release = GatewayRelease(identity, client, ssh, journal)
+            release.client = client
+            entry_phase = "owner_application_authority"
             release.authenticate()
-            ssh.connect()
+            release.save(entry_phase="ssh_authenticated", ssh_outcome=ssh.last_outcome)
+            entry_phase = "observe_original" if args.observe else "gateway_publication"
             result = release.observe() if args.observe else release.execute()
             print(json.dumps(result, ensure_ascii=False))
             return 0 if result["state"] == "healthy" else 2
-    except Exception as error:
-        print(json.dumps({"state": "blocked", "error_type": type(error).__name__,
-                          "error_code": error.code if isinstance(error, (PublishError, BrowserOAuthError)) else "publication_not_confirmed",
-                          "deployed": False}, ensure_ascii=False))
-        return 2
+    except (Exception, KeyboardInterrupt) as error:
+        exit_code = 130 if isinstance(error, KeyboardInterrupt) else 2
+        failure = {"state": "blocked", "entry_phase": entry_phase,
+                   "error_type": type(error).__name__,
+                   "error_code": "owner_interrupted" if isinstance(error, KeyboardInterrupt) else
+                        error.code if isinstance(error, (PublishError, BrowserOAuthError)) else "publication_not_confirmed",
+                   "entry_exit_code": exit_code, "observed_at": int(time.time()),
+                   "import_attempted": bool(release and release.state["import_attempted"]),
+                   "request_attempted": bool(release and release.state["request_attempted"]),
+                   "deployed": False, "raw_error_retained": False}
+        if ssh is not None and isinstance(ssh.last_outcome, dict):
+            failure["ssh_outcome"] = ssh.last_outcome
+        if journal_owned and args.report_dir.is_dir() and not args.report_dir.is_symlink():
+            path = args.report_dir / ("gateway-release-failure-" + str(os.getpid()) + "-" + str(int(time.time())) + ".json")
+            rr.atomic_json(path, failure)
+        print(json.dumps(failure, ensure_ascii=False))
+        return exit_code
     finally:
         if ssh is not None:
             ssh.close()
