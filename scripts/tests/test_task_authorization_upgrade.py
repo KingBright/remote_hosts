@@ -155,7 +155,9 @@ class UpgradePolicyTests(unittest.TestCase):
 
     def test_expiry_policy_requires_protocol_two_even_after_expiry_or_revocation(self):
         for kind in ("task_authorization", "operation_task_authorization"):
-            for value in ({"protocol": 2, "enabled": False}, {"expires_at": 1, "enabled": True}):
+            for value in ({"protocol": 2, "enabled": False},
+                          {"protocol": 2, "expires_at": 1, "enabled": True},
+                          {"expires_at": 1, "enabled": False}):
                 with self.subTest(kind=kind, value=value):
                     with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
                         connection.execute("DELETE FROM kv")
@@ -206,6 +208,43 @@ class UpgradePolicyTests(unittest.TestCase):
         self.assertTrue(result["service_stopped"])
         self.assertEqual(self.binary.read_bytes(), b"candidate")
         self.assertEqual(UPGRADE.task_authorization_required_protocol(self.database), 2)
+
+
+    def test_active_legacy_grant_blocks_expiry_migration_before_service_changes(self):
+        for value in ({"enabled": True}, {"protocol": 1, "enabled": True, "expires_at": 1},
+                      {"protocol": 2, "enabled": True}):
+            with self.subTest(value=value):
+                with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
+                    connection.execute("DELETE FROM kv")
+                self.policy(value=value)
+                calls = []
+                result = self.invoke(lambda command, **kwargs: calls.append(command),
+                                     {"task_authorization_protocol": 2})
+                self.assertIn("owner renewal required", result["error"])
+                self.assertEqual([c for c in calls if c[0] == "systemctl"], [])
+                self.assertEqual(self.binary.read_bytes(), b"previous")
+                self.assertFalse((self.root / "backup").exists())
+
+    def test_legacy_grant_racing_stop_keeps_original_permissions_and_binary(self):
+        calls = []
+        def control(command, **kwargs):
+            calls.append(command)
+            if command[:2] == ["systemctl", "stop"]:
+                self.policy(value={"enabled": True})
+        result = self.invoke(control, {"task_authorization_protocol": 2})
+        self.assertIn("owner renewal required", result["error"])
+        self.assertEqual([c[1] for c in calls if c[0] == "systemctl"], ["stop", "start"])
+        self.assertEqual(self.binary.read_bytes(), b"previous")
+        self.assertFalse(result["service_stopped"])
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            value = json.loads(connection.execute("SELECT value FROM kv").fetchone()[0])
+        self.assertTrue(value["enabled"])
+
+    def test_protocol_two_expiring_grant_is_not_an_unbounded_migration(self):
+        self.policy(value={"protocol": 2, "enabled": True, "expires_at": 1})
+        with mock.patch.object(UPGRADE.subprocess, "check_output",
+                               return_value='{"task_authorization_protocol":2}'):
+            UPGRADE.require_task_authorization_support(self.database, self.binary, "cutover")
 
 
 if __name__ == "__main__":

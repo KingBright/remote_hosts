@@ -88,6 +88,22 @@ def require_task_authorization_support(database, binary, stage):
         raise RuntimeError('task_authorization_policy_required:' + stage +
                            '; refusing a binary without task authorization protocol ' + str(minimum))
 
+    # Protocol 2 must not silently invalidate an owner's existing unbounded
+    # approval. Recheck after stopping the policy writer, before replacement.
+    if minimum and stage in ('preflight', 'cutover') and task_authorization_supported(binary, 2):
+        with contextlib.closing(sqlite3.connect(
+                pathlib.Path(database).resolve().as_uri() + '?mode=ro',
+                uri=True, timeout=2)) as connection:
+            active_legacy = connection.execute(
+                "SELECT COUNT(*) FROM kv WHERE kind='task_authorization' "
+                "AND expires>unixepoch() AND json_extract(value,'$.enabled')=1 "
+                "AND (COALESCE(json_extract(value,'$.protocol'),1)!=2 OR "
+                "COALESCE(json_type(value,'$.expires_at'),'missing')!='integer')"
+            ).fetchone()[0]
+        if active_legacy:
+            raise RuntimeError('task_authorization_policy_required:' + stage +
+                               '; owner renewal required for active unbounded legacy grants')
+
 
 def main():
     parser = argparse.ArgumentParser()
