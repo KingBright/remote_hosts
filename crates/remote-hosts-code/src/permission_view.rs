@@ -163,7 +163,7 @@ pub(crate) fn render(view: &Value) -> String {
             let profile = if full {
                 "本机用户完全访问"
             } else if configured {
-                "本机用户完全访问（设备已允许）"
+                "设备已允许本机用户访问；连接权限待确认"
             } else {
                 "访问受限或待确认"
             };
@@ -362,5 +362,42 @@ mod tests {
         assert!(html.contains("<details id='advanced-permissions'><summary>高级设置</summary>"));
         assert!(!html.contains("<details id='advanced-permissions' open"));
         assert!(html.contains("不撤销 MCP 连接"));
+    }
+    #[test]
+    fn permission_view_full_access_requires_confirmed_account_device_and_local_conditions() {
+        let (fleet, registrations, principal) = fixture();
+        let default = |view: Value| {
+            render(&view)
+                .split("<details id='advanced-permissions'>")
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let mut owner = snapshot(&fleet, &registrations, &principal);
+        owner_status(&mut owner);
+        assert!(!default(owner).contains("完全访问"));
+        for condition in [
+            "unknown",
+            "offline",
+            "exec_disabled",
+            "account_readonly",
+            "device_readonly",
+        ] {
+            let mut f = fleet.clone();
+            let mut r = registrations.clone();
+            let mut p = principal.clone();
+            match condition {
+                "unknown" => f["devices"][0]["capabilities"]["allow_exec"] = Value::Null,
+                "offline" => f["devices"][0]["online"] = json!(false),
+                "exec_disabled" => f["devices"][0]["capabilities"]["allow_exec"] = json!(false),
+                "account_readonly" => p.scopes = vec!["code:read".into()],
+                "device_readonly" => r[0].scopes = vec!["code:read".into()],
+                _ => unreachable!(),
+            }
+            assert!(
+                !default(snapshot(&f, &r, &p)).contains("完全访问"),
+                "{condition}"
+            );
+        }
     }
 }
