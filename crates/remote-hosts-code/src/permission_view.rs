@@ -169,14 +169,13 @@ pub(crate) fn render(view: &Value) -> String {
             };
             html.push_str(&format!("<section class=card data-device='{}'><h3>{}</h3><p class=state>{connected} · {profile}</p>",
                 display(&d["device_id"]),display(&d["name"])));
-            if let Some(caps) = caps {
-                if let Some(c) = caps.iter().find(|c| {
+            if let Some(caps) = caps
+                && let Some(c) = caps.iter().find(|c| {
                     c["state"] != "available" && c["state"] != "registered_connection_unknown"
-                }) {
-                    if let Some(reason) = reason(c["state"].as_str().unwrap_or("")) {
-                        html.push_str(&format!("<p>{reason}</p>"));
-                    }
-                }
+                })
+                && let Some(reason) = reason(c["state"].as_str().unwrap_or(""))
+            {
+                html.push_str(&format!("<p>{reason}</p>"));
             }
             html.push_str("<p class=muted>以本机用户权限执行，不授予 OS 管理员权限；需要系统认证的操作仍由本人完成。</p></section>");
         }
