@@ -12,6 +12,8 @@ pub mod ho5;
 pub mod ho5_bus;
 #[cfg(unix)]
 pub mod ho5_cli;
+#[cfg(unix)]
+pub mod ho5_store;
 pub mod protocol;
 #[cfg(unix)]
 pub mod tasks;

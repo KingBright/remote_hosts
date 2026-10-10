@@ -434,7 +434,12 @@ async fn reboot_response_timeout_does_not_repeat_after_disconnect() {
         State::OutcomeUnknown
     );
     f.inspect_failed = true;
-    assert!(c.reconcile(&mut f, &i.request_id, 1002).await.is_err());
+    let offline = c.reconcile(&mut f, &i.request_id, 1002).await.unwrap();
+    assert_eq!(offline.state, State::OutcomeUnknown);
+    assert_eq!(
+        offline.error_code.as_deref(),
+        Some("observation_unavailable")
+    );
     c.advance(&mut f, &i.request_id, &p.plan_sha256, 1003)
         .await
         .unwrap();
@@ -549,8 +554,8 @@ async fn query_timeout_does_not_create_dispatch_or_receipt() {
 #[test]
 fn journal_lock_and_symlink_rejected() {
     let (_d, c, mut _f, i) = fixture(Action::SystemDeps);
-    let (_s, _lock) = tasks::locked_store(&c.state_dir, c.caller_uid).unwrap();
-    assert!(tasks::locked_store(&c.state_dir, c.caller_uid).is_err());
+    let (_s, _lock) = UserStore::locked(&c.state_dir, c.caller_uid).unwrap();
+    assert!(UserStore::locked(&c.state_dir, c.caller_uid).is_err());
     let dir = tempfile::tempdir().unwrap();
     let link = dir.path().canonicalize().unwrap().join("link");
     std::os::unix::fs::symlink(&c.state_dir, &link).unwrap();
@@ -587,7 +592,7 @@ async fn corrupted_plan_digest_is_rejected() {
     let (_d, c, mut f, i) = fixture(Action::SystemDeps);
     let mut p = prepared(&c, &mut f, &i).await;
     p.plan.device_id = uuid::Uuid::new_v4().to_string();
-    let (s, _lock) = tasks::locked_store(&c.state_dir, c.caller_uid).unwrap();
+    let (s, _lock) = UserStore::locked(&c.state_dir, c.caller_uid).unwrap();
     s.save_json(&i.request_id, &p).unwrap();
     drop(_lock);
     assert!(c.receipt(&i.request_id).is_err());
@@ -679,4 +684,239 @@ fn read_query_argv_has_no_mutation_or_interactive_auth() {
         }));
     }
     assert!(fixed_argv(Query::PackagesAuthorization, "123;sh,456,1000").is_err());
+}
+
+fn restarted(c: &Coordinator) -> Coordinator {
+    Coordinator {
+        state_dir: c.state_dir.clone(),
+        caller_uid: c.caller_uid,
+        timeout: c.timeout,
+    }
+}
+#[tokio::test]
+async fn cold_start_same_boot_then_new_boot_never_reboots_again() {
+    let (_d, c, mut f, i) = fixture(Action::RebootStaged);
+    let p = prepared(&c, &mut f, &i).await;
+    c.advance(&mut f, &i.request_id, &p.plan_sha256, 1001)
+        .await
+        .unwrap();
+    drop(c);
+    let cold = coordinator(&f.path);
+    let mut fresh = Fake {
+        o: f.o.clone(),
+        mode: Mode::Reboot,
+        calls: vec![],
+        path: f.path.clone(),
+        inspect_failed: true,
+        inspect_pending: false,
+    };
+    let offline = cold
+        .reconcile(&mut fresh, &i.request_id, 1002)
+        .await
+        .unwrap();
+    assert_eq!(offline.state, State::AwaitingReconnect);
+    assert_eq!(offline.dispatch_count, 1);
+    fresh.inspect_failed = false;
+    assert_eq!(
+        cold.reconcile(&mut fresh, &i.request_id, 1003)
+            .await
+            .unwrap()
+            .state,
+        State::AwaitingReconnect
+    );
+    boot_target(&mut fresh.o);
+    fresh.o.reboot_authorized = false;
+    assert_eq!(
+        cold.reconcile(&mut fresh, &i.request_id, 2000)
+            .await
+            .unwrap()
+            .state,
+        State::Succeeded
+    );
+    cold.advance(&mut fresh, &i.request_id, &p.plan_sha256, 2001)
+        .await
+        .unwrap();
+    assert!(fresh.calls.is_empty());
+    assert_eq!(f.calls.len(), 1);
+}
+#[tokio::test]
+async fn cold_start_staged_provenance_survives_stale_finished_signal() {
+    let (_d, c, mut f, i) = fixture(Action::SystemDeps);
+    let p = prepared(&c, &mut f, &i).await;
+    c.advance(&mut f, &i.request_id, &p.plan_sha256, 1001)
+        .await
+        .unwrap();
+    staged(&mut f.o);
+    let completion = Completion {
+        transaction: tx(),
+        success: true,
+        target_checksum: hash('b'),
+    };
+    f.o.completion = Some(completion.clone());
+    assert_eq!(
+        c.reconcile(&mut f, &i.request_id, 1002)
+            .await
+            .unwrap()
+            .state,
+        State::StagedPendingReboot
+    );
+    let cold = restarted(&c);
+    boot_target(&mut f.o);
+    f.o.completion = Some(completion);
+    f.o.packages_authorized = false;
+    assert_eq!(
+        cold.reconcile(&mut f, &i.request_id, 2000)
+            .await
+            .unwrap()
+            .state,
+        State::Succeeded
+    );
+    assert_eq!(f.calls.len(), 1);
+}
+#[tokio::test]
+async fn cold_start_timeout_does_not_adopt_matching_external_package_stage() {
+    let (_d, c, mut f, mut i) = fixture(Action::SystemDeps);
+    let p = prepared(&c, &mut f, &i).await;
+    f.mode = Mode::Pending;
+    c.advance(&mut f, &i.request_id, &p.plan_sha256, 1001)
+        .await
+        .unwrap();
+    let cold = restarted(&c);
+    staged(&mut f.o);
+    f.o.completion = Some(Completion {
+        transaction: tx(),
+        success: true,
+        target_checksum: hash('b'),
+    });
+    let r = cold.reconcile(&mut f, &i.request_id, 2000).await.unwrap();
+    assert_eq!(r.state, State::OutcomeUnknown);
+    assert_eq!(r.dispatch_count, 1);
+    i.request_id = uuid::Uuid::new_v4().to_string();
+    i.task_id = uuid::Uuid::new_v4().to_string();
+    assert!(cold.prepare(&mut f, i, 2001).await.is_err());
+    assert_eq!(f.calls.len(), 1);
+}
+#[tokio::test]
+async fn cold_start_reboot_dispatch_intent_only_observes_original() {
+    let (_d, c, mut f, i) = fixture(Action::RebootStaged);
+    let mut p = prepared(&c, &mut f, &i).await;
+    p.state = State::RebootIntent;
+    p.dispatch_count = 1;
+    let (s, lock) = UserStore::locked(&c.state_dir, c.caller_uid).unwrap();
+    s.save_json(&i.request_id, &p).unwrap();
+    drop(lock);
+    let cold = restarted(&c);
+    assert_eq!(
+        cold.advance(&mut f, &i.request_id, &p.plan_sha256, 2000)
+            .await
+            .unwrap()
+            .state,
+        State::RebootIntent
+    );
+    assert_eq!(
+        cold.reconcile(&mut f, &i.request_id, 2001)
+            .await
+            .unwrap()
+            .state,
+        State::AwaitingReconnect
+    );
+    assert!(f.calls.is_empty());
+}
+#[tokio::test]
+async fn reconcile_probe_timeout_preserves_durable_original_state() {
+    let (_d, c, mut f, i) = fixture(Action::SystemDeps);
+    let p = prepared(&c, &mut f, &i).await;
+    c.advance(&mut f, &i.request_id, &p.plan_sha256, 1001)
+        .await
+        .unwrap();
+    f.inspect_pending = true;
+    let cold = restarted(&c);
+    let r = cold.reconcile(&mut f, &i.request_id, 2000).await.unwrap();
+    assert_eq!(r.state, State::Running);
+    assert_eq!(r.transaction, Some(tx()));
+    assert_eq!(r.dispatch_count, 1);
+    assert_eq!(r.error_code.as_deref(), Some("observation_timeout"));
+    assert_eq!(
+        cold.receipt(&i.request_id).unwrap().unwrap().error_code,
+        r.error_code
+    );
+    assert_eq!(f.calls.len(), 1);
+}
+#[tokio::test]
+async fn completed_receipt_is_available_after_cold_start_without_os_connection() {
+    let (_d, c, mut f, i) = fixture(Action::RebootStaged);
+    let p = prepared(&c, &mut f, &i).await;
+    c.advance(&mut f, &i.request_id, &p.plan_sha256, 1001)
+        .await
+        .unwrap();
+    boot_target(&mut f.o);
+    let done = c.reconcile(&mut f, &i.request_id, 2000).await.unwrap();
+    f.inspect_failed = true;
+    let next = restarted(&c)
+        .reconcile(&mut f, &i.request_id, 2001)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(done).unwrap(),
+        serde_json::to_value(next).unwrap()
+    );
+}
+#[tokio::test]
+async fn copied_receipt_cannot_move_to_another_private_store() {
+    let (_d, c, mut f, i) = fixture(Action::SystemDeps);
+    c.prepare(&mut f, i.clone(), 1000).await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().canonicalize().unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::copy(
+        c.state_dir.join(format!("{}.json", i.request_id)),
+        path.join(format!("{}.json", i.request_id)),
+    )
+    .unwrap();
+    let other = Coordinator {
+        state_dir: path,
+        ..restarted(&c)
+    };
+    assert!(other.receipt(&i.request_id).is_err());
+}
+#[tokio::test]
+async fn uid_mapping_identity_mismatch_fails_even_with_recomputed_plan_digest() {
+    let (_d, c, mut f, i) = fixture(Action::SystemDeps);
+    let mut p = c.prepare(&mut f, i.clone(), 1000).await.unwrap();
+    p.plan.caller_identity_sha256 = hash('f');
+    p.plan_sha256 = digest(&p.plan).unwrap();
+    let (s, lock) = UserStore::locked(&c.state_dir, c.caller_uid).unwrap();
+    s.save_json(&i.request_id, &p).unwrap();
+    drop(lock);
+    assert!(restarted(&c).receipt(&i.request_id).is_err());
+    assert!(f.calls.is_empty());
+}
+#[tokio::test]
+async fn same_boot_changed_staged_target_is_uncertain_and_never_reapplied() {
+    let (_d, c, mut f, i) = fixture(Action::SystemDeps);
+    let p = prepared(&c, &mut f, &i).await;
+    c.advance(&mut f, &i.request_id, &p.plan_sha256, 1001)
+        .await
+        .unwrap();
+    staged(&mut f.o);
+    f.o.completion = Some(Completion {
+        transaction: tx(),
+        success: true,
+        target_checksum: hash('b'),
+    });
+    c.reconcile(&mut f, &i.request_id, 1002).await.unwrap();
+    f.o.completion = None;
+    f.o.staged.as_mut().unwrap().checksum = hash('d');
+    assert_eq!(
+        restarted(&c)
+            .reconcile(&mut f, &i.request_id, 1003)
+            .await
+            .unwrap()
+            .state,
+        State::OutcomeUnknown
+    );
+    c.advance(&mut f, &i.request_id, &p.plan_sha256, 1004)
+        .await
+        .unwrap();
+    assert_eq!(f.calls.len(), 1);
 }

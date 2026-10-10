@@ -3,6 +3,7 @@ use crate::{
     engine::unix_time,
     ho5::{self, Action, Backend, Intent},
     ho5_bus::{ReadOnlyBus, SystemReadBus},
+    ho5_store::CallerIdentity,
 };
 use anyhow::{Result, ensure};
 use clap::Subcommand;
@@ -48,7 +49,7 @@ pub async fn run(command: Command) -> Result<Value> {
         Command::Inspect => {
             return Ok(json!({"protocol":1,"device_id":ho5::DEVICE,
             "device_identity_evidence":"caller_device_binding_not_independently_authenticated",
-            "execution_enabled":false,"dns_enabled":false,"observation":bus.inspect().await?}));
+            "execution_enabled":false,"dns_enabled":false,"caller_identity":CallerIdentity::current()?,"observation":bus.inspect().await?}));
         }
         Command::Prepare {
             state_dir,

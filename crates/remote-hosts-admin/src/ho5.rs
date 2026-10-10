@@ -1,8 +1,7 @@
 //! Ordinary-user HO5 plans and reconciliation. The shipped backend cannot mutate the OS.
 use crate::{
-    filesystem::Store,
+    ho5_store::{CallerIdentity, StoreIdentity, UserStore},
     protocol::{PLAN_TTL, digest, valid_id},
-    tasks,
 };
 use anyhow::{Context, Result, ensure};
 use clap::ValueEnum;
@@ -218,6 +217,8 @@ pub struct Plan {
     pub intent: Intent,
     pub device_id: String,
     pub caller_uid: u32,
+    pub caller_identity_sha256: String,
+    pub store_identity: StoreIdentity,
     pub profile_sha256: String,
     pub created_at: u64,
     pub expires_at: u64,
@@ -259,12 +260,14 @@ pub struct Coordinator {
     pub timeout: Duration,
 }
 impl Coordinator {
-    fn validate(&self, r: &Record, id: &str) -> Result<()> {
+    fn validate(&self, store: &UserStore, r: &Record, id: &str) -> Result<()> {
         ensure!(self.caller_uid != 0, "ordinary_non_root_caller_required");
         r.plan.intent.validate()?;
         r.plan.before.validate()?;
         ensure!(
-            r.plan.protocol == 1
+            r.plan.protocol == 2
+                && r.plan.caller_identity_sha256 == CallerIdentity::current()?.sha256()?
+                && r.plan.store_identity == store.identity()?
                 && r.plan.device_id == DEVICE
                 && r.plan.caller_uid == self.caller_uid
                 && r.plan.intent.request_id == id
@@ -295,23 +298,23 @@ impl Coordinator {
         }
         Ok(())
     }
-    fn load(&self, store: &Store, id: &str) -> Result<Record> {
+    fn load(&self, store: &UserStore, id: &str) -> Result<Record> {
         valid_id(id)?;
         let r = store
             .load_json::<Record>(id)?
             .context("ho5_receipt_not_found")?;
-        self.validate(&r, id)?;
+        self.validate(store, &r, id)?;
         Ok(r)
     }
     pub fn receipt(&self, id: &str) -> Result<Option<Record>> {
         valid_id(id)?;
-        let Some(s) = tasks::existing_store(&self.state_dir, self.caller_uid)? else {
+        let Some(s) = UserStore::existing(&self.state_dir, self.caller_uid)? else {
             return Ok(None);
         };
         let Some(r) = s.load_json::<Record>(id)? else {
             return Ok(None);
         };
-        self.validate(&r, id)?;
+        self.validate(&s, &r, id)?;
         Ok(Some(r))
     }
     pub async fn prepare<B: Backend>(
@@ -322,27 +325,21 @@ impl Coordinator {
     ) -> Result<Record> {
         intent.validate()?;
         ensure!(self.caller_uid != 0, "ordinary_non_root_caller_required");
-        let (store, _lock) = tasks::locked_store(&self.state_dir, self.caller_uid)?;
+        let (store, _lock) = UserStore::locked(&self.state_dir, self.caller_uid)?;
         if let Some(r) = store.load_json::<Record>(&intent.request_id)? {
-            self.validate(&r, &intent.request_id)?;
+            self.validate(&store, &r, &intent.request_id)?;
             ensure!(r.plan.intent == intent, "idempotency_binding_conflict");
             return Ok(r);
         }
         store.capacity()?;
         // A new UUID must not bypass an accepted/unknown intent for this task and action.
-        for entry in std::fs::read_dir(&store.dir)?.take(2049) {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(id) = name.to_str().and_then(|s| s.strip_suffix(".json")) else {
-                continue;
-            };
-            if valid_id(id).is_err() {
-                continue;
-            }
-            let previous = self.load(&store, id)?;
+        for id in store.ids()? {
+            let previous = self.load(&store, &id)?;
             ensure!(
-                previous.plan.intent.task_id != intent.task_id
-                    || previous.plan.intent.action != intent.action,
+                previous.plan.intent.action != intent.action
+                    || (previous.plan.intent.task_id != intent.task_id
+                        && (previous.dispatch_count == 0
+                            || matches!(previous.state, State::Succeeded | State::Failed))),
                 "existing_intent_use_original_request"
             );
         }
@@ -351,9 +348,11 @@ impl Coordinator {
             .context("ho5_probe_timeout")??;
         before.validate()?;
         let plan = Plan {
-            protocol: 1,
+            protocol: 2,
             device_id: DEVICE.into(),
             caller_uid: self.caller_uid,
+            caller_identity_sha256: CallerIdentity::current()?.sha256()?,
+            store_identity: store.identity()?,
             profile_sha256: digest(&(PROFILE, PACKAGES))?,
             created_at: now,
             expires_at: now.checked_add(PLAN_TTL).context("plan_clock_overflow")?,
@@ -374,9 +373,9 @@ impl Coordinator {
         store.save_json(&r.plan.intent.request_id, &r)?;
         Ok(r)
     }
-    fn save(&self, store: &Store, r: &mut Record, now: u64) -> Result<()> {
-        r.updated_at = now;
-        self.validate(r, &r.plan.intent.request_id)?;
+    fn save(&self, store: &UserStore, r: &mut Record, now: u64) -> Result<()> {
+        r.updated_at = now.max(r.updated_at);
+        self.validate(store, r, &r.plan.intent.request_id)?;
         store.save_json(&r.plan.intent.request_id, r)
     }
     /// Fixture executor seam. ReadOnlyBus has mutation_enabled=false; no production side effects.
@@ -387,7 +386,7 @@ impl Coordinator {
         hash: &str,
         now: u64,
     ) -> Result<Record> {
-        let (store, _lock) = tasks::locked_store(&self.state_dir, self.caller_uid)?;
+        let (store, _lock) = UserStore::locked(&self.state_dir, self.caller_uid)?;
         let mut r = self.load(&store, id)?;
         ensure!(r.plan_sha256 == hash, "plan_digest_mismatch");
         if r.dispatch_count != 0
@@ -488,18 +487,50 @@ impl Coordinator {
         id: &str,
         now: u64,
     ) -> Result<Record> {
-        let (store, _lock) = tasks::locked_store(&self.state_dir, self.caller_uid)?;
+        let (store, _lock) = UserStore::locked(&self.state_dir, self.caller_uid)?;
         let mut r = self.load(&store, id)?;
-        let o = tokio::time::timeout(self.timeout, backend.inspect())
-            .await
-            .context("ho5_probe_timeout")??;
-        o.validate()?;
         if matches!(r.state, State::Succeeded | State::Failed) {
             return Ok(r);
         }
+        let probe = tokio::time::timeout(self.timeout, backend.inspect()).await;
+        let o = match probe {
+            Ok(Ok(o)) if o.validate().is_ok() => o,
+            failed => {
+                r.error_code = Some(
+                    match failed {
+                        Err(_) => "observation_timeout",
+                        Ok(Err(_)) => "observation_unavailable",
+                        _ => "observation_invalid",
+                    }
+                    .into(),
+                );
+                self.save(&store, &mut r, now)?;
+                return Ok(r);
+            }
+        };
+        r.error_code = None;
         match r.plan.intent.action {
             Action::SystemDeps if r.dispatch_count == 1 => {
-                if let Some(c) = &o.completion {
+                // Durable staged provenance wins over stale or foreign Finished signals.
+                if r.state == State::StagedPendingReboot {
+                    if o.boot_id != r.plan.before.boot_id {
+                        if Some(&o.booted.checksum) == r.target_checksum.as_ref()
+                            && PACKAGES
+                                .iter()
+                                .all(|p| o.verified_booted_packages.iter().any(|s| s == p))
+                        {
+                            r.state = State::Succeeded;
+                        } else {
+                            r.state = State::Failed;
+                            r.error_code = Some("boot_target_or_packages_mismatch".into());
+                        }
+                    } else if !o.staged.as_ref().is_some_and(|d| {
+                        Some(&d.checksum) == r.target_checksum.as_ref() && d.has_profile()
+                    }) {
+                        r.state = State::OutcomeUnknown;
+                        r.error_code = Some("staged_target_changed_observe_original".into());
+                    }
+                } else if let Some(c) = &o.completion {
                     if r.transaction.as_ref() == Some(&c.transaction) {
                         if c.success
                             && o.staged
@@ -517,19 +548,6 @@ impl Coordinator {
                     }
                 } else if r.transaction.is_some() && r.transaction == o.transaction {
                     r.state = State::Running;
-                } else if r.state == State::StagedPendingReboot {
-                    if o.boot_id != r.plan.before.boot_id {
-                        if Some(&o.booted.checksum) == r.target_checksum.as_ref()
-                            && PACKAGES
-                                .iter()
-                                .all(|p| o.verified_booted_packages.iter().any(|s| s == p))
-                        {
-                            r.state = State::Succeeded;
-                        } else {
-                            r.state = State::Failed;
-                            r.error_code = Some("boot_target_or_packages_mismatch".into());
-                        }
-                    }
                 } else {
                     r.state = State::OutcomeUnknown;
                 }

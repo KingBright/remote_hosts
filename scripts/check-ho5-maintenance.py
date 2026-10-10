@@ -20,6 +20,11 @@ def verify(root, evidence, slot, lock, lock_sha):
         raise RuntimeError("fresh_evidence_and_existing_managed_build_slot_required")
     if lock.is_symlink() or hashlib.sha256(lock.read_bytes()).hexdigest() != lock_sha:
         raise RuntimeError("candidate_lock_digest_mismatch")
+    def reserve_ok():
+        info = os.statvfs(slot)
+        return info.f_bavail * info.f_frsize >= 4 * 1024**3
+    if not reserve_ok():
+        raise RuntimeError("host_reserve_required")
     evidence.mkdir(parents=True)
     spec = importlib.util.spec_from_file_location("admin_snapshot", root / "scripts/admin-helper-snapshot.py")
     snapshot = importlib.util.module_from_spec(spec)
@@ -31,7 +36,7 @@ def verify(root, evidence, slot, lock, lock_sha):
     report = dict(protocol=1, state="running", snapshot_id=manifest["snapshot_id"], checks=[],
                   lock_sha256=lock_sha, toolchain="1.94.1", uid=os.geteuid(),
                   build_slot=str(slot), host_maintenance_executed=False, deployed=False,
-                  child_pid=None, started_at=int(time.time()))
+                  child_pid=None, reserve_bytes=4 * 1024**3, started_at=int(time.time()))
     cancelled = False
     def on_signal(_signum, _frame):
         nonlocal cancelled
@@ -58,6 +63,8 @@ def verify(root, evidence, slot, lock, lock_sha):
                 time.sleep(.1)
         raise RuntimeError("owned_test_process_cleanup_unconfirmed")
     def check(name, argv, env, limit=600):
+        if not reserve_ok():
+            raise RuntimeError("host_reserve_reached_before_child")
         row = dict(name=name, state="running", log=str(evidence / (name + ".log")))
         report["checks"].append(row)
         save()
@@ -72,7 +79,7 @@ def verify(root, evidence, slot, lock, lock_sha):
             try:
                 while child.poll() is None:
                     now = time.monotonic()
-                    if cancelled or now-started > limit:
+                    if cancelled or now-started > limit or not reserve_ok():
                         stop_owned(child)
                         raise RuntimeError("cancelled_or_bounded_test_timeout")
                     if now-last >= 30:
@@ -130,8 +137,10 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--evidence-dir", required=True, type=Path)
     p.add_argument("--build-slot", required=True, type=Path)
-    p.add_argument("--dependency-lock", required=True, type=Path)
-    p.add_argument("--accept-lock-sha256", required=True)
+    p.add_argument("--dependency-lock", type=Path,
+                   default=Path(__file__).resolve().parent/"fixtures/ho5-maintenance/Cargo.lock")
+    p.add_argument("--accept-lock-sha256",
+                   default="bd6590a8545d05bd638e8838b0d759f517c7ab6a68eaea765f214e666ef25d2d")
     a = p.parse_args()
     result = verify(Path(__file__).resolve().parents[1], a.evidence_dir.absolute(),
                     a.build_slot.absolute(), a.dependency_lock.absolute(), a.accept_lock_sha256)
