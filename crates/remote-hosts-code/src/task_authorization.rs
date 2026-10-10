@@ -337,7 +337,7 @@ async fn page(
     let token = crate::gateway::status_cookie(&headers).expect("validated session cookie");
     let html = format!(
         r#"<!doctype html><html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Task authorization</title><h1>Task authorization</h1>
+<title>高级限时任务限制</title><p><a href="/status">返回设备权限总览</a></p><h1>高级：可选的限时任务限制</h1><p>普通 MCP 任务复用既有权限，无需在这里创建授权。此页仅给用户主动选择的任务增加限制。</p>
 <p>Approve a time-limited task using the existing Gateway owner password. Each request still requires its current account and device scopes and local allow flags. Terminal access has local-user authority outside code roots. This does not approve platform prompts or administrator actions.</p>
 <p>Expiry blocks new and undispatched work; existing receipts stay readable. This form does not confine commands to a workspace. Updating or revoking increments the version. Already dispatched work may continue. Queued work requires an explicit resume using the new version. No operation runs from this form.</p>
 <ul>{inventory}</ul><form method=post action=/status/task-authorization>

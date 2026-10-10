@@ -4,6 +4,7 @@ pub mod agent;
 pub mod agent_log;
 pub mod auth;
 mod capabilities;
+mod permission_view;
 mod poll_health;
 mod status_view;
 pub use capabilities::release_manifest;

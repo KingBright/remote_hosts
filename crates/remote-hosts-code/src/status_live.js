@@ -17,7 +17,7 @@
         headers: {'If-None-Match': etag}
       });
       if (response.status === 304 || response.status === 204) {
-        notice.textContent = '连接正常，任务状态无变化 · ' + new Date().toLocaleTimeString();
+        notice.textContent = '连接正常，连接与访问状态无变化 · ' + new Date().toLocaleTimeString();
         notice.dataset.stale = 'false';
         return;
       }
@@ -30,6 +30,11 @@
       for (const card of next.querySelectorAll('[data-operation]')) {
         const old = previous.get(card.dataset.operation);
         if (old && old.dataset.view === card.dataset.view) card.replaceWith(old);
+      }
+      // Keep optional panels closed by default, and preserve the owner's choice.
+      for (const panel of body.querySelectorAll('details[id]')) {
+        const replacement = next.querySelector('#' + panel.id);
+        if (replacement) replacement.open = panel.open;
       }
       body.replaceChildren(...next.childNodes);
       body.dataset.revision = next.dataset.revision;

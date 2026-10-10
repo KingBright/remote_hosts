@@ -247,6 +247,7 @@ pub(crate) async fn task(g: &Gateway, p: &Principal, args: &Value) -> Result<Val
 
 pub(crate) async fn status(g: &Gateway, p: &Principal) -> Result<Value> {
     let fleet = g.dispatch(p, "fleet_status", json!({})).await?;
+    let permissions = crate::permission_view::snapshot(&fleet, &g.config.devices, p);
     let ids:Vec<String>=sqlx::query_scalar("SELECT j.id FROM jobs j LEFT JOIN kv t ON t.kind='terminal_observation' AND t.key=j.id AND t.expires>? WHERE json_extract(j.request,'$.owner')=? ORDER BY (j.state IN ('queued','dispatched') OR json_extract(t.value,'$.terminal.state') IN ('running','starting')) DESC,j.updated DESC,j.id LIMIT 101")
         .bind(now()).bind(&p.owner).fetch_all(&g.store.pool).await?;
     let truncated = ids.len() > 100;
@@ -302,6 +303,6 @@ pub(crate) async fn status(g: &Gateway, p: &Principal) -> Result<Value> {
             "unconfirmed_requests":unconfirmed_requests,"unavailable_or_filtered_operations":unavailable,
             "scope_complete":!truncated&&unavailable==0,"state":if active>0{"active_operations"}else if uncertain>0||unconfirmed_requests>0{"outcomes_require_observation"}else if unavailable>0{"observation_incomplete"}else if truncated{"history_page_limited"}else{"no_active_work"}},
         "history_truncated":truncated,"heartbeat_is_not_business_progress":true,
-        "fleet":fleet,"operations":items,"requests_without_operation":request_views}),
+        "permissions":permissions,"fleet":fleet,"operations":items,"requests_without_operation":request_views}),
     )
 }

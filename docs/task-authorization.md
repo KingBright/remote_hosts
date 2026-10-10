@@ -20,15 +20,35 @@ The accepted NAS package is in `releases/0.10.27/verified-02`; runtime evidence 
 `task-auth-release-0.10.27/gateway-01/runtime-acceptance.json` in the task evidence
 workspace. No production grant, OAuth change or other-product action occurred.
 
-The conversation currently exposes 24 Remote Hosts tools against the Gateway's
-25-tool catalog: `task_resume` is absent and its enqueue tools do not accept
-`authorization_version`. The Gateway's advertised catalog does not establish host-side availability. There is no
-supported connector action exposed here to refresh that schema. For a custom
-MCP connection, use ChatGPT Plugins, select the existing connection, choose
-Refresh, verify the metadata, then start a new conversation and inspect the
-tools. Published plugins follow the host's catalog/review update process.
-See [OpenAI's connection documentation](https://developers.openai.com/plugins/deploy/connect-chatgpt).
-Never invent a version or submit a field/tool absent from the active schema.
+An earlier host session exposed 24 tools and lacked task_resume and enqueue
+authorization_version fields. On 2026-10-10, the active session was verified to
+expose all 25 tools, including task_resume and the authorization_version fields.
+The earlier schema blocker is historical, not a current prerequisite for
+ordinary MCP access. Tool availability does not grant account/device scopes,
+local-user permissions or OS administrator authority.
+
+## Ordinary MCP access
+
+Ordinary tasks reuse the existing OAuth account scopes, registered device scopes
+and Agent local settings. They do not require a new TaskGrant or a manually
+entered task ID. Request and operation receipts are automatically linked in the
+existing audit store. A task ID without a stored grant is only optional correlation.
+
+The personal default status page shows connection, native local-user access and
+a client-managed disconnect/revocation entry. Device scopes, code roots, local
+write/execute switches and opt-in task limits remain in collapsed advanced
+settings. Its owner-password browser session is read-only status authority,
+not evidence of any particular MCP client scopes. Terminal access uses
+the native local user and is not confined by code roots or elevated to OS admin.
+Native administrator authentication, Linux NoNewPrivs and platform approvals still
+apply. Missing account/device scopes or disabled Agent flags need review at that
+boundary; refreshing a tool catalog does not grant those permissions.
+
+TaskGrant is an optional extra restriction in the advanced entry. Existing grant
+bindings keep their exact version/expiry/revocation checks. Do not drop a version
+or replace a task ID to evade an established restriction. The five-minute
+taskgrant-expiry-live-0.10.27-01 live experiment was superseded by the owner's
+ordinary-access simplification request; it was not completed or accepted.
 
 ## Owner approval and scope
 

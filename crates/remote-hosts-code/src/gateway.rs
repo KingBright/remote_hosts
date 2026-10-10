@@ -1300,7 +1300,8 @@ async fn status_page(
         return StatusCode::BAD_REQUEST.into_response();
     }
     match status_snapshot(&g, &principal).await {
-        Ok(snapshot) => {
+        Ok(mut snapshot) => {
+            crate::permission_view::owner_status(&mut snapshot["permissions"]);
             let revision = crate::status_view::revision(&snapshot);
             let etag = format!("W/\"{revision}\"");
             let unchanged = headers

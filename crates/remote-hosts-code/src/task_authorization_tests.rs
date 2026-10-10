@@ -18,6 +18,9 @@ struct Fixture {
     password: String,
 }
 async fn fixture() -> Fixture {
+    fixture_with_flags(true, true).await
+}
+async fn fixture_with_flags(allow_write: bool, allow_exec: bool) -> Fixture {
     use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
     let dir = tempfile::tempdir().unwrap();
     let password = "synthetic-owner-password".to_owned();
@@ -58,15 +61,15 @@ async fn fixture() -> Fixture {
         device_token: token,
         state_dir: dir.path().join("agent"),
         roots: vec![root.clone()],
-        allow_write: true,
-        allow_exec: true,
+        allow_write,
+        allow_exec,
         shell: "/bin/sh".into(),
     })
     .await
     .unwrap();
     let hello: DeviceHello = serde_json::from_value(json!({
         "version":env!("CARGO_PKG_VERSION"),"session":session,"roots":[root],
-        "platform":std::env::consts::OS,"allow_write":true,"allow_exec":true,
+        "platform":std::env::consts::OS,"allow_write":allow_write,"allow_exec":allow_exec,
     }))
     .unwrap();
     g.store
@@ -1155,5 +1158,104 @@ async fn legacy_unbounded_grant_is_not_silently_promoted_and_receipts_remain_rea
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn ordinary_mcp_access_reuses_existing_authority_and_automatic_audit() {
+    let f = fixture().await;
+    let ws=run(&f,"workspace_open",json!({"device_id":f.device,"root":f._dir.path().join("project"),"idempotency_key":"ordinary-open"})).await;
+    let id = ws["workspace"]["id"].as_str().unwrap();
+    let written=run(&f,"code_apply_edits",json!({"workspace_id":id,"idempotency_key":"ordinary-write","files":[{"path":"ordinary.txt","action":"create","expected_version":"absent","content":"ordinary"}]})).await;
+    assert!(written.get("error").is_none(), "{written}");
+    let read = run(
+        &f,
+        "code_read",
+        json!({"workspace_id":id,"requests":[{"path":"ordinary.txt","start_line":1,"end_line":1}]}),
+    )
+    .await;
+    assert!(read.get("error").is_none(), "{read}");
+    assert!(
+        read["ranges"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ordinary")
+    );
+    let executed=run(&f,"terminal_exec",json!({"workspace_id":id,"idempotency_key":"ordinary-exec","command":"printf ordinary","wait_ms":1000})).await;
+    assert!(executed.get("error").is_none(), "{executed}");
+    assert_eq!(executed["terminal"]["exit_code"], 0, "{executed}");
+    assert_eq!(count(&f).await, 4);
+    let grant_rows:i64=sqlx::query_scalar("SELECT COUNT(*) FROM kv WHERE kind IN ('task_authorization','operation_task_authorization')").fetch_one(&f.g.store.pool).await.unwrap();
+    assert_eq!(grant_rows, 0);
+    let receipts: Vec<String> =
+        sqlx::query_scalar("SELECT value FROM kv WHERE kind='request_receipt'")
+            .fetch_all(&f.g.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(receipts.len(), 4);
+    for raw in receipts {
+        let receipt: Value = serde_json::from_str(&raw).unwrap();
+        assert!(receipt["operation_id"].is_string());
+        assert!(receipt["task_id"].is_null());
+    }
+}
+#[tokio::test]
+async fn ordinary_mcp_status_is_read_only_and_browser_identity_is_not_execution_scope() {
+    let f = fixture().await;
+    let before = count(&f).await;
+    let response =
+        f.g.router()
+            .unwrap()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header("host", "fixture.example")
+                    .header("cookie", format!("rh_status={}", f.cookie))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("连接与访问"));
+    assert!(html.contains("无需额外限时授权或手填任务 ID"));
+    assert!(html.contains("高级设置"));
+    assert!(html.contains("不代表某个 MCP 连接"));
+    assert!(!html.contains("name=task_id"));
+    assert!(!html.contains(&f.cookie));
+    assert!(!html.contains(&f.password));
+    assert_eq!(count(&f).await, before);
+    let grant_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM kv WHERE kind='task_authorization'")
+            .fetch_one(&f.g.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(grant_rows, 0);
+}
+#[tokio::test]
+async fn ordinary_mcp_agent_disabled_switches_keep_original_denials() {
+    let f = fixture_with_flags(false, false).await;
+    let ws=run(&f,"workspace_open",json!({"device_id":f.device,"root":f._dir.path().join("project"),"idempotency_key":"disabled-open"})).await;
+    let id = ws["workspace"]["id"].as_str().unwrap();
+    let write=run(&f,"code_apply_edits",json!({"workspace_id":id,"idempotency_key":"disabled-write","files":[{"path":"blocked.txt","action":"create","expected_version":"absent","content":"blocked"}]})).await;
+    assert_eq!(write["error_code"], "local_write_disabled", "{write}");
+    let exec=run(&f,"terminal_exec",json!({"workspace_id":id,"idempotency_key":"disabled-exec","command":"printf blocked","wait_ms":1000})).await;
+    assert_eq!(exec["error_code"], "local_exec_disabled", "{exec}");
+    assert!(!f._dir.path().join("project/blocked.txt").exists());
+    let snapshot = crate::activity::status(&f.g, &f.p).await.unwrap();
+    assert_eq!(
+        snapshot["permissions"]["devices"][0]["capabilities"][1]["state"],
+        "local_write_disabled"
+    );
+    assert_eq!(
+        snapshot["permissions"]["devices"][0]["capabilities"][2]["state"],
+        "local_exec_disabled"
     );
 }

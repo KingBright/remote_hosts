@@ -51,29 +51,19 @@ pub(crate) fn revision(snapshot: &Value) -> String {
 
 pub(crate) fn render(snapshot: &Value) -> String {
     let mut html = String::from(
-        "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><noscript><meta http-equiv=refresh content=30></noscript><script src='/status/live.js' defer></script><title>Remote Hosts Status</title><style>body{font-family:system-ui;margin:0;background:#11151c;color:#e9edf5}main{max-width:1200px;margin:auto;padding:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,350px),1fr));gap:16px}.card{border:1px solid #354153;border-radius:12px;padding:16px;background:#19222e;overflow-wrap:anywhere}h1,h2,h3{line-height:1.3}.muted{color:#adb8c7}.state{font-weight:700}dl{display:grid;grid-template-columns:112px 1fr;gap:6px;margin:12px 0}dt{color:#adb8c7}dd{margin:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}button{padding:8px 16px;font:inherit}code{font-size:12px}</style></head><body><p id='rh-observation' role='status' style='margin:16px 24px'>正在显示已确认快照</p><main id='rh-status'><h1>Remote Hosts Status</h1><p>Authoritative Gateway state. Heartbeat is not counted as business progress.</p><p class=muted>每 5 秒核对变化，无变化不重传任务卡。进程结果、日志完整性和业务验收分别显示；unknown 不代表失败，也不允许重放。</p>",
+        "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><noscript><meta http-equiv=refresh content=30></noscript><script src='/status/live.js' defer></script><title>Remote Hosts 连接与访问</title><style>body{font-family:system-ui;margin:0;background:#11151c;color:#e9edf5}main{max-width:1200px;margin:auto;padding:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,350px),1fr));gap:16px}.card{border:1px solid #354153;border-radius:12px;padding:16px;background:#19222e;overflow-wrap:anywhere}h1,h2,h3{line-height:1.3}.muted{color:#adb8c7}.state{font-weight:700}dl{display:grid;grid-template-columns:112px 1fr;gap:6px;margin:12px 0}dt{color:#adb8c7}dd{margin:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}button{padding:8px 16px;font:inherit}code{font-size:12px}</style></head><body><p id='rh-observation' role='status' style='margin:16px 24px'>正在显示已确认快照</p><main id='rh-status'><h1>Remote Hosts 连接与访问</h1><p class=muted>状态随设备报告更新。</p>",
     );
     html = html.replacen(
         "id='rh-status'",
         &format!("id='rh-status' data-revision='{}'", revision(snapshot)),
         1,
     );
+    html.push_str(&crate::permission_view::render(&snapshot["permissions"]));
+    html.push_str("<details id=operation-audit><summary>查看操作与审计</summary>");
     html.push_str(&format!("<section class=card><h2>{}</h2><p>观察时间：{} · 活跃操作：{} · 待核对：{} · 当前页完整：{}</p></section>",
         text(&snapshot["summary"]["state"]),text(&snapshot["observed_at"]),text(&snapshot["summary"]["active_operations"]),
         text(&snapshot["summary"]["uncertain_operations"]),text(&snapshot["summary"]["scope_complete"])));
-    html.push_str("<h2>设备</h2><div class=grid>");
-    if let Some(devices) = snapshot["fleet"]["devices"].as_array() {
-        for d in devices {
-            html.push_str(&format!(
-                "<section class=card><h3>{}</h3><p>版本 {} · 在线 {} · 版本一致 {}</p></section>",
-                text(&d["name"]),
-                text(&d["version"]),
-                text(&d["online"]),
-                text(&d["converged"])
-            ));
-        }
-    }
-    html.push_str("</div><h2>任务与真实操作</h2><div class=grid>");
+    html.push_str("<h2>任务与真实操作</h2><p class=muted>请求及操作回执自动关联；已有任务限制保持原绑定，状态页不会启动或续接操作。</p><div class=grid>");
     if let Some(items) = snapshot["operations"].as_array() {
         for item in items {
             html.push_str(&format!(
@@ -103,6 +93,9 @@ pub(crate) fn render(snapshot: &Value) -> String {
             ] {
                 html.push_str(&format!("<dt>{label}</dt><dd>{}</dd>", text(value)));
             }
+            if let Some(reason) = crate::permission_view::rejection(&item["receipt"]) {
+                html.push_str(&format!("<dt>拒绝说明</dt><dd>{reason}</dd>"));
+            }
             html.push_str(&format!(
                 "</dl><details><summary>查看脱敏回执</summary><pre>{}</pre></details></section>",
                 escape(&serde_json::to_string_pretty(&item["receipt"]).unwrap_or_default())
@@ -112,10 +105,15 @@ pub(crate) fn render(snapshot: &Value) -> String {
     html.push_str("</div><h2>尚无远端操作的请求</h2><div class=grid>");
     if let Some(items) = snapshot["requests_without_operation"].as_array() {
         for item in items {
+            let guidance = crate::permission_view::rejection(item)
+                .or_else(|| crate::permission_view::rejection(&item["receipt"]));
+            if let Some(reason) = guidance {
+                html.push_str(&format!("<p role=note>{reason}</p>"));
+            }
             html.push_str(&format!("<section class=card><h3>{}</h3><p>{}</p><code>{}</code><details><summary>脱敏回执</summary><pre>{}</pre></details></section>",text(&item["tool"]),text(&item["state"]),text(&item["request_id"]),escape(&serde_json::to_string_pretty(item).unwrap_or_default())));
         }
     }
-    html.push_str("</div><p class=muted>只展示已授权、仍在保留期内的记录。历史分页或缺失的证据不会被标为整体完成。</p><form method=post action=/status/logout><button type=submit>退出</button></form></main></body></html>");
+    html.push_str("</div><p class=muted>只展示已授权、仍在保留期内的记录。历史分页或缺失的证据不会被标为整体完成。</p></details><form method=post action=/status/logout><button type=submit>退出管理页</button></form></main></body></html>");
     html
 }
 #[cfg(test)]
