@@ -63,6 +63,7 @@ impl Fixture {
             .unwrap()
             .to_string();
         let g = Gateway::new(GatewayConfig {
+            forge_browser: None,
             public_url: ORIGIN.into(),
             bind: "127.0.0.1:0".into(),
             state_dir: dir.path().join("state"),
@@ -336,8 +337,12 @@ async fn status_page_uses_owner_password_cookie_and_gateway_truth() {
         .await;
     assert_eq!(status, StatusCode::OK);
     let page = page.as_str().unwrap();
-    assert!(page.contains("Authoritative Gateway state"));
-    assert!(page.contains("Heartbeat is not counted as business progress"));
+    assert!(page.contains("Remote Hosts 连接与访问"));
+    assert!(page.contains("任务与真实操作"));
+    assert!(page.contains("id='rh-status' data-revision='"));
+    assert!(page.contains("当前页完整"));
+    assert!(!page.contains("action='/status/login'"));
+    assert!(!page.contains("href='/status/forge/'"));
     assert!(!page.contains("device_token"));
     assert!(!page.contains("command_preview"));
 }

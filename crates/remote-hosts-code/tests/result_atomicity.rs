@@ -16,6 +16,7 @@ async fn fixture() -> (tempfile::TempDir, Gateway, Principal, String) {
         "terminal:exec".into(),
     ];
     let g = Gateway::new(GatewayConfig {
+        forge_browser: None,
         public_url: "https://fixture.example".into(),
         bind: "127.0.0.1:0".into(),
         state_dir: dir.path().into(),

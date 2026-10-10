@@ -58,6 +58,9 @@ pub(crate) fn render(snapshot: &Value) -> String {
         &format!("id='rh-status' data-revision='{}'", revision(snapshot)),
         1,
     );
+    if snapshot["forge_browser_enabled"].as_bool() == Some(true) {
+        html.push_str("<p><a href='/status/forge/' style='display:inline-block;padding:12px 16px;color:#9ecbff;overflow-wrap:anywhere'>Forge 项目 · 问题与实验</a></p>");
+    }
     html.push_str(&crate::permission_view::render(&snapshot["permissions"]));
     html.push_str("<details id=operation-audit><summary>查看操作与审计</summary>");
     html.push_str(&format!("<section class=card><h2>{}</h2><p>观察时间：{} · 活跃操作：{} · 待核对：{} · 当前页完整：{}</p></section>",

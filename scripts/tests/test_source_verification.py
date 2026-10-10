@@ -58,10 +58,10 @@ class SourceEvidenceTests(unittest.TestCase):
             self.assertEqual(entry['working_directory'], str(self.root.resolve()))
             self.assertEqual(checker.digest(self.root/entry['log']), entry['sha256'])
 
-    def test_native_build_gates_have_explicit_bounded_compile_budgets(self):
+    def test_native_gates_have_inactivity_budgets_without_wall_limits(self):
         observed = {}
         commands = {}
-        def fake_run(argv, root, path, env, timeout):
+        def fake_run(argv, root, path, env, timeout, on_update=None):
             observed[path.stem] = timeout
             commands[path.stem] = list(argv)
             path.write_text('test result: ok. 2 passed; 0 failed; 0 ignored;' if path.stem == 'rust_tests' else
@@ -71,7 +71,8 @@ class SourceEvidenceTests(unittest.TestCase):
             proof = checker.run_verification(self.root, self.report)
         self.assertEqual(observed, {'fmt':900, 'clippy':900, 'rust_tests':2700, 'python_tests':900, 'workspace':1800})
         self.assertTrue(checker.receipt_current(proof, self.root))
-        self.assertEqual(proof['checks']['rust_tests']['timeout_seconds'], 2700)
+        self.assertEqual(proof['checks']['rust_tests']['idle_timeout_seconds'], 2700)
+        self.assertTrue(all(x['wall_timeout_seconds'] is None for x in proof['checks'].values()))
         # Serialize independent cases, not the actors inside each concurrency test.
         # Preserve both packages, all normal tests, and collection of every failure.
         self.assertEqual(commands['rust_tests'], [
@@ -175,9 +176,9 @@ class SourceEvidenceTests(unittest.TestCase):
         self.assertEqual(result['checks']['fmt']['failure_type'], 'FileNotFoundError')
 
     @unittest.skipUnless(os.name == 'posix', 'process group cleanup is a POSIX guarantee')
-    def test_timeout_stops_owned_child_group_and_preserves_log(self):
+    def test_inactivity_stops_owned_child_group_and_preserves_log(self):
         sentinel = self.root/'orphan-wrote-file'
-        child = 'import time,pathlib; time.sleep(0.8); pathlib.Path('+repr(str(sentinel))+').touch()'
+        child = 'import time,pathlib; time.sleep(2.0); pathlib.Path('+repr(str(sentinel))+').touch()'
         ready = self.root/'child-group-created'
         parent = 'import subprocess,sys,time,pathlib; subprocess.Popen([sys.executable,"-c",'+repr(child)+']); print("started",flush=True); pathlib.Path('+repr(str(ready))+').touch(); time.sleep(30)'
         # Synchronize process startup before measuring the cancellation window.
@@ -198,9 +199,9 @@ class SourceEvidenceTests(unittest.TestCase):
         with mock.patch.object(checker.subprocess, 'Popen', side_effect=started_process):
             result = self.run_check([('fmt', [sys.executable, '-c', parent])], timeout=0.2)
         self.assertEqual(result['state'], 'failed')
-        self.assertEqual(result['checks']['fmt']['state'], 'timed_out')
+        self.assertEqual(result['checks']['fmt']['state'], 'stalled')
         self.assertIn('started', (self.root/result['checks']['fmt']['log']).read_text())
-        time.sleep(0.9)
+        time.sleep(2.1)
         self.assertFalse(sentinel.exists())
 
 

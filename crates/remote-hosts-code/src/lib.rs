@@ -16,6 +16,7 @@ mod diagnostics;
 mod durable_transfer;
 pub mod files;
 mod files_sync;
+pub mod forge_browser;
 pub mod gateway;
 mod history_artifacts;
 mod history_gateway;
@@ -97,6 +98,8 @@ pub struct DeviceRegistration {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge_browser: Option<forge_browser::ForgeBrowserConfig>,
     pub public_url: String,
     pub bind: String,
     pub state_dir: PathBuf,

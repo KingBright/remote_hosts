@@ -18,6 +18,7 @@ async fn gateway() -> (tempfile::TempDir, Gateway, String) {
     let dir = tempfile::tempdir().unwrap();
     let credential = random();
     let gateway = Gateway::new(GatewayConfig {
+        forge_browser: None,
         allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: "https://review.example".into(),
         bind: "127.0.0.1:0".into(),

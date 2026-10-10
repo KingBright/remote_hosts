@@ -32,6 +32,7 @@ impl Fixture {
         let root = d.path().join("root");
         std::fs::create_dir(&root).unwrap();
         let g = Gateway::new(GatewayConfig {
+            forge_browser: None,
             allowed_origins: remote_hosts_code::default_mcp_client_origins(),
             public_url: format!("https://{addr}"),
             bind: addr.to_string(),

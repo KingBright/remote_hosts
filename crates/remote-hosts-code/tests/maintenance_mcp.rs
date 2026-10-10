@@ -13,6 +13,7 @@ async fn gateway() -> (tempfile::TempDir, Gateway, Principal, String) {
     let temp = tempfile::tempdir().unwrap();
     let device = uuid::Uuid::new_v4().to_string();
     let g = Gateway::new(GatewayConfig {
+        forge_browser: None,
         allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: "https://maintenance.fixture".into(),
         bind: "127.0.0.1:0".into(),

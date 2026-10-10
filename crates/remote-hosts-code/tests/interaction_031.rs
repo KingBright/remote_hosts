@@ -115,6 +115,7 @@ async fn readiness_endpoint_is_authenticated_scoped_and_does_not_refresh_online_
     let (d, a, _ws) = fixture().await;
     let other = uuid::Uuid::new_v4().to_string();
     let g = Gateway::new(GatewayConfig {
+        forge_browser: None,
         allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: "https://ready.example".into(),
         bind: "127.0.0.1:0".into(),

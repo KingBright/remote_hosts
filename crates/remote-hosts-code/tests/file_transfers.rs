@@ -18,6 +18,7 @@ async fn fixture() -> (tempfile::TempDir, Gateway, String, tokio::net::TcpListen
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let credential = random();
     let g = Gateway::new(GatewayConfig {
+        forge_browser: None,
         allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: format!("https://{}", listener.local_addr().unwrap()),
         bind: listener.local_addr().unwrap().to_string(),

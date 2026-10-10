@@ -231,6 +231,9 @@ impl Gateway {
             );
         }
         config.validate_oauth_policy()?;
+        if let Some(browser) = &config.forge_browser {
+            browser.validate()?;
+        }
         let store = Store::open(&config.state_dir).await?;
         store.install_gateway_schema().await?;
         let audit_observations = match std::env::var("REMOTE_HOSTS_OBSERVATION_AUDIT") {
@@ -311,6 +314,7 @@ impl Gateway {
             .with_state(self.clone());
         Ok(Router::new()
             .merge(status)
+            .merge(crate::forge_browser::routes(self.clone()))
             .merge(crate::task_authorization::routes(self.clone()))
             .merge(mcp)
             .merge(admin)
@@ -1302,6 +1306,7 @@ async fn status_page(
     match status_snapshot(&g, &principal).await {
         Ok(mut snapshot) => {
             crate::permission_view::owner_status(&mut snapshot["permissions"]);
+            snapshot["forge_browser_enabled"] = serde_json::json!(g.config.forge_browser.is_some());
             let revision = crate::status_view::revision(&snapshot);
             let etag = format!("W/\"{revision}\"");
             let unchanged = headers

@@ -165,6 +165,7 @@ async fn actual_poll_skips_backlog_for_same_root_aliases_and_then_drains_it() {
     let address = listener.local_addr().unwrap();
     Arc::make_mut(&mut a.config).gateway_url = format!("http://{address}");
     let g = Gateway::new(GatewayConfig {
+        forge_browser: None,
         allowed_origins: crate::default_mcp_client_origins(),
         public_url: format!("https://{address}"),
         bind: "127.0.0.1:0".into(),

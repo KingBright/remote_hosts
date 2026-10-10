@@ -32,6 +32,7 @@ impl Fixture {
             "terminal:exec".to_owned(),
         ];
         let g = Gateway::new(GatewayConfig {
+            forge_browser: None,
             public_url: "https://fixture.example".into(),
             bind: "127.0.0.1:0".into(),
             state_dir: dir.path().join("state"),

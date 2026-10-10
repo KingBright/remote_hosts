@@ -19,6 +19,8 @@ import time
 import tomllib
 import uuid
 
+import build_process
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REQUIRED = {'fmt', 'clippy', 'rust_tests', 'python_tests', 'workspace'}
 
@@ -97,34 +99,10 @@ def publish(path, record):
             tmp.unlink(missing_ok=True)
 
 
-def run_command(argv, root, path, env, timeout):
-    """Bound a whole verification process group, not merely its cargo parent."""
-    with path.open('xb') as output:
-        process = subprocess.Popen(argv, cwd=root, env=env, stdout=output,
-                                   stderr=subprocess.STDOUT, start_new_session=os.name == 'posix')
-        try:
-            return {'exit_code': process.wait(timeout=timeout), 'state': 'finished'}
-        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-            def terminate(force):
-                if os.name == 'posix':
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                elif process.poll() is None:
-                    process.kill() if force else process.terminate()
-            terminate(False)
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                terminate(True)
-                process.wait(timeout=3)
-            else:
-                # A child can retain the original group after the parent exits.
-                if os.name == 'posix':
-                    terminate(True)
-            return {'exit_code': process.returncode,
-                    'state': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'timed_out'}
+def run_command(argv, root, path, env, timeout, on_update=None):
+    """Timeout is an inactivity budget, never a total compiler wall limit."""
+    return build_process.run(argv, root, path, env, idle_timeout=timeout,
+                             on_update=on_update)
 
 
 def summarize(checks, logs):
@@ -208,8 +186,8 @@ def run_verification(root, report, gates=None, timeout=900):
                       run_id=run, scope='native source verification, not deployment', source_inputs=inputs(root), state='running',
                       execution_root=str(root.resolve()), snapshot_id=snapshot_identity(root))
         publish(report, result)
-        # Cargo test includes compiling/linking every test executable. Keep a
-        # bounded build budget distinct from fast checks and caller test fixtures.
+        # Budget only confirmed inactivity. CPU, output or process activity
+        # keeps a cold compiler running regardless of its elapsed duration.
         gate_timeouts = {'rust_tests': 2700, 'workspace': 1800} if gates is None else {}
         if gates is None:
             gates = [
@@ -222,21 +200,25 @@ def run_verification(root, report, gates=None, timeout=900):
                 ('python_tests', [sys.executable, '-W', 'error::ResourceWarning', '-m', 'unittest', 'discover', '-s', 'scripts/tests', '-v']),
                 ('workspace', ['cargo', 'check', '--workspace', '--locked']),
             ]
-        env = dict(os.environ, CARGO_TERM_COLOR='never')
+        env = dict(os.environ, CARGO_TERM_COLOR='never', PYTHONUNBUFFERED='1')
         for name, argv in gates:
             path = logs/(name+'.log')
             started = time.monotonic()
             command_timeout = gate_timeouts.get(name, timeout)
             result['checks'][name] = {'state': 'running', 'exit_code': None,
                                       'command': list(argv), 'working_directory': str(root.resolve()),
-                                      'log': str(path.relative_to(root)), 'timeout_seconds': command_timeout}
+                                      'log': str(path.relative_to(root)), 'idle_timeout_seconds': command_timeout,
+                                      'wall_timeout_seconds': None}
             publish(report, result)
+            def progress(value):
+                result['checks'][name].update(value, log=str(path.relative_to(root)))
+                publish(report, result)
             try:
-                outcome = run_command(argv, root, path, env, command_timeout)
+                outcome = run_command(argv, root, path, env, command_timeout, on_update=progress)
             except Exception as error:
                 outcome = {'state': 'start_or_collection_failed', 'exit_code': None, 'failure_type': type(error).__name__}
-            result['checks'][name].update(outcome, elapsed_seconds=time.monotonic()-started,
-                                         output_complete=outcome['state'] == 'finished' and path.is_file(),
+            result['checks'][name].update(outcome, log=str(path.relative_to(root)), elapsed_seconds=time.monotonic()-started,
+                                         output_complete=outcome.get('output_complete', outcome['state'] == 'finished' and path.is_file()),
                                          output_truncated=False, step_index=len(result['checks'])-1,
                                          sha256=digest(path) if path.exists() else None)
             publish(report, result)

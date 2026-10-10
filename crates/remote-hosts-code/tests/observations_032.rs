@@ -17,6 +17,7 @@ async fn fixture() -> (tempfile::TempDir, Gateway, Principal, String) {
     let d = tempfile::tempdir().unwrap();
     let token = random();
     let g = Gateway::new(GatewayConfig {
+        forge_browser: None,
         allowed_origins: remote_hosts_code::default_mcp_client_origins(),
         public_url: "https://fixture.example".into(),
         bind: "127.0.0.1:0".into(),
