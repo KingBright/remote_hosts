@@ -660,7 +660,7 @@ fn verify_bound(
     )
 }
 // Validation opens no journal, creates no directory and acquires no lock.
-fn existing_store(path: &Path, uid: u32) -> Result<Option<Store>> {
+pub(crate) fn existing_store(path: &Path, uid: u32) -> Result<Option<Store>> {
     ensure!(path.is_absolute(), "task_store_requires_absolute_path");
     ensure!(
         path.components()
@@ -721,7 +721,7 @@ pub fn create_private_store(path: &Path) -> Result<()> {
     );
     Ok(())
 }
-fn locked_store(path: &Path, uid: u32) -> Result<(Store, File)> {
+pub(crate) fn locked_store(path: &Path, uid: u32) -> Result<(Store, File)> {
     let store = existing_store(path, uid)?.context("task_store_missing")?;
     let lock = OpenOptions::new()
         .read(true)

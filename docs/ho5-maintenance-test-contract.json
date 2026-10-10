@@ -1,0 +1,520 @@
+{
+  "contract_protocol": 1,
+  "status": "isolated_fixture_candidate_passed_live_execution_disabled",
+  "task_id": "01a1184e-4ede-76a2-aad4-3141c7b4c03c",
+  "device_id": "02f29fa0-48c1-4e31-a345-90aa88467323",
+  "host_mutations_in_assessment": 0,
+  "execution_environment": "fixtures first, real HO5 later only for specifically authorized actions; no new Cargo target",
+  "reuse": [
+    "remote-hosts-admin Store/atomic_json/engine tests",
+    "Code Gateway operation/receipt/idempotency",
+    "OS rpm-ostree transaction and logind"
+  ],
+  "fixed_profile": {
+    "id": "ho5-system-deps-v1",
+    "proposed_packages": [
+      "alsa-lib-devel",
+      "clang",
+      "clang-libs",
+      "cmake",
+      "fontconfig-devel",
+      "freetype-devel",
+      "libxkbcommon-x11-devel",
+      "pipewire-devel"
+    ],
+    "provenance": "observed staged external deployment difference; proposed future profile, not new authorization",
+    "install_only": true,
+    "remove": [],
+    "no_pull_base": true,
+    "forbidden": [
+      "shell",
+      "argv",
+      "env",
+      "arbitrary_path",
+      "local_rpm",
+      "url",
+      "override",
+      "rebase",
+      "treefile",
+      "apply_live",
+      "automatic_reboot"
+    ]
+  },
+  "states": [
+    "prepared",
+    "awaiting_platform_authorization",
+    "dispatch_intent",
+    "running",
+    "staged_pending_reboot",
+    "reboot_intent",
+    "awaiting_reconnect",
+    "succeeded",
+    "failed",
+    "outcome_unknown",
+    "recovery_required",
+    "external_effect_observed"
+  ],
+  "receipt_required_fields": [
+    "protocol",
+    "task_id",
+    "request_id",
+    "device_id",
+    "caller_uid",
+    "profile_id",
+    "profile_sha256",
+    "plan_sha256",
+    "policy_sha256_if_helper",
+    "accepted_authority_scope",
+    "created_at",
+    "updated_at",
+    "before.boot_id",
+    "before.booted_checksum",
+    "before.staged_checksum",
+    "dispatch_intent",
+    "os_transaction_owner_unique_name",
+    "os_transaction_address_hash",
+    "steps[].state",
+    "steps[].before",
+    "steps[].after",
+    "target_deployment_checksum",
+    "reboot_dispatch_count",
+    "after.boot_id",
+    "after.booted_checksum",
+    "after.packages_verified",
+    "error_code",
+    "next_action",
+    "side_effect_status",
+    "evidence_complete"
+  ],
+  "cases": [
+    {
+      "id": "AUTH01",
+      "given": "same restricted Agent uid1000/NNP1 namespace",
+      "when": "只读 GetConnectionUnixUser、非交互 CheckAuthorization、CanReboot",
+      "expected": "状态分别报告当前允许/拒绝/challenge；不启动动作或交互提示",
+      "status": "partial_fixture",
+      "assessment_status": "observed_current_allow_only_not_full_case_executed",
+      "fixture_test_names": [
+        "fake_dbus_roundtrip_and_real_backend_mutation_gate"
+      ],
+      "remaining": "Actual bus-client CheckAuthorization and host challenge not exercised"
+    },
+    {
+      "id": "AUTH02",
+      "given": "首次加载策略/会话已改变",
+      "when": "原 polkit 检查 yes 后会话结束/boot_id 改变",
+      "expected": "重新检查同一主体及系统 bus owner；不得沿用旧 yes",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "permission_expiry_stops_before_dispatch"
+      ],
+      "remaining": "Real logout/reboot authorization lifetime not exercised"
+    },
+    {
+      "id": "AUTH03",
+      "given": "daemon 回绝/agent local allow_exec=false/task scope denied",
+      "when": "尝试同一固定动作",
+      "expected": "返回明确拒绝边界；不改 task_id、改设备、改 route、sudo/pkexec/run0",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "rejected_call_is_known_not_started_and_not_retried"
+      ],
+      "remaining": "Gateway grant/local allow flags are unchanged and not tested by this adapter"
+    },
+    {
+      "id": "AUTH04",
+      "given": "UID1000 namespace 不映射 root",
+      "when": "socket root peer 显示65534",
+      "expected": "现有客户端 fail closed；不接受任意65534 peer；D-Bus owner UID0验真",
+      "status": "partial_fixture",
+      "assessment_status": "source_inference_and_dbus_owner_read_verified_no_socket_runtime_test",
+      "fixture_test_names": [
+        "untrusted_service_or_changed_nnp_cannot_dispatch"
+      ],
+      "remaining": "Real namespace socket and Store ancestor compatibility remain unresolved"
+    },
+    {
+      "id": "AUTH05",
+      "given": "现有 OS polkit 对 wheel 授予宽包权",
+      "when": "请求包名以外的 profile/参数",
+      "expected": "RH 固定请求拒绝；报告应用限制不能缩减该账户已有 OS 权限",
+      "status": "fixture_passed",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "closed_requests_reject_shell_dns_and_noncanonical_uuid"
+      ],
+      "remaining": "Application constraint does not narrow existing OS wheel authority"
+    },
+    {
+      "id": "REQ01",
+      "given": "固定包 profile",
+      "when": "shell、argv、path、env、local RPM、URL、uninstall、override、rebase、treefile、live apply 字段",
+      "expected": "deny_unknown_fields，无 OS 调用",
+      "status": "fixture_passed",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "closed_requests_reject_shell_dns_and_noncanonical_uuid"
+      ],
+      "remaining": "No live OS dispatch"
+    },
+    {
+      "id": "REQ02",
+      "given": "规范 UUID 与摘要",
+      "when": "非规范UUID/路径穿越/摘要错误/不同 task/device/caller/profile",
+      "expected": "冲突或拒绝；回执不覆盖",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "corrupted_plan_digest_is_rejected"
+      ],
+      "remaining": "Canonical UUID and plan-digest tests; complete actor/device/profile tampering matrix not run"
+    },
+    {
+      "id": "REQ03",
+      "given": "计划已 accepted",
+      "when": "同请求并发 apply；断线后再 apply",
+      "expected": "最多一次 dispatch；返回同一回执；未知不重放",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "duplicate_apply_dispatches_once_and_preserves_fixed_parameters"
+      ],
+      "remaining": "Sequential duplicate and lock rejection tested; multi-process concurrency not run"
+    },
+    {
+      "id": "REQ04",
+      "given": "同 task_id 含多个动作",
+      "when": "request_id1 package，request_id2 reboot",
+      "expected": "独立序号/摘要，重启依赖已验证部署；task_id仅关联",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "inhibitors_and_changed_staged_target_block_reboot"
+      ],
+      "remaining": "Separate action plans exist; cross-request package/reboot provenance linking not implemented"
+    },
+    {
+      "id": "OS01",
+      "given": "已有同/异 task PkgChange",
+      "when": "提交本任务包操作",
+      "expected": "foreign_transaction_busy；只观察，不取消、不接管、不启动新事务",
+      "status": "fixture_passed",
+      "assessment_status": "observed_foreign_transaction_no_mutation",
+      "fixture_test_names": [
+        "existing_transaction_is_not_cancelled_or_adopted"
+      ],
+      "remaining": "No live OS dispatch"
+    },
+    {
+      "id": "OS02",
+      "given": "当前 staged 部署外部形成",
+      "when": "计划与 staged 包相同",
+      "expected": "external_effect_observed；不声明由本任务执行或自动接管",
+      "status": "fixture_passed",
+      "assessment_status": "observed_external_staged_not_adopted",
+      "fixture_test_names": [
+        "externally_staged_packages_are_not_claimed_or_installed"
+      ],
+      "remaining": "External matching stage after unknown remains unknown"
+    },
+    {
+      "id": "OS03",
+      "given": "已接受 fixed profile",
+      "when": "执行允许8包的 PkgChange/严格 UpdateDeployment",
+      "expected": "仅 install8，remove空，no_pull_base=true，no live/reboot/override/rebase；daemon与profile版本先核验",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "duplicate_apply_dispatches_once_and_preserves_fixed_parameters"
+      ],
+      "remaining": "Exact fixed call parameters verified; real daemon ABI and dispatch absent"
+    },
+    {
+      "id": "OS04",
+      "given": "OS 调用前持久化 dispatch intent",
+      "when": "崩溃于 intent前/调用前/接受后/保存 transaction 前",
+      "expected": "重连查询原回执；跨接受空窗为 outcome_unknown，不宣称 exactly once",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "crash_between_os_acceptance_and_receipt_cannot_redispatch"
+      ],
+      "remaining": "Injected post-acceptance write failure and timeout tested; real process crash/fsync matrix not run"
+    },
+    {
+      "id": "OS05",
+      "given": "事务输出可能含private paths",
+      "when": "进度/错误含凭据样式、环境或配置",
+      "expected": "结构化阶段/错误码；模型及审计无原输出/配置/凭据",
+      "status": "source_review_only",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "read_query_argv_has_no_mutation_or_interactive_auth"
+      ],
+      "remaining": "Bounded typed queries discard raw stderr; credential-style output corpus not tested"
+    },
+    {
+      "id": "STATE01",
+      "given": "Store0700 record0600",
+      "when": "symlink祖先/硬链接/别UID/不可信owner/污染JSON",
+      "expected": "固定目录 O_NOFOLLOW，拒绝；普通与root回执独立",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "journal_lock_and_symlink_rejected"
+      ],
+      "remaining": "No complete hostile ancestor/owner/hardlink/namespace matrix"
+    },
+    {
+      "id": "STATE02",
+      "given": "写盘失败/少于4GiB",
+      "when": "ENOSPC/fsync/rename/目录fsync失败",
+      "expected": "副作用前停止；副作用后保留未知/失败，不造成功、不删别任务",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "crash_between_os_acceptance_and_receipt_cannot_redispatch"
+      ],
+      "remaining": "ENOSPC, free-space and fsync/rename fault matrix not run"
+    },
+    {
+      "id": "STATE03",
+      "given": "计划未开始",
+      "when": "TTL过期/时间回退/host baseline或profileSHA改变",
+      "expected": "拒绝执行；记录stale；不能替换UUID掩盖未知",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "expiry_digest_and_baseline_prevent_dispatch"
+      ],
+      "remaining": "Expiry, digest and baseline checked; complete clock/profile matrix not run"
+    },
+    {
+      "id": "BOOT01",
+      "given": "staged目标已验证，request含授权的reboot步骤",
+      "when": "普通logind Reboot(false)",
+      "expected": "先fsync reboot_intent；最多一次dispatch；尊重inhibitors与foreign RH operations，不force",
+      "status": "partial_fixture",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "reboot_is_normal_once_and_same_boot_waits"
+      ],
+      "remaining": "Fixed normal reboot fixture and inhibitors checked; RH foreign-operation draining absent"
+    },
+    {
+      "id": "BOOT02",
+      "given": "网络断连或Agent offline",
+      "when": "等待task_id回执与 boot_id",
+      "expected": "offline不证明重启；same boot不重发；标记awaiting_reboot/recovery_required",
+      "status": "fixture_passed",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "reboot_response_timeout_does_not_repeat_after_disconnect"
+      ],
+      "remaining": "Same boot/offline never causes replay in fixtures"
+    },
+    {
+      "id": "BOOT03",
+      "given": "新 boot_id",
+      "when": "booted checksum与目标相同/不同，rpm -q pkg8",
+      "expected": "相同且包验证通过才系统依赖完成；不同为boot_target_mismatch，不再自动重启",
+      "status": "fixture_passed",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "wrong_boot_target_or_missing_actual_package_fails_without_retry"
+      ],
+      "remaining": "Boot ID/checksum and actual eight-package evidence tested"
+    },
+    {
+      "id": "BOOT04",
+      "given": "接续启动/会话失效",
+      "when": "Agent重连但polkit不允许",
+      "expected": "只读恢复/报awaiting_platform_authorization，不能重装helper或扩大grant",
+      "status": "fixture_passed",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [
+        "new_boot_target_and_packages_verify_without_reboot_permission"
+      ],
+      "remaining": "Read-only recovery succeeds with expired mutation permission in fixtures"
+    },
+    {
+      "id": "DNS01",
+      "given": "本轮DNS profile disabled",
+      "when": "请求DNS write或restart",
+      "expected": "明确profile_not_enabled，无修改/无reload/restart",
+      "status": "partial_fixture",
+      "assessment_status": "observed_no_dns_mutation_no_executor_denial_test",
+      "fixture_test_names": [
+        "closed_requests_reject_shell_dns_and_noncanonical_uuid"
+      ],
+      "remaining": "DNS action/fields rejected; no DNS executor exists"
+    },
+    {
+      "id": "DNS02",
+      "given": "后续root可信精确DNS profile",
+      "when": "不同domain/server/tag/index、任意configpath或unit、外来cfg版本",
+      "expected": "拒绝；不接受客户端完整配置/JSON Patch/shell；保留所有非目标内容",
+      "status": "not_implemented",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "DNS execution remains disabled"
+    },
+    {
+      "id": "DNS03",
+      "given": "拟启用 exact /etc/sing-box/config.json",
+      "when": "symlink/hardlink/inode替换/owner漂移/backup写失败",
+      "expected": "fd pin +元数据及privateSHA复核；先独立备份/fsync，再原子替换",
+      "status": "not_implemented",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "DNS execution remains disabled"
+    },
+    {
+      "id": "DNS04",
+      "given": "候选配置或health失败",
+      "when": "sing-box check失败/restart失败/DNS探测失败",
+      "expected": "无效候选不发布；仅本请求CAS仍匹配可回滚原文件，并最多一次恢复exact unit；否则recovery_required",
+      "status": "not_implemented",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "DNS execution remains disabled"
+    },
+    {
+      "id": "DNS05",
+      "given": "DNS副作用破坏当前RH链路",
+      "when": "worker失去客户端但仍存活",
+      "expected": "独立系统worker写持久回执并执行既定本地health/rollback；client不盲重启网络或换通道",
+      "status": "not_implemented",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "DNS execution remains disabled"
+    },
+    {
+      "id": "DNS06",
+      "given": "namespace中的overflow UID65534",
+      "when": "client依据 stat.uid==65534 推断 root策略可信",
+      "expected": "拒绝此推断；策略检查在host root worker完成，client验证系统D-Bus unique owner uid0",
+      "status": "not_implemented",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "No root DNS worker; never trust overflow UID65534"
+    },
+    {
+      "id": "RES01",
+      "given": "helper首次配置",
+      "when": "篡改binary/manifest/profile/agentcfg/device/UID/GID/覆盖既有安装",
+      "expected": "隔离安装预览与 apply，原管理员本机会话核对摘要；不含 legacy cleanup grant",
+      "status": "not_implemented",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "No privileged helper installation"
+    },
+    {
+      "id": "RES02",
+      "given": "新特权helper被允许后",
+      "when": "别UID调用/策略撤销/版本变更/伪造task_id",
+      "expected": "拒绝新调用；task_id不授权；已接受动作按固定恢复合同收尾",
+      "status": "not_implemented",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "No privileged helper installation"
+    },
+    {
+      "id": "REG01",
+      "given": "启用特定维护动作",
+      "when": "观测同UID其它应用",
+      "expected": "如实说明uid级共享授权，不宣称逐应用隔离；无TCP监听/root shell",
+      "status": "source_review_only",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "No listener or root shell added; live per-UID observation not run"
+    },
+    {
+      "id": "REG02",
+      "given": "HO5维护执行后",
+      "when": "RemotePlay旧/新、RH、Sing-box、Pixel、Android",
+      "expected": "保护指定服务；pkg验证不等于GUI/串流通过；Pixel policy、Android404/offline独立验证",
+      "status": "not_run",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "Application and real host acceptance owned by separate RP work"
+    },
+    {
+      "id": "LIVE01",
+      "given": "真实授权安装/重启/DNS场景",
+      "when": "owner选择具体动作后在HO5完成target execution",
+      "expected": "保留包、boot、DNS与回执证据；单元测试/只读pkcheck不等于实机通过",
+      "status": "not_run",
+      "assessment_status": "required_not_run",
+      "fixture_test_names": [],
+      "remaining": "No real package install, reboot or DNS action"
+    }
+  ],
+  "evidence": "ho5-maintenance-assessment-20261010.json",
+  "coordination": {
+    "execution_owner": "RP task owns current HO5 environment and Linux build checks; external-agent follow-up cancelled by user",
+    "this_task": "repository source handoff and isolated adapter implementation/tests only",
+    "follow_up_acceptance": "Obtain original operation receipt and coordinate one execution owner before any future host mutation",
+    "executor_tests_run": 29,
+    "live_executor_tests_run": 0
+  },
+  "implementation_validation": {
+    "report_path": "/Users/jinliang/Workspace/Codex/2026-10-08/task/ho5-maintenance-adapter-evidence-02/report.json",
+    "report_sha256": "0985463a4839b487b6d3183bc0d767b1ffb014a72ced6680768a7dec8df8ba2d",
+    "operation_id": "b5001b51-d7eb-4249-8af6-02ec8bfd3a71",
+    "process_exit_code": 0,
+    "snapshot_id": "db9f4e12c3445c7a949fefedaf93764d7b7cb5a476d3fb732de08d7ceea22fb8",
+    "rust_tests_passed": 85,
+    "ho5_fixture_tests_passed": 29,
+    "checks": [
+      {
+        "name": "format",
+        "state": "passed",
+        "exit_code": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "tests",
+        "state": "passed",
+        "exit_code": 0,
+        "sha256": "5263b434a8665d738ad4fcfc3bb3de26695ac22ffe9049d2c7b38f3eddc70758"
+      },
+      {
+        "name": "clippy",
+        "state": "passed",
+        "exit_code": 0,
+        "sha256": "7ad4db56c8fa0bd13d0858c4f9701c9842ce4d98942489a5c46e06f484a33f58"
+      },
+      {
+        "name": "build",
+        "state": "passed",
+        "exit_code": 0,
+        "sha256": "c55f239435cb7301200cdf43a67d6b6b9bf4bb0922f4c44ea57166dd4a4b6ed9"
+      },
+      {
+        "name": "cli_help",
+        "state": "passed",
+        "exit_code": 0,
+        "sha256": "c26cab40363f215f8e78dc4dab0c74cbe560077b5790c48392302a5ed5b0adb6"
+      },
+      {
+        "name": "cli_receipt_missing",
+        "state": "passed",
+        "exit_code": 0,
+        "sha256": "0a84558be7cc7883bd1a1851d3553d7a760b548d9a3be1e538b518d4ff0b4a01"
+      }
+    ],
+    "live_execution_enabled": false,
+    "dns_enabled": false,
+    "gaps": [
+      "Linux host execution and real rpm-ostree/logind ABI acceptance not run; OS mutation adapter deliberately absent",
+      "pkcheck process preflight is not authorization for the actual D-Bus client; no persistent grant",
+      "Existing Store rejects root-owned ancestors displayed as overflow UID65534 in the HO5 namespace; no relaxation or live namespace solution",
+      "No durable real OS Finished signal collector, Gateway Linux capability, automatic Agent startup reconcile, or foreign RH activity draining",
+      "No free-space/ENOSPC/fsync fault matrix; no new Cargo target; at least 4GiB retained on builder",
+      "No privileged helper, root receipt, DNS profile or DNS recovery implementation; no real reboot/cold-boot test"
+    ]
+  }
+}

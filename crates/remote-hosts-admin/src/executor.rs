@@ -10,7 +10,7 @@ use tokio::{io::AsyncReadExt, process::Command};
 
 pub struct SystemBackend;
 // No inherited PATH, loader, shell, proxy or systemd pager environment.
-fn command(program: &str, args: &[&str]) -> Command {
+pub(crate) fn command(program: &str, args: &[&str]) -> Command {
     let mut c = Command::new(program);
     c.args(args)
         .env_clear()
@@ -23,7 +23,7 @@ fn command(program: &str, args: &[&str]) -> Command {
         .kill_on_drop(true);
     c
 }
-async fn output(mut cmd: Command, limit: u64) -> Result<(bool, String)> {
+pub(crate) async fn output(mut cmd: Command, limit: u64) -> Result<(bool, String)> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("system_command_spawn_failed")?;
     let stdout = child.stdout.take().context("missing_command_stdout")?;

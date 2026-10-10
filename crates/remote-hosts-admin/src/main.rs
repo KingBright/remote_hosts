@@ -4,7 +4,7 @@
 mod unix_cli {
     use anyhow::Result;
     use clap::{Parser, Subcommand};
-    use remote_hosts_admin::{protocol::Request, tasks, transport};
+    use remote_hosts_admin::{ho5_cli, protocol::Request, tasks, transport};
     use std::path::PathBuf;
     #[derive(Parser)]
     #[command(
@@ -19,6 +19,11 @@ mod unix_cli {
     }
     #[derive(Subcommand)]
     enum Action {
+        /// HO5 read-only status, local plans and reconciliation; no execution command.
+        Ho5 {
+            #[command(subcommand)]
+            command: ho5_cli::Command,
+        },
         /// Ordinary-user task descriptions and metadata checks. Never contacts the root helper.
         Task {
             #[command(subcommand)]
@@ -55,6 +60,13 @@ mod unix_cli {
         let cli = Cli::parse();
         let is_apply = matches!(&cli.command, Action::Apply { .. });
         let req = match cli.command {
+            Action::Ho5 { command } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ho5_cli::run(command).await?)?
+                );
+                return Ok(());
+            }
             Action::Task { command } => {
                 let value = tasks::run_cli(command)?;
                 println!("{}", serde_json::to_string_pretty(&value)?);

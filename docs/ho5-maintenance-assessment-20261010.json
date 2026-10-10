@@ -1,0 +1,489 @@
+{
+  "assessment_protocol": 1,
+  "implementation_addendum": {
+    "scope": "isolated_candidate_only_no_new_HO5_maintenance",
+    "validation_contract": "ho5-maintenance-test-contract.json",
+    "rust_tests_passed": 85,
+    "ho5_fixture_tests_passed": 29,
+    "live_execution_enabled": false,
+    "historical_host_observations_unchanged": true
+  },
+  "state": "read_only_assessment_complete",
+  "task_id": "01a1184e-4ede-76a2-aad4-3141c7b4c03c",
+  "device_id": "02f29fa0-48c1-4e31-a345-90aa88467323",
+  "workspace_id": "02f29fa0-48c1-4e31-a345-90aa88467323:e6074fab-abbb-4f2f-bba0-16cdd3eb1183",
+  "observed_at": {
+    "inventory": "2026-10-10T07:12:09Z",
+    "authority": "2026-10-10T07:14:29Z",
+    "final": "2026-10-10T07:16:12Z"
+  },
+  "scope": {
+    "host_mutations": 0,
+    "package_installs": 0,
+    "reboots": 0,
+    "service_restarts": 0,
+    "permission_changes": 0,
+    "dns_changes": 0,
+    "privileged_service_installs": 0,
+    "credentials_read": false,
+    "config_contents_read": false,
+    "process_args_or_env_read": false,
+    "note": "公开 OS polkit 规则及 D-Bus 服务描述已读取；业务配置仅 stat 元数据。只读 rpm-ostree status 可触发已有 daemon 的正常 D-Bus activation，未请求启动/停止/安装操作。"
+  },
+  "host": {
+    "os": "Bazzite 44 / Fedora",
+    "uid": 1000,
+    "gid": 1000,
+    "agent_version": "0.10.25",
+    "agent_pid": 3526722,
+    "agent_executable": "/var/home/liang/.local/bin/remote-hosts-code",
+    "no_new_privs": 1,
+    "effective_capabilities": "0000000000000000",
+    "namespace": {
+      "uid_map": "1000       1000          1",
+      "gid_map": "1000       1000          1",
+      "setgroups": "deny",
+      "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/remote-hosts-code-agent.service",
+      "user": "user:[4026533164]",
+      "mnt": "mnt:[4026533363]",
+      "pid": "pid:[4026531836]",
+      "net": "net:[4026531833]",
+      "agent_user_ns": "user:[4026533164]"
+    },
+    "metadata_uid_note": "命名空间只映射 1000；主机 root/其他账户显示 overflow UID/GID 65534，不能据此认定文件归 nobody 或授权信任该 peer。",
+    "package_versions": {
+      "exit": 1,
+      "stdout": "rpm-ostree-2026.2-1.fc44.x86_64\nostree-2026.4-1.fc44.x86_64\npolkit-127-2.fc44.2.x86_64\nsystemd-259.9-1.fc44.x86_64\n未安装软件包 sing-box \n",
+      "stderr": ""
+    },
+    "agent_service": {
+      "exit": 0,
+      "stdout": "Id=remote-hosts-code-agent.service\nLoadState=loaded\nActiveState=active\nSubState=running\nFragmentPath=/home/liang/.config/systemd/user/remote-hosts-code-agent.service\nDropInPaths=/usr/lib/systemd/user/service.d/10-timeout-abort.conf /var/home/liang/.config/systemd/user/remote-hosts-code-agent.service.d/40-existing-user-proxy.conf /run/user/1000/systemd/user.control/remote-hosts-code-agent.service.d/50-CPUWeight.conf\nMainPID=3526722\nCapabilityBoundingSet=cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_linux_immutable cap_net_bind_service cap_net_broadcast cap_net_admin cap_net_raw cap_ipc_lock cap_ipc_owner cap_sys_module cap_sys_rawio cap_sys_chroot cap_sys_ptrace cap_sys_pacct cap_sys_admin cap_sys_boot cap_sys_nice cap_sys_resource cap_sys_time cap_sys_tty_config cap_mknod cap_lease cap_audit_write cap_audit_control cap_setfcap cap_mac_override cap_mac_admin cap_syslog cap_wake_alarm cap_block_suspend cap_audit_read cap_perfmon cap_bpf cap_checkpoint_restore\nAmbientCapabilities=\nUser=\nGroup=\nPrivateUsers=no\nProtectHome=no\nProtectSystem=no\nNoNewPrivileges=yes\nRuntimeDirectory=\nStateDirectory=\n",
+      "stderr": ""
+    },
+    "maintenance_capability": "not_advertised_linux_adapter_macos_only"
+  },
+  "helper": {
+    "standard_fixed_paths": [
+      {
+        "path": "/var/lib/remote-hosts-admin",
+        "error": "FileNotFoundError"
+      },
+      {
+        "path": "/var/lib/remote-hosts-admin/bin/remote-hosts-admin",
+        "error": "FileNotFoundError"
+      },
+      {
+        "path": "/var/lib/remote-hosts-admin/policy.json",
+        "error": "FileNotFoundError"
+      },
+      {
+        "path": "/run/remote-hosts-admin",
+        "error": "FileNotFoundError"
+      },
+      {
+        "path": "/run/remote-hosts-admin/helper.sock",
+        "error": "FileNotFoundError"
+      },
+      {
+        "path": "/etc/systemd/system/remote-hosts-admin.service",
+        "error": "FileNotFoundError"
+      }
+    ],
+    "unit": {
+      "exit": 0,
+      "stdout": "Id=remote-hosts-admin.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nFragmentPath=\nDropInPaths=\nMainPID=0\nCapabilityBoundingSet=cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_linux_immutable cap_net_bind_service cap_net_broadcast cap_net_admin cap_net_raw cap_ipc_lock cap_ipc_owner cap_sys_module cap_sys_rawio cap_sys_chroot cap_sys_ptrace cap_sys_pacct cap_sys_admin cap_sys_boot cap_sys_nice cap_sys_resource cap_sys_time cap_sys_tty_config cap_mknod cap_lease cap_audit_write cap_audit_control cap_setfcap cap_mac_override cap_mac_admin cap_syslog cap_wake_alarm cap_block_suspend cap_audit_read cap_perfmon cap_bpf cap_checkpoint_restore\nAmbientCapabilities=\nUser=\nGroup=\nPrivateUsers=no\nProtectHome=no\nProtectSystem=no\nNoNewPrivileges=no\nRuntimeDirectory=\nStateDirectory=\n",
+      "stderr": ""
+    },
+    "extra_candidates": {
+      "/usr/local/bin": [
+        {
+          "name": "sing-box",
+          "uid_namespace": 65534,
+          "gid_namespace": 65534,
+          "mode": "0o755",
+          "size": 58163456,
+          "symlink": false
+        }
+      ],
+      "/usr/local/sbin": [],
+      "/opt": [],
+      "/etc/systemd/system": [
+        {
+          "name": "sing-box.service",
+          "uid_namespace": 65534,
+          "gid_namespace": 65534,
+          "mode": "0o644",
+          "size": 478,
+          "symlink": false
+        }
+      ]
+    },
+    "coverage": "标准安装路径、系统服务/D-Bus 名称及 /usr/local/bin /usr/local/sbin /opt 浅层；不是全盘不存在证明"
+  },
+  "os_services": {
+    "properties": {
+      "rpm-ostreed.service": {
+        "exit": 0,
+        "stdout": "Id=rpm-ostreed.service\nLoadState=loaded\nActiveState=active\nSubState=running\nFragmentPath=/usr/lib/systemd/system/rpm-ostreed.service\nDropInPaths=/usr/lib/systemd/system/service.d/10-timeout-abort.conf\nMainPID=2648902\nCapabilityBoundingSet=cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_linux_immutable cap_net_bind_service cap_net_broadcast cap_net_admin cap_net_raw cap_ipc_lock cap_ipc_owner cap_sys_module cap_sys_rawio cap_sys_chroot cap_sys_ptrace cap_sys_pacct cap_sys_admin cap_sys_boot cap_sys_nice cap_sys_resource cap_sys_time cap_sys_tty_config cap_mknod cap_lease cap_audit_write cap_audit_control cap_setfcap cap_mac_override cap_mac_admin cap_syslog cap_wake_alarm cap_block_suspend cap_audit_read cap_perfmon cap_bpf cap_checkpoint_restore\nAmbientCapabilities=\nUser=rpm-ostree\nGroup=rpm-ostree\nPrivateUsers=no\nProtectHome=yes\nProtectSystem=strict\nNoNewPrivileges=yes\nRuntimeDirectory=\nStateDirectory=\n",
+        "stderr": ""
+      },
+      "polkit.service": {
+        "exit": 0,
+        "stdout": "Id=polkit.service\nLoadState=loaded\nActiveState=active\nSubState=running\nFragmentPath=/usr/lib/systemd/system/polkit.service\nDropInPaths=/usr/lib/systemd/system/service.d/10-timeout-abort.conf\nMainPID=1369\nCapabilityBoundingSet=cap_setgid cap_setuid\nAmbientCapabilities=\nUser=polkitd\nGroup=\nPrivateUsers=no\nProtectHome=yes\nProtectSystem=strict\nNoNewPrivileges=yes\nRuntimeDirectory=\nStateDirectory=\n",
+        "stderr": ""
+      },
+      "sing-box.service": {
+        "exit": 0,
+        "stdout": "Id=sing-box.service\nLoadState=loaded\nActiveState=active\nSubState=running\nFragmentPath=/etc/systemd/system/sing-box.service\nDropInPaths=/usr/lib/systemd/system/service.d/10-timeout-abort.conf\nMainPID=2648561\nCapabilityBoundingSet=cap_net_bind_service cap_net_admin cap_net_raw\nAmbientCapabilities=cap_net_bind_service cap_net_admin cap_net_raw\nUser=\nGroup=\nPrivateUsers=no\nProtectHome=no\nProtectSystem=no\nNoNewPrivileges=no\nRuntimeDirectory=\nStateDirectory=\n",
+        "stderr": ""
+      },
+      "systemd-logind.service": {
+        "exit": 0,
+        "stdout": "Id=systemd-logind.service\nLoadState=loaded\nActiveState=active\nSubState=running\nFragmentPath=/usr/lib/systemd/system/systemd-logind.service\nDropInPaths=/usr/lib/systemd/system/systemd-logind.service.d/10-grub2-logind-service.conf /usr/lib/systemd/system/service.d/10-timeout-abort.conf\nMainPID=1565\nCapabilityBoundingSet=cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_linux_immutable cap_sys_admin cap_sys_tty_config cap_audit_control cap_mac_admin\nAmbientCapabilities=\nUser=\nGroup=\nPrivateUsers=no\nProtectHome=yes\nProtectSystem=strict\nNoNewPrivileges=yes\nRuntimeDirectory=systemd/inhibit systemd/seats systemd/sessions systemd/shutdown systemd/users\nStateDirectory=systemd/linger\n",
+        "stderr": ""
+      }
+    },
+    "dbus_identity": {
+      "exit": 0,
+      "stdout": "u 0\n",
+      "stderr": ""
+    },
+    "noninteractive_authorization": {
+      "org.projectatomic.rpmostree1.install-uninstall-packages": {
+        "exit": 0,
+        "stdout": "polkit\\56result=yes\n",
+        "stderr": ""
+      },
+      "org.freedesktop.login1.reboot": {
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    "can_reboot": {
+      "exit": 0,
+      "stdout": "s \"yes\"\n",
+      "stderr": ""
+    },
+    "authority_scope": "在受限 Agent 同一会话内的当前 polkit 结果；不是实际 mutation 成功证明，不保证 logout/reboot 后仍可用",
+    "public_policy": {
+      "/usr/share/polkit-1/rules.d/org.projectatomic.rpmostree1.rules": {
+        "metadata": {
+          "path": "/usr/share/polkit-1/rules.d/org.projectatomic.rpmostree1.rules",
+          "uid": 65534,
+          "gid": 65534,
+          "mode": "0o644",
+          "size": 862,
+          "symlink": false,
+          "socket": false
+        },
+        "sha256": "1aaa137eaac2f7c82cf1475ec2715472a8cdad698a3b9735fa51bf5b4b602e98",
+        "text": "polkit.addRule(function(action, subject) {\n    if ((action.id == \"org.projectatomic.rpmostree1.repo-refresh\" ||\n         action.id == \"org.projectatomic.rpmostree1.upgrade\") &&\n        subject.active == true &&\n        subject.local == true) {\n            return polkit.Result.YES;\n    }\n\n    if ((action.id == \"org.projectatomic.rpmostree1.install-uninstall-packages\" ||\n         action.id == \"org.projectatomic.rpmostree1.rollback\" ||\n         action.id == \"org.projectatomic.rpmostree1.reload-daemon\" ||\n         action.id == \"org.projectatomic.rpmostree1.cancel\" ||\n         action.id == \"org.projectatomic.rpmostree1.cleanup\" ||\n         action.id == \"org.projectatomic.rpmostree1.client-management\") &&\n        subject.active == true &&\n        subject.local == true &&\n        subject.isInGroup(\"wheel\")) {\n            return polkit.Result.YES;\n    }\n});\n"
+      },
+      "/usr/share/polkit-1/rules.d/20-privileged-ruser.rules": {
+        "metadata": {
+          "path": "/usr/share/polkit-1/rules.d/20-privileged-ruser.rules",
+          "uid": 65534,
+          "gid": 65534,
+          "mode": "0o644",
+          "size": 197,
+          "symlink": false,
+          "socket": false
+        },
+        "sha256": "2f6bd87ed61f98e21af5ab2800c1d2ae0fc1f190b011633ca85eb50fd5b77536",
+        "text": "polkit.addRule(function(action, subject) {\n    if ((action.id == \"org.bazzite.policykit.privileged.user.setup\") &&\n         subject.isInGroup(\"wheel\")) {\n        return polkit.Result.YES;\n    }\n});"
+      },
+      "/usr/share/polkit-1/rules.d/empower.rules": {
+        "metadata": {
+          "path": "/usr/share/polkit-1/rules.d/empower.rules",
+          "uid": 65534,
+          "gid": 65534,
+          "mode": "0o644",
+          "size": 260,
+          "symlink": false,
+          "socket": false
+        },
+        "sha256": "d9a62ab1ec477a4be1657769dfd194c75d1a07a4357e7717aa19ad5c07c3fc26",
+        "text": "// Allow all actions for users who are in the \"empower\" group. Users are added to the\n// \"empower\" group by running run0 --empower.\n\npolkit.addRule(function(action, subject) {\n    if (subject.isInGroup(\"empower\")) {\n        return polkit.Result.YES;\n    }\n});\n"
+      },
+      "/usr/share/dbus-1/system-services/org.projectatomic.rpmostree1.service": {
+        "metadata": {
+          "path": "/usr/share/dbus-1/system-services/org.projectatomic.rpmostree1.service",
+          "uid": 65534,
+          "gid": 65534,
+          "mode": "0o644",
+          "size": 133,
+          "symlink": false,
+          "socket": false
+        },
+        "sha256": "21de5dde8ac4eb54562985a5ffcaaea06dd3614ca0a33c42145c316c0a9f76fc",
+        "text": "[D-BUS Service]\nName=org.projectatomic.rpmostree1\nExec=/usr/bin/rpm-ostree start-daemon\nUser=root\nSystemdService=rpm-ostreed.service\n"
+      }
+    },
+    "unread_boundaries": [
+      "/etc/polkit-1/rules.d PermissionError",
+      "/etc/sudoers.d PermissionError"
+    ],
+    "protected_new_remoteplay": {
+      "exit": 0,
+      "stdout": "LoadState=loaded\nActiveState=active\nSubState=running\nFragmentPath=/home/liang/.config/systemd/user/remote-play-current.service\n",
+      "stderr": ""
+    }
+  },
+  "external_ostree": {
+    "initial": {
+      "exit": 0,
+      "transaction": [
+        "PkgChange",
+        ":1.1332",
+        "/org/projectatomic/rpmostree1/default"
+      ],
+      "deployments": [
+        {
+          "booted": false,
+          "staged": true,
+          "checksum": "8caa6b9a1b942de706362b327d6ac2361463c42fb1954ddf72c4ac293c8d8c7e",
+          "serial": 0,
+          "version": "44.20261006.1",
+          "packages": [
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "mpv",
+            "mpv-libs"
+          ],
+          "requested-packages": [
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "mpv",
+            "mpv-libs"
+          ],
+          "requested-local-packages": []
+        },
+        {
+          "booted": true,
+          "staged": false,
+          "checksum": "9c4755a6e38e11675d1c31697480046e87d9aa2d729c33ffd36993e6c018a16b",
+          "serial": 0,
+          "version": "44.20260921",
+          "packages": [
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "mpv",
+            "mpv-libs"
+          ],
+          "requested-packages": [
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "mpv",
+            "mpv-libs"
+          ],
+          "requested-local-packages": []
+        },
+        {
+          "booted": false,
+          "staged": false,
+          "checksum": "e62e66ec6a1919668371bfb64a0b78b289eba4d564aedd31c97463a7393e80e8",
+          "serial": 0,
+          "version": "44.20260515",
+          "packages": [
+            "mpv",
+            "mpv-libs"
+          ],
+          "requested-packages": [
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "mpv",
+            "mpv-libs"
+          ],
+          "requested-local-packages": []
+        }
+      ]
+    },
+    "final": {
+      "transaction": null,
+      "deployments": [
+        {
+          "booted": false,
+          "staged": true,
+          "checksum": "f540a61bc44714e48d98cd23935f4f3f554e5f3c24c7bcb82ef9cb568cb03032",
+          "serial": 0,
+          "version": "44.20261006.1",
+          "packages": [
+            "alsa-lib-devel",
+            "clang",
+            "clang-libs",
+            "cmake",
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "fontconfig-devel",
+            "freetype-devel",
+            "libxkbcommon-x11-devel",
+            "mpv",
+            "mpv-libs",
+            "pipewire-devel"
+          ],
+          "requested-packages": [
+            "alsa-lib-devel",
+            "clang",
+            "clang-libs",
+            "cmake",
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "fontconfig-devel",
+            "freetype-devel",
+            "libxkbcommon-x11-devel",
+            "mpv",
+            "mpv-libs",
+            "pipewire-devel"
+          ]
+        },
+        {
+          "booted": true,
+          "staged": false,
+          "checksum": "9c4755a6e38e11675d1c31697480046e87d9aa2d729c33ffd36993e6c018a16b",
+          "serial": 0,
+          "version": "44.20260921",
+          "packages": [
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "mpv",
+            "mpv-libs"
+          ],
+          "requested-packages": [
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "mpv",
+            "mpv-libs"
+          ]
+        },
+        {
+          "booted": false,
+          "staged": false,
+          "checksum": "e62e66ec6a1919668371bfb64a0b78b289eba4d564aedd31c97463a7393e80e8",
+          "serial": 0,
+          "version": "44.20260515",
+          "packages": [
+            "mpv",
+            "mpv-libs"
+          ],
+          "requested-packages": [
+            "fcitx5",
+            "fcitx5-chinese-addons",
+            "fcitx5-configtool",
+            "mpv",
+            "mpv-libs"
+          ]
+        }
+      ]
+    },
+    "new_packages_observed": [
+      "alsa-lib-devel",
+      "clang",
+      "clang-libs",
+      "cmake",
+      "fontconfig-devel",
+      "freetype-devel",
+      "libxkbcommon-x11-devel",
+      "pipewire-devel"
+    ],
+    "provenance": "external_user_work_observed; this assessment did not submit, cancel, attach to, replay or reboot the transaction",
+    "status": "staged_pending_reboot_not_booted"
+  },
+  "source": {
+    "repository_root": "/Users/jinliang/Workspace/remote_hosts",
+    "main_head": "0c4850ecd87cd038a25f3fe2ee961ced329f4d18",
+    "analysis_head": "f03410b841b7db401ead47f0990f950ac85980aa",
+    "references": [
+      {
+        "path": "crates/remote-hosts-admin/src/protocol.rs",
+        "lines": "9,99-117",
+        "finding": "单一 remove_legacy_remoteplay 请求；没有 HO5 依赖/DNS/重启动作或 task_id 字段"
+      },
+      {
+        "path": "crates/remote-hosts-admin/src/engine.rs",
+        "lines": "26-35,109-169",
+        "finding": "计划摘要、写前持久化 running、重复请求/不确定结果不重放"
+      },
+      {
+        "path": "crates/remote-hosts-admin/src/filesystem.rs",
+        "lines": "65-130",
+        "finding": "原子 JSON + 文件及父目录 fsync，可复用私有 Store"
+      },
+      {
+        "path": "crates/remote-hosts-admin/src/transport.rs",
+        "lines": "101-109,118-125",
+        "finding": "server peer UID 授权；client 只接受 peer uid0，与 HO5 未映射 root 的 namespace 不兼容，需要测试及 D-Bus 适配，不能放行65534"
+      },
+      {
+        "path": "crates/remote-hosts-code/src/maintenance_tasks.rs",
+        "lines": "25-37,163-178",
+        "finding": "当前可协商维护接口仅 macOS；Linux 没有能力声明且被拒绝"
+      },
+      {
+        "path": "scripts/prepare-admin-helper.py",
+        "lines": "51-74",
+        "finding": "现有候选安装模板为 legacy cleanup，不能作为 HO5 DNS/package grant 安装"
+      }
+    ]
+  },
+  "operations": {
+    "inventory": "979948d2-dc0e-4433-85fe-ab053f59c7b5",
+    "boundary": "cdaadba6-fec0-4af0-9bf5-3c0b9bdf369b",
+    "authority": "7f6b45ca-b467-4404-83fd-f49bab3e2dee",
+    "final": "00a086a5-a0b2-4e5c-b2cb-189465441abe",
+    "all_process_exit_codes": 0,
+    "recovered_original_output": true,
+    "initial_status_capture": "初次 inventory 的内嵌 status 输出被脚本限长截断；部署结论只使用随后完整解析的 boundary/final status，不使用该截断字段"
+  },
+  "proposal": {
+    "ordinary_coordinator_first": true,
+    "new_root_service_deployed": false,
+    "dns_profile_enabled": false,
+    "dns_exact_domains_known": false,
+    "unattended_authority_verified": false,
+    "authority_after_external_maintenance": "requires_fresh_check_not_current_snapshot"
+  },
+  "coordination": {
+    "execution_owner": "external_agent_assigned_by_user",
+    "this_task": "read_only_assessment_and_repo_documentation",
+    "follow_up_acceptance": "await external completion receipt then fresh read-only query; never replay or assume old snapshot current",
+    "executor_tests_run": 0
+  },
+  "sources": [
+    {
+      "title": "Linux kernel: no_new_privs",
+      "url": "https://docs.kernel.org/userspace-api/no_new_privs.html",
+      "claim": "限制 execve 提权；不把对现有系统服务的请求变为自动授权"
+    },
+    {
+      "title": "rpm-ostree daemon architecture",
+      "url": "https://coreos.github.io/rpm-ostree/architecture-daemon/",
+      "claim": "系统 D-Bus、polkit、串行事务及事务进度"
+    },
+    {
+      "title": "rpm-ostree administrator handbook",
+      "url": "https://coreos.github.io/rpm-ostree/administrator-handbook/",
+      "claim": "包分层生成下一次启动的部署，status --json 可区分 booted/staged"
+    },
+    {
+      "title": "rpm-ostree v2026.2 authorization source",
+      "url": "https://raw.githubusercontent.com/coreos/rpm-ostree/v2026.2/src/daemon/rpmostreed-os.cxx",
+      "claim": "包动作交给 polkit 时 details 为 NULL，不能据此在 polkit 规则中限制包名；本地 RPM 版本不等于上游 tag 字节一致"
+    },
+    {
+      "title": "systemd logind interface and security",
+      "url": "https://raw.githubusercontent.com/systemd/systemd/main/man/org.freedesktop.login1.xml",
+      "claim": "CanReboot 只检查能力；Reboot(false) 走系统权限，其他会话及 inhibitors 有独立权限；main 文档不代表主机所有新 flags 已可用"
+    }
+  ]
+}
